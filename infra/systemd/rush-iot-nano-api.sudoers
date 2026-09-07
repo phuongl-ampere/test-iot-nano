@@ -1,0 +1,1 @@
+iot ALL=(root) NOPASSWD: /usr/local/sbin/iot-admin-helper read, /usr/local/sbin/iot-admin-helper apply

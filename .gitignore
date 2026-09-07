@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node.js / Next.js
+/web/node_modules/
+/web/.next/
+/web/out/
+/web/coverage/
+
+# PlatformIO
+/firmware/esp32/.pio/
+/firmware/esp32/.vscode/
+
+# Local tooling
+/.codebase-memory/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

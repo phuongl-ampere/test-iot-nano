@@ -1,0 +1,29 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      POSTGRES_DB: iot
+      POSTGRES_PASSWORD: iot
+      POSTGRES_USER: iot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot -d iot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "54329:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+
+  nanomq:
+    image: emqx/nanomq:0.25.6
+    command: ["nanomq", "start", "--conf", "/etc/nanomq/nanomq.conf"]
+    ports:
+      - "1883:1883"
+    volumes:
+      - ${NANOMQ_CONFIG:-./nanomq/nanomq.dev.conf}:/etc/nanomq/nanomq.conf:ro
+      - nanomq-data:/var/lib/nanomq
+
+volumes:
+  nanomq-data:
+  timescaledb-data:

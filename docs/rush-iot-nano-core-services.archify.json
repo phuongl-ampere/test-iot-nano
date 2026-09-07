@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Rush IoT Nano - Simple Architecture",
+    "quality_profile": "showcase",
+    "viewBox": [1120, 560]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [90, 165],
+    "cols": 4,
+    "gapX": 80,
+    "gapY": 120,
+    "cellW": 190,
+    "cellH": 76
+  },
+  "components": [
+    {
+      "id": "web",
+      "type": "frontend",
+      "label": "Web Frontend",
+      "sublabel": "Dashboard and management UI",
+      "tag": "Operator",
+      "row": 0,
+      "col": 0,
+      "size": [170, 76]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "IoT Core",
+      "sublabel": "API, ingress, validation, stream",
+      "tag": "Application services",
+      "row": 0,
+      "col": 1,
+      "size": [190, 76]
+    },
+    {
+      "id": "database",
+      "type": "database",
+      "label": "Application Database",
+      "sublabel": "TimescaleDB or SQLite",
+      "tag": "Devices and telemetry",
+      "row": 0,
+      "col": 2,
+      "size": [190, 76]
+    },
+    {
+      "id": "devices",
+      "type": "external",
+      "label": "IoT Devices",
+      "sublabel": "ESP32 and gateway devices",
+      "tag": "Device edge",
+      "row": 1,
+      "col": 0,
+      "size": [170, 76]
+    },
+    {
+      "id": "mqtt",
+      "type": "messagebus",
+      "label": "NanoMQ",
+      "sublabel": "MQTT broker",
+      "tag": "QoS 1 transport",
+      "row": 1,
+      "col": 1,
+      "size": [190, 76]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Rush IoT Nano Platform",
+      "wraps": ["core", "database", "mqtt"],
+      "pad": 34
+    }
+  ],
+  "connections": [
+    {
+      "id": "web-core",
+      "from": "web",
+      "to": "core",
+      "label": "HTTPS API",
+      "variant": "emphasis"
+    },
+    {
+      "id": "core-db",
+      "from": "core",
+      "to": "database",
+      "label": "read and write state",
+      "labelAt": [590, 255]
+    },
+    {
+      "id": "device-mqtt",
+      "from": "devices",
+      "to": "mqtt",
+      "label": "MQTT telemetry",
+      "variant": "emphasis"
+    },
+    {
+      "id": "mqtt-core",
+      "from": "mqtt",
+      "to": "core",
+      "label": "telemetry ingress",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [520, 300]
+    },
+    {
+      "id": "core-mqtt",
+      "from": "core",
+      "to": "mqtt",
+      "label": "device commands",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [405, 330]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Data path",
+      "items": [
+        "Devices publish telemetry through NanoMQ.",
+        "IoT Core validates and persists application data."
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Control path",
+      "items": [
+        "The web frontend uses IoT Core APIs.",
+        "IoT Core sends device commands through NanoMQ."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=NanoMQ MQTT broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nanomq
+Group=nanomq
+ExecStart=/usr/bin/nanomq start --conf /etc/nanomq/nanomq.conf
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+WorkingDirectory=/var/lib/nanomq
+
+[Install]
+WantedBy=multi-user.target
