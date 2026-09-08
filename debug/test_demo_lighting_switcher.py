@@ -148,6 +148,15 @@ class ReadinessTimeoutMqttClient(RecordingMqttClient):
         self.loop_started = True
 
 
+class RejectedReconnectMqttClient(RecordingMqttClient):
+    class FailureReasonCode:
+        is_failure = True
+
+    def loop_start(self):
+        self.loop_started = True
+        self.on_connect(self, None, None, self.ReasonCode(), None)
+
+
 class ImmediateSubscribeFailureMqttClient(RecordingMqttClient):
     def subscribe(self, topic, qos):
         self.subscriptions.append((topic, qos))
@@ -468,6 +477,42 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertFalse(callback_thread.is_alive())
         self.assertEqual(requests.get_nowait()["id"], "cmd-1")
 
+    def test_full_request_queue_drops_without_blocking_or_logging_payload(self):
+        requests = queue.Queue(maxsize=1)
+        first_payload = json.dumps({"method": "switch_on"}).encode("utf-8")
+        dropped_payload = b'{"method":"switch_off","secret":"device-token"}'
+        self.assertTrue(
+            module.enqueue_rpc_request(
+                requests,
+                "v1/devices/me/rpc/request/accepted",
+                first_payload,
+            )
+        )
+
+        result = []
+        callback_thread = threading.Thread(
+            target=lambda: result.append(
+                module.enqueue_rpc_request(
+                    requests,
+                    "v1/devices/me/rpc/request/dropped",
+                    dropped_payload,
+                )
+            ),
+            daemon=True,
+        )
+        with self.assertLogs(module.LOGGER, level="WARNING") as logs:
+            callback_thread.start()
+            callback_thread.join(1)
+
+        self.assertFalse(callback_thread.is_alive())
+        self.assertEqual(result, [False])
+        self.assertEqual(requests.qsize(), 1)
+        self.assertEqual(requests.get_nowait()["id"], "accepted")
+        log_output = "\n".join(logs.output)
+        self.assertIn("request queue full", log_output)
+        self.assertNotIn(dropped_payload.decode("utf-8"), log_output)
+        self.assertNotIn("device-token", log_output)
+
     def test_main_worker_processes_command_and_ack_checks_two_way_response(self):
         RecordingMqttClient.instances = []
         with (
@@ -495,6 +540,45 @@ class LightingSwitcherTests(unittest.TestCase):
             if topic == module.TELEMETRY_TOPIC
         ]
         self.assertEqual(telemetry_sequences, [0, 1])
+
+    def test_main_stops_after_rejected_reconnect_and_cleans_up(self):
+        RejectedReconnectMqttClient.instances = []
+        sleep_calls = 0
+
+        def trigger_rejected_reconnect(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 1:
+                client = RejectedReconnectMqttClient.instances[0]
+                client.on_connect(
+                    client,
+                    None,
+                    None,
+                    client.FailureReasonCode(),
+                    None,
+                )
+                return
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True),
+            mock.patch.object(
+                module.mqtt,
+                "Client",
+                side_effect=RejectedReconnectMqttClient,
+            ),
+            mock.patch.object(
+                module.time,
+                "sleep",
+                side_effect=trigger_rejected_reconnect,
+            ),
+        ):
+            with self.assertRaises(SystemExit):
+                module.main()
+
+        client = RejectedReconnectMqttClient.instances[0]
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
 
     def test_command_publish_failure_exits_and_cleans_up_from_main_worker(self):
         CommandResponseFailureMqttClient.instances = []

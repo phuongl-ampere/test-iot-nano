@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import os
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import threading
 import time
 import uuid
@@ -23,6 +23,7 @@ RPC_REQUEST_FILTER = RPC_REQUEST_PREFIX + "+"
 RPC_RESPONSE_PREFIX = "v1/devices/me/rpc/response/"
 TELEMETRY_TOPIC = "v1/devices/me/telemetry"
 PUBLISH_ACK_TIMEOUT_SECONDS = 5.0
+REQUEST_QUEUE_MAXSIZE = 100
 LOGGER = logging.getLogger(__name__)
 
 
@@ -133,7 +134,11 @@ def enqueue_rpc_request(request_queue: Queue, topic: str, payload: bytes) -> boo
     request = decode_rpc_request(topic, payload)
     if request is None:
         return False
-    request_queue.put(request)
+    try:
+        request_queue.put_nowait(request)
+    except Full:
+        LOGGER.warning("request queue full; dropping inbound request")
+        return False
     return True
 
 
@@ -282,7 +287,7 @@ def main() -> None:
     subscribed = threading.Event()
     startup_failed = threading.Event()
     readiness = threading.Event()
-    request_queue = Queue()
+    request_queue = Queue(maxsize=REQUEST_QUEUE_MAXSIZE)
     publisher = TelemetryPublisher(
         client, state, str(uuid.uuid4())
     )
@@ -362,6 +367,8 @@ def main() -> None:
         publisher.publish(sequence)
         sequence += 1
         while True:
+            if startup_failed.is_set():
+                raise SystemExit("MQTT connection or RPC subscription failed.")
             now = time.monotonic()
             if now >= next_periodic_at:
                 state.advance_energy(max(0.0, now - last_energy_at))
