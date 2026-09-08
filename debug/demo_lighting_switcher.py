@@ -94,7 +94,7 @@ def decode_rpc_request(topic: str, payload: bytes) -> Optional[dict]:
     if not isinstance(request, dict) or not isinstance(request.get("method"), str):
         return None
     request_id = topic[len(RPC_REQUEST_PREFIX) :]
-    request.setdefault("id", request_id)
+    request["id"] = request_id
     return request
 
 

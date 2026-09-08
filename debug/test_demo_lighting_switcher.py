@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import pathlib
 import sys
@@ -21,6 +22,79 @@ def load_module():
 
 
 module = load_module()
+
+
+class RecordingPublishInfo:
+    def wait_for_publish(self):
+        return None
+
+
+class RecordingMqttClient:
+    instances = []
+
+    class ReasonCode:
+        is_failure = False
+
+    def __init__(self, *args, **kwargs):
+        self.constructor_args = args
+        self.constructor_kwargs = kwargs
+        self.username = None
+        self.tls_calls = []
+        self.subscriptions = []
+        self.published = []
+        self.loop_started = False
+        self.loop_stopped = False
+        self.disconnected = False
+        self.on_connect = None
+        self.on_subscribe = None
+        self.on_message = None
+        self.__class__.instances.append(self)
+
+    def username_pw_set(self, username, password):
+        self.username = (username, password)
+
+    def tls_set(self, **kwargs):
+        self.tls_calls.append(kwargs)
+
+    def connect(self, host, port, keepalive):
+        self.connect_args = (host, port, keepalive)
+
+    def loop_start(self):
+        self.loop_started = True
+        self.on_connect(self, None, None, self.ReasonCode(), None)
+        self.on_message(
+            self,
+            None,
+            type(
+                "Message",
+                (),
+                {
+                    "topic": "v1/devices/me/rpc/request/cmd-1",
+                    "payload": json.dumps(
+                        {
+                            "id": "#invalid",
+                            "method": "set_brightness",
+                            "params": {"brightness_pct": 75},
+                            "mode": "two_way",
+                        }
+                    ).encode("utf-8"),
+                },
+            )(),
+        )
+
+    def loop_stop(self):
+        self.loop_stopped = True
+
+    def disconnect(self):
+        self.disconnected = True
+
+    def subscribe(self, topic, qos):
+        self.subscriptions.append((topic, qos))
+        self.on_subscribe(self, None, 1, [qos], None)
+
+    def publish(self, topic, payload, qos):
+        self.published.append((topic, payload, qos))
+        return RecordingPublishInfo()
 
 
 class LightingSwitcherTests(unittest.TestCase):
@@ -152,6 +226,82 @@ class LightingSwitcherTests(unittest.TestCase):
             module.rpc_response_topic("#")
         with self.assertRaises(ValueError):
             module.rpc_response_topic("cmd+1")
+
+    def test_decode_rpc_request_uses_concrete_topic_id_over_payload_id(self):
+        request = module.decode_rpc_request(
+            "v1/devices/me/rpc/request/cmd-1",
+            json.dumps({"id": "#invalid", "method": "switch_on"}).encode("utf-8"),
+        )
+
+        self.assertEqual(request["id"], "cmd-1")
+
+    def test_main_configures_v2_auth_subscribes_publishes_and_cleans_up(self):
+        RecordingMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token", "TELEMETRY_INTERVAL_SECONDS": "0"},
+                clear=True,
+            ),
+            mock.patch.object(
+                module.mqtt, "Client", side_effect=RecordingMqttClient
+            ),
+            mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                module.main()
+
+        client = RecordingMqttClient.instances[0]
+        self.assertEqual(
+            client.constructor_args[0], module.mqtt.CallbackAPIVersion.VERSION2
+        )
+        self.assertEqual(client.username, ("test-token", ""))
+        self.assertEqual(
+            client.subscriptions,
+            [("v1/devices/me/rpc/request/+", 1)],
+        )
+        self.assertEqual(client.tls_calls, [])
+        self.assertTrue(client.loop_started)
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
+        telemetry = [
+            item for item in client.published if item[0] == module.TELEMETRY_TOPIC
+        ]
+        responses = [
+            item
+            for item in client.published
+            if item[0] == "v1/devices/me/rpc/response/cmd-1"
+        ]
+        self.assertGreaterEqual(len(telemetry), 1)
+        self.assertTrue(all(item[2] == 1 for item in telemetry))
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0][2], 1)
+        self.assertEqual(json.loads(responses[0][1])["ok"], True)
+
+    def test_main_enables_tls_only_for_configured_ca_file(self):
+        RecordingMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "DEVICE_TOKEN": "test-token",
+                    "MQTT_CA_FILE": "/tmp/test-ca.pem",
+                    "TELEMETRY_INTERVAL_SECONDS": "0",
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                module.mqtt, "Client", side_effect=RecordingMqttClient
+            ),
+            mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                module.main()
+
+        self.assertEqual(
+            RecordingMqttClient.instances[0].tls_calls,
+            [{"ca_certs": "/tmp/test-ca.pem"}],
+        )
 
 
 if __name__ == "__main__":
