@@ -4,6 +4,7 @@ import logging
 import os
 import pathlib
 import sys
+import threading
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -26,8 +27,17 @@ module = load_module()
 
 
 class RecordingPublishInfo:
-    def wait_for_publish(self):
+    def __init__(self, rc=0, published=True):
+        self.rc = rc
+        self._published = published
+        self.wait_timeout = None
+
+    def wait_for_publish(self, timeout=None):
+        self.wait_timeout = timeout
         return None
+
+    def is_published(self):
+        return self._published
 
 
 class RecordingMqttClient:
@@ -98,6 +108,58 @@ class RecordingMqttClient:
         return RecordingPublishInfo()
 
 
+class DowngradedSubscriptionMqttClient(RecordingMqttClient):
+    def loop_start(self):
+        self.loop_started = True
+        self.on_connect(self, None, None, self.ReasonCode(), None)
+
+    def subscribe(self, topic, qos):
+        self.subscriptions.append((topic, qos))
+        self.on_subscribe(self, None, 1, [0], None)
+
+
+class FailedPublishMqttClient(RecordingMqttClient):
+    def loop_start(self):
+        self.loop_started = True
+        self.on_connect(self, None, None, self.ReasonCode(), None)
+
+    def publish(self, topic, payload, qos):
+        self.published.append((topic, payload, qos))
+        return RecordingPublishInfo(rc=1, published=False)
+
+
+class TimeoutPublishMqttClient(RecordingMqttClient):
+    def loop_start(self):
+        self.loop_started = True
+        self.on_connect(self, None, None, self.ReasonCode(), None)
+
+    def publish(self, topic, payload, qos):
+        self.published.append((topic, payload, qos))
+        return RecordingPublishInfo(rc=0, published=False)
+
+
+class OrderedBlockingMqttClient:
+    def __init__(self):
+        self.completed_sequences = []
+        self.first_publish_started = threading.Event()
+        self.release_first_publish = threading.Event()
+        self._publish_count = 0
+        self._lock = threading.Lock()
+
+    def publish(self, _topic, payload, qos):
+        self.assert_qos = qos
+        sequence = json.loads(payload)["sequence"]
+        with self._lock:
+            self._publish_count += 1
+            publish_number = self._publish_count
+        if publish_number == 1:
+            self.first_publish_started.set()
+            self.release_first_publish.wait(2)
+        with self._lock:
+            self.completed_sequences.append(sequence)
+        return RecordingPublishInfo()
+
+
 class ReadinessTimeoutMqttClient(RecordingMqttClient):
     def loop_start(self):
         self.loop_started = True
@@ -132,7 +194,7 @@ class LightingSwitcherTests(unittest.TestCase):
             "MQTT_HOST": "mqtt.test",
             "MQTT_PORT": "2883",
             "MQTT_CA_FILE": "/tmp/test-ca.pem",
-            "TELEMETRY_INTERVAL_SECONDS": "3.5",
+            "PUBLISH_INTERVAL_SECONDS": "3.5",
         }
         with mock.patch.dict(os.environ, environment, clear=True):
             configuration = module.configuration_from_environment()
@@ -141,6 +203,40 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertEqual(configuration.port, 2883)
         self.assertEqual(configuration.ca_file, "/tmp/test-ca.pem")
         self.assertEqual(configuration.publish_interval_seconds, 3.5)
+
+    def test_configuration_rejects_non_positive_or_non_finite_intervals(self):
+        for value in ("0", "-1", "nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                environment = {
+                    "DEVICE_TOKEN": "test-token",
+                    "PUBLISH_INTERVAL_SECONDS": value,
+                }
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaises(ValueError):
+                        module.configuration_from_environment()
+
+    def test_configuration_accepts_a_finite_positive_custom_interval(self):
+        with mock.patch.dict(
+            os.environ,
+            {"DEVICE_TOKEN": "test-token", "PUBLISH_INTERVAL_SECONDS": "3.5"},
+            clear=True,
+        ):
+            configuration = module.configuration_from_environment()
+
+        self.assertEqual(configuration.publish_interval_seconds, 3.5)
+
+    def test_configuration_ignores_removed_telemetry_interval_alias(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DEVICE_TOKEN": "test-token",
+                "TELEMETRY_INTERVAL_SECONDS": "0",
+            },
+            clear=True,
+        ):
+            configuration = module.configuration_from_environment()
+
+        self.assertEqual(configuration.publish_interval_seconds, 10)
 
     def test_set_brightness_updates_state_and_two_way_result(self):
         state = module.LightingSwitcherState()
@@ -202,6 +298,25 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertTrue(outcome.applied)
         self.assertIsNone(outcome.response)
 
+    def test_invalid_explicit_rpc_mode_is_ignored_without_state_change(self):
+        state = module.LightingSwitcherState()
+        outcome = state.handle_rpc(
+            {"method": "switch_on", "params": {}, "mode": "invalid"}
+        )
+
+        self.assertFalse(outcome.applied)
+        self.assertEqual(state.measurements(0)["switch_state"], False)
+
+    def test_decode_ignores_invalid_explicit_rpc_mode(self):
+        request = module.decode_rpc_request(
+            "v1/devices/me/rpc/request/cmd-1",
+            json.dumps(
+                {"method": "switch_on", "mode": "invalid"}
+            ).encode("utf-8"),
+        )
+
+        self.assertIsNone(request)
+
     def test_telemetry_contains_envelope_and_measurements(self):
         state = module.LightingSwitcherState()
         telemetry = module.build_telemetry(state, "boot-1", 7, 10)
@@ -220,6 +335,41 @@ class LightingSwitcherTests(unittest.TestCase):
         )
         parsed = datetime.fromisoformat(telemetry["event_at"].replace("Z", "+00:00"))
         self.assertIsNotNone(parsed.tzinfo)
+
+    def test_telemetry_publishes_unique_sequences_in_completion_order(self):
+        client = OrderedBlockingMqttClient()
+        publisher = module.TelemetryPublisher(
+            client, module.LightingSwitcherState(), 10
+        )
+        first = threading.Thread(
+            target=publisher.publish, kwargs={"wait_for_ack": False}
+        )
+        second = threading.Thread(
+            target=publisher.publish, kwargs={"wait_for_ack": False}
+        )
+
+        first.start()
+        self.assertTrue(client.first_publish_started.wait(1))
+        second.start()
+        client.release_first_publish.set()
+        first.join(1)
+        second.join(1)
+
+        self.assertEqual(client.completed_sequences, [0, 1])
+
+    def test_publish_ack_timeout_is_bounded_and_detected(self):
+        self.assertGreater(module.PUBLISH_ACK_TIMEOUT_SECONDS, 0)
+        info = RecordingPublishInfo(published=False)
+        client = mock.Mock()
+        client.publish.return_value = info
+        publisher = module.TelemetryPublisher(
+            client, module.LightingSwitcherState(), 10
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "telemetry publish"):
+            publisher.publish()
+
+        self.assertEqual(info.wait_timeout, module.PUBLISH_ACK_TIMEOUT_SECONDS)
 
     def test_rpc_topics_require_one_request_identifier(self):
         self.assertTrue(
@@ -242,6 +392,12 @@ class LightingSwitcherTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.rpc_response_topic("cmd+1")
 
+    def test_subscription_requires_every_grant_to_be_exactly_qos_one(self):
+        self.assertTrue(module.subscription_granted([1]))
+        self.assertFalse(module.subscription_granted([]))
+        self.assertFalse(module.subscription_granted([0]))
+        self.assertFalse(module.subscription_granted([1, 2]))
+
     def test_decode_rpc_request_uses_concrete_topic_id_over_payload_id(self):
         request = module.decode_rpc_request(
             "v1/devices/me/rpc/request/cmd-1",
@@ -255,7 +411,7 @@ class LightingSwitcherTests(unittest.TestCase):
         with (
             mock.patch.dict(
                 os.environ,
-                {"DEVICE_TOKEN": "test-token", "TELEMETRY_INTERVAL_SECONDS": "0"},
+                {"DEVICE_TOKEN": "test-token", "PUBLISH_INTERVAL_SECONDS": "10"},
                 clear=True,
             ),
             mock.patch.object(
@@ -305,7 +461,7 @@ class LightingSwitcherTests(unittest.TestCase):
                 {
                     "DEVICE_TOKEN": "test-token",
                     "MQTT_CA_FILE": "/tmp/test-ca.pem",
-                    "TELEMETRY_INTERVAL_SECONDS": "0",
+                    "PUBLISH_INTERVAL_SECONDS": "10",
                 },
                 clear=True,
             ),
@@ -320,6 +476,70 @@ class LightingSwitcherTests(unittest.TestCase):
             RecordingMqttClient.instances[0].tls_calls,
             [{"ca_certs": "/tmp/test-ca.pem"}],
         )
+
+    def test_main_rejects_downgraded_subscription_and_cleans_up(self):
+        DowngradedSubscriptionMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token"},
+                clear=True,
+            ),
+            mock.patch.object(
+                module.mqtt,
+                "Client",
+                side_effect=DowngradedSubscriptionMqttClient,
+            ),
+            mock.patch.object(
+                module.threading.Event,
+                "wait",
+                side_effect=[True, False],
+            ),
+        ):
+            with self.assertRaises(SystemExit):
+                module.main()
+
+        client = DowngradedSubscriptionMqttClient.instances[0]
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
+
+    def test_main_publish_failure_exits_and_cleans_up(self):
+        FailedPublishMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token"},
+                clear=True,
+            ),
+            mock.patch.object(
+                module.mqtt, "Client", side_effect=FailedPublishMqttClient
+            ),
+        ):
+            with self.assertRaises(SystemExit):
+                module.main()
+
+        client = FailedPublishMqttClient.instances[0]
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
+
+    def test_main_publish_timeout_exits_and_cleans_up(self):
+        TimeoutPublishMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token"},
+                clear=True,
+            ),
+            mock.patch.object(
+                module.mqtt, "Client", side_effect=TimeoutPublishMqttClient
+            ),
+        ):
+            with self.assertRaises(SystemExit):
+                module.main()
+
+        client = TimeoutPublishMqttClient.instances[0]
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
 
     def test_main_readiness_timeout_stops_loop_and_disconnects(self):
         ReadinessTimeoutMqttClient.instances = []

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -20,6 +21,7 @@ RPC_REQUEST_PREFIX = "v1/devices/me/rpc/request/"
 RPC_REQUEST_FILTER = RPC_REQUEST_PREFIX + "+"
 RPC_RESPONSE_PREFIX = "v1/devices/me/rpc/response/"
 TELEMETRY_TOPIC = "v1/devices/me/telemetry"
+PUBLISH_ACK_TIMEOUT_SECONDS = 5.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -49,17 +51,17 @@ def configuration_from_environment() -> MqttConfiguration:
     token = os.environ.get("DEVICE_TOKEN")
     if not token:
         raise ValueError("DEVICE_TOKEN is required")
+    publish_interval_seconds = float(
+        os.environ.get("PUBLISH_INTERVAL_SECONDS", "10")
+    )
+    if not math.isfinite(publish_interval_seconds) or publish_interval_seconds <= 0:
+        raise ValueError("PUBLISH_INTERVAL_SECONDS must be finite and positive")
     return MqttConfiguration(
         token=token,
         host=os.environ.get("MQTT_HOST", "127.0.0.1"),
         port=int(os.environ.get("MQTT_PORT", "1883")),
         ca_file=os.environ.get("MQTT_CA_FILE") or None,
-        publish_interval_seconds=float(
-            os.environ.get(
-                "TELEMETRY_INTERVAL_SECONDS",
-                os.environ.get("PUBLISH_INTERVAL_SECONDS", "10"),
-            )
-        ),
+        publish_interval_seconds=publish_interval_seconds,
     )
 
 
@@ -75,23 +77,38 @@ class TelemetryPublisher:
         self.interval_seconds = interval_seconds
         self.boot_id = str(uuid.uuid4())
         self.sequence = 0
+        self._publish_lock = threading.Lock()
 
     def publish(self, wait_for_ack: bool = True) -> None:
-        telemetry = build_telemetry(
-            self.state,
-            self.boot_id,
-            self.sequence,
-            self.interval_seconds,
-        )
-        self.sequence += 1
-        info = self.client.publish(
-            TELEMETRY_TOPIC,
-            json.dumps(telemetry),
-            qos=1,
-        )
-        LOGGER.info("telemetry sequence=%s", telemetry["sequence"])
-        if wait_for_ack:
-            info.wait_for_publish()
+        with self._publish_lock:
+            telemetry = build_telemetry(
+                self.state,
+                self.boot_id,
+                self.sequence,
+                self.interval_seconds,
+            )
+            try:
+                info = self.client.publish(
+                    TELEMETRY_TOPIC,
+                    json.dumps(telemetry),
+                    qos=1,
+                )
+                if info.rc != 0:
+                    raise RuntimeError(
+                        f"telemetry publish failed immediately (rc={info.rc})"
+                    )
+                if wait_for_ack:
+                    info.wait_for_publish(timeout=PUBLISH_ACK_TIMEOUT_SECONDS)
+                    if not info.is_published():
+                        raise RuntimeError(
+                            "telemetry publish acknowledgment timed out"
+                        )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"telemetry publish failed: {exc}") from exc
+            self.sequence += 1
+            LOGGER.info("telemetry sequence=%s", telemetry["sequence"])
 
 
 def decode_rpc_request(topic: str, payload: bytes) -> Optional[dict]:
@@ -102,6 +119,8 @@ def decode_rpc_request(topic: str, payload: bytes) -> Optional[dict]:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(request, dict) or not isinstance(request.get("method"), str):
+        return None
+    if "mode" in request and request["mode"] not in {"one_way", "two_way"}:
         return None
     request_id = topic[len(RPC_REQUEST_PREFIX) :]
     request["id"] = request_id
@@ -124,6 +143,8 @@ class LightingSwitcherState:
         params = request.get("params", {})
         if not isinstance(params, dict):
             return self._outcome(request, False, "invalid_params")
+        if "mode" in request and request["mode"] not in {"one_way", "two_way"}:
+            return self._outcome(request, False, "invalid_mode")
 
         with self._lock:
             method = request.get("method")
@@ -223,6 +244,10 @@ def rpc_response_topic(request_id: str) -> str:
     return RPC_RESPONSE_PREFIX + request_id
 
 
+def subscription_granted(granted_qos) -> bool:
+    return bool(granted_qos) and all(qos == 1 for qos in granted_qos)
+
+
 def main() -> None:
     configuration = configuration_from_environment()
     state = LightingSwitcherState()
@@ -259,7 +284,7 @@ def main() -> None:
         granted_qos,
         _properties,
     ):
-        if granted_qos and all(qos != 128 for qos in granted_qos):
+        if subscription_granted(granted_qos):
             subscribed.set()
 
     def on_message(mqtt_client, _userdata, message):
@@ -291,7 +316,11 @@ def main() -> None:
             RPC_REQUEST_FILTER,
         )
         while True:
-            publisher.publish()
+            try:
+                publisher.publish()
+            except Exception as exc:
+                LOGGER.error("telemetry loop failed: %s", exc)
+                raise SystemExit("MQTT telemetry publication failed.") from exc
             time.sleep(configuration.publish_interval_seconds)
     except KeyboardInterrupt:
         LOGGER.info("shutdown requested")
