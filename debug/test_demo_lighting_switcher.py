@@ -97,6 +97,11 @@ class RecordingMqttClient:
         return RecordingPublishInfo()
 
 
+class ReadinessTimeoutMqttClient(RecordingMqttClient):
+    def loop_start(self):
+        self.loop_started = True
+
+
 class LightingSwitcherTests(unittest.TestCase):
     def test_configuration_defaults_to_the_local_plain_mqtt_listener(self):
         with mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True):
@@ -302,6 +307,27 @@ class LightingSwitcherTests(unittest.TestCase):
             RecordingMqttClient.instances[0].tls_calls,
             [{"ca_certs": "/tmp/test-ca.pem"}],
         )
+
+    def test_main_readiness_timeout_stops_loop_and_disconnects(self):
+        ReadinessTimeoutMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token"},
+                clear=True,
+            ),
+            mock.patch.object(
+                module.mqtt, "Client", side_effect=ReadinessTimeoutMqttClient
+            ),
+            mock.patch.object(module.threading.Event, "wait", return_value=False),
+        ):
+            with self.assertRaises(SystemExit):
+                module.main()
+
+        client = ReadinessTimeoutMqttClient.instances[0]
+        self.assertTrue(client.loop_started)
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
 
 
 if __name__ == "__main__":
