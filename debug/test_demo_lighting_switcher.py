@@ -253,7 +253,7 @@ class LightingSwitcherTests(unittest.TestCase):
             ),
             mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
         ):
-            with self.assertRaises(KeyboardInterrupt):
+            with self.assertLogs(module.LOGGER, level="INFO") as logs:
                 module.main()
 
         client = RecordingMqttClient.instances[0]
@@ -282,6 +282,10 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0][2], 1)
         self.assertEqual(json.loads(responses[0][1])["ok"], True)
+        log_output = "\n".join(logs.output)
+        self.assertIn("connected", log_output)
+        self.assertIn("telemetry sequence=0", log_output)
+        self.assertNotIn("test-token", log_output)
 
     def test_main_enables_tls_only_for_configured_ca_file(self):
         RecordingMqttClient.instances = []
@@ -300,8 +304,7 @@ class LightingSwitcherTests(unittest.TestCase):
             ),
             mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
         ):
-            with self.assertRaises(KeyboardInterrupt):
-                module.main()
+            module.main()
 
         self.assertEqual(
             RecordingMqttClient.instances[0].tls_calls,

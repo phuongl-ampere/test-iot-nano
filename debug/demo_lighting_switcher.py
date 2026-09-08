@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -19,6 +20,7 @@ RPC_REQUEST_PREFIX = "v1/devices/me/rpc/request/"
 RPC_REQUEST_FILTER = RPC_REQUEST_PREFIX + "+"
 RPC_RESPONSE_PREFIX = "v1/devices/me/rpc/response/"
 TELEMETRY_TOPIC = "v1/devices/me/telemetry"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,7 @@ class TelemetryPublisher:
             json.dumps(telemetry),
             qos=1,
         )
+        LOGGER.info("telemetry sequence=%s", telemetry["sequence"])
         if wait_for_ack:
             info.wait_for_publish()
 
@@ -274,9 +277,17 @@ def main() -> None:
         client.loop_start()
         if not connected.wait(10) or not subscribed.wait(10):
             raise SystemExit("MQTT token authentication or RPC subscription failed.")
+        LOGGER.info(
+            "connected host=%s port=%s subscription=%s",
+            configuration.host,
+            configuration.port,
+            RPC_REQUEST_FILTER,
+        )
         while True:
             publisher.publish()
             time.sleep(configuration.publish_interval_seconds)
+    except KeyboardInterrupt:
+        LOGGER.info("shutdown requested")
     finally:
         client.loop_stop()
         client.disconnect()
