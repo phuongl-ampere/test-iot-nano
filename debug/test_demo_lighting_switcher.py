@@ -106,6 +106,10 @@ class LightingSwitcherTests(unittest.TestCase):
             module.is_rpc_request_topic("v1/devices/me/rpc/request/cmd-1")
         )
         self.assertFalse(module.is_rpc_request_topic("v1/devices/me/rpc/request/+"))
+        self.assertFalse(module.is_rpc_request_topic("v1/devices/me/rpc/request/#"))
+        self.assertFalse(
+            module.is_rpc_request_topic("v1/devices/me/rpc/request/cmd+1")
+        )
         self.assertFalse(
             module.is_rpc_request_topic("v1/devices/me/rpc/request/cmd-1/extra")
         )
@@ -113,6 +117,10 @@ class LightingSwitcherTests(unittest.TestCase):
             module.rpc_response_topic("cmd-1"),
             "v1/devices/me/rpc/response/cmd-1",
         )
+        with self.assertRaises(ValueError):
+            module.rpc_response_topic("#")
+        with self.assertRaises(ValueError):
+            module.rpc_response_topic("cmd+1")
 
 
 if __name__ == "__main__":

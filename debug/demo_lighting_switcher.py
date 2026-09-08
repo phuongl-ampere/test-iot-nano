@@ -94,7 +94,12 @@ class LightingSwitcherState:
         return CommandOutcome(applied=False, response={"ok": False, "error": value})
 
 
-def build_telemetry(state, boot_id, sequence, interval_seconds):
+def build_telemetry(
+    state: LightingSwitcherState,
+    boot_id: str,
+    sequence: int,
+    interval_seconds: float,
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "boot_id": boot_id,
@@ -108,10 +113,21 @@ def is_rpc_request_topic(topic: str) -> bool:
     if not isinstance(topic, str) or not topic.startswith(RPC_REQUEST_PREFIX):
         return False
     request_id = topic[len(RPC_REQUEST_PREFIX) :]
-    return bool(request_id) and request_id != "+" and "/" not in request_id
+    return (
+        bool(request_id)
+        and "/" not in request_id
+        and "+" not in request_id
+        and "#" not in request_id
+    )
 
 
 def rpc_response_topic(request_id: str) -> str:
-    if not isinstance(request_id, str) or not request_id or "/" in request_id:
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or "/" in request_id
+        or "+" in request_id
+        or "#" in request_id
+    ):
         raise ValueError("request_id must be one non-empty topic segment")
     return RPC_RESPONSE_PREFIX + request_id
