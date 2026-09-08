@@ -1,8 +1,10 @@
 import importlib.util
+import os
 import pathlib
 import sys
 import unittest
 from datetime import datetime
+from unittest import mock
 
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("demo_lighting_switcher.py")
@@ -22,6 +24,35 @@ module = load_module()
 
 
 class LightingSwitcherTests(unittest.TestCase):
+    def test_configuration_defaults_to_the_local_plain_mqtt_listener(self):
+        with mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True):
+            configuration = module.configuration_from_environment()
+
+        self.assertEqual(configuration.host, "127.0.0.1")
+        self.assertEqual(configuration.port, 1883)
+        self.assertIsNone(configuration.ca_file)
+
+    def test_configuration_requires_device_token(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError):
+                module.configuration_from_environment()
+
+    def test_configuration_reads_custom_listener_and_optional_tls_settings(self):
+        environment = {
+            "DEVICE_TOKEN": "test-token",
+            "MQTT_HOST": "mqtt.test",
+            "MQTT_PORT": "2883",
+            "MQTT_CA_FILE": "/tmp/test-ca.pem",
+            "TELEMETRY_INTERVAL_SECONDS": "3.5",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            configuration = module.configuration_from_environment()
+
+        self.assertEqual(configuration.host, "mqtt.test")
+        self.assertEqual(configuration.port, 2883)
+        self.assertEqual(configuration.ca_file, "/tmp/test-ca.pem")
+        self.assertEqual(configuration.publish_interval_seconds, 3.5)
+
     def test_set_brightness_updates_state_and_two_way_result(self):
         state = module.LightingSwitcherState()
         outcome = state.handle_rpc(
