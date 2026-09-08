@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Deterministic lighting switcher state and telemetry helpers."""
+
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+
+RPC_REQUEST_PREFIX = "v1/devices/me/rpc/request/"
+RPC_REQUEST_FILTER = RPC_REQUEST_PREFIX + "+"
+RPC_RESPONSE_PREFIX = "v1/devices/me/rpc/response/"
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    applied: bool
+    response: Optional[dict]
+
+
+class LightingSwitcherState:
+    MAX_POWER_W = 10.0
+
+    def __init__(self):
+        self.switch_state = False
+        self.brightness_pct = 0
+        self.energy_kwh = 0.0
+        self._lock = threading.Lock()
+
+    def handle_rpc(self, request: dict) -> CommandOutcome:
+        if not isinstance(request, dict):
+            return self._outcome(request, False, "invalid_request")
+
+        params = request.get("params", {})
+        if not isinstance(params, dict):
+            return self._outcome(request, False, "invalid_params")
+
+        with self._lock:
+            method = request.get("method")
+            if method == "switch_on":
+                self.switch_state = True
+                self.brightness_pct = self.brightness_pct or 100.0
+            elif method == "switch_off":
+                self.switch_state = False
+            elif method == "set_power" and isinstance(params.get("on"), bool):
+                self.switch_state = params["on"]
+                if self.switch_state:
+                    self.brightness_pct = self.brightness_pct or 100.0
+            elif method == "set_brightness" and self._valid_brightness(
+                params.get("brightness_pct")
+            ):
+                self.brightness_pct = float(params["brightness_pct"])
+                self.switch_state = self.brightness_pct > 0
+            else:
+                return self._outcome(request, False, "unsupported_method")
+            return self._outcome(request, True, self._snapshot())
+
+    def measurements(self, interval_seconds: float) -> dict:
+        with self._lock:
+            power_w = (
+                self.MAX_POWER_W * self.brightness_pct / 100
+                if self.switch_state
+                else 0.0
+            )
+            if self.switch_state:
+                self.energy_kwh += power_w * interval_seconds / 3_600_000
+            return {
+                "switch_state": self.switch_state,
+                "brightness_pct": self.brightness_pct,
+                "power_w": round(power_w, 3),
+                "energy_kwh": round(self.energy_kwh, 9),
+            }
+
+    @staticmethod
+    def _valid_brightness(value):
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and 0 <= value <= 100
+        )
+
+    def _snapshot(self):
+        return {
+            "switch_state": self.switch_state,
+            "brightness_pct": self.brightness_pct,
+        }
+
+    @staticmethod
+    def _outcome(request, applied, value):
+        if not isinstance(request, dict) or request.get("mode") != "two_way":
+            return CommandOutcome(applied=applied, response=None)
+        if applied:
+            return CommandOutcome(applied=True, response={"ok": True, "result": value})
+        return CommandOutcome(applied=False, response={"ok": False, "error": value})
+
+
+def build_telemetry(state, boot_id, sequence, interval_seconds):
+    return {
+        "schema_version": 1,
+        "boot_id": boot_id,
+        "sequence": sequence,
+        "event_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "measurements": state.measurements(interval_seconds),
+    }
+
+
+def is_rpc_request_topic(topic: str) -> bool:
+    if not isinstance(topic, str) or not topic.startswith(RPC_REQUEST_PREFIX):
+        return False
+    request_id = topic[len(RPC_REQUEST_PREFIX) :]
+    return bool(request_id) and request_id != "+" and "/" not in request_id
+
+
+def rpc_response_topic(request_id: str) -> str:
+    if not isinstance(request_id, str) or not request_id or "/" in request_id:
+        raise ValueError("request_id must be one non-empty topic segment")
+    return RPC_RESPONSE_PREFIX + request_id
