@@ -182,6 +182,8 @@ class LightingSwitcherState:
             return self._outcome(request, True, self._snapshot())
 
     def advance_energy(self, elapsed_seconds: float) -> None:
+        if elapsed_seconds < 0 or not math.isfinite(elapsed_seconds):
+            raise ValueError("elapsed_seconds must be finite and non-negative")
         with self._lock:
             power_w = (
                 self.MAX_POWER_W * self.brightness_pct / 100
@@ -269,24 +271,38 @@ def rpc_response_topic(request_id: str) -> str:
 
 
 def subscription_granted(granted_qos) -> bool:
-    return bool(granted_qos) and all(qos == 1 for qos in granted_qos)
+    return isinstance(granted_qos, (list, tuple)) and granted_qos == [1]
 
 
 def main() -> None:
-    configuration = configuration_from_environment()
+    try:
+        configuration = configuration_from_environment()
+    except (TypeError, ValueError, OverflowError) as exc:
+        LOGGER.error("MQTT configuration failed: %s", exc)
+        raise SystemExit("MQTT configuration failed.") from None
+
     state = LightingSwitcherState()
-    client = mqtt.Client(
-        mqtt.CallbackAPIVersion.VERSION2,
-        client_id=f"python-lighting-switcher-{uuid.uuid4()}",
-    )
-    client.username_pw_set(configuration.token, password="")
-    if configuration.ca_file:
-        client.tls_set(ca_certs=configuration.ca_file)
+    client = None
+    try:
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"python-lighting-switcher-{uuid.uuid4()}",
+        )
+        client.username_pw_set(configuration.token, password="")
+        if configuration.ca_file:
+            client.tls_set(ca_certs=configuration.ca_file)
+    except Exception as exc:
+        LOGGER.error("MQTT initialization failed: %s", exc)
+        if client is not None:
+            client.loop_stop()
+            client.disconnect()
+        raise SystemExit("MQTT initialization failed.") from None
 
     connected = threading.Event()
     subscribed = threading.Event()
     startup_failed = threading.Event()
     readiness = threading.Event()
+    stopping = threading.Event()
     request_queue = Queue(maxsize=REQUEST_QUEUE_MAXSIZE)
     publisher = TelemetryPublisher(
         client, state, str(uuid.uuid4())
@@ -340,9 +356,25 @@ def main() -> None:
     def on_message(_mqtt_client, _userdata, message):
         enqueue_rpc_request(request_queue, message.topic, message.payload)
 
+    def on_connect_fail(_mqtt_client, _userdata):
+        if not stopping.is_set():
+            fail_startup("broker reconnect failed")
+
+    def on_disconnect(
+        _mqtt_client,
+        _userdata,
+        _disconnect_flags,
+        _reason_code,
+        _properties,
+    ):
+        if not stopping.is_set():
+            fail_startup("unexpected broker disconnect")
+
     client.on_connect = on_connect
     client.on_subscribe = on_subscribe
     client.on_message = on_message
+    client.on_connect_fail = on_connect_fail
+    client.on_disconnect = on_disconnect
     try:
         client.connect(configuration.host, configuration.port, keepalive=60)
         client.loop_start()
@@ -403,6 +435,7 @@ def main() -> None:
         LOGGER.error("MQTT worker failed: %s", exc)
         raise SystemExit("MQTT publication failed.") from exc
     finally:
+        stopping.set()
         client.loop_stop()
         client.disconnect()
 

@@ -148,6 +148,23 @@ class ReadinessTimeoutMqttClient(RecordingMqttClient):
         self.loop_started = True
 
 
+class ConnectFailAfterReadyMqttClient(RecordingMqttClient):
+    def loop_start(self):
+        self.loop_started = True
+        self.on_connect(self, None, None, self.ReasonCode(), None)
+
+
+class DisconnectAfterReadyMqttClient(RecordingMqttClient):
+    def loop_start(self):
+        self.loop_started = True
+        self.on_connect(self, None, None, self.ReasonCode(), None)
+
+
+class TlsFailureMqttClient(RecordingMqttClient):
+    def tls_set(self, **kwargs):
+        raise OSError("invalid CA file")
+
+
 class RejectedReconnectMqttClient(RecordingMqttClient):
     class FailureReasonCode:
         is_failure = True
@@ -310,6 +327,25 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertEqual(after["power_w"], 0.0)
         self.assertEqual(after["energy_kwh"], before)
 
+    def test_powered_on_energy_rejects_negative_or_non_finite_elapsed(self):
+        state = module.LightingSwitcherState()
+        self.assertTrue(state.handle_rpc({"method": "switch_on"}).applied)
+
+        for elapsed_seconds in (-1, float("nan"), float("inf")):
+            with self.subTest(elapsed_seconds=elapsed_seconds):
+                before = state.energy_kwh
+                with self.assertRaises(ValueError):
+                    state.advance_energy(elapsed_seconds)
+                self.assertEqual(state.energy_kwh, before)
+
+    def test_powered_on_energy_accepts_valid_elapsed_without_decreasing(self):
+        state = module.LightingSwitcherState()
+        self.assertTrue(state.handle_rpc({"method": "switch_on"}).applied)
+
+        state.advance_energy(3600)
+
+        self.assertEqual(state.energy_kwh, 0.01)
+
     def test_brightness_boundaries_control_power_and_switch(self):
         state = module.LightingSwitcherState()
 
@@ -426,6 +462,7 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertTrue(module.subscription_granted([1]))
         self.assertFalse(module.subscription_granted([]))
         self.assertFalse(module.subscription_granted([0]))
+        self.assertFalse(module.subscription_granted([1, 1]))
         self.assertFalse(module.subscription_granted([1, 2]))
 
     def test_decode_rpc_request_uses_concrete_topic_id_over_payload_id(self):
@@ -580,6 +617,72 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertTrue(client.loop_stopped)
         self.assertTrue(client.disconnected)
 
+    def test_main_stops_after_post_ready_connect_failure_and_cleans_up(self):
+        ConnectFailAfterReadyMqttClient.instances = []
+        sleep_calls = 0
+
+        def trigger_connect_failure(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 1:
+                client = ConnectFailAfterReadyMqttClient.instances[0]
+                client.on_connect_fail(client, None)
+                return
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True),
+            mock.patch.object(
+                module.mqtt,
+                "Client",
+                side_effect=ConnectFailAfterReadyMqttClient,
+            ),
+            mock.patch.object(
+                module.time,
+                "sleep",
+                side_effect=trigger_connect_failure,
+            ),
+        ):
+            with self.assertRaises(SystemExit):
+                module.main()
+
+        client = ConnectFailAfterReadyMqttClient.instances[0]
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
+
+    def test_main_stops_after_unexpected_disconnect_and_cleans_up(self):
+        DisconnectAfterReadyMqttClient.instances = []
+        sleep_calls = 0
+
+        def trigger_disconnect(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 1:
+                client = DisconnectAfterReadyMqttClient.instances[0]
+                client.on_disconnect(client, None, None, None, None)
+                return
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True),
+            mock.patch.object(
+                module.mqtt,
+                "Client",
+                side_effect=DisconnectAfterReadyMqttClient,
+            ),
+            mock.patch.object(
+                module.time,
+                "sleep",
+                side_effect=trigger_disconnect,
+            ),
+        ):
+            with self.assertRaises(SystemExit):
+                module.main()
+
+        client = DisconnectAfterReadyMqttClient.instances[0]
+        self.assertTrue(client.loop_stopped)
+        self.assertTrue(client.disconnected)
+
     def test_command_publish_failure_exits_and_cleans_up_from_main_worker(self):
         CommandResponseFailureMqttClient.instances = []
         with (
@@ -710,6 +813,49 @@ class LightingSwitcherTests(unittest.TestCase):
             RecordingMqttClient.instances[0].tls_calls,
             [{"ca_certs": "/tmp/test-ca.pem"}],
         )
+
+    def test_main_logs_and_exits_for_invalid_configuration(self):
+        with (
+            mock.patch.object(
+                module,
+                "configuration_from_environment",
+                side_effect=ValueError("PUBLISH_INTERVAL_SECONDS must be finite and positive"),
+            ),
+            self.assertLogs(module.LOGGER, level="ERROR") as logs,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                module.main()
+
+        self.assertEqual(str(raised.exception), "MQTT configuration failed.")
+        self.assertIn("MQTT configuration failed", "\n".join(logs.output))
+        self.assertNotIn("test-token", "\n".join(logs.output))
+
+    def test_main_logs_and_exits_for_tls_initialization_failure(self):
+        TlsFailureMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "DEVICE_TOKEN": "test-token",
+                    "MQTT_CA_FILE": "/tmp/missing-ca.pem",
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                module.mqtt,
+                "Client",
+                side_effect=TlsFailureMqttClient,
+            ),
+            self.assertLogs(module.LOGGER, level="ERROR") as logs,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                module.main()
+
+        self.assertEqual(str(raised.exception), "MQTT initialization failed.")
+        log_output = "\n".join(logs.output)
+        self.assertIn("MQTT initialization failed", log_output)
+        self.assertNotIn("test-token", log_output)
+        self.assertFalse(TlsFailureMqttClient.instances[0].loop_started)
 
     def test_main_rejects_downgraded_subscription_and_cleans_up(self):
         DowngradedSubscriptionMqttClient.instances = []
