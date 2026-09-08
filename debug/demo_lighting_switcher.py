@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+from queue import Empty, Queue
 import threading
 import time
 import uuid
@@ -65,50 +66,51 @@ def configuration_from_environment() -> MqttConfiguration:
     )
 
 
+def publish_qos1(
+    client: mqtt.Client,
+    topic: str,
+    payload: str,
+    *,
+    description: str,
+) -> None:
+    try:
+        info = client.publish(topic, payload, qos=1)
+        if info.rc != 0:
+            raise RuntimeError(f"{description} publish failed immediately (rc={info.rc})")
+        info.wait_for_publish(timeout=PUBLISH_ACK_TIMEOUT_SECONDS)
+        if not info.is_published():
+            raise RuntimeError(f"{description} publish acknowledgment timed out")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"{description} publish failed: {exc}") from exc
+
+
 class TelemetryPublisher:
     def __init__(
         self,
         client: mqtt.Client,
         state: LightingSwitcherState,
-        interval_seconds: float,
+        boot_id: str,
     ):
         self.client = client
         self.state = state
-        self.interval_seconds = interval_seconds
-        self.boot_id = str(uuid.uuid4())
-        self.sequence = 0
-        self._publish_lock = threading.Lock()
+        self.boot_id = boot_id
 
-    def publish(self, wait_for_ack: bool = True) -> None:
-        with self._publish_lock:
-            telemetry = build_telemetry(
-                self.state,
-                self.boot_id,
-                self.sequence,
-                self.interval_seconds,
-            )
-            try:
-                info = self.client.publish(
-                    TELEMETRY_TOPIC,
-                    json.dumps(telemetry),
-                    qos=1,
-                )
-                if info.rc != 0:
-                    raise RuntimeError(
-                        f"telemetry publish failed immediately (rc={info.rc})"
-                    )
-                if wait_for_ack:
-                    info.wait_for_publish(timeout=PUBLISH_ACK_TIMEOUT_SECONDS)
-                    if not info.is_published():
-                        raise RuntimeError(
-                            "telemetry publish acknowledgment timed out"
-                        )
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                raise RuntimeError(f"telemetry publish failed: {exc}") from exc
-            self.sequence += 1
-            LOGGER.info("telemetry sequence=%s", telemetry["sequence"])
+    def publish(self, sequence: int, interval_seconds: float = 0) -> None:
+        telemetry = build_telemetry(
+            self.state,
+            self.boot_id,
+            sequence,
+            interval_seconds,
+        )
+        publish_qos1(
+            self.client,
+            TELEMETRY_TOPIC,
+            json.dumps(telemetry),
+            description="telemetry",
+        )
+        LOGGER.info("telemetry sequence=%s", telemetry["sequence"])
 
 
 def decode_rpc_request(topic: str, payload: bytes) -> Optional[dict]:
@@ -125,6 +127,14 @@ def decode_rpc_request(topic: str, payload: bytes) -> Optional[dict]:
     request_id = topic[len(RPC_REQUEST_PREFIX) :]
     request["id"] = request_id
     return request
+
+
+def enqueue_rpc_request(request_queue: Queue, topic: str, payload: bytes) -> bool:
+    request = decode_rpc_request(topic, payload)
+    if request is None:
+        return False
+    request_queue.put(request)
+    return True
 
 
 class LightingSwitcherState:
@@ -166,7 +176,7 @@ class LightingSwitcherState:
                 return self._outcome(request, False, "unsupported_method")
             return self._outcome(request, True, self._snapshot())
 
-    def measurements(self, interval_seconds: float) -> dict:
+    def advance_energy(self, elapsed_seconds: float) -> None:
         with self._lock:
             power_w = (
                 self.MAX_POWER_W * self.brightness_pct / 100
@@ -174,7 +184,16 @@ class LightingSwitcherState:
                 else 0.0
             )
             if self.switch_state:
-                self.energy_kwh += power_w * interval_seconds / 3_600_000
+                self.energy_kwh += power_w * elapsed_seconds / 3_600_000
+
+    def measurements(self, interval_seconds: float) -> dict:
+        self.advance_energy(interval_seconds)
+        with self._lock:
+            power_w = (
+                self.MAX_POWER_W * self.brightness_pct / 100
+                if self.switch_state
+                else 0.0
+            )
             return {
                 "switch_state": self.switch_state,
                 "brightness_pct": self.brightness_pct,
@@ -261,9 +280,17 @@ def main() -> None:
 
     connected = threading.Event()
     subscribed = threading.Event()
+    startup_failed = threading.Event()
+    readiness = threading.Event()
+    request_queue = Queue()
     publisher = TelemetryPublisher(
-        client, state, configuration.publish_interval_seconds
+        client, state, str(uuid.uuid4())
     )
+
+    def fail_startup(message: str) -> None:
+        LOGGER.error("MQTT startup failed: %s", message)
+        startup_failed.set()
+        readiness.set()
 
     def on_connect(
         mqtt_client,
@@ -273,8 +300,23 @@ def main() -> None:
         _properties,
     ):
         if reason_code.is_failure:
+            fail_startup("broker connection rejected")
             return
-        mqtt_client.subscribe(RPC_REQUEST_FILTER, qos=1)
+        try:
+            subscribe_result = mqtt_client.subscribe(RPC_REQUEST_FILTER, qos=1)
+        except Exception as exc:
+            fail_startup(f"RPC subscription failed: {exc}")
+            return
+        subscribe_rc = (
+            subscribe_result[0]
+            if isinstance(subscribe_result, (tuple, list))
+            else subscribe_result
+        )
+        if subscribe_rc != 0:
+            fail_startup(f"RPC subscription failed immediately (rc={subscribe_rc})")
+            return
+        if startup_failed.is_set():
+            return
         connected.set()
 
     def on_subscribe(
@@ -286,20 +328,12 @@ def main() -> None:
     ):
         if subscription_granted(granted_qos):
             subscribed.set()
+            readiness.set()
+        else:
+            fail_startup("RPC subscription did not grant exact QoS 1")
 
-    def on_message(mqtt_client, _userdata, message):
-        request = decode_rpc_request(message.topic, message.payload)
-        if request is None:
-            return
-        outcome = state.handle_rpc(request)
-        if outcome.applied:
-            publisher.publish(wait_for_ack=False)
-        if outcome.response is not None:
-            mqtt_client.publish(
-                rpc_response_topic(request["id"]),
-                json.dumps(outcome.response),
-                qos=1,
-            )
+    def on_message(_mqtt_client, _userdata, message):
+        enqueue_rpc_request(request_queue, message.topic, message.payload)
 
     client.on_connect = on_connect
     client.on_subscribe = on_subscribe
@@ -307,7 +341,14 @@ def main() -> None:
     try:
         client.connect(configuration.host, configuration.port, keepalive=60)
         client.loop_start()
-        if not connected.wait(10) or not subscribed.wait(10):
+        if startup_failed.is_set():
+            raise SystemExit("MQTT token authentication or RPC subscription failed.")
+        if (
+            not readiness.wait(10)
+            or startup_failed.is_set()
+            or not connected.is_set()
+            or not subscribed.is_set()
+        ):
             raise SystemExit("MQTT token authentication or RPC subscription failed.")
         LOGGER.info(
             "connected host=%s port=%s subscription=%s",
@@ -315,15 +356,45 @@ def main() -> None:
             configuration.port,
             RPC_REQUEST_FILTER,
         )
+        sequence = 0
+        last_energy_at = time.monotonic()
+        next_periodic_at = last_energy_at + configuration.publish_interval_seconds
+        publisher.publish(sequence)
+        sequence += 1
         while True:
+            now = time.monotonic()
+            if now >= next_periodic_at:
+                state.advance_energy(max(0.0, now - last_energy_at))
+                last_energy_at = now
+                publisher.publish(sequence)
+                sequence += 1
+                next_periodic_at = now + configuration.publish_interval_seconds
+                continue
+
             try:
-                publisher.publish()
-            except Exception as exc:
-                LOGGER.error("telemetry loop failed: %s", exc)
-                raise SystemExit("MQTT telemetry publication failed.") from exc
-            time.sleep(configuration.publish_interval_seconds)
+                request = request_queue.get_nowait()
+            except Empty:
+                time.sleep(min(0.1, max(0.0, next_periodic_at - now)))
+                continue
+
+            state.advance_energy(max(0.0, now - last_energy_at))
+            last_energy_at = now
+            outcome = state.handle_rpc(request)
+            if outcome.applied:
+                publisher.publish(sequence)
+                sequence += 1
+            if outcome.response is not None:
+                publish_qos1(
+                    client,
+                    rpc_response_topic(request["id"]),
+                    json.dumps(outcome.response),
+                    description="RPC response",
+                )
     except KeyboardInterrupt:
         LOGGER.info("shutdown requested")
+    except Exception as exc:
+        LOGGER.error("MQTT worker failed: %s", exc)
+        raise SystemExit("MQTT publication failed.") from exc
     finally:
         client.loop_stop()
         client.disconnect()
