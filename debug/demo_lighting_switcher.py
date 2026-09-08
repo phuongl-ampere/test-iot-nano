@@ -23,6 +23,13 @@ TELEMETRY_TOPIC = "v1/devices/me/telemetry"
 LOGGER = logging.getLogger(__name__)
 
 
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
+
+
 @dataclass(frozen=True)
 class CommandOutcome:
     applied: bool
@@ -294,4 +301,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    configure_logging()
     main()

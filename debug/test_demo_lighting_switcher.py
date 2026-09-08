@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import logging
 import os
 import pathlib
 import sys
@@ -103,6 +104,15 @@ class ReadinessTimeoutMqttClient(RecordingMqttClient):
 
 
 class LightingSwitcherTests(unittest.TestCase):
+    def test_configure_logging_bootstraps_info_with_stable_format(self):
+        with mock.patch.object(logging, "basicConfig") as basic_config:
+            module.configure_logging()
+
+        basic_config.assert_called_once_with(
+            level=logging.INFO,
+            format="%(levelname)s:%(name)s:%(message)s",
+        )
+
     def test_configuration_defaults_to_the_local_plain_mqtt_listener(self):
         with mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True):
             configuration = module.configuration_from_environment()
