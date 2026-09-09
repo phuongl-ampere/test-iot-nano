@@ -16,7 +16,7 @@ use iot_core::{
 };
 use iot_ingest::{
     IngestMetrics, SqliteTokenWebhookIngress, TelemetryWriter, TokenWebhookIngress, migrate,
-    sqlite_webhook_router, webhook_router,
+    sqlite_webhook_router, sqlite_webhook_router_with_transport_secret, webhook_router,
 };
 use iot_storage::SqliteStore;
 use iot_stream::{GroupStart, LocalStream, StreamConfig};
@@ -26,6 +26,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const WEBHOOK_SECRET: &str = "test-nanomq-webhook-secret-must-have-32-bytes";
+const TRANSPORT_WEBHOOK_SECRET: &str = "test-transport-webhook-secret-must-have-32-bytes";
 static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 async fn prepared_pool() -> PgPool {
@@ -33,7 +34,7 @@ async fn prepared_pool() -> PgPool {
         .expect("DATABASE_URL must point to the local TimescaleDB test database");
     let pool = PgPool::connect(&database_url).await.unwrap();
     migrate(&pool).await.unwrap();
-    query("TRUNCATE device_tokens, notification_outbox, alert_incidents, alert_rules, telemetry, devices")
+    query("TRUNCATE command_outbox, device_tokens, notification_outbox, alert_incidents, alert_rules, telemetry, devices")
         .execute(&pool)
         .await
         .unwrap();
@@ -193,6 +194,16 @@ fn webhook_request_with_qos(token: &str, secret: &str, qos: u8) -> Request<Body>
         .unwrap()
 }
 
+fn transport_webhook_request(token: &str, secret: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/internal/mqtt-transport/telemetry")
+        .header("content-type", "application/json")
+        .header("x-iot-mqtt-transport-webhook", secret)
+        .body(Body::from(webhook_body(token, 1)))
+        .unwrap()
+}
+
 fn gateway_webhook_request(token: &str, topic: &str, payload: serde_json::Value) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -283,6 +294,34 @@ async fn active_token_webhook_appends_then_writes_timescaledb() {
     assert_eq!(result.inserted, 1);
     assert_eq!(row.get::<String, _>("device_id"), "esp-000123");
     assert_eq!(row.get::<String, _>("topic"), DEVICE_TELEMETRY_TOPIC);
+}
+
+#[tokio::test]
+async fn sqlite_transport_webhook_uses_its_dedicated_secret() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = sqlite_store(&tempdir).await;
+    let token = active_sqlite_device_token(store.pool()).await;
+    let stream =
+        LocalStream::open(tempdir.path().join("stream"), StreamConfig::for_test(8)).unwrap();
+    let app = sqlite_webhook_router_with_transport_secret(
+        SqliteTokenWebhookIngress::new(
+            store,
+            stream.clone(),
+            WEBHOOK_SECRET,
+            tempdir.path().join("inbox"),
+            Arc::new(IngestMetrics::default()),
+        )
+        .unwrap(),
+        TRANSPORT_WEBHOOK_SECRET,
+    );
+
+    let response = app
+        .oneshot(transport_webhook_request(&token, TRANSPORT_WEBHOOK_SECRET))
+        .await
+        .unwrap();
+    wait_for_stream_record(&stream).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

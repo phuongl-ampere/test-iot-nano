@@ -6,9 +6,12 @@
 
 #include <mqtt_client.h>
 
+#include <cstddef>
+#include <cstring>
 #include <ctime>
 
 #include "device_config.h"
+#include "one_way_rpc.h"
 #include "uuid_v4.h"
 
 namespace {
@@ -19,6 +22,7 @@ constexpr unsigned long kDefaultTelemetryIntervalMs = 6000;
 constexpr unsigned short kMqttTlsPort = 8883;
 constexpr int kProvisionButtonPin = 0;
 constexpr int kAdcPin = 34;
+constexpr std::size_t kMaximumRpcPayloadBytes = 1024;
 constexpr const char* kProvisioningUsername = "admin";
 constexpr const char* kProvisioningPassword = PROVISIONING_PASSWORD;
 constexpr time_t kMinimumValidEpoch = 1704067200;  // 2024-01-01T00:00:00Z
@@ -37,6 +41,11 @@ unsigned long next_publish_at = 0;
 unsigned long sequence = 0;
 String boot_id;
 String mqtt_client_id;
+iot::OneWayRpcProcessor rpc_processor;
+String rpc_payload;
+int rpc_payload_total_length = 0;
+bool rpc_payload_active = false;
+bool rpc_response_to_gateway = false;
 
 String as_string(const std::string& value) {
   return String(value.c_str());
@@ -86,6 +95,24 @@ bool read_config() {
   return config.is_valid();
 }
 
+void restore_last_processed_rpc_id() {
+  preferences.begin("iot-config", true);
+  rpc_processor.restore_processed_id(as_std_string(preferences.getString("last_rpc_id", "")));
+  preferences.end();
+}
+
+bool persist_last_processed_rpc_id() {
+  const std::string id = rpc_processor.latest_processed_id();
+  if (id.empty()) {
+    return false;
+  }
+
+  preferences.begin("iot-config", false);
+  const std::size_t written = preferences.putString("last_rpc_id", as_string(id));
+  preferences.end();
+  return written == id.size();
+}
+
 void save_config(const iot::DeviceConfig& next_config) {
   preferences.begin("iot-config", false);
   preferences.putString("wifi_ssid", as_string(next_config.wifi_ssid));
@@ -104,6 +131,7 @@ void save_config(const iot::DeviceConfig& next_config) {
   preferences.remove("mqtt_username");
   preferences.remove("mqtt_password");
   preferences.remove("mqtt_tls");
+  preferences.remove("last_rpc_id");
   preferences.end();
 }
 
@@ -179,6 +207,8 @@ void save_config_from_form() {
 
 namespace {
 
+void handle_rpc_mqtt_data(const esp_mqtt_event_handle_t event);
+
 void start_provisioning() {
   provisioning = true;
   if (mqtt_client != nullptr && mqtt_started) {
@@ -247,11 +277,21 @@ void configure_mqtt() {
 
   esp_mqtt_client_register_event(
       mqtt_client, MQTT_EVENT_ANY,
-      [](void*, esp_event_base_t, int32_t event_id, void*) {
+      [](void*, esp_event_base_t, int32_t event_id, void* event_data) {
         if (event_id == MQTT_EVENT_CONNECTED) {
           mqtt_connected = true;
+          const std::string topic = iot::one_way_rpc_request_topic();
+          esp_mqtt_client_subscribe(mqtt_client, topic.c_str(), iot::one_way_rpc_qos());
+          const std::string gateway_topic = iot::one_way_gateway_rpc_request_topic();
+          esp_mqtt_client_subscribe(mqtt_client, gateway_topic.c_str(), iot::one_way_rpc_qos());
         } else if (event_id == MQTT_EVENT_DISCONNECTED) {
           mqtt_connected = false;
+          rpc_payload_active = false;
+          rpc_payload = "";
+          rpc_payload_total_length = 0;
+          rpc_response_to_gateway = false;
+        } else if (event_id == MQTT_EVENT_DATA && event_data != nullptr) {
+          handle_rpc_mqtt_data(static_cast<esp_mqtt_event_handle_t>(event_data));
         }
       },
       nullptr);
@@ -276,6 +316,88 @@ void publish_telemetry() {
   const std::string topic = iot::telemetry_topic();
   esp_mqtt_client_publish(mqtt_client, topic.c_str(), payload.c_str(), payload.length(),
                           iot::telemetry_qos(), 0);
+}
+
+void restart_from_one_way_rpc() {
+  ESP.restart();
+}
+
+class FirmwareRpcActions final : public iot::OneWayRpcActions {
+ public:
+  void sample_now() override {
+    persist_last_processed_rpc_id();
+    publish_telemetry();
+  }
+
+  void reboot() override {
+    if (persist_last_processed_rpc_id()) {
+      restart_from_one_way_rpc();
+    }
+  }
+
+  void publish_two_way_response(const std::string& id, const std::string& response) override {
+    if (!mqtt_connected || mqtt_client == nullptr || !persist_last_processed_rpc_id()) {
+      return;
+    }
+    const std::string topic = iot::rpc_response_topic(id, rpc_response_to_gateway);
+    esp_mqtt_client_publish(mqtt_client, topic.c_str(), response.c_str(), response.size(),
+                            iot::one_way_rpc_qos(), 0);
+  }
+};
+
+FirmwareRpcActions rpc_actions;
+
+void reset_rpc_payload() {
+  rpc_payload_active = false;
+  rpc_payload = "";
+  rpc_payload_total_length = 0;
+}
+
+bool is_one_way_rpc_topic(const esp_mqtt_event_handle_t event) {
+  if (event->topic == nullptr || event->topic_len < 0) {
+    return false;
+  }
+  return iot::matches_one_way_rpc_request_topic(
+      std::string(event->topic, static_cast<std::size_t>(event->topic_len)));
+}
+
+void handle_rpc_mqtt_data(const esp_mqtt_event_handle_t event) {
+  if (event->data == nullptr || event->data_len < 0 || event->total_data_len <= 0 ||
+      event->total_data_len > static_cast<int>(kMaximumRpcPayloadBytes)) {
+    reset_rpc_payload();
+    return;
+  }
+
+  if (event->current_data_offset == 0) {
+    reset_rpc_payload();
+    if (!is_one_way_rpc_topic(event)) {
+      return;
+    }
+    rpc_response_to_gateway = iot::is_gateway_rpc_request_topic(
+        std::string(event->topic, static_cast<std::size_t>(event->topic_len)));
+    rpc_payload_active = true;
+    rpc_payload_total_length = event->total_data_len;
+    rpc_payload.reserve(static_cast<unsigned int>(event->total_data_len));
+  }
+
+  if (!rpc_payload_active || event->total_data_len != rpc_payload_total_length ||
+      event->current_data_offset != static_cast<int>(rpc_payload.length()) ||
+      event->data_len > rpc_payload_total_length - static_cast<int>(rpc_payload.length())) {
+    reset_rpc_payload();
+    return;
+  }
+
+  rpc_payload.concat(event->data, static_cast<unsigned int>(event->data_len));
+  if (rpc_payload.length() != static_cast<unsigned int>(rpc_payload_total_length)) {
+    return;
+  }
+
+  time_t now;
+  time(&now);
+  rpc_processor.handle(
+      std::string(rpc_payload.c_str(), static_cast<std::size_t>(rpc_payload.length())), now,
+      rpc_actions);
+  reset_rpc_payload();
 }
 
 void ensure_mqtt_connection() {
@@ -318,6 +440,7 @@ void setup() {
     return;
   }
 
+  restore_last_processed_rpc_id();
   configure_mqtt();
   start_station();
 }

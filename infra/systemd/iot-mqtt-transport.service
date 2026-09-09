@@ -1,0 +1,20 @@
+[Unit]
+Description=Rush IoT Nano device-facing MQTT transport
+After=network-online.target iot-api.service iot-ingest.service
+Wants=network-online.target iot-api.service iot-ingest.service
+
+[Service]
+Type=simple
+User=iot
+Group=iot
+UMask=0077
+Environment=IOT_MQTT_TRANSPORT_ADDRESS=0.0.0.0:8883
+EnvironmentFile=/etc/rush-iot-nano/mqtt-transport.env
+ExecStart=/opt/rush-iot-nano/iot-mqtt-transport
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+WorkingDirectory=/opt/rush-iot-nano
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,15 @@
 export type TimeRange = "1h" | "24h" | "7d";
 export type Role = "admin" | "viewer";
+export type AccountClass = "system" | "admin" | "user";
+export type ResourcePermission = "viewer" | "controller" | "manager" | "owner";
+export type RpcMode = "one_way" | "two_way";
+export type DeviceCommandMethod =
+  | "sample_now"
+  | "reboot"
+  | "switch_on"
+  | "switch_off"
+  | "set_power"
+  | "set_brightness";
 
 export interface ApiClient {
   apiBaseUrl: string;
@@ -8,6 +18,7 @@ export interface ApiClient {
 
 export interface UserSession {
   role: Role;
+  accountClass: AccountClass;
   username: string;
   defaultApp: string;
   grantedApps: string[];
@@ -30,6 +41,15 @@ export interface DeviceToken {
   token?: string;
 }
 
+export interface DeviceCommandLifecycle {
+  id: string;
+  state: "queued" | "published_to_broker" | "responded" | "expired" | "failed";
+  mode: RpcMode;
+  expires_at: string;
+  response: Record<string, unknown> | null;
+  responded_at: string | null;
+}
+
 export interface TelemetryPoint {
   at: string;
   temperature_c: number | null;
@@ -48,6 +68,7 @@ export interface PowerSummary {
 export interface PowerAsset {
   id: string;
   name: string;
+  permission: ResourcePermission;
   asset_profile_id: string | null;
   parent_asset_id: string | null;
   metadata: Record<string, unknown>;
@@ -59,8 +80,10 @@ export interface PowerAsset {
 export interface PowerDevice {
   device_id: string;
   display_name: string | null;
+  permission: ResourcePermission;
   asset_id: string | null;
   device_profile_id?: string | null;
+  device_profile_name?: string | null;
   online: boolean;
   last_seen_at: string | null;
   is_gateway?: boolean;
@@ -73,6 +96,8 @@ export interface PowerDevice {
   energy_kwh: number | null;
   frequency_hz: number | null;
   power_factor: number | null;
+  switch_state?: boolean | null;
+  brightness_pct?: number | null;
 }
 
 export interface PowerTelemetryPoint {
@@ -118,6 +143,7 @@ export interface ManagementUser {
   id: string;
   username: string;
   role: Role;
+  account_class: AccountClass;
   default_app: string;
   granted_apps: string[];
 }
@@ -319,6 +345,7 @@ export async function login(
   assertOk(response, "Login failed");
   const body = await response.json() as {
     role: Role;
+    account_class?: AccountClass;
     session_id: string;
     username: string;
     default_app?: string;
@@ -326,6 +353,7 @@ export async function login(
   };
   return {
     role: body.role,
+    accountClass: body.account_class ?? (body.role === "admin" ? "admin" : "user"),
     sessionId: body.session_id,
     username: body.username,
     defaultApp: body.default_app ?? "/apps/powermonitor",
@@ -342,12 +370,14 @@ export async function getCurrentUser(client: ApiClient): Promise<UserSession> {
   assertOk(response, "Profile request failed");
   const body = await response.json() as {
     role: Role;
+    account_class?: AccountClass;
     username: string;
     default_app?: string;
     granted_apps?: string[];
   };
   return {
     role: body.role,
+    accountClass: body.account_class ?? (body.role === "admin" ? "admin" : "user"),
     username: body.username,
     defaultApp: body.default_app ?? "/apps/powermonitor",
     grantedApps: body.granted_apps ?? [],
@@ -628,6 +658,44 @@ export async function createManagementAsset(
   return response.json() as Promise<ManagementAsset>;
 }
 
+export async function createMyAsset(
+  client: ApiClient,
+  asset: Pick<ManagementAsset, "name" | "asset_profile_id" | "parent_asset_id" | "metadata" | "attributes">,
+): Promise<ManagementAsset> {
+  const response = await authenticatedRequest(client, "/api/my/assets", {
+    method: "POST",
+    body: JSON.stringify(asset),
+  });
+  assertOk(response, "Asset creation failed");
+  return response.json() as Promise<ManagementAsset>;
+}
+
+export async function provisionMyDevice(
+  client: ApiClient,
+  displayName: string,
+  assetId: string | null,
+): Promise<DeviceToken> {
+  const response = await authenticatedRequest(client, "/api/my/devices", {
+    method: "POST",
+    body: JSON.stringify({ display_name: displayName, asset_id: assetId }),
+  });
+  assertOk(response, "Device provisioning failed");
+  return response.json() as Promise<DeviceToken>;
+}
+
+export async function assignMyDeviceAsset(
+  client: ApiClient,
+  deviceId: string,
+  assetId: string | null,
+): Promise<void> {
+  const response = await authenticatedRequest(
+    client,
+    `/api/my/devices/${encodeURIComponent(deviceId)}/asset`,
+    { method: "PUT", body: JSON.stringify({ asset_id: assetId }) },
+  );
+  assertOk(response, "Device assignment failed");
+}
+
 export async function updateManagementAsset(
   client: ApiClient,
   id: string,
@@ -769,17 +837,32 @@ export async function deleteManagementAssetProfile(
 export async function sendDeviceCommand(
   client: ApiClient,
   deviceId: string,
-  command: "sample_now" | "reboot",
-): Promise<void> {
+  command: DeviceCommandMethod,
+  params: Record<string, unknown> = {},
+  mode: RpcMode = "one_way",
+): Promise<DeviceCommandLifecycle> {
   const response = await authenticatedRequest(
     client,
     `/api/devices/${encodeURIComponent(deviceId)}/commands`,
     {
       method: "POST",
-      body: JSON.stringify({ command, parameters: {} }),
+      body: JSON.stringify({ method: command, params, mode }),
     },
   );
   assertOk(response, "Command request failed");
+  return response.json() as Promise<DeviceCommandLifecycle>;
+}
+
+export async function fetchDeviceCommand(
+  client: ApiClient,
+  commandId: string,
+): Promise<DeviceCommandLifecycle> {
+  const response = await authenticatedRequest(
+    client,
+    `/api/device-commands/${encodeURIComponent(commandId)}`,
+  );
+  assertOk(response, "Command lifecycle request failed");
+  return response.json() as Promise<DeviceCommandLifecycle>;
 }
 
 export async function fetchAlertRules(client: ApiClient): Promise<AlertRule[]> {

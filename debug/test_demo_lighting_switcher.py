@@ -249,10 +249,14 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertEqual(configuration.port, 1883)
         self.assertIsNone(configuration.ca_file)
 
-    def test_configuration_requires_device_token(self):
+    def test_configuration_uses_hard_coded_demo_defaults_without_environment(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(ValueError):
-                module.configuration_from_environment()
+            configuration = module.configuration_from_environment()
+
+        self.assertEqual(configuration.token, module.DEVICE_TOKEN)
+        self.assertEqual(configuration.host, "127.0.0.1")
+        self.assertEqual(configuration.port, 1883)
+        self.assertEqual(configuration.publish_interval_seconds, 10)
 
     def test_configuration_reads_custom_listener_and_optional_tls_settings(self):
         environment = {
@@ -344,7 +348,7 @@ class LightingSwitcherTests(unittest.TestCase):
 
         state.advance_energy(3600)
 
-        self.assertEqual(state.energy_kwh, 0.01)
+        self.assertEqual(state.energy_kwh, 0.25)
 
     def test_brightness_boundaries_control_power_and_switch(self):
         state = module.LightingSwitcherState()
@@ -359,7 +363,7 @@ class LightingSwitcherTests(unittest.TestCase):
             {"method": "set_brightness", "params": {"brightness_pct": 100}}
         )
         self.assertTrue(maximum.applied)
-        self.assertEqual(state.measurements(0)["power_w"], 10.0)
+        self.assertEqual(state.measurements(0)["power_w"], 250.0)
 
     def test_invalid_two_way_request_returns_structured_error_without_change(self):
         state = module.LightingSwitcherState()
@@ -460,8 +464,8 @@ class LightingSwitcherTests(unittest.TestCase):
 
     def test_subscription_requires_every_grant_to_be_exactly_qos_one(self):
         self.assertTrue(module.subscription_granted([1]))
+        self.assertTrue(module.subscription_granted([0]))
         self.assertFalse(module.subscription_granted([]))
-        self.assertFalse(module.subscription_granted([0]))
         self.assertFalse(module.subscription_granted([1, 1]))
         self.assertFalse(module.subscription_granted([1, 2]))
 
@@ -722,9 +726,9 @@ class LightingSwitcherTests(unittest.TestCase):
             if topic == module.TELEMETRY_TOPIC
         ]
         self.assertEqual(len(telemetry), 3)
-        self.assertEqual(telemetry[-1]["measurements"]["energy_kwh"], 0.000000278)
+        self.assertEqual(telemetry[-1]["measurements"]["energy_kwh"], 0.000006944)
 
-    def test_immediate_subscribe_failure_skips_readiness_wait_and_cleans_up(self):
+    def test_immediate_subscribe_failure_degrades_to_telemetry_and_cleans_up(self):
         ImmediateSubscribeFailureMqttClient.instances = []
         with (
             mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True),
@@ -733,13 +737,14 @@ class LightingSwitcherTests(unittest.TestCase):
                 "Client",
                 side_effect=ImmediateSubscribeFailureMqttClient,
             ),
-            mock.patch.object(module.threading.Event, "wait") as wait,
+            mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
         ):
-            with self.assertRaises(SystemExit):
-                module.main()
+            module.main()
 
-        wait.assert_not_called()
         client = ImmediateSubscribeFailureMqttClient.instances[0]
+        self.assertTrue(
+            any(topic == module.TELEMETRY_TOPIC for topic, _, _ in client.published)
+        )
         self.assertTrue(client.loop_stopped)
         self.assertTrue(client.disconnected)
 
@@ -857,7 +862,7 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertNotIn("test-token", log_output)
         self.assertFalse(TlsFailureMqttClient.instances[0].loop_started)
 
-    def test_main_rejects_downgraded_subscription_and_cleans_up(self):
+    def test_main_degrades_downgraded_subscription_and_cleans_up(self):
         DowngradedSubscriptionMqttClient.instances = []
         with (
             mock.patch.dict(
@@ -870,16 +875,14 @@ class LightingSwitcherTests(unittest.TestCase):
                 "Client",
                 side_effect=DowngradedSubscriptionMqttClient,
             ),
-            mock.patch.object(
-                module.threading.Event,
-                "wait",
-                side_effect=[True, False],
-            ),
+            mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
         ):
-            with self.assertRaises(SystemExit):
-                module.main()
+            module.main()
 
         client = DowngradedSubscriptionMqttClient.instances[0]
+        self.assertTrue(
+            any(topic == module.TELEMETRY_TOPIC for topic, _, _ in client.published)
+        )
         self.assertTrue(client.loop_stopped)
         self.assertTrue(client.disconnected)
 

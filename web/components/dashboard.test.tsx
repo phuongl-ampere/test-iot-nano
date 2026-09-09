@@ -58,7 +58,7 @@ describe("Dashboard", () => {
     expect(sessionStorage.getItem("rush-iot-nano.session-id")).toBe("session_test");
   });
 
-  it("shows Admin setting inside the admin gear menu", async () => {
+  it("does not show System setting inside the admin gear menu", async () => {
     sessionStorage.setItem("rush-iot-nano.session-id", "session_admin");
     vi.stubGlobal("fetch", vi.fn((input: string) => {
       if (input.endsWith("/api/auth/me")) {
@@ -73,7 +73,7 @@ describe("Dashboard", () => {
       expect(screen.getByRole("button", { name: "Open account menu" })).not.toBeNull();
     });
     fireEvent.click(screen.getByRole("button", { name: "Open account menu" }));
-    expect(screen.getByRole("button", { name: "Admin setting" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "System setting" })).toBeNull();
   });
 
   it("opens the User profile view from the gear menu", async () => {
@@ -94,31 +94,6 @@ describe("Dashboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "User profile" }));
 
     expect(screen.getByRole("heading", { name: "User profile" })).not.toBeNull();
-  });
-
-  it("opens Admin setting from the admin gear menu", async () => {
-    sessionStorage.setItem("rush-iot-nano.session-id", "session_admin");
-    vi.stubGlobal("fetch", vi.fn((input: string) => {
-      if (input.endsWith("/api/auth/me")) {
-        return Promise.resolve(new Response(JSON.stringify({ role: "admin" }), { status: 200 }));
-      }
-      if (input.endsWith("/api/system-configuration")) {
-        return Promise.resolve(new Response(JSON.stringify(systemConfiguration), { status: 200 }));
-      }
-      return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
-    }));
-
-    render(<Dashboard />);
-
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Open account menu" })).not.toBeNull();
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Open account menu" }));
-    fireEvent.click(screen.getByRole("button", { name: "Admin setting" }));
-
-    await waitFor(() => {
-      expect(screen.getByRole("heading", { name: "System Configuration" })).not.toBeNull();
-    });
   });
 
   it("does not expose System Configuration to a viewer session", async () => {

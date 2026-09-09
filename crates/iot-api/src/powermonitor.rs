@@ -25,6 +25,7 @@ pub struct PowerSummary {
 pub struct PowerAsset {
     pub id: Uuid,
     pub name: String,
+    pub permission: String,
     pub asset_profile_id: Option<Uuid>,
     pub parent_asset_id: Option<Uuid>,
     pub metadata: Value,
@@ -37,8 +38,10 @@ pub struct PowerAsset {
 pub struct PowerDevice {
     pub device_id: String,
     pub display_name: Option<String>,
+    pub permission: String,
     pub asset_id: Option<Uuid>,
     pub device_profile_id: Option<Uuid>,
+    pub device_profile_name: Option<String>,
     pub online: bool,
     pub last_seen_at: Option<DateTime<Utc>>,
     pub is_gateway: bool,
@@ -51,6 +54,8 @@ pub struct PowerDevice {
     pub energy_kwh: Option<f64>,
     pub frequency_hz: Option<f64>,
     pub power_factor: Option<f64>,
+    pub switch_state: Option<bool>,
+    pub brightness_pct: Option<f64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -69,57 +74,6 @@ pub struct PowerTelemetryPoint {
 pub struct PowerTelemetryRecord {
     pub at: DateTime<Utc>,
     pub measurements: Value,
-}
-
-pub async fn summary(
-    pool: &PgPool,
-    online_after: DateTime<Utc>,
-) -> Result<PowerSummary, sqlx::Error> {
-    let row = sqlx::query(
-        "WITH latest AS (
-            SELECT DISTINCT ON (device_id) device_id, measurements
-            FROM telemetry
-            ORDER BY device_id, event_at DESC
-         )
-         SELECT
-            COUNT(devices.device_id) AS device_count,
-            COUNT(devices.device_id) FILTER (
-                WHERE (
-                    devices.is_gateway = TRUE
-                    AND devices.last_seen_at >= $1
-                ) OR (
-                    devices.gateway_device_id IS NOT NULL
-                    AND devices.gateway_read_quality IS DISTINCT FROM 'unavailable'
-                    AND devices.gateway_last_read_at >= $1
-                ) OR (
-                    devices.is_gateway = FALSE
-                    AND devices.gateway_device_id IS NULL
-                    AND devices.last_seen_at >= $1
-                )
-            ) AS online_device_count,
-            (SELECT COUNT(*) FROM assets) AS asset_count,
-            COALESCE(SUM(
-                CASE WHEN jsonb_typeof(latest.measurements -> 'power_w') = 'number'
-                     THEN (latest.measurements ->> 'power_w')::double precision END
-            ), 0) AS total_power_w,
-            COALESCE(SUM(
-                CASE WHEN jsonb_typeof(latest.measurements -> 'energy_kwh') = 'number'
-                     THEN (latest.measurements ->> 'energy_kwh')::double precision END
-            ), 0) AS total_energy_kwh
-         FROM devices
-         LEFT JOIN latest ON latest.device_id = devices.device_id
-         WHERE devices.deleted_at IS NULL",
-    )
-    .bind(online_after)
-    .fetch_one(pool)
-    .await?;
-    Ok(PowerSummary {
-        device_count: row.try_get("device_count")?,
-        online_device_count: row.try_get("online_device_count")?,
-        asset_count: row.try_get("asset_count")?,
-        total_power_w: row.try_get("total_power_w")?,
-        total_energy_kwh: row.try_get("total_energy_kwh")?,
-    })
 }
 
 pub async fn list_assets(pool: &PgPool) -> Result<Vec<PowerAsset>, sqlx::Error> {
@@ -164,6 +118,7 @@ pub async fn list_assets(pool: &PgPool) -> Result<Vec<PowerAsset>, sqlx::Error> 
             Ok(PowerAsset {
                 id: row.try_get("id")?,
                 name: row.try_get("name")?,
+                permission: "viewer".to_owned(),
                 asset_profile_id: row.try_get("asset_profile_id")?,
                 parent_asset_id: row.try_get("parent_asset_id")?,
                 metadata: row.try_get("metadata")?,
@@ -187,6 +142,7 @@ pub async fn list_devices(
          )
          SELECT
             devices.device_id, devices.display_name, devices.asset_id, devices.device_profile_id,
+            profiles.name AS device_profile_name,
             devices.last_seen_at,
             devices.is_gateway, devices.gateway_device_id, devices.gateway_last_read_at,
             devices.gateway_read_quality,
@@ -201,9 +157,14 @@ pub async fn list_devices(
             CASE WHEN jsonb_typeof(latest.measurements -> 'frequency_hz') = 'number'
                  THEN (latest.measurements ->> 'frequency_hz')::double precision END AS frequency_hz,
             CASE WHEN jsonb_typeof(latest.measurements -> 'power_factor') = 'number'
-                 THEN (latest.measurements ->> 'power_factor')::double precision END AS power_factor
+                 THEN (latest.measurements ->> 'power_factor')::double precision END AS power_factor,
+            CASE WHEN jsonb_typeof(latest.measurements -> 'switch_state') = 'boolean'
+                 THEN (latest.measurements ->> 'switch_state')::boolean END AS switch_state,
+            CASE WHEN jsonb_typeof(latest.measurements -> 'brightness_pct') = 'number'
+                 THEN (latest.measurements ->> 'brightness_pct')::double precision END AS brightness_pct
          FROM devices
          LEFT JOIN latest ON latest.device_id = devices.device_id
+         LEFT JOIN device_profiles AS profiles ON profiles.id = devices.device_profile_id
          WHERE devices.deleted_at IS NULL
          ORDER BY devices.device_id",
     )
@@ -228,8 +189,10 @@ pub async fn list_devices(
             Ok(PowerDevice {
                 device_id: row.try_get("device_id")?,
                 display_name: row.try_get("display_name")?,
+                permission: "viewer".to_owned(),
                 asset_id: row.try_get("asset_id")?,
                 device_profile_id: row.try_get("device_profile_id")?,
+                device_profile_name: row.try_get("device_profile_name")?,
                 online,
                 last_seen_at,
                 is_gateway,
@@ -242,6 +205,8 @@ pub async fn list_devices(
                 energy_kwh: row.try_get("energy_kwh")?,
                 frequency_hz: row.try_get("frequency_hz")?,
                 power_factor: row.try_get("power_factor")?,
+                switch_state: row.try_get("switch_state")?,
+                brightness_pct: row.try_get("brightness_pct")?,
             })
         })
         .collect()

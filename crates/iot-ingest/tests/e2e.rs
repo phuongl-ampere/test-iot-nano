@@ -68,7 +68,7 @@ async fn simulated_telemetry_flows_from_mqtt_to_timescaledb() {
         .expect("DATABASE_URL must point to the local TimescaleDB test database");
     let pool = PgPool::connect(&database_url).await.unwrap();
     migrate(&pool).await.unwrap();
-    sqlx::query("TRUNCATE device_tokens, telemetry, devices")
+    sqlx::query("TRUNCATE command_outbox, device_tokens, telemetry, devices")
         .execute(&pool)
         .await
         .unwrap();

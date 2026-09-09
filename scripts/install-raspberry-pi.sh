@@ -22,12 +22,27 @@ if ! id --user iot >/dev/null 2>&1; then
 fi
 sudo install --directory --owner nanomq --group nanomq /var/lib/nanomq
 sudo install --directory --owner iot --group iot --mode 0700 /var/lib/iot-ingest
-sudo install --directory /etc/rush-iot-nano
-sudo install --mode 0644 infra/nanomq/nanomq.conf /etc/nanomq/nanomq.conf
+sudo install --directory --owner root --group iot --mode 0750 /etc/rush-iot-nano
+sudo install --directory --owner root --group iot --mode 0750 /etc/rush-iot-nano/tls
+sudo install --directory --owner root --group root --mode 0755 /opt/rush-iot-nano
+sudo install --owner root --group nanomq --mode 0640 \
+  infra/nanomq/nanomq.conf /etc/nanomq/nanomq.conf
 sudo install --mode 0644 infra/nanomq/nanomq.service /etc/systemd/system/nanomq.service
 sudo install --mode 0644 infra/systemd/iot-ingest.service /etc/systemd/system/iot-ingest.service
 sudo install --mode 0644 infra/systemd/iot-api.service /etc/systemd/system/iot-api.service
-cargo build --release --package iot-admin-helper
+sudo install --mode 0644 \
+  infra/systemd/iot-mqtt-transport.service /etc/systemd/system/iot-mqtt-transport.service
+cargo build --release \
+  --package iot-admin-helper \
+  --package iot-api \
+  --package iot-ingest \
+  --package iot-mqtt-transport
+sudo install --owner root --group root --mode 0755 \
+  target/release/iot-api /opt/rush-iot-nano/iot-api
+sudo install --owner root --group root --mode 0755 \
+  target/release/iot-ingest /opt/rush-iot-nano/iot-ingest
+sudo install --owner root --group root --mode 0755 \
+  target/release/iot-mqtt-transport /opt/rush-iot-nano/iot-mqtt-transport
 sudo install --owner root --group root --mode 0700 \
   target/release/iot-admin-helper /usr/local/sbin/iot-admin-helper
 sudo install --owner root --group root --mode 0440 \
@@ -35,4 +50,4 @@ sudo install --owner root --group root --mode 0440 \
 sudo visudo --check --file /etc/sudoers.d/rush-iot-nano-api
 sudo systemctl daemon-reload
 
-printf 'Set NanoMQ HTTP auth and webhook secrets plus TLS certificate paths in /etc/nanomq/nanomq.conf, then enable services.\n'
+printf 'Create /etc/rush-iot-nano/{api,ingest,mqtt-transport}.env, install TLS material, and set NanoMQ secrets before enabling services. See docs/operations.md.\n'

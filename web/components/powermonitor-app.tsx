@@ -15,6 +15,7 @@ export function PowerMonitorApp({ initialDeviceId }: PowerMonitorAppProps) {
           client={session.client}
           initialDeviceId={initialDeviceId}
           onUnauthorized={onUnauthorized}
+          accountClass={session.user.accountClass}
           role={session.user.role}
         />
       )}

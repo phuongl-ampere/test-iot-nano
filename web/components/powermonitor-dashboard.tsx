@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 
 import {
   type ApiClient,
+  type AccountClass,
   type DeviceToken,
   type ManagementAsset,
   type ManagementAssetProfile,
@@ -17,10 +18,12 @@ import {
   type PowerSummary,
   type PowerTelemetryPoint,
   type PowerTelemetryRecord,
+  type RpcMode,
   type Role,
   type TimeRange,
   UnauthorizedApiError,
   createManagementAsset,
+  createMyAsset,
   deleteManagementAsset,
   deleteManagementDevice,
   fetchManagementAssetProfiles,
@@ -33,14 +36,20 @@ import {
   fetchPowerDeviceTelemetryRecords,
   fetchPowerDevices,
   fetchPowerSummary,
+  fetchDeviceCommand,
   logout,
   provisionManagementDevice,
+  provisionMyDevice,
+  assignMyDeviceAsset,
+  sendDeviceCommand,
   updateManagementAsset,
   updateManagementDevice,
 } from "../lib/api";
 import { browserDateTime } from "../lib/time";
 import { AttributeEditor, DeviceDrawer, ManagementDrawer } from "./management-panels";
+import { LightSwitchControl } from "./light-switch-control";
 import { PowerMonitorAdminTools } from "./powermonitor-admin-tools";
+import { PowerSwitcherControl } from "./power-switcher-control";
 import { PowerTelemetryChart } from "./power-telemetry-chart";
 import { PowerTelemetryTable } from "./power-telemetry-table";
 import { PowerMonitorTree } from "./powermonitor-tree";
@@ -49,6 +58,7 @@ import { TimeRangeControl } from "./time-range-control";
 import { UserProfilePanel } from "./user-profile";
 
 type PowerMonitorDashboardProps = {
+  accountClass: AccountClass;
   client: ApiClient;
   initialDeviceId?: string;
   role: Role;
@@ -74,6 +84,7 @@ function deviceStatus(device: PowerDevice): string {
 }
 
 export function PowerMonitorDashboard({
+  accountClass,
   client,
   initialDeviceId,
   role,
@@ -111,6 +122,8 @@ export function PowerMonitorDashboard({
   const [editorAssets, setEditorAssets] = useState<ManagementAsset[]>([]);
   const [editorDevices, setEditorDevices] = useState<ManagementDevice[]>([]);
   const [createdToken, setCreatedToken] = useState<DeviceToken | null>(null);
+  const [switchCommandState, setSwitchCommandState] = useState<string | null>(null);
+  const [switchCommandBusy, setSwitchCommandBusy] = useState(false);
 
   const selectedDevice = useMemo(
     () => devices.find((device) => device.device_id === selectedDeviceId) ?? null,
@@ -121,6 +134,12 @@ export function PowerMonitorDashboard({
     [assets, selectedAssetId],
   );
   const selectedDeviceIsUnprofiled = selectedDevice !== null && selectedDevice.device_profile_id == null;
+  const selectedDeviceIsPowerSwitcher =
+    selectedDevice?.device_profile_name === "PowerSwitcher";
+  const selectedDeviceIsLightSwitch =
+    selectedDevice?.device_profile_name === "LightSwitch";
+  const isPlatformAdmin = accountClass === "admin";
+  const canManagePersonalResources = accountClass === "user";
   const visibleAssets = useMemo(() => {
     const term = search.trim().toLowerCase();
     return term === "" ? assets : assets.filter((asset) => asset.name.toLowerCase().includes(term));
@@ -196,7 +215,14 @@ export function PowerMonitorDashboard({
     void loadTelemetry();
   }, [loadTelemetry]);
   useEffect(() => {
-    if (role !== "admin") {
+    const timer = window.setInterval(() => {
+      void loadWorkspace();
+      void loadTelemetry();
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [loadTelemetry, loadWorkspace]);
+  useEffect(() => {
+    if (!isPlatformAdmin) {
       return;
     }
     void Promise.all([fetchManagementAssetProfiles(client), fetchManagementDeviceProfiles(client)])
@@ -211,12 +237,48 @@ export function PowerMonitorDashboard({
         }
         setError(loadError instanceof Error ? loadError.message : "Power Monitor profile request failed.");
       });
-  }, [client, onUnauthorized, role]);
+  }, [client, isPlatformAdmin, onUnauthorized]);
 
   const signOut = () => {
     void logout(client).catch(() => undefined);
     onUnauthorized();
     router.replace("/");
+  };
+
+  const sendSwitchCommand = async (
+    command: "switch_on" | "switch_off" | "set_brightness",
+    params: Record<string, number>,
+    mode: RpcMode,
+  ) => {
+    if (selectedDevice === null || selectedDevice.permission === "viewer") {
+      return;
+    }
+    setSwitchCommandBusy(true);
+    setSwitchCommandState(null);
+    try {
+      let lifecycle = await sendDeviceCommand(client, selectedDevice.device_id, command, params, mode);
+      setSwitchCommandState(lifecycle.state);
+      const terminalStates = mode === "two_way"
+        ? ["responded", "expired", "failed"]
+        : ["published_to_broker", "expired", "failed"];
+      for (let attempt = 0; attempt < 35; attempt += 1) {
+        if (terminalStates.includes(lifecycle.state)) {
+          break;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
+        lifecycle = await fetchDeviceCommand(client, lifecycle.id);
+        setSwitchCommandState(lifecycle.state);
+      }
+      await Promise.all([loadWorkspace(), loadTelemetry()]);
+    } catch (commandError) {
+      if (commandError instanceof UnauthorizedApiError) {
+        onUnauthorized();
+        return;
+      }
+      setError(commandError instanceof Error ? commandError.message : "Power switch command failed.");
+    } finally {
+      setSwitchCommandBusy(false);
+    }
   };
 
   const openAsset = () => {
@@ -240,6 +302,12 @@ export function PowerMonitorDashboard({
       return;
     }
     setAdminError(null);
+    if (!isPlatformAdmin) {
+      setAssignedAssetId(selectedDevice.asset_id ?? "");
+      setAssignedProfileId("");
+      setAdminView("assign");
+      return;
+    }
     try {
       const managed = await fetchManagementDevices(client);
       const device = managed.find((item) => item.device_id === selectedDevice.device_id);
@@ -314,9 +382,17 @@ export function PowerMonitorDashboard({
     setAdminWorking(true);
     setAdminError(null);
     try {
-      const asset = await createManagementAsset(client, {
+      const asset = isPlatformAdmin
+        ? await createManagementAsset(client, {
+            name: assetName.trim(),
+            asset_profile_id: assetProfileId || null,
+            parent_asset_id: assetParentId || null,
+            metadata: {},
+            attributes: {},
+          })
+        : await createMyAsset(client, {
         name: assetName.trim(),
-        asset_profile_id: assetProfileId || null,
+        asset_profile_id: null,
         parent_asset_id: assetParentId || null,
         metadata: {},
         attributes: {},
@@ -342,13 +418,17 @@ export function PowerMonitorDashboard({
     setAdminWorking(true);
     setAdminError(null);
     try {
-      const token = await provisionManagementDevice(client, deviceName.trim());
-      await updateManagementDevice(client, token.device_id, {
-        display_name: deviceName.trim(),
-        asset_id: deviceAssetId || null,
-        device_profile_id: deviceProfileId || null,
-        attributes: {},
-      });
+      const token = isPlatformAdmin
+        ? await provisionManagementDevice(client, deviceName.trim())
+        : await provisionMyDevice(client, deviceName.trim(), deviceAssetId || null);
+      if (isPlatformAdmin) {
+        await updateManagementDevice(client, token.device_id, {
+          display_name: deviceName.trim(),
+          asset_id: deviceAssetId || null,
+          device_profile_id: deviceProfileId || null,
+          attributes: {},
+        });
+      }
       setCreatedToken(token);
       setSelectedDeviceId(token.device_id);
       setSelectedAssetId(null);
@@ -370,17 +450,21 @@ export function PowerMonitorDashboard({
     setAdminWorking(true);
     setAdminError(null);
     try {
-      const managed = await fetchManagementDevices(client);
-      const device = managed.find((item) => item.device_id === selectedDevice.device_id);
-      if (device === undefined) {
-        throw new Error("Selected meter is unavailable.");
+      if (isPlatformAdmin) {
+        const managed = await fetchManagementDevices(client);
+        const device = managed.find((item) => item.device_id === selectedDevice.device_id);
+        if (device === undefined) {
+          throw new Error("Selected meter is unavailable.");
+        }
+        await updateManagementDevice(client, device.device_id, {
+          display_name: device.display_name ?? device.device_id,
+          asset_id: assignedAssetId || null,
+          device_profile_id: assignedProfileId || null,
+          attributes: device.attributes,
+        });
+      } else {
+        await assignMyDeviceAsset(client, selectedDevice.device_id, assignedAssetId || null);
       }
-      await updateManagementDevice(client, device.device_id, {
-        display_name: device.display_name ?? device.device_id,
-        asset_id: assignedAssetId || null,
-        device_profile_id: assignedProfileId || null,
-        attributes: device.attributes,
-      });
       setAdminView(null);
       await loadWorkspace();
     } catch (assignError) {
@@ -519,13 +603,13 @@ export function PowerMonitorDashboard({
           <div><span className="eyebrow">Asset tree</span><strong>{loading ? "Loading" : `${devices.length} meters`}</strong></div>
           <span className="fleet-online">{summary?.online_device_count ?? 0} online</span>
         </div>
-        {role === "admin" && (
+        {(isPlatformAdmin || canManagePersonalResources) && (
           <div className="powermonitor-setup-actions">
             <PowerMonitorAdminTools
               onAddAsset={openAsset}
               onAddDevice={openDevice}
               onAssignDevice={() => void openAssignment()}
-              role={role}
+              canManage
               selectedDevice={selectedDevice !== null}
             />
           </div>
@@ -533,8 +617,8 @@ export function PowerMonitorDashboard({
         <PowerMonitorTree
           assets={assets}
           devices={devices}
-          onEditAsset={role === "admin" ? (assetId) => { void openAssetEditor(assetId); } : undefined}
-          onEditDevice={role === "admin" ? (deviceId) => { void openDeviceEditor(deviceId); } : undefined}
+          onEditAsset={isPlatformAdmin ? (assetId) => { void openAssetEditor(assetId); } : undefined}
+          onEditDevice={isPlatformAdmin ? (deviceId) => { void openDeviceEditor(deviceId); } : undefined}
           onSelectAsset={(assetId) => {
             setSelectedAssetId(assetId);
             setSelectedDeviceId(null);
@@ -564,7 +648,7 @@ export function PowerMonitorDashboard({
             <button aria-label="Refresh Power Monitor" className="icon-button" disabled={loading || loadingTelemetry} onClick={() => { void loadWorkspace(); void loadTelemetry(); }} title="Refresh Power Monitor" type="button">
               <RefreshCw aria-hidden="true" size={17} />
             </button>
-            <ProfileMenu onLogout={signOut} onOpenProfile={() => setProfileOpen(true)} onOpenSystemConfiguration={() => router.push("/management/settings")} role={role} />
+            <ProfileMenu accountClass={accountClass} onLogout={signOut} onOpenProfile={() => setProfileOpen(true)} onOpenSystemConfiguration={() => router.push("/management/settings")} role={role} />
           </div>
         </header>
 
@@ -585,6 +669,26 @@ export function PowerMonitorDashboard({
               <div><dt><Gauge aria-hidden="true" size={16} /> Voltage</dt><dd>{formatted(selectedDevice?.voltage_v ?? null, " V")}</dd></div>
               <div><dt><Activity aria-hidden="true" size={16} /> Current</dt><dd>{formatted(selectedDevice?.current_a ?? null, " A")}</dd></div>
             </dl>
+
+            {selectedDevice !== null && selectedDeviceIsPowerSwitcher && (
+              <PowerSwitcherControl
+                busy={switchCommandBusy}
+                commandState={switchCommandState}
+                onCommand={(command, mode) => { void sendSwitchCommand(command, {}, mode); }}
+                permission={selectedDevice.permission}
+                switchState={selectedDevice.switch_state}
+              />
+            )}
+            {selectedDevice !== null && selectedDeviceIsLightSwitch && (
+              <LightSwitchControl
+                brightnessPct={selectedDevice.brightness_pct}
+                busy={switchCommandBusy}
+                commandState={switchCommandState}
+                onCommand={(command, params, mode) => { void sendSwitchCommand(command, params, mode); }}
+                permission={selectedDevice.permission}
+                switchState={selectedDevice.switch_state}
+              />
+            )}
 
             <section className="chart-section" aria-label="Power telemetry chart">
               <div className="section-heading">

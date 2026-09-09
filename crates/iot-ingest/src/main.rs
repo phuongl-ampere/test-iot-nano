@@ -8,11 +8,12 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use clap::Parser;
 use iot_core::{DatabaseStorage, IngestTuning, StorageConfiguration};
 use iot_ingest::{
-    AlertEvaluator, EmailSender, IngestMetrics, MqttRuntime, MqttRuntimeConfig,
-    NotificationDispatcher, ReloadingSmtpEmailSender, SmtpConfig, SqliteAlertEvaluator,
-    SqliteNotificationDispatcher, SqliteTelemetryWriter, SqliteTokenWebhookIngress,
-    TelemetryWriter, TokenWebhookIngress, WriterError, migrate, sqlite_webhook_router,
-    webhook_router,
+    AlertEvaluator, CommandDispatcher, EmailSender, HttpTransportRpcClient, IngestMetrics,
+    MqttRuntime, MqttRuntimeConfig, NotificationDispatcher, ReloadingSmtpEmailSender, SmtpConfig,
+    SqliteAlertEvaluator, SqliteCommandDispatcher, SqliteNotificationDispatcher,
+    SqliteTelemetryWriter, SqliteTokenWebhookIngress, TelemetryWriter, TokenWebhookIngress,
+    TransportRpcClient, WriterError, migrate, sqlite_webhook_router_with_transport_secret,
+    webhook_router_with_transport_secret,
 };
 use iot_storage::SqliteStore;
 use iot_stream::{GroupStart, LocalStream, StreamConfig, StreamConsumer};
@@ -83,6 +84,8 @@ struct Arguments {
     alert_batch_size: u64,
     #[arg(long, env = "IOT_NOTIFICATION_BATCH_SIZE", default_value_t = 10)]
     notification_batch_size: u64,
+    #[arg(long, env = "IOT_COMMAND_BATCH_SIZE", default_value_t = 10)]
+    command_batch_size: u32,
     #[arg(long, env = "IOT_WRITER_FLUSH_SECONDS", default_value_t = 1)]
     writer_flush_seconds: u64,
     #[arg(
@@ -95,6 +98,8 @@ struct Arguments {
     alert_window_interval_seconds: u64,
     #[arg(long, env = "IOT_NOTIFICATION_INTERVAL_SECONDS", default_value_t = 1)]
     notification_interval_seconds: u64,
+    #[arg(long, env = "IOT_COMMAND_INTERVAL_SECONDS", default_value_t = 1)]
+    command_interval_seconds: u64,
     #[arg(long, env = "IOT_RETENTION_INTERVAL_SECONDS", default_value_t = 60)]
     retention_interval_seconds: u64,
     #[arg(long, env = "IOT_SQLITE_RAW_RETENTION_DAYS", default_value_t = 30)]
@@ -125,6 +130,12 @@ struct Arguments {
     smtp_config_path: PathBuf,
     #[arg(long, env = "IOT_NANOMQ_WEBHOOK_SECRET")]
     nanomq_webhook_secret: String,
+    #[arg(long, env = "IOT_MQTT_TRANSPORT_URL")]
+    mqtt_transport_url: String,
+    #[arg(long, env = "IOT_MQTT_TRANSPORT_SECRET")]
+    mqtt_transport_secret: String,
+    #[arg(long, env = "IOT_MQTT_TRANSPORT_INGEST_WEBHOOK_SECRET")]
+    mqtt_transport_ingest_webhook_secret: String,
     #[arg(
         long,
         env = "IOT_NANOMQ_WEBHOOK_INBOX_DIR",
@@ -169,6 +180,12 @@ impl Arguments {
                 return Err(format!("{name} does not fit this platform"));
             }
         }
+        if self.command_batch_size == 0 {
+            return Err("IOT_COMMAND_BATCH_SIZE must be positive".to_owned());
+        }
+        if self.command_interval_seconds == 0 {
+            return Err("IOT_COMMAND_INTERVAL_SECONDS must be positive".to_owned());
+        }
         if self.nanomq_webhook_secret.len() < 32
             || !self.nanomq_webhook_secret.is_ascii()
             || self
@@ -178,6 +195,30 @@ impl Arguments {
         {
             return Err(
                 "IOT_NANOMQ_WEBHOOK_SECRET must be at least 32 ASCII non-whitespace characters"
+                    .to_owned(),
+            );
+        }
+        if self.mqtt_transport_secret.len() < 32
+            || !self.mqtt_transport_secret.is_ascii()
+            || self
+                .mqtt_transport_secret
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace())
+        {
+            return Err(
+                "IOT_MQTT_TRANSPORT_SECRET must be at least 32 ASCII non-whitespace characters"
+                    .to_owned(),
+            );
+        }
+        if self.mqtt_transport_ingest_webhook_secret.len() < 32
+            || !self.mqtt_transport_ingest_webhook_secret.is_ascii()
+            || self
+                .mqtt_transport_ingest_webhook_secret
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace())
+        {
+            return Err(
+                "IOT_MQTT_TRANSPORT_INGEST_WEBHOOK_SECRET must be at least 32 ASCII non-whitespace characters"
                     .to_owned(),
             );
         }
@@ -278,6 +319,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         runtime.subscribe().await?;
     }
     let smtp_fallback = SmtpConfig::from_env()?;
+    let command_transport = HttpTransportRpcClient::new(
+        &arguments.mqtt_transport_url,
+        &arguments.mqtt_transport_secret,
+    )
+    .map_err(std::io::Error::other)?;
 
     let mut tasks = JoinSet::new();
     if let Some(runtime) = runtime {
@@ -304,7 +350,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             start_http_server(
                 arguments.health_address,
                 Arc::clone(&metrics),
-                webhook_router(webhook_ingress),
+                webhook_router_with_transport_secret(
+                    webhook_ingress,
+                    &arguments.mqtt_transport_ingest_webhook_secret,
+                ),
             )
             .await?;
 
@@ -345,7 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ));
 
             let dispatcher = NotificationDispatcher::new(
-                pool,
+                pool.clone(),
                 ReloadingSmtpEmailSender::new(arguments.smtp_config_path, smtp_fallback),
                 usize::try_from(tuning.notification_batch_size)
                     .expect("validated notification batch size"),
@@ -370,6 +419,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Arc::clone(&metrics),
                 Duration::from_secs(tuning.notification_interval_seconds),
             ));
+            tasks.spawn(run_command_dispatcher(
+                CommandDispatcher::new(
+                    pool,
+                    command_transport.clone(),
+                    arguments.command_batch_size,
+                ),
+                Duration::from_secs(arguments.command_interval_seconds),
+            ));
         }
         DatabaseStorage::Sqlite => {
             let store = SqliteStore::open(&storage).await?;
@@ -384,7 +441,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             start_http_server(
                 arguments.health_address,
                 Arc::clone(&metrics),
-                sqlite_webhook_router(webhook_ingress),
+                sqlite_webhook_router_with_transport_secret(
+                    webhook_ingress,
+                    &arguments.mqtt_transport_ingest_webhook_secret,
+                ),
             )
             .await?;
 
@@ -456,6 +516,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 dispatcher,
                 Arc::clone(&metrics),
                 Duration::from_secs(tuning.notification_interval_seconds),
+            ));
+            tasks.spawn(run_sqlite_command_dispatcher(
+                SqliteCommandDispatcher::new(
+                    store,
+                    command_transport.clone(),
+                    arguments.command_batch_size,
+                ),
+                Duration::from_secs(arguments.command_interval_seconds),
             ));
         }
     }
@@ -711,6 +779,40 @@ where
     }
 }
 
+async fn run_command_dispatcher<C>(
+    dispatcher: CommandDispatcher<C>,
+    dispatch_interval: Duration,
+) -> TaskResult
+where
+    C: TransportRpcClient + 'static,
+{
+    let mut tick = interval(dispatch_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        if let Err(error) = dispatcher.dispatch_once(Utc::now()).await {
+            eprintln!("command dispatch error: {error}");
+        }
+    }
+}
+
+async fn run_sqlite_command_dispatcher<C>(
+    dispatcher: SqliteCommandDispatcher<C>,
+    dispatch_interval: Duration,
+) -> TaskResult
+where
+    C: TransportRpcClient + 'static,
+{
+    let mut tick = interval(dispatch_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        if let Err(error) = dispatcher.dispatch_once(Utc::now()).await {
+            eprintln!("SQLite command dispatch error: {error}");
+        }
+    }
+}
+
 async fn run_retention(
     stream: LocalStream,
     metrics: Arc<IngestMetrics>,
@@ -937,6 +1039,12 @@ mod tests {
             "postgres://iot:iot@127.0.0.1:54329/iot",
             "--nanomq-webhook-secret",
             "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "test-mqtt-transport-secret-must-have-32-bytes",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
         ])
         .unwrap();
 
@@ -951,6 +1059,12 @@ mod tests {
             "iot-ingest",
             "--nanomq-webhook-secret",
             "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "test-mqtt-transport-secret-must-have-32-bytes",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
         ])
         .unwrap();
 
@@ -963,6 +1077,12 @@ mod tests {
             "iot-ingest",
             "--nanomq-webhook-secret",
             "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "test-mqtt-transport-secret-must-have-32-bytes",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
         ])
         .unwrap();
         let storage = storage_configuration(
@@ -987,6 +1107,12 @@ mod tests {
             "iot-ingest",
             "--nanomq-webhook-secret",
             "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "test-mqtt-transport-secret-must-have-32-bytes",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
         ])
         .unwrap();
 
@@ -1001,6 +1127,12 @@ mod tests {
             "iot-ingest",
             "--nanomq-webhook-secret",
             "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "test-mqtt-transport-secret-must-have-32-bytes",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
             "--sqlite-raw-retention-days",
             "7",
             "--sqlite-rollup-retention-days",
@@ -1027,6 +1159,12 @@ mod tests {
             "postgres://iot:iot@127.0.0.1:54329/iot",
             "--nanomq-webhook-secret",
             "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "test-mqtt-transport-secret-must-have-32-bytes",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
         ])
         .unwrap();
 
@@ -1044,6 +1182,12 @@ mod tests {
             "postgres://iot:iot@127.0.0.1:54329/iot",
             "--nanomq-webhook-secret",
             "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "test-mqtt-transport-secret-must-have-32-bytes",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
             "--notification-retry-base-seconds",
             "60",
             "--notification-retry-max-seconds",
@@ -1052,5 +1196,25 @@ mod tests {
         .unwrap();
 
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn transport_secret_matches_the_transport_service_policy() {
+        let arguments = Arguments::try_parse_from([
+            "iot-ingest",
+            "--database-url",
+            "postgres://iot:iot@127.0.0.1:54329/iot",
+            "--nanomq-webhook-secret",
+            "test-nanomq-webhook-secret-must-have-32-bytes",
+            "--mqtt-transport-url",
+            "http://127.0.0.1:8082",
+            "--mqtt-transport-secret",
+            "short-secret",
+            "--mqtt-transport-ingest-webhook-secret",
+            "test-transport-ingest-webhook-secret-must-have-32-bytes",
+        ])
+        .unwrap();
+
+        assert!(arguments.validate().is_err());
     }
 }

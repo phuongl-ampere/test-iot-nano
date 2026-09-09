@@ -321,6 +321,7 @@ export function Dashboard() {
               <RefreshCw aria-hidden="true" size={17} />
             </button>
             <ProfileMenu
+              accountClass={role === "admin" ? "admin" : "user"}
               onLogout={signOut}
               onOpenProfile={() => setView("user_profile")}
               onOpenSystemConfiguration={() => setView("system_configuration")}

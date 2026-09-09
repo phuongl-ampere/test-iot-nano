@@ -2,6 +2,7 @@
 
 mod device_token;
 mod gateway;
+mod rpc;
 mod storage;
 mod system_config;
 mod telemetry;
@@ -14,6 +15,7 @@ pub use gateway::{
     GATEWAY_CONNECT_TOPIC, GATEWAY_DISCONNECT_TOPIC, GATEWAY_TELEMETRY_TOPIC,
     GatewayChildLifecyclePayload, GatewayPayloadError, GatewayTelemetryPayload,
 };
+pub use rpc::{CommandState, RpcMode, RpcRequest, RpcRequestValidationError, RpcTarget};
 pub use storage::{DatabaseStorage, StorageConfiguration, StorageConfigurationError};
 pub use system_config::{
     IngestTuning, MqttConfiguration, MqttConfigurationUpdate, SmtpConfiguration,

@@ -3,9 +3,10 @@
 import { LogOut, Settings, Settings2, UserRound } from "lucide-react";
 import { useState } from "react";
 
-import { type Role } from "../lib/api";
+import { type AccountClass, type Role } from "../lib/api";
 
 type ProfileMenuProps = {
+  accountClass: AccountClass;
   role: Role;
   onLogout(): void;
   onOpenProfile(): void;
@@ -13,6 +14,7 @@ type ProfileMenuProps = {
 };
 
 export function ProfileMenu({
+  accountClass,
   role,
   onLogout,
   onOpenProfile,
@@ -38,14 +40,14 @@ export function ProfileMenu({
             <UserRound aria-hidden="true" size={15} />
             User profile
           </button>
-          {role === "admin" && (
+          {accountClass === "system" && (
             <button
               className="profile-menu-action"
               onClick={onOpenSystemConfiguration}
               type="button"
             >
               <Settings2 aria-hidden="true" size={15} />
-              Admin setting
+              System setting
             </button>
           )}
           <button

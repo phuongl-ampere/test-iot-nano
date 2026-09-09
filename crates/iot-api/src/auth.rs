@@ -16,8 +16,10 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 const ADMIN_USERNAME: &str = "admin";
+const SYSTEM_USERNAME: &str = "system";
 const VIEWER_USERNAME: &str = "viewer";
 const INITIAL_ADMIN_PASSWORD: &str = "NanoAdmin@1234";
+const INITIAL_SYSTEM_PASSWORD: &str = "NanoSystem@1234";
 const INITIAL_VIEWER_PASSWORD: &str = "NanoView@1234";
 pub const DEFAULT_APP: &str = "/apps/powermonitor";
 pub const POWER_MONITOR_APP: &str = "powermonitor";
@@ -57,9 +59,49 @@ impl FromStr for Role {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountClass {
+    System,
+    Admin,
+    User,
+}
+
+impl AccountClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Admin => "admin",
+            Self::User => "user",
+        }
+    }
+
+    pub const fn from_legacy_role(role: Role) -> Self {
+        match role {
+            Role::Admin => Self::Admin,
+            Role::Viewer => Self::User,
+        }
+    }
+}
+
+impl FromStr for AccountClass {
+    type Err = AuthError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "system" => Ok(Self::System),
+            "admin" => Ok(Self::Admin),
+            "user" => Ok(Self::User),
+            _ => Err(AuthError::InvalidAccountClass),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthContext {
+    pub user_id: Uuid,
     pub role: Role,
+    pub account_class: AccountClass,
     pub username: String,
     pub default_app: String,
     pub granted_apps: Vec<String>,
@@ -68,7 +110,9 @@ pub struct AuthContext {
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
+    pub user_id: Uuid,
     pub role: Role,
+    pub account_class: AccountClass,
     pub username: String,
     pub default_app: String,
     pub granted_apps: Vec<String>,
@@ -85,7 +129,27 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         match parts.extensions.get::<AuthContext>() {
             Some(AuthContext {
-                role: Role::Admin, ..
+                account_class: AccountClass::Admin,
+                ..
+            }) => Ok(Self),
+            _ => Err(StatusCode::FORBIDDEN),
+        }
+    }
+}
+
+pub struct System;
+
+impl<S> FromRequestParts<S> for System
+where
+    S: Send + Sync,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        match parts.extensions.get::<AuthContext>() {
+            Some(AuthContext {
+                account_class: AccountClass::System,
+                ..
             }) => Ok(Self),
             _ => Err(StatusCode::FORBIDDEN),
         }
@@ -102,6 +166,8 @@ pub enum AuthError {
     IncompleteStoredUsers,
     #[error("invalid user role")]
     InvalidRole,
+    #[error("invalid account class")]
+    InvalidAccountClass,
     #[error("stored password hash is invalid")]
     InvalidStoredHash,
     #[error("authentication failed")]
@@ -139,7 +205,9 @@ pub fn generate_session_id() -> String {
 
 pub fn default_user(username: impl Into<String>, role: Role) -> AuthenticatedUser {
     AuthenticatedUser {
+        user_id: Uuid::nil(),
         role,
+        account_class: AccountClass::from_legacy_role(role),
         username: username.into(),
         default_app: DEFAULT_APP.to_owned(),
         granted_apps: vec![POWER_MONITOR_APP.to_owned()],
@@ -169,12 +237,13 @@ pub async fn bootstrap_users(pool: &PgPool) -> Result<(), AuthError> {
             validate_password(password)?;
             let password_hash = hash_password(password)?;
             sqlx::query(
-                "INSERT INTO users (username, password_hash, role, default_app)
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO users (username, password_hash, role, account_class, default_app)
+                 VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(role.username())
             .bind(password_hash)
             .bind(role.as_str())
+            .bind(AccountClass::from_legacy_role(role).as_str())
             .bind(DEFAULT_APP)
             .execute(&mut *transaction)
             .await?;
@@ -184,6 +253,32 @@ pub async fn bootstrap_users(pool: &PgPool) -> Result<(), AuthError> {
             row.try_get::<String, _>("role")?
                 .parse::<Role>()
                 .map_err(|_| AuthError::IncompleteStoredUsers)?;
+        }
+    }
+    let has_system: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM users WHERE account_class = 'system'
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !has_system {
+        validate_password(INITIAL_SYSTEM_PASSWORD)?;
+        let inserted = sqlx::query(
+            "INSERT INTO users (username, password_hash, role, account_class, default_app)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (username) DO NOTHING",
+        )
+        .bind(SYSTEM_USERNAME)
+        .bind(hash_password(INITIAL_SYSTEM_PASSWORD)?)
+        .bind(Role::Admin.as_str())
+        .bind(AccountClass::System.as_str())
+        .bind(DEFAULT_APP)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if inserted != 1 {
+            return Err(AuthError::IncompleteStoredUsers);
         }
     }
 
@@ -219,13 +314,15 @@ pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> 
         ] {
             validate_password(password)?;
             sqlx::query(
-                "INSERT INTO users (id, username, password_hash, role, default_app)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (
+                    id, username, password_hash, role, account_class, default_app
+                 ) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::new_v4().to_string())
             .bind(role.username())
             .bind(hash_password(password)?)
             .bind(role.as_str())
+            .bind(AccountClass::from_legacy_role(role).as_str())
             .bind(DEFAULT_APP)
             .execute(&mut *transaction)
             .await?;
@@ -251,6 +348,33 @@ pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> 
                 .map_err(|_| AuthError::IncompleteStoredUsers)?;
         }
     }
+    let has_system: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM users WHERE account_class = 'system'
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if !has_system {
+        validate_password(INITIAL_SYSTEM_PASSWORD)?;
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO users (
+                id, username, password_hash, role, account_class, default_app
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(SYSTEM_USERNAME)
+        .bind(hash_password(INITIAL_SYSTEM_PASSWORD)?)
+        .bind(Role::Admin.as_str())
+        .bind(AccountClass::System.as_str())
+        .bind(DEFAULT_APP)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if inserted != 1 {
+            return Err(AuthError::IncompleteStoredUsers);
+        }
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -261,7 +385,7 @@ pub async fn authenticate_credentials(
     password: &str,
 ) -> Result<AuthenticatedUser, AuthError> {
     let row = sqlx::query(
-        "SELECT id, role, password_hash, default_app
+        "SELECT id, role, account_class, password_hash, default_app
          FROM users
          WHERE username = $1",
     )
@@ -272,6 +396,10 @@ pub async fn authenticate_credentials(
     let stored_role = row
         .try_get::<String, _>("role")?
         .parse::<Role>()
+        .map_err(|_| AuthError::InvalidStoredHash)?;
+    let account_class = row
+        .try_get::<String, _>("account_class")?
+        .parse::<AccountClass>()
         .map_err(|_| AuthError::InvalidStoredHash)?;
     let password_hash = row.try_get::<String, _>("password_hash")?;
     let password_hash =
@@ -294,7 +422,9 @@ pub async fn authenticate_credentials(
         .map(|grant| grant.try_get("app_key"))
         .collect::<Result<Vec<String>, sqlx::Error>>()?;
         Ok(AuthenticatedUser {
+            user_id,
             role: stored_role,
+            account_class,
             username: username.to_owned(),
             default_app: row.try_get("default_app")?,
             granted_apps,
@@ -310,7 +440,7 @@ pub async fn authenticate_credentials_sqlite(
     password: &str,
 ) -> Result<AuthenticatedUser, AuthError> {
     let row = sqlx::query(
-        "SELECT id, role, password_hash, default_app
+        "SELECT id, role, account_class, password_hash, default_app
          FROM users
          WHERE username = ?",
     )
@@ -322,6 +452,10 @@ pub async fn authenticate_credentials_sqlite(
         .try_get::<String, _>("role")?
         .parse::<Role>()
         .map_err(|_| AuthError::InvalidStoredHash)?;
+    let account_class = row
+        .try_get::<String, _>("account_class")?
+        .parse::<AccountClass>()
+        .map_err(|_| AuthError::InvalidStoredHash)?;
     let password_hash = row.try_get::<String, _>("password_hash")?;
     let password_hash =
         PasswordHash::new(&password_hash).map_err(|_| AuthError::InvalidStoredHash)?;
@@ -331,21 +465,24 @@ pub async fn authenticate_credentials_sqlite(
     {
         return Err(AuthError::AuthenticationFailed);
     }
-    let user_id = row.try_get::<String, _>("id")?;
+    let user_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
+        .map_err(|_| AuthError::InvalidStoredHash)?;
     let granted_apps = sqlx::query(
         "SELECT app_key
          FROM user_app_grants
          WHERE user_id = ?
          ORDER BY app_key",
     )
-    .bind(user_id)
+    .bind(user_id.to_string())
     .fetch_all(pool)
     .await?
     .into_iter()
     .map(|grant| grant.try_get("app_key"))
     .collect::<Result<Vec<String>, sqlx::Error>>()?;
     Ok(AuthenticatedUser {
+        user_id,
         role: stored_role,
+        account_class,
         username: username.to_owned(),
         default_app: row.try_get("default_app")?,
         granted_apps,

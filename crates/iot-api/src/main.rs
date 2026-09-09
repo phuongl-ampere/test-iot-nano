@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, sync::Arc}
 use clap::Parser;
 use iot_api::{
     ApiState, CommandMqttConfig, HelperSystemConfigurationService, SqliteApiState, TokenVault,
-    bootstrap_users, bootstrap_users_sqlite, router, sqlite_router,
+    bootstrap_power_switcher_profile, bootstrap_power_switcher_profile_sqlite, bootstrap_users,
+    bootstrap_users_sqlite, router, sqlite_router,
 };
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_ingest::migrate;
@@ -26,6 +27,14 @@ struct Arguments {
     mqtt_password: Option<String>,
     #[arg(long, env = "IOT_NANOMQ_AUTH_SECRET")]
     nanomq_auth_secret: String,
+    #[arg(long, env = "IOT_MQTT_TRANSPORT_SECRET")]
+    mqtt_transport_secret: String,
+    #[arg(
+        long,
+        env = "IOT_MQTT_TRANSPORT_URL",
+        default_value = "http://127.0.0.1:8083"
+    )]
+    mqtt_transport_control_url: String,
     #[arg(long, env = "IOT_DEVICE_TOKEN_VAULT_KEY")]
     device_token_vault_key: Option<String>,
     #[arg(
@@ -57,6 +66,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "IOT_NANOMQ_AUTH_SECRET must be at least 32 ASCII non-whitespace characters".into(),
         );
     }
+    if validate_vault_key(&arguments.mqtt_transport_secret).is_err() {
+        return Err(
+            "IOT_MQTT_TRANSPORT_SECRET must be at least 32 ASCII non-whitespace characters".into(),
+        );
+    }
     if arguments
         .device_token_vault_key
         .as_deref()
@@ -86,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             migrate(&pool).await?;
             bootstrap_users(&pool).await?;
+            bootstrap_power_switcher_profile(&pool).await?;
             router(
                 ApiState::with_command_mqtt(
                     pool,
@@ -99,16 +114,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .with_device_token_vault(TokenVault::from_key_material(vault_key))
                 .with_nanomq_auth_secret(arguments.nanomq_auth_secret)
+                .with_mqtt_transport_secret(arguments.mqtt_transport_secret)
+                .with_mqtt_transport_control_url(arguments.mqtt_transport_control_url)
                 .with_system_configuration(system_configuration),
             )
         }
         DatabaseStorage::Sqlite => {
             let store = SqliteStore::open(&storage).await?;
             bootstrap_users_sqlite(store.pool()).await?;
+            bootstrap_power_switcher_profile_sqlite(store.pool()).await?;
             sqlite_router(
                 SqliteApiState::new(store)
                     .with_device_token_vault(TokenVault::from_key_material(vault_key))
                     .with_nanomq_auth_secret(arguments.nanomq_auth_secret)
+                    .with_mqtt_transport_secret(arguments.mqtt_transport_secret)
+                    .with_mqtt_transport_control_url(arguments.mqtt_transport_control_url)
                     .with_system_configuration(system_configuration),
             )
         }

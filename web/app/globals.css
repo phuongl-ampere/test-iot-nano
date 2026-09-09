@@ -495,6 +495,156 @@ button:focus-visible {
   margin: -16px 0 12px;
 }
 
+.power-switcher-control {
+  border-bottom: 1px solid var(--line);
+  padding: 24px 0;
+}
+
+.power-switcher-control > header {
+  align-items: end;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.power-switcher-control h2 {
+  font-size: 18px;
+  margin: 3px 0 0;
+}
+
+.switch-state {
+  align-items: center;
+  border: 1px solid var(--line-strong);
+  display: inline-flex;
+  font-family: var(--font-data);
+  font-size: 12px;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.switch-state-on {
+  background: var(--teal-soft);
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.switch-state-off {
+  color: var(--muted);
+}
+
+.switch-state-unknown {
+  border-style: dashed;
+  color: var(--amber);
+}
+
+.power-switcher-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.switch-command-actions {
+  display: inline-flex;
+}
+
+.two-way-rpc-state {
+  align-items: center;
+  border: 1px solid var(--line-strong);
+  color: var(--teal);
+  display: inline-flex;
+  font-family: var(--font-data);
+  font-size: 12px;
+  gap: 6px;
+  min-height: 34px;
+  padding: 0 10px;
+}
+
+.switch-command-actions button {
+  align-items: center;
+  background: var(--surface);
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-family: var(--font-data);
+  font-size: 12px;
+  gap: 5px;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.switch-command-actions {
+  border: 1px solid var(--line-strong);
+}
+
+.switch-command-actions button + button {
+  border-left: 1px solid var(--line);
+}
+
+.switch-command-actions .switch-command-on {
+  color: var(--teal);
+}
+
+.switch-command-actions .switch-command-off {
+  color: var(--red);
+}
+
+.switch-command-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.light-brightness-control {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(130px, 1fr) auto;
+  width: min(100%, 440px);
+}
+
+.light-brightness-control label {
+  color: var(--muted);
+  font-family: var(--font-data);
+  font-size: 12px;
+}
+
+.light-brightness-control label strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.light-brightness-control input[type="range"] {
+  accent-color: var(--teal);
+  margin: 0;
+  min-width: 0;
+}
+
+.light-brightness-control button {
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  color: var(--text);
+  cursor: pointer;
+  font-family: var(--font-data);
+  font-size: 12px;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.light-brightness-control button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.switch-command-status {
+  color: var(--muted);
+  font-family: var(--font-data);
+  font-size: 12px;
+  margin: 12px 0 0;
+}
+
 .time-range-control {
   border: 1px solid var(--line-strong);
   display: inline-grid;

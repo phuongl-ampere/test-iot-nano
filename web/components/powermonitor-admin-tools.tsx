@@ -2,22 +2,20 @@
 
 import { FolderPlus, Link2, PlusCircle } from "lucide-react";
 
-import type { Role } from "../lib/api";
-
 export function PowerMonitorAdminTools({
   onAddAsset,
   onAddDevice,
   onAssignDevice,
-  role,
+  canManage,
   selectedDevice,
 }: {
   onAddAsset(): void;
   onAddDevice(): void;
   onAssignDevice(): void;
-  role: Role;
+  canManage: boolean;
   selectedDevice: boolean;
 }) {
-  if (role !== "admin") {
+  if (!canManage) {
     return null;
   }
   return (

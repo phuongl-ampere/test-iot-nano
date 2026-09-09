@@ -13,8 +13,9 @@ use axum::{
 use chrono::{TimeZone, Utc};
 use fs2::FileExt;
 use iot_api::{
-    ApiState, Role, SystemConfigurationService, SystemConfigurationServiceError, bootstrap_users,
-    router, validate_password,
+    ApiState, MqttTransportSessionRevocation, MqttTransportSessionRevoker,
+    MqttTransportSessionRevokerError, Role, SystemConfigurationService,
+    SystemConfigurationServiceError, bootstrap_users, router, validate_password,
 };
 use iot_core::{
     DEVICE_TELEMETRY_TOPIC, GATEWAY_CONNECT_TOPIC, GATEWAY_DISCONNECT_TOPIC,
@@ -34,7 +35,51 @@ const VIEWER_PASSWORD: &str = "NanoView@1234";
 const ADMIN_SESSION: &str = "session_test_admin";
 const VIEWER_SESSION: &str = "session_test_viewer";
 const NANOMQ_AUTH_SECRET: &str = "test-nanomq-auth-secret-must-have-32-bytes";
+const MQTT_TRANSPORT_SECRET: &str = "test-mqtt-transport-secret-must-have-32";
 const MQTT_API_SERVICE_PASSWORD: &str = "test-iot-api-service-password";
+
+#[derive(Clone, Default)]
+struct RecordingSessionRevoker {
+    calls: Arc<Mutex<Vec<MqttTransportSessionRevocation>>>,
+    fail: bool,
+}
+
+impl RecordingSessionRevoker {
+    fn failing() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            fail: true,
+        }
+    }
+
+    fn calls(&self) -> Vec<MqttTransportSessionRevocation> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl MqttTransportSessionRevoker for RecordingSessionRevoker {
+    fn revoke_session(
+        &self,
+        revocation: MqttTransportSessionRevocation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MqttTransportSessionRevokerError>> + Send + '_>>
+    {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(revocation);
+        let fail = self.fail;
+        Box::pin(async move {
+            if fail {
+                Err(MqttTransportSessionRevokerError::Unavailable)
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
 
 #[derive(Clone)]
 struct TestSystemConfigurationService {
@@ -116,9 +161,9 @@ async fn prepared_pool() -> PgPool {
     let pool = PgPool::connect(&database_url).await.unwrap();
     migrate(&pool).await.unwrap();
     query(
-        "TRUNCATE user_app_grants, users, api_access_tokens, device_tokens, notification_outbox,
-                  alert_incidents, alert_rules, telemetry, devices, assets, device_profiles,
-                  asset_profiles CASCADE",
+        "TRUNCATE user_app_grants, users, api_access_tokens, device_tokens, command_outbox,
+                  notification_outbox, alert_incidents, alert_rules, telemetry, devices, assets,
+                  device_profiles, asset_profiles CASCADE",
     )
     .execute(&pool)
     .await
@@ -182,10 +227,32 @@ fn test_state(pool: PgPool) -> ApiState {
     ApiState::new(pool)
         .with_session(ADMIN_SESSION, "admin", Role::Admin)
         .with_session(VIEWER_SESSION, "viewer", Role::Viewer)
+        .with_mqtt_transport_session_revoker(RecordingSessionRevoker::default())
 }
 
 fn with_nanomq_auth(builder: axum::http::request::Builder) -> axum::http::request::Builder {
     builder.header("x-iot-nanomq-auth", NANOMQ_AUTH_SECRET)
+}
+
+fn with_mqtt_transport_auth(builder: axum::http::request::Builder) -> axum::http::request::Builder {
+    builder.header("x-iot-mqtt-transport-secret", MQTT_TRANSPORT_SECRET)
+}
+
+fn mqtt_transport_session_authorization_request(device_id: &str, token_id: &str) -> Request<Body> {
+    with_mqtt_transport_auth(
+        Request::builder()
+            .method("POST")
+            .uri("/internal/mqtt-transport/session-authorization")
+            .header(header::CONTENT_TYPE, "application/json"),
+    )
+    .body(Body::from(
+        json!({
+            "device_id": device_id,
+            "token_id": token_id,
+        })
+        .to_string(),
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -242,6 +309,19 @@ async fn serves_openapi_3_1_document_and_swagger_ui() {
             .is_some()
     );
     assert!(document["paths"].get("/api/management/devices").is_some());
+    assert!(document["paths"].get("/api/my/assets").is_some());
+    assert!(document["paths"].get("/api/my/devices").is_some());
+    assert!(document["paths"].get("/api/device-claims").is_some());
+    assert!(
+        document["paths"]
+            .get("/api/devices/{device_id}/shares")
+            .is_some()
+    );
+    assert!(
+        document["paths"]
+            .get("/api/resource-shares/{id}/accept")
+            .is_some()
+    );
     assert!(
         document["paths"]
             .get("/api/device-tokens/{id}/rotate")
@@ -704,6 +784,350 @@ async fn admin_manages_device_tokens_and_nanomq_only_accepts_active_token_teleme
 }
 
 #[tokio::test]
+async fn token_mutations_revoke_only_the_prior_timescale_transport_session() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = prepared_pool().await;
+    query("INSERT INTO devices (device_id, display_name) VALUES ($1, $2)")
+        .bind("other-device")
+        .bind("Other device")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let revoker = RecordingSessionRevoker::default();
+    let app = router(test_state(pool).with_mqtt_transport_session_revoker(revoker.clone()));
+
+    let other = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/other-device/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let other: serde_json::Value =
+        serde_json::from_slice(&to_bytes(other.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let other_token_id = Uuid::parse_str(other["id"].as_str().unwrap()).unwrap();
+
+    let first = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first: serde_json::Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_token_id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+
+    let second = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second: serde_json::Value =
+        serde_json::from_slice(&to_bytes(second.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let second_token_id = Uuid::parse_str(second["id"].as_str().unwrap()).unwrap();
+
+    let third = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri(format!("/api/device-tokens/{second_token_id}/rotate"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::CREATED);
+    let third: serde_json::Value =
+        serde_json::from_slice(&to_bytes(third.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let third_token_id = Uuid::parse_str(third["id"].as_str().unwrap()).unwrap();
+
+    let revoke = app
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri(format!("/api/device-tokens/{third_token_id}/revoke"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        revoker.calls(),
+        vec![
+            MqttTransportSessionRevocation {
+                device_id: "esp-000123".to_owned(),
+                token_id: first_token_id,
+            },
+            MqttTransportSessionRevocation {
+                device_id: "esp-000123".to_owned(),
+                token_id: second_token_id,
+            },
+            MqttTransportSessionRevocation {
+                device_id: "esp-000123".to_owned(),
+                token_id: third_token_id,
+            },
+        ]
+    );
+    assert!(
+        !revoker
+            .calls()
+            .iter()
+            .any(|call| call.token_id == other_token_id)
+    );
+}
+
+#[tokio::test]
+async fn failed_timescale_session_revocation_returns_503_without_restoring_the_token() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = prepared_pool().await;
+    let revoker = RecordingSessionRevoker::failing();
+    let app = router(test_state(pool.clone()).with_mqtt_transport_session_revoker(revoker.clone()));
+    let first = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first: serde_json::Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_token_id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+
+    let replacement = app
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let revoked_at: Option<chrono::DateTime<Utc>> =
+        query("SELECT revoked_at FROM device_tokens WHERE id = $1")
+            .bind(first_token_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get("revoked_at")
+            .unwrap();
+
+    assert_eq!(replacement.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(revoked_at.is_some());
+    assert_eq!(
+        revoker.calls(),
+        vec![MqttTransportSessionRevocation {
+            device_id: "esp-000123".to_owned(),
+            token_id: first_token_id,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn mqtt_transport_resolves_only_active_direct_device_tokens() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = prepared_pool().await;
+    query(
+        "INSERT INTO devices (device_id, display_name, is_gateway)
+         VALUES ('gateway-001', 'Field gateway', TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = router(
+        test_state(pool.clone())
+            .with_nanomq_auth_secret(NANOMQ_AUTH_SECRET)
+            .with_mqtt_transport_secret(MQTT_TRANSPORT_SECRET),
+    );
+
+    let create = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(create.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let token = created["token"].as_str().unwrap().to_owned();
+    let token_id = created["id"].as_str().unwrap().to_owned();
+    let request_body = json!({
+        "client_id": "transport-device-001",
+        "username": token,
+        "password": ""
+    })
+    .to_string();
+
+    let missing_secret = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/mqtt-transport/session-resolution")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bad_secret = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/internal/mqtt-transport/session-resolution")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-iot-mqtt-transport-secret", "wrong-secret")
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let password_auth = app
+        .clone()
+        .oneshot(
+            with_mqtt_transport_auth(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/mqtt-transport/session-resolution")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            )
+            .body(Body::from(
+                json!({
+                    "client_id": "transport-device-001",
+                    "username": token,
+                    "password": "not-empty"
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let active = app
+        .clone()
+        .oneshot(
+            with_mqtt_transport_auth(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/mqtt-transport/session-resolution")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            )
+            .body(Body::from(request_body.clone()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let active_status = active.status();
+    let active_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(active.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    query("UPDATE devices SET gateway_device_id = $1 WHERE device_id = $2")
+        .bind("gateway-001")
+        .bind("esp-000123")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let child_token = app
+        .clone()
+        .oneshot(
+            with_mqtt_transport_auth(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/mqtt-transport/session-resolution")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            )
+            .body(Body::from(request_body.clone()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    query("UPDATE devices SET gateway_device_id = NULL WHERE device_id = $1")
+        .bind("esp-000123")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let revoke = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri(format!("/api/device-tokens/{token_id}/revoke"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let revoked = app
+        .oneshot(
+            with_mqtt_transport_auth(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/mqtt-transport/session-resolution")
+                    .header(header::CONTENT_TYPE, "application/json"),
+            )
+            .body(Body::from(request_body))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(missing_secret.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(bad_secret.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(password_auth.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(active_status, StatusCode::OK);
+    assert_eq!(
+        active_body,
+        json!({
+            "device_id": "esp-000123",
+            "token_id": token_id,
+            "is_gateway": false
+        })
+    );
+    assert_eq!(child_token.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn gateway_assignment_revokes_child_tokens_and_restricts_nanomq_topics() {
     let _database_lock = DATABASE_TEST_LOCK
         .lock()
@@ -889,6 +1313,189 @@ async fn gateway_assignment_revokes_child_tokens_and_restricts_nanomq_topics() {
 }
 
 #[tokio::test]
+async fn mqtt_transport_authorizes_only_the_exact_active_direct_or_gateway_token() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = prepared_pool().await;
+    query(
+        "INSERT INTO devices (device_id, display_name, is_gateway)
+         VALUES
+            ('other-esp-000123', 'Other sensor', FALSE),
+            ('gateway-authorization-001', 'Field gateway', TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = router(test_state(pool.clone()).with_mqtt_transport_secret(MQTT_TRANSPORT_SECRET));
+
+    let direct_create = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let direct_create_status = direct_create.status();
+    let direct: serde_json::Value = serde_json::from_slice(
+        &to_bytes(direct_create.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let direct_token_id = direct["id"].as_str().unwrap().to_owned();
+
+    let other_create = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/other-esp-000123/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let other: serde_json::Value = serde_json::from_slice(
+        &to_bytes(other_create.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let other_token_id = other["id"].as_str().unwrap().to_owned();
+
+    let gateway_create = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/gateway-authorization-001/tokens")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let gateway: serde_json::Value = serde_json::from_slice(
+        &to_bytes(gateway_create.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let gateway_token_id = gateway["id"].as_str().unwrap().to_owned();
+
+    let direct_authorized = app
+        .clone()
+        .oneshot(mqtt_transport_session_authorization_request(
+            "esp-000123",
+            &direct_token_id,
+        ))
+        .await
+        .unwrap();
+    let gateway_authorized = app
+        .clone()
+        .oneshot(mqtt_transport_session_authorization_request(
+            "gateway-authorization-001",
+            &gateway_token_id,
+        ))
+        .await
+        .unwrap();
+    let wrong_token = app
+        .clone()
+        .oneshot(mqtt_transport_session_authorization_request(
+            "esp-000123",
+            &other_token_id,
+        ))
+        .await
+        .unwrap();
+
+    query("UPDATE devices SET gateway_device_id = $1 WHERE device_id = $2")
+        .bind("gateway-authorization-001")
+        .bind("esp-000123")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let child_device = app
+        .clone()
+        .oneshot(mqtt_transport_session_authorization_request(
+            "esp-000123",
+            &direct_token_id,
+        ))
+        .await
+        .unwrap();
+    query("UPDATE devices SET gateway_device_id = NULL WHERE device_id = $1")
+        .bind("esp-000123")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let rotate = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri(format!("/api/device-tokens/{direct_token_id}/rotate"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let rotate_status = rotate.status();
+    let rotated: serde_json::Value =
+        serde_json::from_slice(&to_bytes(rotate.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let rotated_token_id = rotated["id"].as_str().unwrap().to_owned();
+    let rotated_old_token = app
+        .clone()
+        .oneshot(mqtt_transport_session_authorization_request(
+            "esp-000123",
+            &direct_token_id,
+        ))
+        .await
+        .unwrap();
+    let rotated_token = app
+        .clone()
+        .oneshot(mqtt_transport_session_authorization_request(
+            "esp-000123",
+            &rotated_token_id,
+        ))
+        .await
+        .unwrap();
+    let revoke = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri(format!("/api/device-tokens/{rotated_token_id}/revoke"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let revoked_token = app
+        .oneshot(mqtt_transport_session_authorization_request(
+            "esp-000123",
+            &rotated_token_id,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(direct_create_status, StatusCode::CREATED);
+    assert_eq!(direct_authorized.status(), StatusCode::NO_CONTENT);
+    assert_eq!(gateway_authorized.status(), StatusCode::NO_CONTENT);
+    assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(child_device.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(rotate_status, StatusCode::CREATED);
+    assert_eq!(rotated_old_token.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(rotated_token.status(), StatusCode::NO_CONTENT);
+    assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+    assert_eq!(revoked_token.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn powermonitor_reports_gateway_and_child_health_independently() {
     let _database_lock = DATABASE_TEST_LOCK
         .lock()
@@ -969,7 +1576,7 @@ async fn powermonitor_exposes_raw_measurement_records_for_an_unprofiled_device()
 }
 
 #[tokio::test]
-async fn system_configuration_is_admin_only_and_redacts_smtp_password() {
+async fn system_configuration_requires_system_account_and_redacts_smtp_password() {
     let _database_lock = DATABASE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -978,6 +1585,26 @@ async fn system_configuration_is_admin_only_and_redacts_smtp_password() {
     let app = router(
         test_state(prepared_pool().await).with_system_configuration(Arc::new(service.clone())),
     );
+
+    let system_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"system","password":"NanoSystem@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let system_login_body = to_bytes(system_login.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let system_session: serde_json::Value = serde_json::from_slice(&system_login_body).unwrap();
+    let system_session = system_session["session_id"].as_str().unwrap().to_owned();
 
     let viewer = app
         .clone()
@@ -989,11 +1616,22 @@ async fn system_configuration_is_admin_only_and_redacts_smtp_password() {
         )
         .await
         .unwrap();
-    let read = app
+    let admin = app
         .clone()
         .oneshot(
             with_admin_auth(Request::builder())
                 .uri("/api/system-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/system-configuration")
+                .header(header::AUTHORIZATION, format!("Session {system_session}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1021,10 +1659,11 @@ async fn system_configuration_is_admin_only_and_redacts_smtp_password() {
     let save = app
         .clone()
         .oneshot(
-            with_admin_auth(Request::builder())
+            Request::builder()
                 .method("PUT")
                 .uri("/api/system-configuration")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Session {system_session}"))
                 .body(Body::from(serde_json::to_string(&update).unwrap()))
                 .unwrap(),
         )
@@ -1032,9 +1671,10 @@ async fn system_configuration_is_admin_only_and_redacts_smtp_password() {
         .unwrap();
     let removed_restart = app
         .oneshot(
-            with_admin_auth(Request::builder())
+            Request::builder()
                 .method("POST")
                 .uri("/api/system-configuration/restart")
+                .header(header::AUTHORIZATION, format!("Session {system_session}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1042,10 +1682,255 @@ async fn system_configuration_is_admin_only_and_redacts_smtp_password() {
         .unwrap();
 
     assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+    assert_eq!(admin.status(), StatusCode::FORBIDDEN);
     assert_eq!(read_json["smtp"]["password_configured"], true);
     assert!(read_json["smtp"].get("password").is_none());
     assert_eq!(save.status(), StatusCode::OK);
     assert_eq!(removed_restart.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn timescaledb_user_share_limits_powermonitor_device_visibility() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = prepared_pool().await;
+    let viewer_password_hash: String =
+        query("SELECT password_hash FROM users WHERE username = 'viewer'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get("password_hash")
+            .unwrap();
+    let alice_id = Uuid::now_v7();
+    let bob_id = Uuid::now_v7();
+    for (id, username) in [(alice_id, "alice"), (bob_id, "bob")] {
+        query(
+            "INSERT INTO users (
+                id, username, password_hash, role, account_class, default_app
+             ) VALUES ($1, $2, $3, 'viewer', 'user', '/apps/powermonitor')",
+        )
+        .bind(id)
+        .bind(username)
+        .bind(&viewer_password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        query(
+            "INSERT INTO user_app_grants (user_id, app_key)
+             VALUES ($1, 'powermonitor')",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    query("UPDATE devices SET owner_user_id = $1 WHERE device_id = 'esp-000123'")
+        .bind(alice_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    query(
+        "INSERT INTO devices (device_id, display_name, owner_user_id)
+         VALUES ('unrelated-device', 'Unrelated device', $1)",
+    )
+    .bind(alice_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = router(ApiState::new(pool));
+    let mut sessions = std::collections::HashMap::new();
+    for username in ["alice", "bob"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "username": username,
+                            "password": VIEWER_PASSWORD,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        sessions.insert(username, payload["session_id"].as_str().unwrap().to_owned());
+    }
+    let alice_session = sessions["alice"].as_str();
+    let bob_session = sessions["bob"].as_str();
+
+    let share = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/devices/esp-000123/shares")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Session {alice_session}"))
+                .body(Body::from(
+                    json!({
+                        "username": "bob",
+                        "permission": "viewer",
+                        "inherit_children": false,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(share.status(), StatusCode::CREATED);
+    let share_body = to_bytes(share.into_body(), usize::MAX).await.unwrap();
+    let share: serde_json::Value = serde_json::from_slice(&share_body).unwrap();
+    let share_id = share["id"].as_str().unwrap();
+
+    let accepted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/resource-shares/{share_id}/accept"))
+                .header(header::AUTHORIZATION, format!("Session {bob_session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+
+    let visible = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/apps/powermonitor/devices")
+                .header(header::AUTHORIZATION, format!("Session {bob_session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(visible.status(), StatusCode::OK);
+    let visible_body = to_bytes(visible.into_body(), usize::MAX).await.unwrap();
+    let visible: serde_json::Value = serde_json::from_slice(&visible_body).unwrap();
+    assert_eq!(visible.as_array().unwrap().len(), 1);
+    assert_eq!(visible[0]["device_id"], "esp-000123");
+}
+
+#[tokio::test]
+async fn timescaledb_viewer_claims_an_unowned_device_with_a_one_time_code() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = prepared_pool().await;
+    let viewer_id: Uuid = query("SELECT id FROM users WHERE username = 'viewer'")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get("id")
+        .unwrap();
+    let app = router(ApiState::new(pool.clone()));
+    let mut sessions = std::collections::HashMap::new();
+    for (username, password) in [("admin", ADMIN_PASSWORD), ("viewer", VIEWER_PASSWORD)] {
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "username": username, "password": password }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let login: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        sessions.insert(username, login["session_id"].as_str().unwrap().to_owned());
+    }
+    let admin_session = sessions["admin"].as_str();
+    let viewer_session = sessions["viewer"].as_str();
+
+    let device = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Session {admin_session}"))
+                .body(Body::from(r#"{"display_name":"Claimable meter"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(device.status(), StatusCode::CREATED);
+    let device_body = to_bytes(device.into_body(), usize::MAX).await.unwrap();
+    let device: serde_json::Value = serde_json::from_slice(&device_body).unwrap();
+    let device_id = device["device_id"].as_str().unwrap().to_owned();
+
+    let claim_code = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/management/devices/{device_id}/claim-code"))
+                .header(header::AUTHORIZATION, format!("Session {admin_session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let claim_code_status = claim_code.status();
+    let claim_code_body = to_bytes(claim_code.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        claim_code_status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&claim_code_body)
+    );
+    let claim_code: serde_json::Value = serde_json::from_slice(&claim_code_body).unwrap();
+    let claim_code = claim_code["claim_code"].as_str().unwrap();
+
+    let claimed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/device-claims")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Session {viewer_session}"))
+                .body(Body::from(
+                    json!({
+                        "device_id": device_id,
+                        "claim_code": claim_code,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::NO_CONTENT);
+    let owner: Uuid = query("SELECT owner_user_id FROM devices WHERE device_id = $1")
+        .bind(&device_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get("owner_user_id")
+        .unwrap();
+    assert_eq!(owner, viewer_id);
 }
 
 #[tokio::test]
@@ -1093,7 +1978,9 @@ async fn login_enforces_roles_changes_password_and_rate_limits_failures() {
                 .method("POST")
                 .uri("/api/alert-rules")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from("{}"))
+                .body(Body::from(
+                    r#"{"name":"Viewer rule","device_id":"esp-000123","metric_key":"temperature_c","rule_type":"event_threshold","comparison":"gt","threshold":40,"for_seconds":0}"#,
+                ))
                 .unwrap(),
         )
         .await
@@ -1244,22 +2131,281 @@ async fn raw_telemetry_query_returns_points_in_the_requested_range() {
 }
 
 #[tokio::test]
-async fn invalid_command_request_is_rejected_before_any_mqtt_publish() {
+async fn invalid_command_request_is_rejected_before_durable_enqueue() {
     let _database_lock = DATABASE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _database_file_lock = lock_database_file();
-    let app = router(test_state(prepared_pool().await));
+    let pool = prepared_pool().await;
+    let app = router(test_state(pool.clone()));
     let request = with_admin_auth(Request::builder())
         .method("POST")
         .uri("/api/devices/esp-000123/commands")
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"command":"reboot now","parameters":{}}"#))
+        .body(Body::from(r#"{"method":"reboot now","params":{}}"#))
         .unwrap();
 
     let response = app.oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let queued: i64 = query("SELECT COUNT(*) FROM command_outbox")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert_eq!(queued, 0);
+}
+
+#[tokio::test]
+async fn admin_enqueues_a_uuid_v7_command_and_reads_its_lifecycle() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = prepared_pool().await;
+    let app = router(test_state(pool.clone()));
+    let before_create = Utc::now();
+
+    let create = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"method":"sample_now","params":{"source":"dashboard"},"mode":"two_way"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let create_status = create.status();
+    let create_body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+    assert_eq!(create_status, StatusCode::ACCEPTED, "{created}");
+    let after_create = Utc::now();
+    let command_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    let expires_at = created["expires_at"]
+        .as_str()
+        .unwrap()
+        .parse::<chrono::DateTime<Utc>>()
+        .unwrap();
+
+    let read = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .uri(format!("/api/device-commands/{command_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let read_status = read.status();
+    let read_body = to_bytes(read.into_body(), usize::MAX).await.unwrap();
+    let read: serde_json::Value = serde_json::from_slice(&read_body).unwrap();
+    let viewer_create = app
+        .clone()
+        .oneshot(
+            with_viewer_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"method":"sample_now","params":{}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let row = query(
+        "SELECT device_id, method, params::text, mode, state, expires_at
+         FROM command_outbox
+         WHERE id = $1",
+    )
+    .bind(command_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    query(
+        "INSERT INTO devices (device_id, display_name, is_gateway)
+         VALUES ('command-gateway', 'Command gateway', TRUE)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    query("UPDATE devices SET gateway_device_id = 'command-gateway' WHERE device_id = $1")
+        .bind("esp-000123")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let child_command = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"method":"reboot","params":{"delay_seconds":5}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let child_command_status = child_command.status();
+    assert_eq!(child_command_status, StatusCode::ACCEPTED);
+    let child_command_body = to_bytes(child_command.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let child_command: serde_json::Value = serde_json::from_slice(&child_command_body).unwrap();
+    let child_command_id = Uuid::parse_str(child_command["id"].as_str().unwrap()).unwrap();
+    let child_row = query(
+        "SELECT device_id, method, params::text, state
+         FROM command_outbox
+         WHERE id = $1",
+    )
+    .bind(child_command_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let gateway_command = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/command-gateway/commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"method":"sample_now","params":{"scope":"gateway"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let gateway_command_status = gateway_command.status();
+    let gateway_command_body = to_bytes(gateway_command.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let gateway_command: serde_json::Value = serde_json::from_slice(&gateway_command_body).unwrap();
+    let gateway_command_id = Uuid::parse_str(gateway_command["id"].as_str().unwrap()).unwrap();
+    let gateway_row = query(
+        "SELECT device_id, method, params::text
+         FROM command_outbox
+         WHERE id = $1",
+    )
+    .bind(gateway_command_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    query("UPDATE devices SET is_gateway = FALSE WHERE device_id = 'command-gateway'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let non_gateway_child_command = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"method":"sample_now","params":{}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    query(
+        "UPDATE devices
+         SET is_gateway = TRUE, deleted_at = now()
+         WHERE device_id = 'command-gateway'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let inactive_gateway_child_command = app
+        .clone()
+        .oneshot(
+            with_admin_auth(Request::builder())
+                .method("POST")
+                .uri("/api/devices/esp-000123/commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"method":"sample_now","params":{}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(command_id.get_version_num(), 7);
+    assert_eq!(created["state"], "queued");
+    assert_eq!(created["mode"], "two_way");
+    assert!(expires_at >= before_create + chrono::Duration::seconds(29));
+    assert!(expires_at <= after_create + chrono::Duration::seconds(31));
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read["id"], created["id"]);
+    assert_eq!(read["state"], "queued");
+    assert_eq!(read["mode"], "two_way");
+    assert_eq!(read["expires_at"], created["expires_at"]);
+    assert_eq!(viewer_create.status(), StatusCode::FORBIDDEN);
+    assert_eq!(child_command["state"], "queued");
+    assert_eq!(
+        child_row.try_get::<String, _>("device_id").unwrap(),
+        "command-gateway"
+    );
+    assert_eq!(
+        child_row.try_get::<String, _>("method").unwrap(),
+        "gateway_child_rpc"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &child_row.try_get::<String, _>("params").unwrap()
+        )
+        .unwrap(),
+        json!({
+            "child_device_id": "esp-000123",
+            "method": "reboot",
+            "params": {"delay_seconds": 5}
+        })
+    );
+    assert_eq!(child_row.try_get::<String, _>("state").unwrap(), "queued");
+    assert_eq!(
+        gateway_command_status,
+        StatusCode::ACCEPTED,
+        "{gateway_command}"
+    );
+    assert_eq!(
+        gateway_row.try_get::<String, _>("device_id").unwrap(),
+        "command-gateway"
+    );
+    assert_eq!(
+        gateway_row.try_get::<String, _>("method").unwrap(),
+        "sample_now"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &gateway_row.try_get::<String, _>("params").unwrap()
+        )
+        .unwrap(),
+        json!({"scope": "gateway"})
+    );
+    assert_eq!(non_gateway_child_command.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        inactive_gateway_child_command.status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(row.try_get::<String, _>("device_id").unwrap(), "esp-000123");
+    assert_eq!(row.try_get::<String, _>("method").unwrap(), "sample_now");
+    assert_eq!(row.try_get::<String, _>("mode").unwrap(), "two_way");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&row.try_get::<String, _>("params").unwrap())
+            .unwrap(),
+        json!({"source":"dashboard"})
+    );
+    assert_eq!(row.try_get::<String, _>("state").unwrap(), "queued");
+    assert_eq!(
+        row.try_get::<chrono::DateTime<Utc>, _>("expires_at")
+            .unwrap(),
+        expires_at
+    );
 }
 
 #[tokio::test]
@@ -1324,8 +2470,9 @@ async fn domain_app_and_management_routes_enforce_the_platform_boundary() {
     assert_eq!(current_user_json["granted_apps"], json!(["powermonitor"]));
     assert_eq!(management_as_viewer.status(), StatusCode::FORBIDDEN);
     assert_eq!(power_monitor_status, StatusCode::OK);
-    assert_eq!(power_monitor_json["total_power_w"], 529.9);
-    assert_eq!(power_monitor_json["total_energy_kwh"], 31.25);
+    assert_eq!(power_monitor_json["device_count"], 0);
+    assert_eq!(power_monitor_json["total_power_w"], 0.0);
+    assert_eq!(power_monitor_json["total_energy_kwh"], 0.0);
     assert_eq!(management_as_admin.status(), StatusCode::OK);
 }
 
@@ -1421,7 +2568,7 @@ async fn admin_creates_profiles_assets_and_assigns_a_device() {
     let update_json: serde_json::Value = serde_json::from_slice(&update_body).unwrap();
     let power_assets = app
         .oneshot(
-            with_viewer_auth(Request::builder())
+            with_admin_auth(Request::builder())
                 .uri("/api/apps/powermonitor/assets")
                 .body(Body::empty())
                 .unwrap(),
@@ -1499,7 +2646,7 @@ async fn admin_soft_deletes_a_device_and_revokes_its_token() {
                 .method("POST")
                 .uri("/api/devices/esp-000123/commands")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"command":"sample_now","parameters":{}}"#))
+                .body(Body::from(r#"{"method":"sample_now","params":{}}"#))
                 .unwrap(),
         )
         .await
@@ -2050,7 +3197,7 @@ async fn powermonitor_rolls_up_descendant_assets_and_honors_telemetry_buckets() 
     let assets = app
         .clone()
         .oneshot(
-            with_viewer_auth(Request::builder())
+            with_admin_auth(Request::builder())
                 .uri("/api/apps/powermonitor/assets")
                 .body(Body::empty())
                 .unwrap(),
@@ -2070,7 +3217,7 @@ async fn powermonitor_rolls_up_descendant_assets_and_honors_telemetry_buckets() 
     let bucketed = app
         .clone()
         .oneshot(
-            with_viewer_auth(Request::builder())
+            with_admin_auth(Request::builder())
                 .uri(
                     "/api/apps/powermonitor/devices/esp-000123/telemetry?from=2026-09-04T10%3A00%3A00Z&to=2026-09-04T10%3A20%3A00Z&bucket=5m",
                 )
@@ -2084,7 +3231,7 @@ async fn powermonitor_rolls_up_descendant_assets_and_honors_telemetry_buckets() 
     let asset_bucketed = app
         .clone()
         .oneshot(
-            with_viewer_auth(Request::builder())
+            with_admin_auth(Request::builder())
                 .uri(format!(
                     "/api/apps/powermonitor/assets/{site_id}/telemetry?from=2026-09-04T10%3A00%3A00Z&to=2026-09-04T10%3A20%3A00Z&bucket=5m"
                 ))
@@ -2101,7 +3248,7 @@ async fn powermonitor_rolls_up_descendant_assets_and_honors_telemetry_buckets() 
         serde_json::from_slice(&asset_bucketed_body).unwrap();
     let asset_raw = app
         .oneshot(
-            with_viewer_auth(Request::builder())
+            with_admin_auth(Request::builder())
                 .uri(format!(
                     "/api/apps/powermonitor/assets/{site_id}/telemetry?from=2026-09-04T10%3A00%3A00Z&to=2026-09-04T10%3A20%3A00Z&bucket=raw"
                 ))

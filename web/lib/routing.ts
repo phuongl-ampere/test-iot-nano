@@ -13,12 +13,21 @@ export function defaultAppPath(user: UserSession): string {
 }
 
 export function rootPath(user: UserSession): string {
-  return user.role === "admin" ? "/management" : defaultAppPath(user);
+  if (user.accountClass === "system") {
+    return "/management/settings";
+  }
+  if (user.accountClass === "admin") {
+    return "/management";
+  }
+  return defaultAppPath(user);
 }
 
 export function canAccessPath(user: UserSession, path: string): boolean {
   if (path === "/management" || path.startsWith("/management/")) {
-    return user.role === "admin";
+    if (path === "/management/settings") {
+      return user.accountClass === "system";
+    }
+    return user.accountClass === "admin";
   }
   if (path === powerMonitorPath || path.startsWith(`${powerMonitorPath}/`)) {
     return user.grantedApps.includes("powermonitor");

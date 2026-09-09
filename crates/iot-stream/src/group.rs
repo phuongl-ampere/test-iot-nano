@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::{LocalStream, Offset, PartitionId, StreamError, StreamRecord};
 
 const GROUP_FORMAT_VERSION: u16 = 1;
-const LEASE_DURATION: Duration = Duration::seconds(30);
+const LEASE_DURATION: Duration = Duration::minutes(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupStart {

@@ -15,6 +15,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../db/migrations/0008_device_lifecycle.sql"),
     include_str!("../../../db/migrations/0009_device_token_ciphertext.sql"),
     include_str!("../../../db/migrations/0010_gateway_child_devices.sql"),
+    include_str!("../../../db/migrations/0011_command_outbox.sql"),
+    include_str!("../../../db/migrations/0012_two_way_rpc.sql"),
+    include_str!("../../../db/migrations/0013_simple_resource_authorization.sql"),
+    include_str!("../../../db/migrations/0014_authorization_audit.sql"),
+    include_str!("../../../db/migrations/0015_device_claim_codes.sql"),
 ];
 
 #[derive(Debug, Clone)]

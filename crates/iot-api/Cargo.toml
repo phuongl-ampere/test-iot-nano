@@ -17,6 +17,7 @@ iot-ingest = { path = "../iot-ingest" }
 iot-storage = { path = "../iot-storage" }
 rumqttc.workspace = true
 rand_core.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -70,11 +70,11 @@ fn expired_member_lease_reassigns_partition_from_last_committed_offset() {
             "timescaledb-writer",
             "writer-b",
             GroupStart::Earliest,
-            now + Duration::seconds(31),
+            now + Duration::seconds(301),
         )
         .unwrap();
-    replacement.heartbeat(now + Duration::seconds(31)).unwrap();
-    let replay = replacement.poll(10, now + Duration::seconds(31)).unwrap();
+    replacement.heartbeat(now + Duration::seconds(301)).unwrap();
+    let replay = replacement.poll(10, now + Duration::seconds(301)).unwrap();
 
     assert_eq!(replay.records.len(), 1);
     assert_eq!(replay.records[0].offset, 1);

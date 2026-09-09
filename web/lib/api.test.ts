@@ -9,6 +9,7 @@ import {
   deleteManagementDevice,
   fetchDevices,
   fetchSystemConfiguration,
+  fetchDeviceCommand,
   getCurrentUser,
   login,
   sendDeviceCommand,
@@ -50,19 +51,50 @@ describe("telemetryRequest", () => {
 });
 
 describe("sendDeviceCommand", () => {
-  it("posts a selected command to the device command endpoint", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 202 }));
+  it("posts a two-way switch command and returns its lifecycle", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: "018f6da9-1234-7abc-8def-0123456789ab",
+        state: "queued",
+        mode: "two_way",
+        expires_at: "2026-09-08T10:00:30Z",
+        response: null,
+        responded_at: null,
+      }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: "018f6da9-1234-7abc-8def-0123456789ab",
+        state: "responded",
+        mode: "two_way",
+        expires_at: "2026-09-08T10:00:30Z",
+        response: { switch_state: true },
+        responded_at: "2026-09-08T10:00:01Z",
+      }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
     const client = createApiClient("http://127.0.0.1:8080", "session_test");
 
-    await sendDeviceCommand(client, "esp-000123", "sample_now");
+    await expect(
+      sendDeviceCommand(client, "switcher-1", "switch_on", {}, "two_way"),
+    ).resolves.toMatchObject({ state: "queued", mode: "two_way" });
+    await expect(
+      fetchDeviceCommand(client, "018f6da9-1234-7abc-8def-0123456789ab"),
+    ).resolves.toMatchObject({
+      state: "responded",
+      response: { switch_state: true },
+    });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:8080/api/devices/esp-000123/commands",
+      "http://127.0.0.1:8080/api/devices/switcher-1/commands",
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({ authorization: "Session session_test" }),
-        body: JSON.stringify({ command: "sample_now", parameters: {} }),
+        body: JSON.stringify({ method: "switch_on", params: {}, mode: "two_way" }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:8080/api/device-commands/018f6da9-1234-7abc-8def-0123456789ab",
+      expect.objectContaining({
+        headers: expect.objectContaining({ authorization: "Session session_test" }),
       }),
     );
   });
@@ -121,6 +153,7 @@ describe("authenticated alert lifecycle API", () => {
 
     await expect(login("http://127.0.0.1:8080", "admin", "Aa1!bcDe")).resolves.toEqual({
       role: "admin",
+      accountClass: "admin",
       sessionId: "session_test",
       username: "admin",
       defaultApp: "/apps/powermonitor",
@@ -151,6 +184,7 @@ describe("authenticated alert lifecycle API", () => {
 
     await expect(getCurrentUser(client)).resolves.toEqual({
       role: "viewer",
+      accountClass: "user",
       username: "viewer",
       defaultApp: "/apps/powermonitor",
       grantedApps: ["powermonitor"],

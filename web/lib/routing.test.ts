@@ -1,44 +1,35 @@
 import { describe, expect, it } from "vitest";
 
-import { canAccessPath, defaultAppPath, rootPath } from "./routing";
+import type { UserSession } from "./api";
+import { canAccessPath, rootPath } from "./routing";
 
-describe("portal route policy", () => {
-  it("always sends an administrator from root to management", () => {
-    expect(rootPath({
-      defaultApp: "/apps/powermonitor",
-      grantedApps: ["powermonitor"],
+describe("account-class routing", () => {
+  it("sends the system account only to system configuration", () => {
+    const system = {
       role: "admin",
+      accountClass: "system",
+      username: "system",
+      defaultApp: "/apps/powermonitor",
+      grantedApps: [],
+    } as UserSession;
+
+    expect(rootPath(system)).toBe("/management/settings");
+    expect(canAccessPath(system, "/management/settings")).toBe(true);
+    expect(canAccessPath(system, "/management")).toBe(false);
+    expect(canAccessPath(system, "/apps/powermonitor")).toBe(false);
+  });
+
+  it("keeps admin out of system configuration", () => {
+    const admin = {
+      role: "admin",
+      accountClass: "admin",
       username: "admin",
-    })).toBe("/management");
-  });
-
-  it("sends a viewer from root to their configured domain app", () => {
-    expect(rootPath({
       defaultApp: "/apps/powermonitor",
       grantedApps: ["powermonitor"],
-      role: "viewer",
-      username: "viewer",
-    })).toBe("/apps/powermonitor");
-  });
+    } as UserSession;
 
-  it("uses Power Monitor when a viewer has no valid default app", () => {
-    expect(defaultAppPath({
-      defaultApp: "/management",
-      grantedApps: ["powermonitor"],
-      role: "viewer",
-      username: "viewer",
-    })).toBe("/apps/powermonitor");
-  });
-
-  it("does not authorize a viewer to open management", () => {
-    const viewer = {
-      defaultApp: "/apps/powermonitor",
-      grantedApps: ["powermonitor"],
-      role: "viewer" as const,
-      username: "viewer",
-    };
-
-    expect(canAccessPath(viewer, "/management/entities/devices")).toBe(false);
-    expect(canAccessPath(viewer, "/apps/powermonitor")).toBe(true);
+    expect(rootPath(admin)).toBe("/management");
+    expect(canAccessPath(admin, "/management/entities/devices")).toBe(true);
+    expect(canAccessPath(admin, "/management/settings")).toBe(false);
   });
 });

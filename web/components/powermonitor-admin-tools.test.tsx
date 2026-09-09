@@ -8,13 +8,13 @@ import { PowerMonitorAdminTools } from "./powermonitor-admin-tools";
 describe("PowerMonitorAdminTools", () => {
   afterEach(cleanup);
 
-  it("shows domain actions to an administrator", () => {
+  it("shows domain actions to a user who can manage resources", () => {
     render(
       <PowerMonitorAdminTools
         onAddAsset={vi.fn()}
         onAddDevice={vi.fn()}
         onAssignDevice={vi.fn()}
-        role="admin"
+        canManage
         selectedDevice={true}
       />,
     );
@@ -24,13 +24,13 @@ describe("PowerMonitorAdminTools", () => {
     expect(screen.getByRole("button", { name: "Assign meter" })).not.toBeNull();
   });
 
-  it("hides domain actions from a viewer", () => {
+  it("hides domain actions from a user without management access", () => {
     render(
       <PowerMonitorAdminTools
         onAddAsset={vi.fn()}
         onAddDevice={vi.fn()}
         onAssignDevice={vi.fn()}
-        role="viewer"
+        canManage={false}
         selectedDevice={false}
       />,
     );
@@ -44,7 +44,7 @@ describe("PowerMonitorAdminTools", () => {
         onAddAsset={vi.fn()}
         onAddDevice={vi.fn()}
         onAssignDevice={vi.fn()}
-        role="admin"
+        canManage
         selectedDevice={false}
       />,
     );

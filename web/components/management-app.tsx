@@ -76,12 +76,18 @@ export function ManagementApp({ section }: ManagementAppProps) {
                 <span><strong>Rush IoT Nano</strong><small>Management</small></span>
               </div>
               <nav aria-label="Management navigation">
-                {managementNavigation.map(({ href, icon: Icon, label, section: target }) => (
+                {managementNavigation
+                  .filter((item) =>
+                    session.user.accountClass === "system"
+                      ? item.section === "settings"
+                      : item.section !== "settings",
+                  )
+                  .map(({ href, icon: Icon, label, section: target }) => (
                   <Link className={target === section ? "is-active" : ""} href={href} key={href}>
                     <Icon aria-hidden="true" size={16} />
                     {label}
                   </Link>
-                ))}
+                  ))}
               </nav>
               <Link className="management-domain-link" href="/apps/powermonitor">Open Power Monitor</Link>
             </aside>
@@ -92,6 +98,7 @@ export function ManagementApp({ section }: ManagementAppProps) {
                   onLogout={signOut}
                   onOpenProfile={() => setProfileOpen(true)}
                   onOpenSystemConfiguration={() => router.push("/management/settings")}
+                  accountClass={session.user.accountClass}
                   role={session.user.role}
                 />
               </header>

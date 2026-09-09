@@ -70,11 +70,13 @@ struct WebhookSpool {
 #[derive(Clone)]
 struct WebhookState {
     ingress: TokenWebhookIngress,
+    transport_secret: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
 struct SqliteWebhookState {
     ingress: SqliteTokenWebhookIngress,
+    transport_secret: Option<Arc<str>>,
 }
 
 struct WebhookWorker {
@@ -158,6 +160,10 @@ impl TokenWebhookIngress {
         if !constant_time_equal(self.secret.as_bytes(), supplied_secret.as_bytes()) {
             return Err(WebhookError::Unauthorized);
         }
+        self.enqueue_trusted(webhook).await
+    }
+
+    async fn enqueue_trusted(&self, webhook: NanoMqWebhook) -> Result<(), WebhookError> {
         let spool = self.spool.clone();
         let record = SpoolRecord {
             id: Uuid::new_v4(),
@@ -202,6 +208,10 @@ impl SqliteTokenWebhookIngress {
         if !constant_time_equal(self.secret.as_bytes(), supplied_secret.as_bytes()) {
             return Err(WebhookError::Unauthorized);
         }
+        self.enqueue_trusted(webhook).await
+    }
+
+    async fn enqueue_trusted(&self, webhook: NanoMqWebhook) -> Result<(), WebhookError> {
         let spool = self.spool.clone();
         let record = SpoolRecord {
             id: Uuid::new_v4(),
@@ -948,15 +958,57 @@ fn sync_parent(path: &Path) -> Result<(), std::io::Error> {
 }
 
 pub fn webhook_router(ingress: TokenWebhookIngress) -> Router {
+    webhook_router_with_optional_transport_secret(ingress, None)
+}
+
+pub fn webhook_router_with_transport_secret(
+    ingress: TokenWebhookIngress,
+    secret: impl AsRef<str>,
+) -> Router {
+    webhook_router_with_optional_transport_secret(ingress, Some(Arc::from(secret.as_ref())))
+}
+
+fn webhook_router_with_optional_transport_secret(
+    ingress: TokenWebhookIngress,
+    transport_secret: Option<Arc<str>>,
+) -> Router {
     Router::new()
         .route("/internal/nanomq/telemetry", post(receive_webhook))
-        .with_state(WebhookState { ingress })
+        .route(
+            "/internal/mqtt-transport/telemetry",
+            post(receive_transport_webhook),
+        )
+        .with_state(WebhookState {
+            ingress,
+            transport_secret,
+        })
 }
 
 pub fn sqlite_webhook_router(ingress: SqliteTokenWebhookIngress) -> Router {
+    sqlite_webhook_router_with_optional_transport_secret(ingress, None)
+}
+
+pub fn sqlite_webhook_router_with_transport_secret(
+    ingress: SqliteTokenWebhookIngress,
+    secret: impl AsRef<str>,
+) -> Router {
+    sqlite_webhook_router_with_optional_transport_secret(ingress, Some(Arc::from(secret.as_ref())))
+}
+
+fn sqlite_webhook_router_with_optional_transport_secret(
+    ingress: SqliteTokenWebhookIngress,
+    transport_secret: Option<Arc<str>>,
+) -> Router {
     Router::new()
         .route("/internal/nanomq/telemetry", post(receive_sqlite_webhook))
-        .with_state(SqliteWebhookState { ingress })
+        .route(
+            "/internal/mqtt-transport/telemetry",
+            post(receive_sqlite_transport_webhook),
+        )
+        .with_state(SqliteWebhookState {
+            ingress,
+            transport_secret,
+        })
 }
 
 async fn receive_webhook(
@@ -980,6 +1032,46 @@ async fn receive_sqlite_webhook(
         .get("x-iot-nanomq-webhook")
         .and_then(|value| value.to_str().ok());
     state.ingress.enqueue(secret, webhook).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn receive_transport_webhook(
+    State(state): State<WebhookState>,
+    headers: HeaderMap,
+    Json(webhook): Json<NanoMqWebhook>,
+) -> Result<StatusCode, WebhookError> {
+    let expected = state
+        .transport_secret
+        .as_deref()
+        .ok_or(WebhookError::Unauthorized)?;
+    let supplied = headers
+        .get("x-iot-mqtt-transport-webhook")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(WebhookError::Unauthorized)?;
+    if !constant_time_equal(expected.as_bytes(), supplied.as_bytes()) {
+        return Err(WebhookError::Unauthorized);
+    }
+    state.ingress.enqueue_trusted(webhook).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn receive_sqlite_transport_webhook(
+    State(state): State<SqliteWebhookState>,
+    headers: HeaderMap,
+    Json(webhook): Json<NanoMqWebhook>,
+) -> Result<StatusCode, WebhookError> {
+    let expected = state
+        .transport_secret
+        .as_deref()
+        .ok_or(WebhookError::Unauthorized)?;
+    let supplied = headers
+        .get("x-iot-mqtt-transport-webhook")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(WebhookError::Unauthorized)?;
+    if !constant_time_equal(expected.as_bytes(), supplied.as_bytes()) {
+        return Err(WebhookError::Unauthorized);
+    }
+    state.ingress.enqueue_trusted(webhook).await?;
     Ok(StatusCode::OK)
 }
 

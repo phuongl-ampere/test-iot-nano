@@ -5,6 +5,7 @@ members = [
     "crates/iot-api",
     "crates/iot-core",
     "crates/iot-ingest",
+    "crates/iot-mqtt-transport",
     "crates/iot-stream",
     "crates/iot-storage",
 ]
@@ -20,20 +21,26 @@ argon2 = "0.5.3"
 aes-gcm = "0.10.3"
 axum = "0.8.9"
 base64 = "0.22.1"
+bytes = "1.11.1"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
 crc32fast = "1.5.0"
 fs2 = "0.4.3"
+futures-util = "0.3.31"
 lettre = { version = "0.11.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
 rumqttc = "0.25.1"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+rustls-pemfile = "2.2.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "json", "postgres", "runtime-tokio", "sqlite", "uuid"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
 tokio = { version = "1.50.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26.5"
+tokio-util = { version = "0.7.18", features = ["codec"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors"] }
 uuid = { version = "1.21.0", features = ["serde", "v4", "v5", "v7"] }

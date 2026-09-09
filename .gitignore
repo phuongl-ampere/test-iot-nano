@@ -19,6 +19,7 @@
 .env
 .env.*
 !.env.example
+debug/.demo_lighting_switcher.env
 
 # Logs
 *.log

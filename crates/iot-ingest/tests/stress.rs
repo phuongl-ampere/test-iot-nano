@@ -44,7 +44,7 @@ async fn prepared_pool() -> PgPool {
     let pool = PgPool::connect(&database_url()).await.unwrap();
     migrate(&pool).await.unwrap();
     query(
-        "TRUNCATE device_tokens, notification_outbox, alert_incidents, alert_rules, telemetry, devices",
+        "TRUNCATE command_outbox, device_tokens, notification_outbox, alert_incidents, alert_rules, telemetry, devices",
     )
         .execute(&pool)
         .await

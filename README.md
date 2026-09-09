@@ -3,13 +3,21 @@
 Rust and Next.js IoT telemetry platform for ESP32 devices:
 
 ```text
-ESP32 -> NanoMQ HTTP auth/ACL -> NanoMQ webhook -> iot-ingest -> iot-stream -> writer consumer group -> TimescaleDB or SQLite -> Rust API -> Next.js
+ESP32 -> iot-mqtt-transport (TLS MQTT session router) -> iot-ingest -> iot-stream -> writer consumer group -> TimescaleDB or SQLite -> Rust API -> Next.js
+                                  |
+                                  +-> iot-api token/session resolution
 ```
 
 `iot-ingest` also runs an independent `alert-evaluator` stream group. Alert
 rules, incidents, and a durable SMTP notification outbox live in the selected
 storage backend. SMTP delivery is optional and configured through environment
 variables.
+
+NanoMQ remains an internal loopback broker at `127.0.0.1:1883`. It does not
+listen for public device traffic and must never receive a literal
+`v1/devices/me/rpc/request/+` subscription from multiple devices. The Rust
+transport owns public TLS port `8883`, authenticates the token-only MQTT
+connection, and routes each virtual `me` RPC to its one active session.
 
 ## Development
 
@@ -39,23 +47,115 @@ http://127.0.0.1:8080/docs/
 
 Protected operations use the `sessionAuth` scheme. In Swagger UI, set the
 `Authorization` value to `Session <opaque session ID>` after logging in.
-Internal NanoMQ HTTP auth/ACL endpoints are intentionally not included in the
-public REST API document.
+Internal NanoMQ HTTP auth/ACL and MQTT transport session-resolution endpoints
+are intentionally not included in the public REST API document.
 
-The default Docker NanoMQ broker at `1883` requires an active device token.
-Run `iot-api` with
-`IOT_NANOMQ_AUTH_SECRET=development-nanomq-auth-secret-32-bytes` before
-connecting a local simulator. Use `DEVICE_TOKEN=<iotd_...> python3
-debug/sim.py`; an empty token is denied before telemetry is published.
+The Docker NanoMQ listener at `1883` is private broker infrastructure, not the
+device endpoint. `scripts/e2e-local.sh` explicitly uses
+`infra/nanomq/nanomq.legacy.conf` for its legacy simulator only. Modern
+token-only device traffic uses the Rust transport at `8883`.
 
-Run the token webhook ingest worker in a second terminal to persist telemetry
-and update the device online status:
+## Device-Facing MQTT Transport
+
+The device-facing MQTT endpoint is configured independently from NanoMQ. Source
+each file in its owning process, not one shared shell:
+
+```bash
+# iot-api process
+set -a
+source infra/dev/api.env
+set +a
+
+# iot-mqtt-transport process
+set -a
+source infra/dev/mqtt-transport.env
+set +a
+```
+
+`infra/dev/mqtt-transport.env` binds only to `127.0.0.1:8883` and deliberately
+uses local TLS file paths. Create a local development certificate before
+starting the transport:
+
+```bash
+mkdir -p /tmp/rush-iot-nano/tls
+openssl req -x509 -newkey rsa:2048 -nodes -days 7 \
+  -keyout /tmp/rush-iot-nano/tls/mqtt-key.pem \
+  -out /tmp/rush-iot-nano/tls/mqtt-cert.pem \
+  -subj '/CN=localhost' \
+  -addext 'basicConstraints=critical,CA:FALSE' \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+  -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+  -addext 'extendedKeyUsage=serverAuth'
+```
+
+The transport requires `IOT_MQTT_TRANSPORT_ADDRESS`,
+`IOT_MQTT_TRANSPORT_TLS_CERT_PATH`, `IOT_MQTT_TRANSPORT_TLS_KEY_PATH`,
+`IOT_MQTT_TRANSPORT_API_BASE_URL`, and `IOT_MQTT_TRANSPORT_SECRET`. Its
+ingest callback additionally requires
+`IOT_MQTT_TRANSPORT_INGEST_WEBHOOK_URL` and
+`IOT_MQTT_TRANSPORT_INGEST_WEBHOOK_SECRET`. The transport/API secret must
+match in `api.env` and `mqtt-transport.env`; the ingest webhook secret must
+match in `ingest.env` and `mqtt-transport.env`.
+
+No NanoMQ ACL rule is used to virtualize `v1/devices/me/...`. NanoMQ 0.25.6
+routes literal MQTT topic filters, while the Rust transport routes virtual RPC
+by authenticated connection.
+
+RPC requests accept an optional `"mode": "one_way" | "two_way"`; omitted mode
+is one-way. `published_to_broker` means the device MQTT client acknowledged
+the request publish. For two-way commands, the transport accepts only the
+matching authenticated session's QoS 1 response on
+`v1/devices/me/rpc/response/{id}` or
+`v1/gateways/me/rpc/response/{id}`, and the command becomes `responded` only
+after the API durably records that response. The command lifecycle endpoint
+returns the stored response and response timestamp.
+
+Run `iot-ingest` in a second terminal to persist telemetry and update device
+status:
 
 ```bash
 set -a
 source infra/dev/ingest.env
 set +a
 target/debug/iot-ingest
+```
+
+### PowerSwitcher Simulator
+
+`debug/sim.py` simulates a `PowerSwitcher`: it publishes `switch_state` plus
+power telemetry and accepts `switch_on`, `switch_off`, and
+`set_power` on the virtual RPC request topic. With no `DEVICE_TOKEN`, provide
+the API URL and it provisions a device, assigns the built-in `PowerSwitcher`
+profile, and prints the generated device ID:
+
+```bash
+IOT_API_BASE_URL=http://127.0.0.1:8080 \
+MQTT_HOST=127.0.0.1 \
+MQTT_PORT=8883 \
+MQTT_CA_FILE=/tmp/rush-iot-nano/tls/mqtt-cert.pem \
+python3 debug/sim.py
+```
+
+Set `DEVICE_TOKEN` to use an existing assigned PowerSwitcher instead. A
+two-way control publishes its result to `v1/devices/me/rpc/response/{id}`.
+
+### Power Monitor Demo Seed
+
+For a local development reset that removes existing Power Monitor domain data
+but preserves login users, use the Python debug script. TimescaleDB Docker is
+the default:
+
+```bash
+python3 debug/seed_powermonitor.py --yes
+```
+
+For SQLite:
+
+```bash
+python3 debug/seed_powermonitor.py \
+  --storage sqlite \
+  --sqlite-path "$PWD/target/rush-iot-nano.db" \
+  --yes
 ```
 
 ## SQLite Mode
@@ -68,6 +168,8 @@ export IOT_DATABASE_STORAGE=sqlite
 export IOT_SQLITE_PATH="$PWD/target/rush-iot-nano.db"
 export IOT_NANOMQ_AUTH_SECRET=development-nanomq-auth-secret-32-bytes
 export IOT_NANOMQ_WEBHOOK_SECRET=development-nanomq-webhook-secret-32-bytes
+export IOT_MQTT_TRANSPORT_SECRET=development-mqtt-transport-secret-32-bytes
+export IOT_MQTT_TRANSPORT_INGEST_WEBHOOK_SECRET=development-mqtt-transport-ingest-webhook-secret-32-bytes
 ```
 
 Do not set `DATABASE_URL` in this mode. SQLite enables WAL and foreign keys,

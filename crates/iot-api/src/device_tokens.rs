@@ -187,6 +187,57 @@ pub async fn provision_sqlite(
     Ok(response)
 }
 
+pub async fn provision_owned(
+    pool: &PgPool,
+    vault: &TokenVault,
+    display_name: &str,
+    owner_user_id: Uuid,
+    asset_id: Option<Uuid>,
+) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
+    let mut transaction = pool.begin().await?;
+    let device_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO devices (
+            device_id, display_name, owner_user_id, asset_id, claimed_at
+         ) VALUES ($1, $2, $3, $4, now())",
+    )
+    .bind(&device_id)
+    .bind(display_name)
+    .bind(owner_user_id)
+    .bind(asset_id)
+    .execute(&mut *transaction)
+    .await?;
+    let response = insert_token(&mut transaction, vault, &device_id).await?;
+    transaction.commit().await?;
+    Ok(response)
+}
+
+pub async fn provision_owned_sqlite(
+    pool: &SqlitePool,
+    vault: &TokenVault,
+    display_name: &str,
+    owner_user_id: Uuid,
+    asset_id: Option<Uuid>,
+) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
+    let mut transaction = pool.begin().await?;
+    let device_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO devices (
+            device_id, display_name, owner_user_id, asset_id, claimed_at
+         ) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&device_id)
+    .bind(display_name)
+    .bind(owner_user_id.to_string())
+    .bind(asset_id.map(|id| id.to_string()))
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut *transaction)
+    .await?;
+    let response = insert_token_sqlite(&mut transaction, vault, &device_id).await?;
+    transaction.commit().await?;
+    Ok(response)
+}
+
 pub async fn rotate(
     pool: &PgPool,
     vault: &TokenVault,
