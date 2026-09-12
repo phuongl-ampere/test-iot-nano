@@ -13,7 +13,7 @@ use iot_storage::{PlatformStore, PlatformStoreError};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::{MonolithConfig, Readiness};
+use crate::{CacheError, MonolithConfig, PersistentCache, Readiness};
 
 const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
 const INTERNAL_DIRECTORY_MARKER_CONTENT: &[u8] = b"iot-nano-monolith-state-v1\n";
@@ -24,6 +24,7 @@ pub struct MonolithRuntime {
     platform: Option<PlatformStore>,
     stream: Option<Arc<LocalStream>>,
     mqtt_storage: Option<Arc<SqliteStorage>>,
+    cache: Option<Arc<PersistentCache>>,
     readiness: Readiness,
     cancellation: CancellationToken,
 }
@@ -52,6 +53,14 @@ impl MonolithRuntime {
                 .map_err(|error| StartupError::MqttStorageTask(error.to_string()))?
                 .map_err(StartupError::MqttStorage)?,
         );
+        let cache_path = internal_directory
+            .prepare_state_file("cache.sqlite")
+            .map_err(StartupError::InternalDirectory)?;
+        let cache = Arc::new(
+            PersistentCache::open(cache_path)
+                .await
+                .map_err(StartupError::CacheRecovery)?,
+        );
 
         let readiness = Readiness::default();
         readiness.mark_ready();
@@ -62,6 +71,7 @@ impl MonolithRuntime {
             platform: Some(platform),
             stream: Some(stream),
             mqtt_storage: Some(mqtt_storage),
+            cache: Some(cache),
             readiness,
             cancellation: CancellationToken::new(),
         })
@@ -87,9 +97,14 @@ impl MonolithRuntime {
         self.mqtt_storage.as_ref()
     }
 
+    pub fn cache(&self) -> Option<&Arc<PersistentCache>> {
+        self.cache.as_ref()
+    }
+
     pub async fn shutdown(&mut self, deadline: Instant) -> Result<(), ShutdownError> {
         self.readiness.mark_not_ready();
         self.cancellation.cancel();
+        self.cache.take();
         self.mqtt_storage.take();
         self.stream.take();
         self.platform.take();
@@ -126,6 +141,8 @@ pub enum StartupError {
     MqttStorage(#[source] iot_nano_mqttd::StorageError),
     #[error("MQTTD state recovery task failed: {0}")]
     MqttStorageTask(String),
+    #[error("cache state recovery failed")]
+    CacheRecovery(#[source] CacheError),
 }
 
 #[derive(Debug, Error)]

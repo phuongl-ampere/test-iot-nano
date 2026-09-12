@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod cache;
 mod config;
 mod readiness;
 mod runtime;
 
+pub use cache::{CacheEntry, CacheError, PersistentCache};
 pub use config::{
     ConfigError, MonolithConfig, RETIRED_ENVIRONMENT_NAMES, validate_retired_environment,
 };
