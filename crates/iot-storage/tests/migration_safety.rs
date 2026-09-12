@@ -36,3 +36,79 @@ async fn sqlite_backup_preserves_committed_platform_data() {
 
     assert_eq!(device_count, 1);
 }
+
+#[tokio::test]
+async fn sqlite_backup_is_a_coherent_snapshot_during_an_atomic_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let platform_path = directory.path().join("platform.sqlite");
+    let configuration = sqlite_configuration(platform_path);
+    let store = PlatformStore::open(&configuration).await.unwrap();
+    let device_id = "backup-snapshot-device";
+    store.register_device(device_id).await.unwrap();
+    sqlx::query("UPDATE devices SET display_name = 'before' WHERE device_id = ?")
+        .bind(device_id)
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    let command_id = uuid::Uuid::now_v7().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut transaction = store.sqlite_pool().unwrap().begin().await.unwrap();
+    sqlx::query("UPDATE devices SET display_name = 'after' WHERE device_id = ?")
+        .bind(device_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO command_outbox (
+            id, device_id, method, params, mode, expires_at, next_attempt_at
+         ) VALUES (?, ?, 'switch_on', '{}', 'one_way', ?, ?)",
+    )
+    .bind(&command_id)
+    .bind(device_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    let backup_store = store.clone();
+    let backup_path = tokio::spawn(async move { backup_store.backup_sqlite().await })
+        .await
+        .unwrap()
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let backup = PlatformStore::open(&sqlite_configuration(backup_path))
+        .await
+        .unwrap();
+    let backup_display_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(backup.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    let backup_command_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM command_outbox WHERE id = ?")
+            .bind(&command_id)
+            .fetch_one(backup.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(backup_display_name.as_deref(), Some("before"));
+    assert_eq!(backup_command_count, 0);
+
+    let primary_display_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    let primary_command_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM command_outbox WHERE id = ?")
+            .bind(&command_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(primary_display_name.as_deref(), Some("after"));
+    assert_eq!(primary_command_count, 1);
+}

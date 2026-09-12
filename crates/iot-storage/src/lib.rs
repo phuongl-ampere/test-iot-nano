@@ -358,6 +358,8 @@ pub enum PlatformStoreError {
     InvalidCommandId(String),
     #[error("command params must be valid JSON")]
     InvalidCommandParams,
+    #[error("device is not registered: {0:?}")]
+    UnknownDevice(String),
     #[error("telemetry sequence does not fit PostgreSQL BIGINT")]
     TelemetrySequenceOverflow,
     #[error("filesystem backups are available only for SQLite platform storage")]
@@ -456,13 +458,15 @@ impl PlatformStore {
         &self,
         command: NewCommandOutboxEntry,
     ) -> Result<CommandOutboxRecord, PlatformStoreError> {
+        let id = uuid::Uuid::parse_str(&command.id)
+            .map_err(|_| PlatformStoreError::InvalidCommandId(command.id.clone()))?;
+        let params = serde_json::from_str::<serde_json::Value>(&command.params)
+            .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
+        self.require_registered_device(&command.device_id).await?;
+
         match self {
             Self::Sqlite(store) => Ok(store.enqueue_command(command).await?),
             Self::Timescale(pool) => {
-                let id = uuid::Uuid::parse_str(&command.id)
-                    .map_err(|_| PlatformStoreError::InvalidCommandId(command.id.clone()))?;
-                let params = serde_json::from_str::<serde_json::Value>(&command.params)
-                    .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
                 let row = sqlx::query(
                     "INSERT INTO command_outbox (
                         id, device_id, method, params, mode, expires_at, next_attempt_at
@@ -491,6 +495,8 @@ impl PlatformStore {
         received_at: DateTime<Utc>,
         topic: &str,
     ) -> Result<bool, PlatformStoreError> {
+        self.require_registered_device(&event.device_id).await?;
+
         match self {
             Self::Sqlite(store) => Ok(store.write_telemetry(event, received_at, topic).await?),
             Self::Timescale(pool) => {
@@ -531,6 +537,30 @@ impl PlatformStore {
                 transaction.commit().await?;
                 Ok(result.rows_affected() == 1)
             }
+        }
+    }
+
+    async fn require_registered_device(&self, device_id: &str) -> Result<(), PlatformStoreError> {
+        let registered = match self {
+            Self::Sqlite(store) => sqlx::query_scalar::<_, String>(
+                "SELECT device_id FROM devices WHERE device_id = ? LIMIT 1",
+            )
+            .bind(device_id)
+            .fetch_optional(store.pool())
+            .await?
+            .is_some(),
+            Self::Timescale(pool) => sqlx::query_scalar::<_, String>(
+                "SELECT device_id FROM devices WHERE device_id = $1 LIMIT 1",
+            )
+            .bind(device_id)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
+        };
+        if registered {
+            Ok(())
+        } else {
+            Err(PlatformStoreError::UnknownDevice(device_id.to_owned()))
         }
     }
 
