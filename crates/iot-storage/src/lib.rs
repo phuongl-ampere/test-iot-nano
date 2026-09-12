@@ -456,12 +456,15 @@ impl PlatformStore {
 
     pub async fn enqueue_command(
         &self,
-        command: NewCommandOutboxEntry,
+        mut command: NewCommandOutboxEntry,
     ) -> Result<CommandOutboxRecord, PlatformStoreError> {
         let id = uuid::Uuid::parse_str(&command.id)
             .map_err(|_| PlatformStoreError::InvalidCommandId(command.id.clone()))?;
         let params = serde_json::from_str::<serde_json::Value>(&command.params)
             .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
+        command.id = id.to_string();
+        command.params =
+            serde_json::to_string(&params).map_err(|_| PlatformStoreError::InvalidCommandParams)?;
         self.require_registered_device(&command.device_id).await?;
 
         match self {
@@ -495,13 +498,13 @@ impl PlatformStore {
         received_at: DateTime<Utc>,
         topic: &str,
     ) -> Result<bool, PlatformStoreError> {
+        let sequence = i64::try_from(event.sequence)
+            .map_err(|_| PlatformStoreError::TelemetrySequenceOverflow)?;
         self.require_registered_device(&event.device_id).await?;
 
         match self {
             Self::Sqlite(store) => Ok(store.write_telemetry(event, received_at, topic).await?),
             Self::Timescale(pool) => {
-                let sequence = i64::try_from(event.sequence)
-                    .map_err(|_| PlatformStoreError::TelemetrySequenceOverflow)?;
                 let mut transaction = pool.begin().await?;
                 sqlx::query(
                     "INSERT INTO device_runtime_state (device_id, last_seen_at)

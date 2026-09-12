@@ -134,6 +134,45 @@ async fn platform_store_enqueues_a_command_for_a_registered_sqlite_device() {
 }
 
 #[tokio::test]
+async fn platform_store_canonicalizes_sqlite_command_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let canonical_id = uuid::Uuid::now_v7();
+    let canonical_params = r#"{"target":"on"}"#;
+    TopologyRepository::register_device(&store, "platform-command-device")
+        .await
+        .unwrap();
+
+    let command = CommandRepository::enqueue_command(
+        &store,
+        command(
+            "platform-command-device",
+            &canonical_id.to_string().to_uppercase(),
+            "{\n  \"target\": \"on\"\n}",
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(command.id, canonical_id.to_string());
+    assert_eq!(command.params, canonical_params);
+
+    let persisted = sqlx::query("SELECT id, params FROM command_outbox")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(persisted.get::<String, _>("id"), canonical_id.to_string());
+    assert_eq!(persisted.get::<String, _>("params"), canonical_params);
+}
+
+#[tokio::test]
 async fn platform_store_rejects_malformed_sqlite_commands_before_persistence() {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -264,6 +303,36 @@ async fn platform_store_persists_idempotent_sqlite_telemetry_via_the_repository_
 }
 
 #[tokio::test]
+async fn platform_store_rejects_overflowing_sqlite_telemetry_sequences() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let event = telemetry("platform-telemetry-device", (i64::MAX as u64) + 1);
+    TopologyRepository::register_device(&store, &event.device_id)
+        .await
+        .unwrap();
+
+    let result = TelemetryRepository::write_telemetry(
+        &store,
+        &event,
+        Utc::now(),
+        "iot/v1/devices/telemetry",
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(PlatformStoreError::TelemetrySequenceOverflow)
+    ));
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn platform_store_persists_idempotent_timescale_telemetry_via_the_repository_port() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
@@ -368,6 +437,67 @@ async fn platform_store_enqueues_a_command_for_a_registered_timescale_device() {
 
     assert_eq!(command.state, CommandOutboxState::Queued);
     assert_eq!(command.device_id, "platform-command-device");
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn platform_store_canonicalizes_timescale_command_values() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let cleanup = PgPool::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&cleanup)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&cleanup)
+        .await
+        .unwrap();
+    cleanup.close().await;
+
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let canonical_id = uuid::Uuid::now_v7();
+    let canonical_params = r#"{"target":"on"}"#;
+    TopologyRepository::register_device(&store, "platform-command-device")
+        .await
+        .unwrap();
+
+    let command = CommandRepository::enqueue_command(
+        &store,
+        command(
+            "platform-command-device",
+            &canonical_id.to_string().to_uppercase(),
+            "{\n  \"target\": \"on\"\n}",
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(command.id, canonical_id.to_string());
+    assert_eq!(command.params, canonical_params);
+
+    let persisted = sqlx::query("SELECT id::text AS id, params FROM command_outbox")
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(persisted.get::<String, _>("id"), canonical_id.to_string());
+    assert_eq!(
+        persisted
+            .get::<sqlx::types::Json<serde_json::Value>, _>("params")
+            .0,
+        serde_json::from_str::<serde_json::Value>(canonical_params).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -564,4 +694,51 @@ async fn platform_store_rejects_unknown_timescale_devices_for_commands_and_telem
         .unwrap();
     assert_eq!(device_count, 0);
     assert_eq!(telemetry_count, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn platform_store_rejects_overflowing_timescale_telemetry_sequences() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let cleanup = PgPool::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&cleanup)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&cleanup)
+        .await
+        .unwrap();
+    cleanup.close().await;
+
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let event = telemetry("platform-telemetry-device", (i64::MAX as u64) + 1);
+    TopologyRepository::register_device(&store, &event.device_id)
+        .await
+        .unwrap();
+
+    let result = TelemetryRepository::write_telemetry(
+        &store,
+        &event,
+        Utc::now(),
+        "iot/v1/devices/telemetry",
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(PlatformStoreError::TelemetrySequenceOverflow)
+    ));
 }
