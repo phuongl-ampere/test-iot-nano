@@ -1,0 +1,25 @@
+[package]
+name = "iot-nano-monolith"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+fs2.workspace = true
+iot-api = { package = "iot-nano-api", path = "../iot-nano-api" }
+iot-core = { path = "../../crates/iot-core" }
+iot-nano-core = { path = "../iot-nano-core" }
+iot-nano-mqttd = { path = "../iot-nano-mqttd" }
+iot-nano-stream = { path = "../iot-nano-stream" }
+iot-storage = { path = "../../crates/iot-storage" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lib]
+name = "iot_nano_monolith"

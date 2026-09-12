@@ -1751,6 +1751,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iot-nano-monolith"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "fs2",
+ "iot-core",
+ "iot-nano-api",
+ "iot-nano-core",
+ "iot-nano-mqttd",
+ "iot-nano-stream",
+ "iot-storage",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "iot-nano-mqttd"
 version = "0.1.0"
 dependencies = [
