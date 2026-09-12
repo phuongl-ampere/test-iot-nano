@@ -97,6 +97,33 @@ async fn sqlite_platform_store_command_lifecycle_port_claims_a_command() {
 }
 
 #[tokio::test]
+async fn sqlite_platform_store_command_lifecycle_port_accepts_typed_command_ids() {
+    let (_directory, sqlite) = store().await;
+    let platform = PlatformStore::Sqlite(sqlite);
+    let now = at(1_800_000_000);
+    let command_id = uuid::Uuid::now_v7();
+    platform
+        .enqueue_command(command(
+            &command_id.to_string(),
+            now,
+            now + Duration::minutes(5),
+        ))
+        .await
+        .unwrap();
+    platform
+        .claim_commands(now, now + Duration::seconds(30), 1)
+        .await
+        .unwrap();
+
+    let published = platform.mark_command_published(command_id, now).await;
+
+    assert_eq!(
+        published.unwrap().unwrap().state,
+        CommandOutboxState::PublishedToBroker
+    );
+}
+
+#[tokio::test]
 async fn sqlite_command_outbox_expire_marks_queued_and_leased_commands() {
     let (_directory, store) = store().await;
     let now = at(1_800_000_000);

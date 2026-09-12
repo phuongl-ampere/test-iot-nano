@@ -62,51 +62,55 @@ fn telemetry(device_id: &str, sequence: u64) -> TelemetryEvent {
     }
 }
 
-async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
+fn lifecycle_command(id: uuid::Uuid) -> NewCommandOutboxEntry {
+    command("lifecycle-device", &id.to_string(), "{}")
+}
+
+async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid) {
     let now = Utc::now() + Duration::seconds(1);
 
-    let published_id = uuid::Uuid::now_v7().to_string();
-    CommandRepository::enqueue_command(store, command("lifecycle-device", &published_id, "{}"))
+    let published_id = uuid::Uuid::now_v7();
+    CommandRepository::enqueue_command(store, lifecycle_command(published_id))
         .await
         .unwrap();
     CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
     let published =
-        CommandLifecycleRepository::mark_command_published(store, &published_id, now).await;
+        CommandLifecycleRepository::mark_command_published(store, published_id, now).await;
     assert_eq!(
         published.unwrap().unwrap().state,
         CommandOutboxState::PublishedToBroker
     );
     assert!(
-        CommandLifecycleRepository::mark_command_published(store, &published_id, now)
+        CommandLifecycleRepository::mark_command_published(store, published_id, now)
             .await
             .unwrap()
             .is_none()
     );
 
-    let failed_id = uuid::Uuid::now_v7().to_string();
-    CommandRepository::enqueue_command(store, command("lifecycle-device", &failed_id, "{}"))
+    let failed_id = uuid::Uuid::now_v7();
+    CommandRepository::enqueue_command(store, lifecycle_command(failed_id))
         .await
         .unwrap();
     CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
     let failed =
-        CommandLifecycleRepository::mark_command_failed(store, &failed_id, "broker unavailable")
+        CommandLifecycleRepository::mark_command_failed(store, failed_id, "broker unavailable")
             .await
             .unwrap()
             .unwrap();
     assert_eq!(failed.state, CommandOutboxState::Failed);
     assert!(
-        CommandLifecycleRepository::mark_command_published(store, &failed_id, now)
+        CommandLifecycleRepository::mark_command_published(store, failed_id, now)
             .await
             .unwrap()
             .is_none()
     );
 
-    let retry_id = uuid::Uuid::now_v7().to_string();
-    CommandRepository::enqueue_command(store, command("lifecycle-device", &retry_id, "{}"))
+    let retry_id = uuid::Uuid::now_v7();
+    CommandRepository::enqueue_command(store, lifecycle_command(retry_id))
         .await
         .unwrap();
     CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
@@ -114,7 +118,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
         .unwrap();
     let retried = CommandLifecycleRepository::release_command_for_retry(
         store,
-        &retry_id,
+        retry_id,
         "temporary broker failure",
         now + Duration::seconds(1),
     )
@@ -124,8 +128,39 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
     assert_eq!(retried.state, CommandOutboxState::Queued);
     assert_eq!(retried.lease_until, None);
 
-    let response_id = uuid::Uuid::now_v7().to_string();
-    let mut response_command = command("lifecycle-device", &response_id, "{}");
+    let reclaimed_id = uuid::Uuid::now_v7();
+    CommandRepository::enqueue_command(store, lifecycle_command(reclaimed_id))
+        .await
+        .unwrap();
+    let initially_leased =
+        CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        initially_leased
+            .iter()
+            .find(|record| record.id == reclaimed_id.to_string())
+            .unwrap()
+            .attempt_count,
+        1
+    );
+    let reclaimed = CommandLifecycleRepository::claim_commands(
+        store,
+        now + Duration::seconds(30),
+        now + Duration::minutes(1),
+        10,
+    )
+    .await
+    .unwrap();
+    let reclaimed = reclaimed
+        .iter()
+        .find(|record| record.id == reclaimed_id.to_string())
+        .unwrap();
+    assert_eq!(reclaimed.state, CommandOutboxState::Leased);
+    assert_eq!(reclaimed.attempt_count, 2);
+
+    let response_id = uuid::Uuid::now_v7();
+    let mut response_command = lifecycle_command(response_id);
     response_command.mode = RpcMode::TwoWay;
     CommandRepository::enqueue_command(store, response_command)
         .await
@@ -133,16 +168,30 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
     CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
-    CommandLifecycleRepository::mark_command_published(store, &response_id, now)
+    CommandLifecycleRepository::mark_command_published(store, response_id, now)
         .await
         .unwrap()
         .unwrap();
+    let mismatched_token_id = uuid::Uuid::now_v7();
+    assert_eq!(
+        CommandLifecycleRepository::mark_command_responded(
+            store,
+            response_id,
+            "lifecycle-device",
+            mismatched_token_id,
+            r#"{"ok":false}"#,
+            now,
+        )
+        .await
+        .unwrap(),
+        None
+    );
     assert!(matches!(
         CommandLifecycleRepository::mark_command_responded(
             store,
-            &response_id,
+            response_id,
             "lifecycle-device",
-            "wrong-token",
+            token_id,
             "{not-json}",
             now,
         )
@@ -151,7 +200,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
     ));
     let responded = CommandLifecycleRepository::mark_command_responded(
         store,
-        &response_id,
+        response_id,
         "lifecycle-device",
         token_id,
         r#"{ "ok": true }"#,
@@ -162,7 +211,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
     .unwrap();
     let response_retry = CommandLifecycleRepository::mark_command_responded(
         store,
-        &response_id,
+        response_id,
         "lifecycle-device",
         token_id,
         r#"{"ok":true}"#,
@@ -173,60 +222,15 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
     .unwrap();
     assert_eq!(response_retry, responded);
 
-    let revoked_id = uuid::Uuid::now_v7().to_string();
-    let mut revoked_command = command("lifecycle-device", &revoked_id, "{}");
-    revoked_command.mode = RpcMode::TwoWay;
-    CommandRepository::enqueue_command(store, revoked_command)
-        .await
-        .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
-        .await
-        .unwrap();
-    CommandLifecycleRepository::mark_command_published(store, &revoked_id, now)
-        .await
-        .unwrap()
-        .unwrap();
-    match store {
-        PlatformStore::Sqlite(store) => {
-            sqlx::query("UPDATE device_tokens SET revoked_at = ? WHERE id = ?")
-                .bind(now.to_rfc3339())
-                .bind(token_id)
-                .execute(store.pool())
-                .await
-                .unwrap();
-        }
-        PlatformStore::Timescale(pool) => {
-            sqlx::query("UPDATE device_tokens SET revoked_at = $1 WHERE id::text = $2")
-                .bind(now)
-                .bind(token_id)
-                .execute(pool)
-                .await
-                .unwrap();
-        }
-    }
-    assert!(
-        CommandLifecycleRepository::mark_command_responded(
-            store,
-            &revoked_id,
-            "lifecycle-device",
-            token_id,
-            r#"{"ok":true}"#,
-            now,
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
-
-    let mut queued_expired = command("lifecycle-device", &uuid::Uuid::now_v7().to_string(), "{}");
+    let mut queued_expired = lifecycle_command(uuid::Uuid::now_v7());
     queued_expired.expires_at = now - Duration::seconds(1);
     queued_expired.next_attempt_at = now - Duration::seconds(2);
     CommandRepository::enqueue_command(store, queued_expired)
         .await
         .unwrap();
 
-    let leased_id = uuid::Uuid::now_v7().to_string();
-    let mut leased_expired = command("lifecycle-device", &leased_id, "{}");
+    let leased_id = uuid::Uuid::now_v7();
+    let mut leased_expired = lifecycle_command(leased_id);
     leased_expired.expires_at = now + Duration::seconds(1);
     CommandRepository::enqueue_command(store, leased_expired)
         .await
@@ -235,8 +239,8 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
         .await
         .unwrap();
 
-    let two_way_expired_id = uuid::Uuid::now_v7().to_string();
-    let mut two_way_expired = command("lifecycle-device", &two_way_expired_id, "{}");
+    let two_way_expired_id = uuid::Uuid::now_v7();
+    let mut two_way_expired = lifecycle_command(two_way_expired_id);
     two_way_expired.mode = RpcMode::TwoWay;
     two_way_expired.expires_at = now + Duration::seconds(1);
     CommandRepository::enqueue_command(store, two_way_expired)
@@ -245,7 +249,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
     CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 10)
         .await
         .unwrap();
-    CommandLifecycleRepository::mark_command_published(store, &two_way_expired_id, now)
+    CommandLifecycleRepository::mark_command_published(store, two_way_expired_id, now)
         .await
         .unwrap()
         .unwrap();
@@ -258,6 +262,64 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: &str) {
         expired
             .iter()
             .all(|record| record.state == CommandOutboxState::Expired)
+    );
+    assert_eq!(
+        CommandLifecycleRepository::mark_command_responded(
+            store,
+            two_way_expired_id,
+            "lifecycle-device",
+            token_id,
+            r#"{"ok":true}"#,
+            now + Duration::seconds(2),
+        )
+        .await
+        .unwrap(),
+        None
+    );
+
+    let revoked_id = uuid::Uuid::now_v7();
+    let mut revoked_command = lifecycle_command(revoked_id);
+    revoked_command.mode = RpcMode::TwoWay;
+    CommandRepository::enqueue_command(store, revoked_command)
+        .await
+        .unwrap();
+    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 10)
+        .await
+        .unwrap();
+    CommandLifecycleRepository::mark_command_published(store, revoked_id, now)
+        .await
+        .unwrap()
+        .unwrap();
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query("UPDATE device_tokens SET revoked_at = ? WHERE id = ?")
+                .bind(now.to_rfc3339())
+                .bind(token_id.to_string())
+                .execute(store.pool())
+                .await
+                .unwrap();
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query("UPDATE device_tokens SET revoked_at = $1 WHERE id = $2")
+                .bind(now)
+                .bind(token_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        CommandLifecycleRepository::mark_command_responded(
+            store,
+            revoked_id,
+            "lifecycle-device",
+            token_id,
+            r#"{"ok":true}"#,
+            now,
+        )
+        .await
+        .unwrap(),
+        None
     );
 }
 
@@ -641,11 +703,12 @@ async fn platform_store_command_lifecycle_sqlite_contract() {
     TopologyRepository::register_device(&store, "lifecycle-device")
         .await
         .unwrap();
+    let token_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
          VALUES (?, ?, ?, ?)",
     )
-    .bind("lifecycle-token")
+    .bind(token_id.to_string())
     .bind("lifecycle-device")
     .bind("lifecycle-token-prefix")
     .bind("unused")
@@ -653,7 +716,7 @@ async fn platform_store_command_lifecycle_sqlite_contract() {
     .await
     .unwrap();
 
-    exercise_command_lifecycle(&store, "lifecycle-token").await;
+    exercise_command_lifecycle(&store, token_id).await;
 }
 
 #[tokio::test]
@@ -676,7 +739,7 @@ async fn platform_store_command_lifecycle_timescale_contract() {
     .await
     .unwrap();
 
-    exercise_command_lifecycle(&store, &token_id.to_string()).await;
+    exercise_command_lifecycle(&store, token_id).await;
 }
 
 #[tokio::test]

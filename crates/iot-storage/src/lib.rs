@@ -412,7 +412,7 @@ pub trait CommandLifecycleRepository: Send + Sync {
     >;
     fn mark_command_published<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         published_at: DateTime<Utc>,
     ) -> Pin<
         Box<
@@ -423,7 +423,7 @@ pub trait CommandLifecycleRepository: Send + Sync {
     >;
     fn mark_command_failed<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         error: &'a str,
     ) -> Pin<
         Box<
@@ -434,7 +434,7 @@ pub trait CommandLifecycleRepository: Send + Sync {
     >;
     fn release_command_for_retry<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         error: &'a str,
         next_attempt_at: DateTime<Utc>,
     ) -> Pin<
@@ -452,9 +452,9 @@ pub trait CommandLifecycleRepository: Send + Sync {
     >;
     fn mark_command_responded<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         device_id: &'a str,
-        token_id: &'a str,
+        token_id: uuid::Uuid,
         response: &'a str,
         responded_at: DateTime<Utc>,
     ) -> Pin<
@@ -971,12 +971,12 @@ impl PlatformStore {
 
     pub async fn mark_command_published(
         &self,
-        command_id: &str,
+        command_id: uuid::Uuid,
         published_at: DateTime<Utc>,
     ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
         match self {
             Self::Sqlite(store) => Ok(store
-                .mark_command_published(command_id, published_at)
+                .mark_command_published(&command_id.to_string(), published_at)
                 .await?),
             Self::Timescale(pool) => {
                 mark_timescale_command_published(pool, command_id, published_at).await
@@ -986,24 +986,26 @@ impl PlatformStore {
 
     pub async fn mark_command_failed(
         &self,
-        command_id: &str,
+        command_id: uuid::Uuid,
         error: &str,
     ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
         match self {
-            Self::Sqlite(store) => Ok(store.mark_command_failed(command_id, error).await?),
+            Self::Sqlite(store) => Ok(store
+                .mark_command_failed(&command_id.to_string(), error)
+                .await?),
             Self::Timescale(pool) => mark_timescale_command_failed(pool, command_id, error).await,
         }
     }
 
     pub async fn release_command_for_retry(
         &self,
-        command_id: &str,
+        command_id: uuid::Uuid,
         error: &str,
         next_attempt_at: DateTime<Utc>,
     ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
         match self {
             Self::Sqlite(store) => Ok(store
-                .release_command_for_retry(command_id, error, next_attempt_at)
+                .release_command_for_retry(&command_id.to_string(), error, next_attempt_at)
                 .await?),
             Self::Timescale(pool) => {
                 release_timescale_command_for_retry(pool, command_id, error, next_attempt_at).await
@@ -1042,9 +1044,9 @@ impl PlatformStore {
 
     pub async fn mark_command_responded(
         &self,
-        command_id: &str,
+        command_id: uuid::Uuid,
         device_id: &str,
-        token_id: &str,
+        token_id: uuid::Uuid,
         response: &str,
         responded_at: DateTime<Utc>,
     ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
@@ -1054,7 +1056,13 @@ impl PlatformStore {
             .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
         match self {
             Self::Sqlite(store) => Ok(store
-                .mark_command_responded(command_id, device_id, token_id, &response, responded_at)
+                .mark_command_responded(
+                    &command_id.to_string(),
+                    device_id,
+                    &token_id.to_string(),
+                    &response,
+                    responded_at,
+                )
                 .await?),
             Self::Timescale(pool) => {
                 let row = sqlx::query(
@@ -1072,7 +1080,7 @@ impl PlatformStore {
                             ELSE $2
                          END,
                          lease_until = NULL
-                     WHERE command.id = $3::uuid
+                     WHERE command.id = $3
                        AND command.device_id = $4
                        AND command.mode = 'two_way'
                        AND (
@@ -1082,7 +1090,7 @@ impl PlatformStore {
                        AND EXISTS (
                             SELECT 1
                             FROM device_tokens
-                            WHERE id::text = $5
+                            WHERE id = $5
                               AND device_id = command.device_id
                               AND revoked_at IS NULL
                        )
@@ -1349,13 +1357,13 @@ async fn claim_timescale_commands(
 
 async fn mark_timescale_command_published(
     pool: &PgPool,
-    command_id: &str,
+    command_id: uuid::Uuid,
     published_at: DateTime<Utc>,
 ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
     let row = sqlx::query(
         "UPDATE command_outbox
          SET state = 'published_to_broker', published_at = $1, lease_until = NULL
-         WHERE id::text = $2 AND state = 'leased' AND expires_at > $1
+         WHERE id = $2 AND state = 'leased' AND expires_at > $1
          RETURNING
             id, device_id, method, params, mode, state, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
@@ -1369,13 +1377,13 @@ async fn mark_timescale_command_published(
 
 async fn mark_timescale_command_failed(
     pool: &PgPool,
-    command_id: &str,
+    command_id: uuid::Uuid,
     error: &str,
 ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
     let row = sqlx::query(
         "UPDATE command_outbox
          SET state = 'failed', last_error = $1, lease_until = NULL
-         WHERE id::text = $2 AND state = 'leased'
+         WHERE id = $2 AND state = 'leased'
          RETURNING
             id, device_id, method, params, mode, state, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
@@ -1389,14 +1397,14 @@ async fn mark_timescale_command_failed(
 
 async fn release_timescale_command_for_retry(
     pool: &PgPool,
-    command_id: &str,
+    command_id: uuid::Uuid,
     error: &str,
     next_attempt_at: DateTime<Utc>,
 ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
     let row = sqlx::query(
         "UPDATE command_outbox
          SET state = 'queued', next_attempt_at = $1, last_error = $2, lease_until = NULL
-         WHERE id::text = $3 AND state = 'leased' AND expires_at > $1
+         WHERE id = $3 AND state = 'leased' AND expires_at > $1
          RETURNING
             id, device_id, method, params, mode, state, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
@@ -1472,7 +1480,7 @@ impl CommandLifecycleRepository for PlatformStore {
 
     fn mark_command_published<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         published_at: DateTime<Utc>,
     ) -> Pin<
         Box<
@@ -1488,7 +1496,7 @@ impl CommandLifecycleRepository for PlatformStore {
 
     fn mark_command_failed<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         error: &'a str,
     ) -> Pin<
         Box<
@@ -1502,7 +1510,7 @@ impl CommandLifecycleRepository for PlatformStore {
 
     fn release_command_for_retry<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         error: &'a str,
         next_attempt_at: DateTime<Utc>,
     ) -> Pin<
@@ -1528,9 +1536,9 @@ impl CommandLifecycleRepository for PlatformStore {
 
     fn mark_command_responded<'a>(
         &'a self,
-        command_id: &'a str,
+        command_id: uuid::Uuid,
         device_id: &'a str,
-        token_id: &'a str,
+        token_id: uuid::Uuid,
         response: &'a str,
         responded_at: DateTime<Utc>,
     ) -> Pin<
