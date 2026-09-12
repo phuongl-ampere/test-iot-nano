@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" version="31.4.5">
+  <diagram name="Monolith Architecture">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" value="External App" style="swimlane;startSize=30;horizontal=1;rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="70" width="300" height="220" as="geometry" />
+        </mxCell>
+        <mxCell id="3" value="PowerMonitor FE&#xa;or FE-only app" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;" vertex="1" parent="2">
+          <mxGeometry x="25" y="55" width="115" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="4" value="App Backend&#xa;optional" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;" vertex="1" parent="2">
+          <mxGeometry x="160" y="55" width="115" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="6" value="MQTT Device" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="130" y="500" width="120" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="7" value="iot-nano-monolith&#xa;one binary / one Tokio runtime" style="swimlane;startSize=34;horizontal=1;rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="430" y="50" width="650" height="680" as="geometry" />
+        </mxCell>
+        <mxCell id="8" value="Public HTTP API&#xa;identity, registry, /api/v1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="7">
+          <mxGeometry x="35" y="65" width="170" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="9" value="MQTTD&#xa;MQTT TCP / TLS" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="7">
+          <mxGeometry x="35" y="230" width="170" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="10" value="CoreFacade&#xa;core workers, alerts, commands" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="7">
+          <mxGeometry x="250" y="150" width="180" height="85" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="App Registry&#xa;app_id, URLs, scopes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="7">
+          <mxGeometry x="455" y="65" width="160" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="stream.sqlite&#xa;durable events / offsets" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="7">
+          <mxGeometry x="40" y="425" width="165" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="mqttd.sqlite&#xa;sessions / QoS" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="7">
+          <mxGeometry x="245" y="425" width="165" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="cache.sqlite&#xa;durable checkpoints" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="7">
+          <mxGeometry x="450" y="425" width="165" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="15" value="Platform Data&#xa;IOT_NANO_STORAGE" style="swimlane;startSize=30;horizontal=1;rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1150" y="170" width="260" height="330" as="geometry" />
+        </mxCell>
+        <mxCell id="16" value="platform.sqlite&#xa;SQLite mode" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="15">
+          <mxGeometry x="45" y="65" width="170" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="17" value="TimescaleDB&#xa;iot_nano schema" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="15">
+          <mxGeometry x="45" y="185" width="170" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="18" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.25;entryDx=0;entryDy=0;" edge="1" parent="1" source="3" target="8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="19" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.65;exitDx=0;exitDy=0;entryX=0;entryY=0.75;entryDx=0;entryDy=0;" edge="1" parent="1" source="4" target="8">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="21" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="6" target="9">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="22" value="in-process" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="8" target="10">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="23" value="commit then ACK" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="9" target="12">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="24" value="consume / commit" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.85;entryDx=0;entryDy=0;" edge="1" parent="1" source="12" target="10">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="25" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="9" target="13">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="26" value="platform repository" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.45;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" edge="1" parent="1" source="10" target="15">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="27" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.4;exitDx=0;exitDy=0;entryX=0;entryY=0.65;entryDx=0;entryDy=0;" edge="1" parent="1" source="8" target="11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
