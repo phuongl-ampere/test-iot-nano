@@ -5,10 +5,10 @@ use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Timelike, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use sqlx::{
-    Executor, PgPool, Row, Sqlite, SqlitePool, Transaction,
+    Executor, PgPool, Postgres, Row, Sqlite, SqlitePool, Transaction,
     postgres::{PgPoolOptions, PgRow},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
     types::Json,
@@ -358,6 +358,8 @@ pub enum PlatformStoreError {
     InvalidCommandId(String),
     #[error("command params must be valid JSON")]
     InvalidCommandParams,
+    #[error("command payload conflicts with existing command ID: {0:?}")]
+    CommandConflict(String),
     #[error("device is not registered: {0:?}")]
     UnknownDevice(String),
     #[error("telemetry sequence does not fit PostgreSQL BIGINT")]
@@ -465,29 +467,17 @@ impl PlatformStore {
         command.id = id.to_string();
         command.params =
             serde_json::to_string(&params).map_err(|_| PlatformStoreError::InvalidCommandParams)?;
-        self.require_registered_device(&command.device_id).await?;
+        command.expires_at = canonical_command_timestamp(command.expires_at);
+        command.next_attempt_at = canonical_command_timestamp(command.next_attempt_at);
 
         match self {
-            Self::Sqlite(store) => Ok(store.enqueue_command(command).await?),
+            Self::Sqlite(store) => {
+                self.require_sqlite_registered_device(&command.device_id)
+                    .await?;
+                enqueue_sqlite_platform_command(store, &command).await
+            }
             Self::Timescale(pool) => {
-                let row = sqlx::query(
-                    "INSERT INTO command_outbox (
-                        id, device_id, method, params, mode, expires_at, next_attempt_at
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                     RETURNING
-                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
-                        lease_until, attempt_count, last_error, published_at, response, responded_at",
-                )
-                .bind(id)
-                .bind(command.device_id)
-                .bind(command.method)
-                .bind(Json(params))
-                .bind(command_mode_value(command.mode))
-                .bind(command.expires_at)
-                .bind(command.next_attempt_at)
-                .fetch_one(pool)
-                .await?;
-                postgres_command_outbox_record(row)
+                enqueue_timescale_platform_command(pool, id, params, &command).await
             }
         }
     }
@@ -500,12 +490,18 @@ impl PlatformStore {
     ) -> Result<bool, PlatformStoreError> {
         let sequence = i64::try_from(event.sequence)
             .map_err(|_| PlatformStoreError::TelemetrySequenceOverflow)?;
-        self.require_registered_device(&event.device_id).await?;
 
         match self {
-            Self::Sqlite(store) => Ok(store.write_telemetry(event, received_at, topic).await?),
+            Self::Sqlite(store) => {
+                self.require_sqlite_registered_device(&event.device_id)
+                    .await?;
+                Ok(store.write_telemetry(event, received_at, topic).await?)
+            }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
+                if !timescale_device_is_locked(&mut transaction, &event.device_id).await? {
+                    return Err(PlatformStoreError::UnknownDevice(event.device_id.clone()));
+                }
                 sqlx::query(
                     "INSERT INTO device_runtime_state (device_id, last_seen_at)
                      VALUES ($1, $2)
@@ -543,23 +539,20 @@ impl PlatformStore {
         }
     }
 
-    async fn require_registered_device(&self, device_id: &str) -> Result<(), PlatformStoreError> {
-        let registered = match self {
-            Self::Sqlite(store) => sqlx::query_scalar::<_, String>(
-                "SELECT device_id FROM devices WHERE device_id = ? LIMIT 1",
-            )
-            .bind(device_id)
-            .fetch_optional(store.pool())
-            .await?
-            .is_some(),
-            Self::Timescale(pool) => sqlx::query_scalar::<_, String>(
-                "SELECT device_id FROM devices WHERE device_id = $1 LIMIT 1",
-            )
-            .bind(device_id)
-            .fetch_optional(pool)
-            .await?
-            .is_some(),
+    async fn require_sqlite_registered_device(
+        &self,
+        device_id: &str,
+    ) -> Result<(), PlatformStoreError> {
+        let Self::Sqlite(store) = self else {
+            unreachable!("SQLite validation is only used by the SQLite adapter");
         };
+        let registered = sqlx::query_scalar::<_, String>(
+            "SELECT device_id FROM devices WHERE device_id = ? LIMIT 1",
+        )
+        .bind(device_id)
+        .fetch_optional(store.pool())
+        .await?
+        .is_some();
         if registered {
             Ok(())
         } else {
@@ -573,6 +566,140 @@ impl PlatformStore {
             Self::Timescale(_) => Err(PlatformStoreError::BackupUnsupported),
         }
     }
+}
+
+async fn enqueue_sqlite_platform_command(
+    store: &SqliteStore,
+    command: &NewCommandOutboxEntry,
+) -> Result<CommandOutboxRecord, PlatformStoreError> {
+    let row = sqlx::query(
+        "INSERT INTO command_outbox (
+            id, device_id, method, params, mode, expires_at, next_attempt_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO NOTHING
+         RETURNING
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at",
+    )
+    .bind(&command.id)
+    .bind(&command.device_id)
+    .bind(&command.method)
+    .bind(&command.params)
+    .bind(command_mode_value(command.mode))
+    .bind(command.expires_at.to_rfc3339())
+    .bind(command.next_attempt_at.to_rfc3339())
+    .fetch_optional(store.pool())
+    .await?;
+    if let Some(row) = row {
+        return Ok(command_outbox_record(row)?);
+    }
+
+    let existing = sqlx::query(
+        "SELECT
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at
+         FROM command_outbox
+         WHERE id = ?",
+    )
+    .bind(&command.id)
+    .fetch_optional(store.pool())
+    .await?
+    .map(command_outbox_record)
+    .transpose()?;
+    match existing {
+        Some(existing) if command_payload_matches(&existing, command) => Ok(existing),
+        Some(_) | None => Err(PlatformStoreError::CommandConflict(command.id.clone())),
+    }
+}
+
+async fn enqueue_timescale_platform_command(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    params: serde_json::Value,
+    command: &NewCommandOutboxEntry,
+) -> Result<CommandOutboxRecord, PlatformStoreError> {
+    let mut transaction = pool.begin().await?;
+    if !timescale_device_is_locked(&mut transaction, &command.device_id).await? {
+        return Err(PlatformStoreError::UnknownDevice(command.device_id.clone()));
+    }
+
+    let row = sqlx::query(
+        "INSERT INTO command_outbox (
+            id, device_id, method, params, mode, expires_at, next_attempt_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (id) DO NOTHING
+         RETURNING
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at",
+    )
+    .bind(id)
+    .bind(&command.device_id)
+    .bind(&command.method)
+    .bind(Json(params))
+    .bind(command_mode_value(command.mode))
+    .bind(command.expires_at)
+    .bind(command.next_attempt_at)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if let Some(row) = row {
+        let record = postgres_command_outbox_record(row)?;
+        transaction.commit().await?;
+        return Ok(record);
+    }
+
+    let existing = sqlx::query(
+        "SELECT
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at
+         FROM command_outbox
+         WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .map(postgres_command_outbox_record)
+    .transpose()?;
+    let result = match existing {
+        Some(existing) if command_payload_matches(&existing, command) => Ok(existing),
+        Some(_) | None => Err(PlatformStoreError::CommandConflict(command.id.clone())),
+    };
+    transaction.commit().await?;
+    result
+}
+
+async fn timescale_device_is_locked(
+    transaction: &mut Transaction<'_, Postgres>,
+    device_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT device_id
+         FROM devices
+         WHERE device_id = $1
+         FOR KEY SHARE",
+    )
+    .bind(device_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map(|device| device.is_some())
+}
+
+fn command_payload_matches(
+    existing: &CommandOutboxRecord,
+    command: &NewCommandOutboxEntry,
+) -> bool {
+    existing.id == command.id
+        && existing.device_id == command.device_id
+        && existing.method == command.method
+        && existing.params == command.params
+        && existing.mode == command.mode
+        && existing.expires_at == command.expires_at
+        && existing.next_attempt_at == command.next_attempt_at
+}
+
+fn canonical_command_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    timestamp
+        .with_nanosecond(timestamp.nanosecond() / 1_000 * 1_000)
+        .expect("a valid UTC timestamp can be represented at microsecond precision")
 }
 
 impl TopologyRepository for PlatformStore {
@@ -627,7 +754,59 @@ async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(CORE_POSTGRES_SCHEMA)
         .execute(&mut *transaction)
         .await?;
+    migrate_timescale_device_ownership(&mut transaction).await?;
     transaction.commit().await
+}
+
+async fn migrate_timescale_device_ownership(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
+        "DO $$
+         BEGIN
+             IF NOT EXISTS (
+                 SELECT 1
+                 FROM pg_constraint
+                 WHERE conname = 'command_outbox_device_id_fkey'
+                   AND conrelid = 'command_outbox'::regclass
+             ) THEN
+                 ALTER TABLE command_outbox
+                     ADD CONSTRAINT command_outbox_device_id_fkey
+                     FOREIGN KEY (device_id)
+                     REFERENCES devices(device_id)
+                     ON DELETE CASCADE;
+             END IF;
+
+             IF NOT EXISTS (
+                 SELECT 1
+                 FROM pg_constraint
+                 WHERE conname = 'device_runtime_state_device_id_fkey'
+                   AND conrelid = 'device_runtime_state'::regclass
+             ) THEN
+                 ALTER TABLE device_runtime_state
+                     ADD CONSTRAINT device_runtime_state_device_id_fkey
+                     FOREIGN KEY (device_id)
+                     REFERENCES devices(device_id)
+                     ON DELETE CASCADE;
+             END IF;
+
+             IF NOT EXISTS (
+                 SELECT 1
+                 FROM pg_constraint
+                 WHERE conname = 'telemetry_device_id_fkey'
+                   AND conrelid = 'telemetry'::regclass
+             ) THEN
+                 ALTER TABLE telemetry
+                     ADD CONSTRAINT telemetry_device_id_fkey
+                     FOREIGN KEY (device_id)
+                     REFERENCES devices(device_id);
+             END IF;
+         END
+         $$;",
+    )
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn postgres_command_outbox_record(row: PgRow) -> Result<CommandOutboxRecord, PlatformStoreError> {
