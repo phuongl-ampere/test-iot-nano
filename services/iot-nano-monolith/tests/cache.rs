@@ -115,3 +115,28 @@ async fn cache_rejects_an_existing_schema_without_the_expiry_constraint() {
         Err(CacheError::InvalidState(_))
     ));
 }
+
+#[tokio::test]
+async fn cache_rejects_an_existing_entry_with_a_non_text_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cache.sqlite");
+    let cache = PersistentCache::open(&path).await.unwrap();
+    drop(cache);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "
+            INSERT INTO cache_entries (key, value, expires_at_ms)
+            VALUES (?1, ?2, ?3)
+            ",
+            rusqlite::params![b"binary-key".as_slice(), b"value".as_slice(), i64::MAX],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(matches!(
+        PersistentCache::open(&path).await,
+        Err(CacheError::InvalidState(_))
+    ));
+}

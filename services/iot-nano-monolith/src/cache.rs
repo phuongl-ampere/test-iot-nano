@@ -113,8 +113,8 @@ impl PersistentCache {
 
 impl CacheState {
     fn open_path(path: PathBuf) -> Result<Self, CacheError> {
+        let path = canonical_cache_path(&path)?;
         let file = open_cache_file(&path)?;
-        let path = std::fs::canonicalize(path)?;
         Self::open_file(file, path)
     }
 
@@ -286,6 +286,14 @@ fn current_time_ms() -> Result<i64, CacheError> {
     i64::try_from(duration.as_millis()).map_err(|_| CacheError::InvalidExpiration)
 }
 
+fn canonical_cache_path(path: &Path) -> Result<PathBuf, CacheError> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| CacheError::InvalidState("cache path must name a file".to_owned()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(std::fs::canonicalize(parent)?.join(file_name))
+}
+
 fn validate_cache_schema(connection: &Connection) -> Result<(), CacheError> {
     let schema: Option<String> = connection
         .query_row(
@@ -368,6 +376,7 @@ fn validate_cache_entries(connection: &Connection) -> Result<(), CacheError> {
             SELECT 1
             FROM cache_entries
             WHERE key = ''
+               OR typeof(key) <> 'text'
                OR typeof(value) <> 'blob'
                OR typeof(expires_at_ms) <> 'integer'
                OR expires_at_ms < 0
@@ -457,11 +466,14 @@ fn validate_cache_file(file: &File) -> Result<(), CacheError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use tempfile::tempdir;
 
-    use super::{CacheEntry, PersistentCache};
+    use super::{CacheEntry, PersistentCache, canonical_cache_path};
 
     fn future_expiration() -> u64 {
         SystemTime::now()
@@ -503,5 +515,26 @@ mod tests {
         assert!(state.hot.contains_key("device:0"));
         assert!(!state.hot.contains_key("device:1"));
         assert!(state.hot.contains_key("device:overflow"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_cache_path_resolves_only_the_parent_directory() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("cache-parent");
+        let target = directory.path().join("cache-target.sqlite");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&target, b"unrelated").unwrap();
+        let cache_path = parent.join("cache.sqlite");
+        std::os::unix::fs::symlink(&target, &cache_path).unwrap();
+
+        assert_eq!(
+            canonical_cache_path(&cache_path).unwrap(),
+            std::fs::canonicalize(&parent).unwrap().join("cache.sqlite")
+        );
+        assert_ne!(
+            canonical_cache_path(&cache_path).unwrap(),
+            PathBuf::from(std::fs::canonicalize(&target).unwrap())
+        );
     }
 }
