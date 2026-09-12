@@ -7,15 +7,16 @@
 
 Added storage-owned account, permission, resource-kind, and authorization-subject
 types; the `AuthorizationRepository` port; inherent `PlatformStore` methods for
-SQLite and Timescale; and SQLite plus ignored guarded Timescale contract tests.
-No API authorization types or routes were imported.
+SQLite and Timescale; and SQLite plus ignored guarded approved-storage-
+authorization contract tests. No API authorization types or routes were
+imported.
 
 ## TDD RED Evidence
 
-Command:
+Initial focused compilation command:
 
 ```text
-cargo test -p iot-storage --test resource_authorization sqlite_resource_authorization_repository_matches_api_contract
+cargo test -p iot-storage --test resource_authorization
 ```
 
 Before production implementation, the command failed during compilation with
@@ -35,7 +36,7 @@ The RED run exited with status `101`.
 
 ## Verification
 
-- `cargo test -p iot-storage --test resource_authorization sqlite_resource_authorization_repository_matches_api_contract`: 1 passed, 0 failed.
+- Initial post-implementation SQLite contract: 1 passed, 0 failed.
 - `cargo test -p iot-storage --tests`: 27 passed, 0 failed, 14 ignored.
 - `cargo fmt --all -- --check`: passed.
 - `git diff --check`: passed.
@@ -52,3 +53,27 @@ The RED run exited with status `101`.
   present and compiled, but remains ignored.
 - The worktree still contains unrelated user-owned deleted documents; they were
   not staged or modified.
+
+## Review Resolution
+
+The approved storage authorization contract intentionally diverges from the
+legacy API resource authorizer for a deleted device with a stale active direct
+share. Storage returns `None`, rather than exposing the stale share. This is
+the explicit Task 2e requirement, "A deleted device has no owner/share-derived
+permission", and is the fail-closed monolith security behavior.
+
+The legacy API resource-authorizer implementation must be removed when API
+routes migrate to the storage authorization port, leaving this approved storage
+authorization contract as the single source of truth.
+
+Focused SQLite review verification:
+
+- `cargo test -p iot-storage --test resource_authorization sqlite_resource_authorization`: 5 passed, 0 failed, 1 filtered out.
+- Covered independently: existing unshared device and asset, pending-only
+  device and asset shares, deleted device with an active direct share, and
+  inheritance at the 64-ancestor inclusion boundary with a 65th-only share
+  denied.
+- The ignored Timescale parity test executes the same assertions when a guarded
+  disposable `IOT_NANO_TIMESCALE_TEST_URL` is available; it was not run.
+
+Review fix commit: `d174a3c57b44e41adf655a8ddd8d4cc685edb5d7`
