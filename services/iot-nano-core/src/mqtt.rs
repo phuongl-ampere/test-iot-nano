@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use iot_core::TelemetryEvent;
@@ -83,6 +83,21 @@ pub enum MqttRuntimeError {
     Join(#[from] tokio::task::JoinError),
 }
 
+async fn ingest_before_ack<F>(
+    producer: &MqttStreamProducer,
+    topic: &str,
+    payload: &[u8],
+    received_at: DateTime<Utc>,
+    acknowledgement: F,
+) -> Result<IngestOutcome, MqttRuntimeError>
+where
+    F: Future<Output = Result<(), rumqttc::ClientError>>,
+{
+    let outcome = producer.ingest(topic, payload, received_at).await?;
+    acknowledgement.await?;
+    Ok(outcome)
+}
+
 pub struct MqttRuntime {
     client: AsyncClient,
     event_loop: EventLoop,
@@ -127,14 +142,155 @@ impl MqttRuntime {
                 Ok(None)
             }
             Event::Incoming(Packet::Publish(publish)) => {
-                let outcome = self
-                    .producer
-                    .ingest(&publish.topic, &publish.payload, received_at)
-                    .await?;
-                self.client.ack(&publish).await?;
+                let outcome = ingest_before_ack(
+                    &self.producer,
+                    &publish.topic,
+                    &publish.payload,
+                    received_at,
+                    self.client.ack(&publish),
+                )
+                .await?;
                 Ok(Some(outcome))
             }
             _ => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
+
+    use chrono::{TimeZone, Utc};
+    use iot_core::TelemetryEvent;
+    use iot_stream::{
+        AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment,
+        HeartbeatRequest, PartitionId, StreamError, StreamMessage, StreamPort,
+    };
+    use serde_json::json;
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+
+    use super::{IngestOutcome, MqttStreamProducer, ingest_before_ack};
+
+    #[derive(Clone)]
+    struct BlockingAppendStream {
+        append_started: Arc<Notify>,
+        release_append: Arc<Notify>,
+        append_count: Arc<AtomicUsize>,
+    }
+
+    impl BlockingAppendStream {
+        fn new() -> Self {
+            Self {
+                append_started: Arc::new(Notify::new()),
+                release_append: Arc::new(Notify::new()),
+                append_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl StreamPort for BlockingAppendStream {
+        fn append(
+            &self,
+            _message: StreamMessage,
+        ) -> Pin<Box<dyn Future<Output = Result<AppendReceipt, StreamError>> + Send + '_>> {
+            let append_started = Arc::clone(&self.append_started);
+            let release_append = Arc::clone(&self.release_append);
+            let append_count = Arc::clone(&self.append_count);
+            Box::pin(async move {
+                append_started.notify_one();
+                release_append.notified().await;
+                append_count.fetch_add(1, Ordering::SeqCst);
+                Ok(AppendReceipt {
+                    partition: PartitionId::new(0),
+                    offset: 0,
+                })
+            })
+        }
+
+        fn claim(
+            &self,
+            _request: ClaimRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ClaimedRecord>, StreamError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn acknowledge(
+            &self,
+            _request: AcknowledgeRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn heartbeat(
+            &self,
+            _request: HeartbeatRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<GroupAssignment, StreamError>> + Send + '_>>
+        {
+            Box::pin(async {
+                Ok(GroupAssignment {
+                    generation: 1,
+                    partitions: vec![PartitionId::new(0)],
+                })
+            })
+        }
+
+        fn drain(
+            &self,
+            _deadline: Instant,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_append_completes_before_acknowledgement_starts() {
+        let stream = BlockingAppendStream::new();
+        let producer = MqttStreamProducer::new(Arc::new(stream.clone()));
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let now = Utc.with_ymd_and_hms(2026, 9, 12, 0, 0, 0).unwrap();
+        let event = TelemetryEvent {
+            schema_version: 1,
+            device_id: "esp-000123".to_owned(),
+            boot_id: Uuid::new_v4(),
+            sequence: 1,
+            event_at: now,
+            measurements: serde_json::Map::from_iter([("temperature_c".to_owned(), json!(26.4))]),
+            gateway_device_id: None,
+        };
+        let payload = serde_json::to_vec(&event).unwrap();
+        let acknowledged_by_task = Arc::clone(&acknowledged);
+        let task = tokio::spawn(async move {
+            ingest_before_ack(
+                &producer,
+                "iot/v1/devices/esp-000123/telemetry",
+                &payload,
+                now,
+                async move {
+                    acknowledged_by_task.store(true, Ordering::SeqCst);
+                    Ok::<(), rumqttc::ClientError>(())
+                },
+            )
+            .await
+        });
+
+        stream.append_started.notified().await;
+        assert!(!acknowledged.load(Ordering::SeqCst));
+        assert_eq!(stream.append_count.load(Ordering::SeqCst), 0);
+
+        stream.release_append.notify_one();
+        assert_eq!(task.await.unwrap().unwrap(), IngestOutcome::Accepted);
+        assert_eq!(stream.append_count.load(Ordering::SeqCst), 1);
+        assert!(acknowledged.load(Ordering::SeqCst));
     }
 }

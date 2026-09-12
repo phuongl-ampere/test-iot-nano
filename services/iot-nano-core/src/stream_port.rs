@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use iot_stream::{
-    AcknowledgeRequest, ClaimRequest, ClaimedRecord, GroupStart, StreamError, StreamPort,
+    AcknowledgeRequest, ClaimRequest, ClaimedRecord, GroupStart, HeartbeatRequest, StreamError,
+    StreamPort,
 };
 
 #[derive(Clone)]
@@ -79,6 +80,17 @@ impl CoreStreamConsumer {
     }
 
     pub async fn heartbeat(&self) -> Result<(), StreamError> {
-        self.claim(0).await.map(|_| ())
+        match self
+            .stream
+            .heartbeat(HeartbeatRequest::new(
+                self.group.clone(),
+                self.member_id.clone(),
+            ))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(StreamError::GroupMemberNotFound { .. }) => self.claim(0).await.map(|_| ()),
+            Err(error) => Err(error),
+        }
     }
 }

@@ -1738,6 +1738,7 @@ dependencies = [
  "iot-nano-stream",
  "iot-sqldb-common",
  "lettre",
+ "reqwest",
  "rumqttc",
  "serde",
  "serde_json",

@@ -160,6 +160,22 @@ async fn sqlite_dispatcher_claims_then_marks_published_after_transport_puback() 
 }
 
 #[tokio::test]
+async fn sqlite_dispatcher_accepts_an_arc_trait_object_transport() {
+    let (_directory, store) = sqlite_store().await;
+    let now = Utc::now();
+    let command_id = Uuid::now_v7();
+    enqueue_sqlite_command(&store, command_id, now).await;
+    let concrete = Arc::new(RecordingTransport::succeeds());
+    let transport: Arc<dyn CommandTransport> = concrete.clone();
+    let dispatcher = SqliteCommandDispatcher::new(store, transport, 10);
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+
+    assert_eq!(result.published, 1);
+    assert_eq!(concrete.requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
 async fn sqlite_dispatcher_forwards_a_two_way_mode_to_the_transport() {
     let (_directory, store) = sqlite_store().await;
     let now = Utc::now();
