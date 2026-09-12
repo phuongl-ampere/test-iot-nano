@@ -1802,18 +1802,15 @@ dependencies = [
 name = "iot-nano-stream"
 version = "0.1.0"
 dependencies = [
- "axum 0.8.9",
  "chrono",
- "clap",
  "crc32fast",
- "fs2",
  "iot-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tower",
  "uuid",
 ]
 

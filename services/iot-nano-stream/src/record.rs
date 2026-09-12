@@ -97,6 +97,16 @@ impl StreamMessage {
         }
     }
 
+    pub(crate) fn idempotency_key(&self) -> String {
+        match self {
+            Self::Telemetry(message) => format!(
+                "telemetry:{}:{}:{}",
+                message.event.device_id, message.event.boot_id, message.event.sequence
+            ),
+            Self::Gateway(message) => message.gateway_event.idempotency_key.clone(),
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), StreamError> {
         match self {
             Self::Telemetry(message) => message.event.validate_for_topic(&message.topic)?,
@@ -149,17 +159,13 @@ pub struct StreamRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendedRecord {
+pub struct AppendReceipt {
     pub partition: PartitionId,
     pub offset: Offset,
 }
 
-pub(crate) fn encode_message(message: &StreamMessage) -> Result<Vec<u8>, StreamError> {
-    Ok(serde_json::to_vec(message)?)
-}
-
-pub(crate) fn decode_message(payload: &[u8]) -> Result<StreamMessage, StreamError> {
-    let message = serde_json::from_slice::<StreamMessage>(payload)?;
+pub(crate) fn decode_message(payload: &str) -> Result<StreamMessage, StreamError> {
+    let message = serde_json::from_str::<StreamMessage>(payload)?;
     message.validate()?;
     Ok(message)
 }

@@ -1,38 +1,37 @@
-use std::time::Duration;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::StreamError;
 
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
-    pub partition_count: u16,
-    pub segment_max_bytes: u64,
+    pub path: PathBuf,
+    pub partitions: u16,
     pub retention_max_bytes: u64,
     pub retention_max_age: Duration,
     pub max_record_bytes: usize,
-    pub index_stride: u64,
+    pub busy_timeout: Duration,
+    pub lease_duration: Duration,
 }
 
 impl StreamConfig {
-    pub fn production() -> Self {
+    pub fn sqlite(path: impl AsRef<Path>) -> Self {
         Self {
-            partition_count: 8,
-            segment_max_bytes: 128 * 1024 * 1024,
+            path: path.as_ref().to_path_buf(),
+            partitions: 8,
             retention_max_bytes: 2 * 1024 * 1024 * 1024,
             retention_max_age: Duration::from_secs(24 * 60 * 60),
             max_record_bytes: 1024 * 1024,
-            index_stride: 128,
+            busy_timeout: Duration::from_secs(5),
+            lease_duration: Duration::from_secs(5 * 60),
         }
     }
 
-    pub fn for_test(partition_count: u16) -> Self {
-        Self {
-            partition_count,
-            segment_max_bytes: 256,
-            retention_max_bytes: 4 * 1024,
-            retention_max_age: Duration::from_secs(24 * 60 * 60),
-            max_record_bytes: 1024,
-            index_stride: 2,
-        }
+    pub fn with_partitions(mut self, partitions: u16) -> Self {
+        self.partitions = partitions;
+        self
     }
 
     pub fn with_max_record_bytes(mut self, max_record_bytes: usize) -> Self {
@@ -40,20 +39,25 @@ impl StreamConfig {
         self
     }
 
+    pub fn with_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.lease_duration = lease_duration;
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<(), StreamError> {
-        if self.partition_count == 0 {
+        if self.path.as_os_str().is_empty() {
             return Err(StreamError::InvalidConfig(
-                "partition_count must be greater than zero".to_owned(),
+                "path must not be empty".to_owned(),
             ));
         }
-        if self.segment_max_bytes == 0 {
+        if self.partitions == 0 {
             return Err(StreamError::InvalidConfig(
-                "segment_max_bytes must be greater than zero".to_owned(),
+                "partitions must be greater than zero".to_owned(),
             ));
         }
-        if self.segment_max_bytes > self.retention_max_bytes {
+        if self.retention_max_bytes == 0 {
             return Err(StreamError::InvalidConfig(
-                "segment_max_bytes must not exceed retention_max_bytes".to_owned(),
+                "retention_max_bytes must be greater than zero".to_owned(),
             ));
         }
         if self.retention_max_age.is_zero() {
@@ -66,9 +70,14 @@ impl StreamConfig {
                 "max_record_bytes must be greater than zero".to_owned(),
             ));
         }
-        if self.index_stride == 0 {
+        if self.busy_timeout.is_zero() {
             return Err(StreamError::InvalidConfig(
-                "index_stride must be greater than zero".to_owned(),
+                "busy_timeout must be greater than zero".to_owned(),
+            ));
+        }
+        if self.lease_duration.is_zero() {
+            return Err(StreamError::InvalidConfig(
+                "lease_duration must be greater than zero".to_owned(),
             ));
         }
 

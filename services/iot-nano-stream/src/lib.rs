@@ -2,48 +2,52 @@
 
 mod config;
 mod group;
-pub mod http;
 pub mod maintenance;
 mod record;
 mod retention;
 mod segment;
+mod sqlite_store;
 
 use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
-use iot_core::TelemetryValidationError;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use config::StreamConfig;
 pub use group::{
-    GroupAssignment, GroupPartitionStats, GroupStart, GroupStats, PartitionCommit, PollBatch,
-    StreamConsumer,
+    AcknowledgeRequest, ClaimRequest, ClaimedRecord, GroupAssignment, GroupPartitionStats,
+    GroupStart, GroupStats, HeartbeatRequest, PartitionCommit,
 };
 pub use record::{
-    AppendedRecord, GatewayEvent, GatewayEventKind, GatewayMessage, StreamMessage, StreamRecord,
+    AppendReceipt, GatewayEvent, GatewayEventKind, GatewayMessage, StreamMessage, StreamRecord,
     TelemetryMessage,
 };
 pub use retention::{PartitionStats, RetentionResult, StreamStats};
 
+pub type AppendedRecord = AppendReceipt;
 pub type Offset = u64;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalStream {
     inner: Arc<StreamInner>,
 }
 
-#[derive(Debug)]
 struct StreamInner {
-    root: PathBuf,
     config: StreamConfig,
-    capacity_lock: Mutex<()>,
-    partitions: Vec<Mutex<segment::PartitionLog>>,
+    store: Arc<sqlite_store::SqliteStore>,
+    accepting: AtomicBool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct PartitionId(u16);
 
 impl PartitionId {
@@ -73,13 +77,17 @@ pub enum StreamError {
     },
     #[error("partition {partition} is outside the configured partition range")]
     InvalidPartition { partition: u16 },
-    #[error("stream partition lock was poisoned")]
+    #[error("stream store lock was poisoned")]
     LockPoisoned,
-    #[error("segment {path} is corrupt: {reason}")]
-    CorruptSegment { path: PathBuf, reason: String },
+    #[error("stream SQLite file belongs to application id {application_id}")]
+    ForeignDatabase { application_id: i32 },
+    #[error("stream SQLite file contains non-stream table {table:?}")]
+    ForeignTable { table: String },
+    #[error("stream store is corrupt: {0}")]
+    CorruptStore(String),
     #[error("invalid consumer group {kind}: {value:?}")]
     InvalidGroupIdentifier { kind: &'static str, value: String },
-    #[error("consumer member {member_id:?} is not an active member of group {group:?}")]
+    #[error("consumer member {member_id:?} is not active in group {group:?}")]
     GroupMemberNotFound { group: String, member_id: String },
     #[error("consumer member {member_id:?} lease expired in group {group:?}")]
     LeaseExpired { group: String, member_id: String },
@@ -91,164 +99,199 @@ pub enum StreamError {
         requested: Offset,
         earliest: Offset,
     },
+    #[error(
+        "commit for partition {partition:?} is outside [{current}, {high_watermark}]: {requested}"
+    )]
+    InvalidCommit {
+        partition: PartitionId,
+        current: Offset,
+        requested: Offset,
+        high_watermark: Offset,
+    },
+    #[error("stream offset overflowed")]
+    OffsetOverflow,
+    #[error("stream is draining and no longer accepts claims")]
+    Draining,
+    #[error("stream drain deadline elapsed with {remaining} in-flight claims")]
+    DrainTimeout { remaining: u64 },
     #[error(transparent)]
-    InvalidTelemetry(#[from] TelemetryValidationError),
+    InvalidTelemetry(#[from] iot_core::TelemetryValidationError),
     #[error("invalid gateway event")]
     InvalidGatewayEvent,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
     Serialization(#[from] serde_json::Error),
+    #[error("stream blocking task failed: {0}")]
+    TaskJoin(String),
+}
+
+pub trait StreamPort: Send + Sync {
+    fn append(
+        &self,
+        message: StreamMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<AppendReceipt, StreamError>> + Send + '_>>;
+
+    fn claim(
+        &self,
+        request: ClaimRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ClaimedRecord>, StreamError>> + Send + '_>>;
+
+    fn acknowledge(
+        &self,
+        request: AcknowledgeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>>;
+
+    fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GroupAssignment, StreamError>> + Send + '_>>;
+
+    fn drain(
+        &self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>>;
 }
 
 impl LocalStream {
-    pub fn open(path: impl AsRef<Path>, config: StreamConfig) -> Result<Self, StreamError> {
+    pub async fn open(config: StreamConfig) -> Result<Self, StreamError> {
         config.validate()?;
-        let root = path.as_ref().to_path_buf();
-        segment::initialize_root(&root, config.partition_count)?;
-        let mut partitions = Vec::with_capacity(usize::from(config.partition_count));
-        for id in 0..config.partition_count {
-            partitions.push(Mutex::new(segment::PartitionLog::open(
-                &root,
-                PartitionId(id),
-                &config,
-            )?));
-        }
-
+        let open_config = config.clone();
+        let store =
+            tokio::task::spawn_blocking(move || sqlite_store::SqliteStore::open(&open_config))
+                .await
+                .map_err(|error| StreamError::TaskJoin(error.to_string()))??;
         Ok(Self {
             inner: Arc::new(StreamInner {
-                root,
                 config,
-                capacity_lock: Mutex::new(()),
-                partitions,
+                store: Arc::new(store),
+                accepting: AtomicBool::new(true),
             }),
         })
     }
 
-    pub fn partition_for(&self, device_id: &str) -> PartitionId {
-        let partition =
-            crc32fast::hash(device_id.as_bytes()) % u32::from(self.inner.config.partition_count);
-        PartitionId(partition as u16)
+    pub fn partition_for(&self, partition_key: &str) -> PartitionId {
+        segment::partition_for(partition_key, &self.inner.config)
     }
 
-    pub fn append(&self, message: impl Into<StreamMessage>) -> Result<AppendedRecord, StreamError> {
+    pub async fn append(
+        &self,
+        message: impl Into<StreamMessage>,
+    ) -> Result<AppendReceipt, StreamError> {
+        let config = self.inner.config.clone();
         let message = message.into();
-        message.validate()?;
-        let encoded = record::encode_message(&message)?;
-        if encoded.len() > self.inner.config.max_record_bytes {
-            return Err(StreamError::RecordTooLarge {
-                encoded_bytes: encoded.len(),
-                max_bytes: self.inner.config.max_record_bytes,
-            });
-        }
-
-        let frame_bytes = u64::try_from(encoded.len())
-            .map_err(|_| StreamError::RecordTooLarge {
-                encoded_bytes: encoded.len(),
-                max_bytes: self.inner.config.max_record_bytes,
-            })?
-            .checked_add(segment::frame_header_bytes())
-            .ok_or_else(|| StreamError::Io(std::io::Error::other("frame length overflow")))?;
-        let _capacity_guard = self
-            .inner
-            .capacity_lock
-            .lock()
-            .map_err(|_| StreamError::LockPoisoned)?;
-        retention::enforce_locked(self, chrono::Utc::now(), frame_bytes, false)?;
-
-        let partition = self.partition_for(message.partition_key());
-        let mut partition_log = self
-            .partition(partition)?
-            .lock()
-            .map_err(|_| StreamError::LockPoisoned)?;
-
-        partition_log.append(
-            &self.inner.root,
-            &self.inner.config,
-            encoded,
-            message.received_at(),
-        )
+        self.blocking(move |store| store.append(&config, message))
+            .await
     }
 
-    pub fn read_partition(
+    pub async fn claim(&self, request: ClaimRequest) -> Result<Vec<ClaimedRecord>, StreamError> {
+        if !self.inner.accepting.load(Ordering::Acquire) {
+            return Err(StreamError::Draining);
+        }
+        let config = self.inner.config.clone();
+        let inner = self.inner.clone();
+        self.blocking(move |store| {
+            if !inner.accepting.load(Ordering::Acquire) {
+                return Err(StreamError::Draining);
+            }
+            store.claim(&config, request)
+        })
+        .await
+    }
+
+    pub async fn acknowledge(&self, request: AcknowledgeRequest) -> Result<(), StreamError> {
+        let config = self.inner.config.clone();
+        self.blocking(move |store| store.acknowledge(&config, request))
+            .await
+    }
+
+    pub async fn heartbeat(
         &self,
-        partition: PartitionId,
-        offset: Offset,
-        limit: usize,
-    ) -> Result<Vec<StreamRecord>, StreamError> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-
-        let partition_log = self
-            .partition(partition)?
-            .lock()
-            .map_err(|_| StreamError::LockPoisoned)?;
-        let (earliest, _) = partition_log.bounds();
-        if offset < earliest {
-            return Err(StreamError::OffsetOutOfRange {
-                partition,
-                requested: offset,
-                earliest,
-            });
-        }
-        partition_log.read(offset, limit)
+        request: HeartbeatRequest,
+    ) -> Result<GroupAssignment, StreamError> {
+        let config = self.inner.config.clone();
+        self.blocking(move |store| store.heartbeat(&config, request))
+            .await
     }
 
-    pub fn join_group(
-        &self,
-        group: &str,
-        member_id: &str,
-        start: GroupStart,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<StreamConsumer, StreamError> {
-        group::join_group(self.clone(), group, member_id, start, now)
-    }
-
-    pub fn enforce_retention(
+    pub async fn enforce_retention(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<RetentionResult, StreamError> {
-        let _capacity_guard = self
-            .inner
-            .capacity_lock
-            .lock()
-            .map_err(|_| StreamError::LockPoisoned)?;
-        retention::enforce_locked(self, now, 0, true)
+        let config = self.inner.config.clone();
+        self.blocking(move |store| store.enforce_retention(&config, now.timestamp_millis()))
+            .await
     }
 
-    pub fn stats(&self) -> Result<StreamStats, StreamError> {
-        retention::stats(self)
+    pub async fn stats(&self) -> Result<StreamStats, StreamError> {
+        let config = self.inner.config.clone();
+        self.blocking(move |store| store.stats(&config)).await
     }
 
-    fn partition(
+    pub async fn drain_until(&self, deadline: Instant) -> Result<(), StreamError> {
+        self.inner.accepting.store(false, Ordering::Release);
+        loop {
+            let remaining = self
+                .blocking(|store| store.inflight_count(chrono::Utc::now().timestamp_millis()))
+                .await?;
+            if remaining == 0 {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(StreamError::DrainTimeout { remaining });
+            }
+            tokio::time::sleep((deadline - now).min(Duration::from_millis(25))).await;
+        }
+    }
+
+    async fn blocking<T, F>(&self, operation: F) -> Result<T, StreamError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&sqlite_store::SqliteStore) -> Result<T, StreamError> + Send + 'static,
+    {
+        let store = self.inner.store.clone();
+        tokio::task::spawn_blocking(move || operation(&store))
+            .await
+            .map_err(|error| StreamError::TaskJoin(error.to_string()))?
+    }
+}
+
+impl StreamPort for LocalStream {
+    fn append(
         &self,
-        partition: PartitionId,
-    ) -> Result<&Mutex<segment::PartitionLog>, StreamError> {
-        self.inner
-            .partitions
-            .get(usize::from(partition.0))
-            .ok_or(StreamError::InvalidPartition {
-                partition: partition.0,
-            })
+        message: StreamMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<AppendReceipt, StreamError>> + Send + '_>> {
+        Box::pin(LocalStream::append(self, message))
     }
 
-    pub(crate) fn partition_bounds(
+    fn claim(
         &self,
-        partition: PartitionId,
-    ) -> Result<(Offset, Offset), StreamError> {
-        let partition_log = self
-            .partition(partition)?
-            .lock()
-            .map_err(|_| StreamError::LockPoisoned)?;
-        Ok(partition_log.bounds())
+        request: ClaimRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ClaimedRecord>, StreamError>> + Send + '_>> {
+        Box::pin(LocalStream::claim(self, request))
     }
 
-    pub(crate) fn partition_count(&self) -> u16 {
-        self.inner.config.partition_count
+    fn acknowledge(
+        &self,
+        request: AcknowledgeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+        Box::pin(LocalStream::acknowledge(self, request))
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.inner.root
+    fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GroupAssignment, StreamError>> + Send + '_>> {
+        Box::pin(LocalStream::heartbeat(self, request))
+    }
+
+    fn drain(
+        &self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+        Box::pin(LocalStream::drain_until(self, deadline))
     }
 }
