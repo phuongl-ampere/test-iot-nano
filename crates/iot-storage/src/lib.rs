@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use chrono::{DateTime, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use sqlx::{
-    PgPool, Row, Sqlite, SqlitePool, Transaction,
+    Executor, PgPool, Row, Sqlite, SqlitePool, Transaction,
     postgres::PgPoolOptions,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
@@ -363,11 +363,25 @@ impl PlatformStore {
                     .database_url
                     .as_deref()
                     .ok_or(PlatformStoreError::InvalidConfiguration)?;
-                let pool = PgPoolOptions::new()
-                    .max_connections(8)
+                let migration_pool = PgPoolOptions::new()
+                    .max_connections(1)
                     .connect(database_url)
                     .await?;
-                migrate_platform_timescale(&pool).await?;
+                migrate_platform_timescale(&migration_pool).await?;
+                migration_pool.close().await;
+
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .after_connect(|connection, _| {
+                        Box::pin(async move {
+                            connection
+                                .execute("SET search_path TO iot_nano, public")
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .connect(database_url)
+                    .await?;
                 Ok(Self::Timescale(pool))
             }
         }
@@ -394,6 +408,9 @@ async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(&mut *transaction)
         .await?;
     sqlx::query("CREATE SCHEMA IF NOT EXISTS iot_nano")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" WITH SCHEMA public")
         .execute(&mut *transaction)
         .await?;
     sqlx::query("SET LOCAL search_path TO iot_nano, public")
