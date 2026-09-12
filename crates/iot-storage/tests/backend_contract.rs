@@ -1,6 +1,24 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_storage::PlatformStore;
+use chrono::{Duration, Utc};
+use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
+use iot_storage::{
+    CommandOutboxState, CommandRepository, NewCommandOutboxEntry, PlatformStore,
+    TelemetryRepository, TopologyRepository,
+};
 use sqlx::{PgPool, Row};
+
+fn telemetry(device_id: &str, sequence: u64) -> TelemetryEvent {
+    TelemetryEvent {
+        schema_version: 1,
+        device_id: device_id.to_owned(),
+        boot_id: uuid::Uuid::now_v7(),
+        sequence,
+        event_at: Utc::now(),
+        measurements: [("temperature_c".to_owned(), serde_json::json!(23.5))]
+            .into_iter()
+            .collect(),
+        gateway_device_id: None,
+    }
+}
 
 #[tokio::test]
 async fn platform_store_opens_the_complete_sqlite_platform_schema() {
@@ -56,6 +74,186 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "users",
         ]
     );
+}
+
+#[tokio::test]
+async fn platform_store_enqueues_a_command_for_a_registered_sqlite_device() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+
+    TopologyRepository::register_device(&store, "platform-command-device")
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let command = CommandRepository::enqueue_command(
+        &store,
+        NewCommandOutboxEntry {
+            id: uuid::Uuid::now_v7().to_string(),
+            device_id: "platform-command-device".to_owned(),
+            method: "switch_on".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: now + Duration::minutes(5),
+            next_attempt_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(command.state, CommandOutboxState::Queued);
+    assert_eq!(command.device_id, "platform-command-device");
+}
+
+#[tokio::test]
+async fn platform_store_persists_idempotent_sqlite_telemetry_via_the_repository_port() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let event = telemetry("platform-telemetry-device", 1);
+    TopologyRepository::register_device(&store, &event.device_id)
+        .await
+        .unwrap();
+
+    assert!(
+        TelemetryRepository::write_telemetry(
+            &store,
+            &event,
+            Utc::now(),
+            "iot/v1/devices/telemetry",
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !TelemetryRepository::write_telemetry(
+            &store,
+            &event,
+            Utc::now(),
+            "iot/v1/devices/telemetry",
+        )
+        .await
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn platform_store_persists_idempotent_timescale_telemetry_via_the_repository_port() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let cleanup = PgPool::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&cleanup)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&cleanup)
+        .await
+        .unwrap();
+    cleanup.close().await;
+
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let event = telemetry("platform-telemetry-device", 1);
+    TopologyRepository::register_device(&store, &event.device_id)
+        .await
+        .unwrap();
+
+    assert!(
+        TelemetryRepository::write_telemetry(
+            &store,
+            &event,
+            Utc::now(),
+            "iot/v1/devices/telemetry",
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !TelemetryRepository::write_telemetry(
+            &store,
+            &event,
+            Utc::now(),
+            "iot/v1/devices/telemetry",
+        )
+        .await
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn platform_store_enqueues_a_command_for_a_registered_timescale_device() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let cleanup = PgPool::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&cleanup)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&cleanup)
+        .await
+        .unwrap();
+    cleanup.close().await;
+
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+
+    TopologyRepository::register_device(&store, "platform-command-device")
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let command = CommandRepository::enqueue_command(
+        &store,
+        NewCommandOutboxEntry {
+            id: uuid::Uuid::now_v7().to_string(),
+            device_id: "platform-command-device".to_owned(),
+            method: "switch_on".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: now + Duration::minutes(5),
+            next_attempt_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(command.state, CommandOutboxState::Queued);
+    assert_eq!(command.device_id, "platform-command-device");
 }
 
 #[tokio::test]

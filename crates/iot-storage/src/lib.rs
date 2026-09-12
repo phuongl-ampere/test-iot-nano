@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{fs, time::Duration};
+use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -9,8 +9,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use sqlx::{
     Executor, PgPool, Row, Sqlite, SqlitePool, Transaction,
-    postgres::PgPoolOptions,
+    postgres::{PgPoolOptions, PgRow},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
+    types::Json,
 };
 use thiserror::Error;
 
@@ -336,6 +337,7 @@ CREATE INDEX IF NOT EXISTS command_outbox_due_index
 #[derive(Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -352,6 +354,37 @@ pub enum PlatformStoreError {
     Sqlite(#[from] SqliteStoreError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    #[error("command ID must be a UUID, got {0:?}")]
+    InvalidCommandId(String),
+    #[error("command params must be valid JSON")]
+    InvalidCommandParams,
+    #[error("telemetry sequence does not fit PostgreSQL BIGINT")]
+    TelemetrySequenceOverflow,
+    #[error("filesystem backups are available only for SQLite platform storage")]
+    BackupUnsupported,
+}
+
+pub trait TopologyRepository: Send + Sync {
+    fn register_device<'a>(
+        &'a self,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
+}
+
+pub trait CommandRepository: Send + Sync {
+    fn enqueue_command<'a>(
+        &'a self,
+        command: NewCommandOutboxEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandOutboxRecord, PlatformStoreError>> + Send + 'a>>;
+}
+
+pub trait TelemetryRepository: Send + Sync {
+    fn write_telemetry<'a>(
+        &'a self,
+        event: &'a TelemetryEvent,
+        received_at: DateTime<Utc>,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
 }
 
 impl PlatformStore {
@@ -400,6 +433,145 @@ impl PlatformStore {
             Self::Timescale(pool) => Some(pool),
         }
     }
+
+    pub async fn register_device(&self, device_id: &str) -> Result<(), PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                sqlx::query("INSERT INTO devices (device_id) VALUES (?) ON CONFLICT DO NOTHING")
+                    .bind(device_id)
+                    .execute(store.pool())
+                    .await?;
+            }
+            Self::Timescale(pool) => {
+                sqlx::query("INSERT INTO devices (device_id) VALUES ($1) ON CONFLICT DO NOTHING")
+                    .bind(device_id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn enqueue_command(
+        &self,
+        command: NewCommandOutboxEntry,
+    ) -> Result<CommandOutboxRecord, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.enqueue_command(command).await?),
+            Self::Timescale(pool) => {
+                let id = uuid::Uuid::parse_str(&command.id)
+                    .map_err(|_| PlatformStoreError::InvalidCommandId(command.id.clone()))?;
+                let params = serde_json::from_str::<serde_json::Value>(&command.params)
+                    .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
+                let row = sqlx::query(
+                    "INSERT INTO command_outbox (
+                        id, device_id, method, params, mode, expires_at, next_attempt_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     RETURNING
+                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                        lease_until, attempt_count, last_error, published_at, response, responded_at",
+                )
+                .bind(id)
+                .bind(command.device_id)
+                .bind(command.method)
+                .bind(Json(params))
+                .bind(command_mode_value(command.mode))
+                .bind(command.expires_at)
+                .bind(command.next_attempt_at)
+                .fetch_one(pool)
+                .await?;
+                postgres_command_outbox_record(row)
+            }
+        }
+    }
+
+    pub async fn write_telemetry(
+        &self,
+        event: &TelemetryEvent,
+        received_at: DateTime<Utc>,
+        topic: &str,
+    ) -> Result<bool, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.write_telemetry(event, received_at, topic).await?),
+            Self::Timescale(pool) => {
+                let sequence = i64::try_from(event.sequence)
+                    .map_err(|_| PlatformStoreError::TelemetrySequenceOverflow)?;
+                let mut transaction = pool.begin().await?;
+                sqlx::query(
+                    "INSERT INTO device_runtime_state (device_id, last_seen_at)
+                     VALUES ($1, $2)
+                     ON CONFLICT (device_id)
+                     DO UPDATE SET last_seen_at = GREATEST(
+                         COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
+                         EXCLUDED.last_seen_at
+                     )",
+                )
+                .bind(&event.device_id)
+                .bind(received_at)
+                .execute(&mut *transaction)
+                .await?;
+
+                let result = sqlx::query(
+                    "INSERT INTO telemetry (
+                        event_at, received_at, device_id, boot_id, sequence, measurements, topic,
+                        gateway_device_id
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (event_at, device_id, boot_id, sequence) DO NOTHING",
+                )
+                .bind(event.event_at)
+                .bind(received_at)
+                .bind(&event.device_id)
+                .bind(event.boot_id)
+                .bind(sequence)
+                .bind(Json(serde_json::Value::Object(event.measurements.clone())))
+                .bind(topic)
+                .bind(&event.gateway_device_id)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                Ok(result.rows_affected() == 1)
+            }
+        }
+    }
+
+    pub async fn backup_sqlite(&self) -> Result<PathBuf, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.backup().await?),
+            Self::Timescale(_) => Err(PlatformStoreError::BackupUnsupported),
+        }
+    }
+}
+
+impl TopologyRepository for PlatformStore {
+    fn register_device<'a>(
+        &'a self,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>> {
+        Box::pin(async move { PlatformStore::register_device(self, device_id).await })
+    }
+}
+
+impl CommandRepository for PlatformStore {
+    fn enqueue_command<'a>(
+        &'a self,
+        command: NewCommandOutboxEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandOutboxRecord, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { PlatformStore::enqueue_command(self, command).await })
+    }
+}
+
+impl TelemetryRepository for PlatformStore {
+    fn write_telemetry<'a>(
+        &'a self,
+        event: &'a TelemetryEvent,
+        received_at: DateTime<Utc>,
+        topic: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>> {
+        Box::pin(
+            async move { PlatformStore::write_telemetry(self, event, received_at, topic).await },
+        )
+    }
 }
 
 async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
@@ -423,6 +595,30 @@ async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(&mut *transaction)
         .await?;
     transaction.commit().await
+}
+
+fn postgres_command_outbox_record(row: PgRow) -> Result<CommandOutboxRecord, PlatformStoreError> {
+    Ok(CommandOutboxRecord {
+        id: row.try_get::<uuid::Uuid, _>("id")?.to_string(),
+        device_id: row.try_get("device_id")?,
+        method: row.try_get("method")?,
+        params: row
+            .try_get::<Json<serde_json::Value>, _>("params")?
+            .0
+            .to_string(),
+        mode: command_mode_from_database(&row.try_get::<String, _>("mode")?)?,
+        state: CommandOutboxState::from_database(&row.try_get::<String, _>("state")?)?,
+        expires_at: row.try_get("expires_at")?,
+        next_attempt_at: row.try_get("next_attempt_at")?,
+        lease_until: row.try_get("lease_until")?,
+        attempt_count: i64::from(row.try_get::<i32, _>("attempt_count")?),
+        last_error: row.try_get("last_error")?,
+        published_at: row.try_get("published_at")?,
+        response: row
+            .try_get::<Option<Json<serde_json::Value>>, _>("response")?
+            .map(|response| response.0.to_string()),
+        responded_at: row.try_get("responded_at")?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,11 +719,35 @@ impl SqliteStore {
         sqlx::raw_sql(SQLITE_SCHEMA).execute(&pool).await?;
         migrate_command_outbox_schema(&pool).await?;
         migrate_resource_authorization_schema(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            path: path.clone(),
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub async fn backup(&self) -> Result<PathBuf, SqliteStoreError> {
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(SqliteStoreError::InvalidConfiguration)?;
+        let backup_name = format!(
+            "{file_name}.backup-{}",
+            Utc::now().format("%Y%m%dT%H%M%S%fZ")
+        );
+        let backup_path = self.path.with_file_name(backup_name);
+
+        sqlx::query("VACUUM INTO ?")
+            .bind(backup_path.to_string_lossy().as_ref())
+            .execute(&self.pool)
+            .await?;
+        #[cfg(unix)]
+        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
+        Ok(backup_path)
     }
 
     pub async fn enqueue_command(
