@@ -6,7 +6,10 @@ use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 use std::os::unix::fs::PermissionsExt;
 
 use chrono::{DateTime, TimeZone, Timelike, Utc};
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
+use iot_core::{
+    DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent, device_token_prefix,
+    verify_device_token,
+};
 use sqlx::{
     Executor, PgPool, Postgres, Row, Sqlite, SqlitePool, Transaction,
     postgres::{PgPoolOptions, PgRow},
@@ -359,6 +362,8 @@ pub enum PlatformStoreError {
     CommandConflict(String),
     #[error("device is not registered: {0:?}")]
     UnknownDevice(String),
+    #[error("device token authentication denied")]
+    DeviceTokenDenied,
     #[error("telemetry sequence does not fit PostgreSQL BIGINT")]
     TelemetrySequenceOverflow,
     #[error("filesystem backups are available only for SQLite platform storage")]
@@ -370,6 +375,23 @@ pub trait TopologyRepository: Send + Sync {
         &'a self,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDeviceToken {
+    pub token_id: uuid::Uuid,
+    pub device_id: String,
+    pub is_gateway: bool,
+    pub gateway_device_id: Option<String>,
+}
+
+pub trait IdentityRepository: Send + Sync {
+    fn resolve_active_device_token<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<AuthenticatedDeviceToken, PlatformStoreError>> + Send + 'a>,
+    >;
 }
 
 pub trait CommandRepository: Send + Sync {
@@ -451,6 +473,115 @@ impl PlatformStore {
             }
         }
         Ok(())
+    }
+
+    pub async fn resolve_active_device_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedDeviceToken, PlatformStoreError> {
+        let token_prefix =
+            device_token_prefix(token).map_err(|_| PlatformStoreError::DeviceTokenDenied)?;
+        let last_used_at = Utc::now();
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin().await?;
+                let row = sqlx::query(
+                    "SELECT device_tokens.id, device_tokens.device_id, device_tokens.token_hash,
+                            devices.is_gateway, devices.gateway_device_id
+                     FROM device_tokens
+                     JOIN devices ON devices.device_id = device_tokens.device_id
+                     WHERE device_tokens.token_prefix = ?
+                       AND device_tokens.revoked_at IS NULL
+                       AND devices.deleted_at IS NULL",
+                )
+                .bind(token_prefix)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(PlatformStoreError::DeviceTokenDenied)?;
+
+                let token_hash = row.try_get::<String, _>("token_hash")?;
+                if !verify_device_token(token, &token_hash).unwrap_or(false) {
+                    return Err(PlatformStoreError::DeviceTokenDenied);
+                }
+                let authenticated = AuthenticatedDeviceToken {
+                    token_id: uuid::Uuid::parse_str(&row.try_get::<String, _>("id")?)
+                        .map_err(|_| PlatformStoreError::DeviceTokenDenied)?,
+                    device_id: row.try_get("device_id")?,
+                    is_gateway: row.try_get::<i64, _>("is_gateway")? != 0,
+                    gateway_device_id: row.try_get("gateway_device_id")?,
+                };
+                let updated = sqlx::query(
+                    "UPDATE device_tokens
+                     SET last_used_at = ?
+                     WHERE id = ?
+                       AND revoked_at IS NULL
+                       AND EXISTS (
+                           SELECT 1
+                           FROM devices
+                           WHERE devices.device_id = device_tokens.device_id
+                             AND devices.deleted_at IS NULL
+                       )",
+                )
+                .bind(last_used_at.to_rfc3339())
+                .bind(authenticated.token_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(PlatformStoreError::DeviceTokenDenied);
+                }
+                transaction.commit().await?;
+                Ok(authenticated)
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                let row = sqlx::query(
+                    "SELECT device_tokens.id, device_tokens.device_id, device_tokens.token_hash,
+                            devices.is_gateway, devices.gateway_device_id
+                     FROM device_tokens
+                     JOIN devices ON devices.device_id = device_tokens.device_id
+                     WHERE device_tokens.token_prefix = $1
+                       AND device_tokens.revoked_at IS NULL
+                       AND devices.deleted_at IS NULL
+                     FOR UPDATE OF device_tokens, devices",
+                )
+                .bind(token_prefix)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(PlatformStoreError::DeviceTokenDenied)?;
+
+                let token_hash = row.try_get::<String, _>("token_hash")?;
+                if !verify_device_token(token, &token_hash).unwrap_or(false) {
+                    return Err(PlatformStoreError::DeviceTokenDenied);
+                }
+                let authenticated = AuthenticatedDeviceToken {
+                    token_id: row.try_get("id")?,
+                    device_id: row.try_get("device_id")?,
+                    is_gateway: row.try_get("is_gateway")?,
+                    gateway_device_id: row.try_get("gateway_device_id")?,
+                };
+                let updated = sqlx::query(
+                    "UPDATE device_tokens
+                     SET last_used_at = $1
+                       WHERE id = $2
+                       AND revoked_at IS NULL
+                       AND EXISTS (
+                           SELECT 1
+                           FROM devices
+                           WHERE devices.device_id = device_tokens.device_id
+                             AND devices.deleted_at IS NULL
+                       )",
+                )
+                .bind(last_used_at)
+                .bind(authenticated.token_id)
+                .execute(&mut *transaction)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(PlatformStoreError::DeviceTokenDenied);
+                }
+                transaction.commit().await?;
+                Ok(authenticated)
+            }
+        }
     }
 
     pub async fn enqueue_command(
@@ -705,6 +836,17 @@ impl TopologyRepository for PlatformStore {
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>> {
         Box::pin(async move { PlatformStore::register_device(self, device_id).await })
+    }
+}
+
+impl IdentityRepository for PlatformStore {
+    fn resolve_active_device_token<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<AuthenticatedDeviceToken, PlatformStoreError>> + Send + 'a>,
+    > {
+        Box::pin(async move { PlatformStore::resolve_active_device_token(self, token).await })
     }
 }
 
