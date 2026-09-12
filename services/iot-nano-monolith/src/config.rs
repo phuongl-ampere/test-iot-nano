@@ -60,44 +60,8 @@ const MAX_BUSY_TIMEOUT_MS: u64 = 60_000;
 const MAX_SHUTDOWN_DEADLINE_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlatformStorage {
-    Sqlite { path: PathBuf, busy_timeout_ms: u64 },
-    Timescale { database_url: String },
-}
-
-impl PlatformStorage {
-    pub const fn is_sqlite(&self) -> bool {
-        matches!(self, Self::Sqlite { .. })
-    }
-
-    pub const fn is_timescale(&self) -> bool {
-        matches!(self, Self::Timescale { .. })
-    }
-
-    pub fn as_legacy_storage_configuration(&self) -> StorageConfiguration {
-        match self {
-            Self::Sqlite {
-                path,
-                busy_timeout_ms,
-            } => StorageConfiguration {
-                storage: DatabaseStorage::Sqlite,
-                database_url: None,
-                sqlite_path: Some(path.clone()),
-                sqlite_busy_timeout_ms: *busy_timeout_ms,
-            },
-            Self::Timescale { database_url } => StorageConfiguration {
-                storage: DatabaseStorage::Timescale,
-                database_url: Some(database_url.clone()),
-                sqlite_path: None,
-                sqlite_busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonolithConfig {
-    pub storage: PlatformStorage,
+    pub storage: StorageConfiguration,
     pub internal_dir: PathBuf,
     pub public_http: SocketAddr,
     pub management_http: SocketAddr,
@@ -170,7 +134,7 @@ pub fn validate_retired_environment(values: &BTreeMap<String, String>) -> Result
         .unwrap_or(Ok(()))
 }
 
-fn parse_storage(values: &BTreeMap<String, String>) -> Result<PlatformStorage, ConfigError> {
+fn parse_storage(values: &BTreeMap<String, String>) -> Result<StorageConfiguration, ConfigError> {
     let storage = values
         .get("IOT_NANO_STORAGE")
         .filter(|value| !value.trim().is_empty())
@@ -178,7 +142,7 @@ fn parse_storage(values: &BTreeMap<String, String>) -> Result<PlatformStorage, C
 
     match storage.as_str() {
         "sqlite" => {
-            if has_value(values, "DATABASE_URL") {
+            if values.contains_key("DATABASE_URL") {
                 return Err(ConfigError::ContradictoryStorage(
                     "DATABASE_URL is not valid with IOT_NANO_STORAGE=sqlite".to_owned(),
                 ));
@@ -190,13 +154,15 @@ fn parse_storage(values: &BTreeMap<String, String>) -> Result<PlatformStorage, C
                 DEFAULT_BUSY_TIMEOUT_MS,
                 MAX_BUSY_TIMEOUT_MS,
             )?;
-            Ok(PlatformStorage::Sqlite {
-                path,
-                busy_timeout_ms,
+            Ok(StorageConfiguration {
+                storage: DatabaseStorage::Sqlite,
+                database_url: None,
+                sqlite_path: Some(path),
+                sqlite_busy_timeout_ms: busy_timeout_ms,
             })
         }
         "timescale" => {
-            if has_value(values, "IOT_NANO_SQLITE_PATH") {
+            if values.contains_key("IOT_NANO_SQLITE_PATH") {
                 return Err(ConfigError::ContradictoryStorage(
                     "IOT_NANO_SQLITE_PATH is not valid with IOT_NANO_STORAGE=timescale".to_owned(),
                 ));
@@ -206,16 +172,15 @@ fn parse_storage(values: &BTreeMap<String, String>) -> Result<PlatformStorage, C
                 .filter(|value| !value.trim().is_empty())
                 .cloned()
                 .ok_or(ConfigError::MissingDatabaseUrl)?;
-            Ok(PlatformStorage::Timescale { database_url })
+            Ok(StorageConfiguration {
+                storage: DatabaseStorage::Timescale,
+                database_url: Some(database_url),
+                sqlite_path: None,
+                sqlite_busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
+            })
         }
         value => Err(ConfigError::UnsupportedStorage(value.to_owned())),
     }
-}
-
-fn has_value(values: &BTreeMap<String, String>, name: &str) -> bool {
-    values
-        .get(name)
-        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn absolute_path(
@@ -264,9 +229,9 @@ fn socket_address(
 fn validate_unique_addresses(
     addresses: impl IntoIterator<Item = SocketAddr>,
 ) -> Result<(), ConfigError> {
-    let mut seen = BTreeSet::new();
+    let mut seen_ports = BTreeSet::new();
     for address in addresses {
-        if !seen.insert(address) {
+        if !seen_ports.insert(address.port()) {
             return Err(ConfigError::DuplicateListenerAddress(address));
         }
     }

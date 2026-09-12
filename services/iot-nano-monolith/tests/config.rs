@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-use iot_nano_monolith::{ConfigError, MonolithConfig, RETIRED_ENVIRONMENT_NAMES};
+use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_monolith::{
+    ConfigError, MonolithConfig, RETIRED_ENVIRONMENT_NAMES, validate_retired_environment,
+};
 
 fn values(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -33,15 +36,22 @@ fn timescale_values() -> BTreeMap<String, String> {
 #[test]
 fn config_accepts_only_complete_sqlite_or_timescale_storage() {
     let sqlite = MonolithConfig::from_values(sqlite_values()).unwrap();
-    assert!(sqlite.storage.is_sqlite());
+    accepts_storage_configuration(&sqlite.storage);
+    assert!(matches!(sqlite.storage.storage, DatabaseStorage::Sqlite));
     assert_eq!(
         sqlite.internal_dir,
         std::path::PathBuf::from("/var/lib/iot-nano/internal")
     );
 
     let timescale = MonolithConfig::from_values(timescale_values()).unwrap();
-    assert!(timescale.storage.is_timescale());
+    accepts_storage_configuration(&timescale.storage);
+    assert!(matches!(
+        timescale.storage.storage,
+        DatabaseStorage::Timescale
+    ));
 }
+
+fn accepts_storage_configuration(_: &StorageConfiguration) {}
 
 #[test]
 fn config_rejects_incomplete_or_contradictory_storage() {
@@ -65,6 +75,13 @@ fn config_rejects_incomplete_or_contradictory_storage() {
         Err(ConfigError::ContradictoryStorage(_))
     ));
 
+    let mut sqlite_with_empty_database = sqlite_values();
+    sqlite_with_empty_database.insert("DATABASE_URL".to_owned(), String::new());
+    assert!(matches!(
+        MonolithConfig::from_values(sqlite_with_empty_database),
+        Err(ConfigError::ContradictoryStorage(_))
+    ));
+
     let mut timescale_with_sqlite = timescale_values();
     timescale_with_sqlite.insert(
         "IOT_NANO_SQLITE_PATH".to_owned(),
@@ -72,6 +89,13 @@ fn config_rejects_incomplete_or_contradictory_storage() {
     );
     assert!(matches!(
         MonolithConfig::from_values(timescale_with_sqlite),
+        Err(ConfigError::ContradictoryStorage(_))
+    ));
+
+    let mut timescale_with_empty_sqlite_path = timescale_values();
+    timescale_with_empty_sqlite_path.insert("IOT_NANO_SQLITE_PATH".to_owned(), String::new());
+    assert!(matches!(
+        MonolithConfig::from_values(timescale_with_empty_sqlite_path),
         Err(ConfigError::ContradictoryStorage(_))
     ));
 }
@@ -108,6 +132,20 @@ fn config_rejects_unsafe_paths_incomplete_tls_and_duplicate_listener_addresses()
         MonolithConfig::from_values(duplicate_addresses),
         Err(ConfigError::DuplicateListenerAddress(_))
     ));
+
+    let mut conflicting_port = sqlite_values();
+    conflicting_port.insert(
+        "IOT_NANO_PUBLIC_HTTP_ADDRESS".to_owned(),
+        "0.0.0.0:8080".to_owned(),
+    );
+    conflicting_port.insert(
+        "IOT_NANO_MANAGEMENT_ADDRESS".to_owned(),
+        "127.0.0.1:8080".to_owned(),
+    );
+    assert!(matches!(
+        MonolithConfig::from_values(conflicting_port),
+        Err(ConfigError::DuplicateListenerAddress(_))
+    ));
 }
 
 #[test]
@@ -124,6 +162,20 @@ fn config_rejects_every_retired_internal_service_environment_variable() {
             "expected {name} to be rejected"
         );
     }
+}
+
+#[test]
+fn retired_environment_validator_is_publicly_re_exported() {
+    let mut configuration = sqlite_values();
+    configuration.insert(
+        "IOT_NANO_API_CORE_SECRET".to_owned(),
+        "retired-value".to_owned(),
+    );
+
+    assert!(matches!(
+        validate_retired_environment(&configuration),
+        Err(ConfigError::RetiredEnvironment(name)) if name == "IOT_NANO_API_CORE_SECRET"
+    ));
 }
 
 #[test]
