@@ -8,10 +8,16 @@ use std::os::unix::fs::PermissionsExt;
 use chrono::{DateTime, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use sqlx::{
-    Row, Sqlite, SqlitePool, Transaction,
+    PgPool, Row, Sqlite, SqlitePool, Transaction,
+    postgres::PgPoolOptions,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 use thiserror::Error;
+
+const API_POSTGRES_SCHEMA: &str =
+    include_str!("../../../services/iot-nano-api/migrations/0001_api.sql");
+const CORE_POSTGRES_SCHEMA: &str =
+    include_str!("../../../services/iot-nano-core/migrations/0001_core.sql");
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS devices (
@@ -330,6 +336,76 @@ CREATE INDEX IF NOT EXISTS command_outbox_due_index
 #[derive(Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+}
+
+#[derive(Clone)]
+pub enum PlatformStore {
+    Sqlite(SqliteStore),
+    Timescale(PgPool),
+}
+
+#[derive(Debug, Error)]
+pub enum PlatformStoreError {
+    #[error("platform storage configuration is incomplete")]
+    InvalidConfiguration,
+    #[error(transparent)]
+    Sqlite(#[from] SqliteStoreError),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+impl PlatformStore {
+    pub async fn open(configuration: &StorageConfiguration) -> Result<Self, PlatformStoreError> {
+        match configuration.storage {
+            DatabaseStorage::Sqlite => Ok(Self::Sqlite(SqliteStore::open(configuration).await?)),
+            DatabaseStorage::Timescale => {
+                let database_url = configuration
+                    .database_url
+                    .as_deref()
+                    .ok_or(PlatformStoreError::InvalidConfiguration)?;
+                let pool = PgPoolOptions::new()
+                    .max_connections(8)
+                    .connect(database_url)
+                    .await?;
+                migrate_platform_timescale(&pool).await?;
+                Ok(Self::Timescale(pool))
+            }
+        }
+    }
+
+    pub fn sqlite_pool(&self) -> Option<&SqlitePool> {
+        match self {
+            Self::Sqlite(store) => Some(store.pool()),
+            Self::Timescale(_) => None,
+        }
+    }
+
+    pub fn timescale_pool(&self) -> Option<&PgPool> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Timescale(pool) => Some(pool),
+        }
+    }
+}
+
+async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('iot_nano:migrate'))")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS iot_nano")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("SET LOCAL search_path TO iot_nano, public")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::raw_sql(API_POSTGRES_SCHEMA)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::raw_sql(CORE_POSTGRES_SCHEMA)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
