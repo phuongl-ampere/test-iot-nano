@@ -107,6 +107,7 @@ fn write_semantically_corrupt_mqttd_sqlite(path: &Path) {
             rusqlite::params!["devices/meter-a/state", b"not JSON".as_slice(), now_ms],
         )
         .unwrap();
+    set_owner_only_mode(path);
 }
 
 fn write_semantically_corrupt_cache_sqlite(path: &Path) {
@@ -122,7 +123,18 @@ fn write_semantically_corrupt_cache_sqlite(path: &Path) {
             ",
         )
         .unwrap();
+    set_owner_only_mode(path);
 }
+
+#[cfg(unix)]
+fn set_owner_only_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_mode(_path: &Path) {}
 
 async fn prepare_internal_state(fixture: &Fixture) {
     let mut runtime = MonolithRuntime::start(fixture.config()).await.unwrap();
@@ -332,6 +344,29 @@ async fn semantic_cache_recovery_failure_prevents_readiness() {
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_existing_cache_mode_prevents_runtime_startup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::sqlite().await;
+    prepare_internal_state(&fixture).await;
+    let cache_path = fixture.internal_path("cache.sqlite");
+    std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let error = match MonolithRuntime::start(fixture.config()).await {
+        Ok(_) => panic!("unsafe cache mode unexpectedly started a runtime"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, StartupError::InternalDirectory(_)));
+    assert_eq!(
+        cache_path.metadata().unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    fixture.assert_configured_addresses_are_unbound().await;
 }
 
 #[cfg(unix)]

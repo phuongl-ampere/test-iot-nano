@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::Path,
+    fs::File,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,6 +44,7 @@ pub enum CacheError {
 }
 
 struct CacheState {
+    _state_file: File,
     connection: Connection,
     hot: HashMap<String, CacheEntry>,
     recency: VecDeque<String>,
@@ -51,7 +53,17 @@ struct CacheState {
 impl PersistentCache {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, CacheError> {
         let path = path.as_ref().to_path_buf();
-        let state = tokio::task::spawn_blocking(move || CacheState::open(&path))
+        let state = tokio::task::spawn_blocking(move || CacheState::open_path(path))
+            .await
+            .map_err(|error| CacheError::Task(error.to_string()))??;
+
+        Ok(Self {
+            state: Arc::new(Mutex::new(state)),
+        })
+    }
+
+    pub(crate) async fn open_file(file: File, path: PathBuf) -> Result<Self, CacheError> {
+        let state = tokio::task::spawn_blocking(move || CacheState::open_file(file, path))
             .await
             .map_err(|error| CacheError::Task(error.to_string()))??;
 
@@ -100,11 +112,19 @@ impl PersistentCache {
 }
 
 impl CacheState {
-    fn open(path: &Path) -> Result<Self, CacheError> {
-        prepare_cache_file(path)?;
+    fn open_path(path: PathBuf) -> Result<Self, CacheError> {
+        let file = open_cache_file(&path)?;
+        let path = std::fs::canonicalize(path)?;
+        Self::open_file(file, path)
+    }
+
+    fn open_file(file: File, path: PathBuf) -> Result<Self, CacheError> {
+        validate_cache_file(&file)?;
         let connection = Connection::open_with_flags(
             path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         connection.execute_batch(
             "
@@ -120,6 +140,8 @@ impl CacheState {
             ",
         )?;
 
+        validate_cache_schema(&connection)?;
+
         let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
         if integrity != "ok" {
             return Err(CacheError::InvalidState(format!(
@@ -127,23 +149,15 @@ impl CacheState {
             )));
         }
 
+        validate_cache_entries(&connection)?;
         let now_ms = current_time_ms()?;
         connection.execute(
             "DELETE FROM cache_entries WHERE expires_at_ms <= ?1",
             params![now_ms],
         )?;
-        let has_empty_key: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cache_entries WHERE key = '')",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_empty_key {
-            return Err(CacheError::InvalidState(
-                "cache entries cannot have empty keys".to_owned(),
-            ));
-        }
 
         Ok(Self {
+            _state_file: file,
             connection,
             hot: HashMap::new(),
             recency: VecDeque::new(),
@@ -272,59 +286,172 @@ fn current_time_ms() -> Result<i64, CacheError> {
     i64::try_from(duration.as_millis()).map_err(|_| CacheError::InvalidExpiration)
 }
 
-fn prepare_cache_file(path: &Path) -> Result<(), CacheError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(CacheError::InvalidState(format!(
-                    "cache path is not a regular file: {}",
-                    path.display()
-                )));
-            }
-            ensure_cache_file_owner_only(path, &metadata)?;
+fn validate_cache_schema(connection: &Connection) -> Result<(), CacheError> {
+    let schema: Option<String> = connection
+        .query_row(
+            "
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'cache_entries'
+            ",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let schema = schema
+        .ok_or_else(|| CacheError::InvalidState("cache_entries table is missing".to_owned()))?;
+    let normalized = schema
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    for required in [
+        "keytextprimarykeynotnullcheck(key<>'')",
+        "valueblobnotnull",
+        "expires_at_msintegernotnullcheck(expires_at_ms>=0)",
+    ] {
+        if !normalized.contains(required) {
+            return Err(CacheError::InvalidState(
+                "cache_entries schema does not enforce the required invariants".to_owned(),
+            ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_cache_file(path)?,
-        Err(error) => return Err(CacheError::Io(error)),
+    }
+
+    let columns = connection
+        .prepare("PRAGMA table_info(cache_entries)")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns
+        != [
+            ("key".to_owned(), "TEXT".to_owned(), 1, 1),
+            ("value".to_owned(), "BLOB".to_owned(), 1, 0),
+            ("expires_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+        ]
+    {
+        return Err(CacheError::InvalidState(
+            "cache_entries columns are invalid".to_owned(),
+        ));
+    }
+
+    let has_expiry_index: bool = connection.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'cache_entries_expiry'
+              AND tbl_name = 'cache_entries'
+        )
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_expiry_index {
+        return Err(CacheError::InvalidState(
+            "cache expiration index is missing".to_owned(),
+        ));
     }
     Ok(())
 }
 
-fn create_cache_file(path: &Path) -> Result<(), CacheError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.mode(0o600);
+fn validate_cache_entries(connection: &Connection) -> Result<(), CacheError> {
+    let has_invalid_entry: bool = connection.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM cache_entries
+            WHERE key = ''
+               OR typeof(value) <> 'blob'
+               OR typeof(expires_at_ms) <> 'integer'
+               OR expires_at_ms < 0
+        )
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_invalid_entry {
+        return Err(CacheError::InvalidState(
+            "cache entries violate the required invariants".to_owned(),
+        ));
     }
-    drop(options.open(path)?);
     Ok(())
 }
 
 #[cfg(unix)]
-fn ensure_cache_file_owner_only(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-) -> Result<(), CacheError> {
-    use std::os::unix::fs::MetadataExt;
+fn open_cache_file(path: &Path) -> Result<File, CacheError> {
+    use rustix::{
+        fs::{Mode, OFlags, fchmod, openat},
+        io::Errno,
+    };
 
-    let current_uid = rustix::process::geteuid().as_raw();
-    let mode = metadata.mode() & 0o777;
-    if metadata.uid() != current_uid || mode != 0o600 {
-        return Err(CacheError::InvalidState(format!(
-            "cache file must be owned by the service user with mode 0600: {}",
-            path.display()
-        )));
+    let (file, created) = loop {
+        match openat(
+            rustix::fs::CWD,
+            path,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(file) => break (file, false),
+            Err(Errno::NOENT) => match openat(
+                rustix::fs::CWD,
+                path,
+                OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::from(0o600),
+            ) {
+                Ok(file) => break (file, true),
+                Err(Errno::EXIST) => continue,
+                Err(error) => return Err(CacheError::Io(error.into())),
+            },
+            Err(error) => return Err(CacheError::Io(error.into())),
+        }
+    };
+    if created {
+        fchmod(&file, Mode::from(0o600)).map_err(std::io::Error::from)?;
     }
-    Ok(())
+    let file = File::from(file);
+    validate_cache_file(&file)?;
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn ensure_cache_file_owner_only(
-    _path: &Path,
-    _metadata: &std::fs::Metadata,
-) -> Result<(), CacheError> {
+fn open_cache_file(path: &Path) -> Result<File, CacheError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    validate_cache_file(&file)?;
+    Ok(file)
+}
+
+fn validate_cache_file(file: &File) -> Result<(), CacheError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(CacheError::InvalidState(
+            "cache path is not a regular file".to_owned(),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let current_uid = rustix::process::geteuid().as_raw();
+        let mode = metadata.mode() & 0o777;
+        if metadata.uid() != current_uid || mode != 0o600 || metadata.nlink() != 1 {
+            return Err(CacheError::InvalidState(
+                "cache file must be owner-only with no additional hard links".to_owned(),
+            ));
+        }
+    }
+
     Ok(())
 }
 

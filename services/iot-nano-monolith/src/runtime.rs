@@ -53,11 +53,14 @@ impl MonolithRuntime {
                 .map_err(|error| StartupError::MqttStorageTask(error.to_string()))?
                 .map_err(StartupError::MqttStorage)?,
         );
+        let cache_file = internal_directory
+            .open_state_file("cache.sqlite")
+            .map_err(StartupError::InternalDirectory)?;
         let cache_path = internal_directory
-            .prepare_state_file("cache.sqlite")
+            .state_path("cache.sqlite")
             .map_err(StartupError::InternalDirectory)?;
         let cache = Arc::new(
-            PersistentCache::open(cache_path)
+            PersistentCache::open_file(cache_file, cache_path)
                 .await
                 .map_err(StartupError::CacheRecovery)?,
         );
@@ -196,19 +199,49 @@ impl InternalDirectory {
     #[cfg(unix)]
     fn open_state_file(&self, name: &str) -> io::Result<File> {
         use rustix::{
-            fs::{Mode, OFlags, fchmod, openat},
+            fs::{Mode, OFlags, fchmod, fstat, openat},
+            io::Errno,
             process::geteuid,
         };
 
-        let file = openat(
-            &self.directory,
-            name,
-            OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::from(0o600),
-        )
-        .map_err(io::Error::from)?;
-        ensure_owned_regular_file(&file, &self.path.join(name), geteuid().as_raw())?;
-        fchmod(&file, Mode::from(0o600)).map_err(io::Error::from)?;
+        let (file, created) = loop {
+            match openat(
+                &self.directory,
+                name,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(file) => break (file, false),
+                Err(Errno::NOENT) => match openat(
+                    &self.directory,
+                    name,
+                    OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::RDWR
+                        | OFlags::CLOEXEC
+                        | OFlags::NOFOLLOW,
+                    Mode::from(0o600),
+                ) {
+                    Ok(file) => break (file, true),
+                    Err(Errno::EXIST) => continue,
+                    Err(error) => return Err(error.into()),
+                },
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let path = self.path.join(name);
+        ensure_owned_regular_file(&file, &path, geteuid().as_raw())?;
+        if created {
+            fchmod(&file, Mode::from(0o600)).map_err(io::Error::from)?;
+        } else if fstat(&file).map_err(io::Error::from)?.st_mode as u32 & 0o777 != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "internal state file must retain owner-only permissions: {}",
+                    path.display()
+                ),
+            ));
+        }
         Ok(File::from(file))
     }
 
@@ -590,6 +623,8 @@ fn recover_mqtt_storage(path: PathBuf) -> Result<SqliteStorage, iot_nano_mqttd::
 
 #[cfg(all(test, unix))]
 mod tests {
+    use crate::{CacheError, PersistentCache};
+
     use super::prepare_internal_directory_unix;
 
     #[test]
@@ -614,5 +649,26 @@ mod tests {
             b"anchored"
         );
         assert!(!parent.join("internal/stream.sqlite").exists());
+    }
+
+    #[tokio::test]
+    async fn cache_open_rejects_a_symlink_replacing_the_validated_state_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let internal = parent.join("internal");
+        std::fs::create_dir(&parent).unwrap();
+        let directory = prepare_internal_directory_unix(&internal).unwrap();
+        let cache_file = directory.open_state_file("cache.sqlite").unwrap();
+        let cache_path = directory.state_path("cache.sqlite").unwrap();
+
+        let original = internal.join("original-cache.sqlite");
+        std::fs::rename(internal.join("cache.sqlite"), &original).unwrap();
+        std::os::unix::fs::symlink(&original, internal.join("cache.sqlite")).unwrap();
+
+        assert!(matches!(
+            PersistentCache::open_file(cache_file, cache_path).await,
+            Err(CacheError::Sqlite(_))
+        ));
     }
 }
