@@ -8,7 +8,7 @@ use iot_api::{
 use iot_core::{
     DatabaseStorage, RpcMode, StorageConfiguration, generate_device_token, hash_device_token,
 };
-use iot_nano_core::{CoreControlState, core_control_router};
+use iot_nano_core::{CoreControlState, CoreSqliteStore, core_control_router};
 use iot_storage::SqliteStore;
 use serde_json::json;
 use sqlx::Row;
@@ -29,11 +29,22 @@ async fn sqlite_store(path: std::path::PathBuf) -> SqliteStore {
     .unwrap()
 }
 
+async fn core_sqlite_store(path: std::path::PathBuf) -> CoreSqliteStore {
+    CoreSqliteStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(path),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn public_api_creates_commands_in_the_separate_core_database() {
     let directory = tempfile::tempdir().unwrap();
     let api_store = sqlite_store(directory.path().join("api.db")).await;
-    let core_store = sqlite_store(directory.path().join("core.db")).await;
+    let core_store = core_sqlite_store(directory.path().join("core.db")).await;
     bootstrap_users_sqlite(api_store.pool()).await.unwrap();
     sqlx::query("INSERT INTO devices (device_id) VALUES ('api-core-device')")
         .execute(api_store.pool())
@@ -110,7 +121,7 @@ async fn public_api_creates_commands_in_the_separate_core_database() {
 async fn transport_response_is_authorized_by_api_and_recorded_in_core() {
     let directory = tempfile::tempdir().unwrap();
     let api_store = sqlite_store(directory.path().join("api.db")).await;
-    let core_store = sqlite_store(directory.path().join("core.db")).await;
+    let core_store = core_sqlite_store(directory.path().join("core.db")).await;
     sqlx::query("INSERT INTO devices (device_id) VALUES ('response-device')")
         .execute(api_store.pool())
         .await
