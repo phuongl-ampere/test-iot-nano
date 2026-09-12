@@ -130,6 +130,21 @@ CREATE TABLE IF NOT EXISTS user_app_grants (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, app_key)
 );
+CREATE TABLE IF NOT EXISTS applications (
+    app_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('frontend', 'full_stack')),
+    launch_url TEXT NOT NULL,
+    client_id TEXT NOT NULL UNIQUE,
+    allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS application_redirect_uris (
+    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    redirect_uri TEXT NOT NULL,
+    PRIMARY KEY (app_id, redirect_uri)
+);
+CREATE INDEX IF NOT EXISTS application_redirect_uris_lookup_index
+    ON application_redirect_uris (app_id, redirect_uri);
 
 CREATE TABLE IF NOT EXISTS asset_profiles (
     id TEXT PRIMARY KEY,
@@ -381,6 +396,174 @@ pub enum PlatformStoreError {
     TelemetrySequenceOverflow,
     #[error("filesystem backups are available only for SQLite platform storage")]
     BackupUnsupported,
+    #[error("invalid application ID: {0:?}")]
+    InvalidApplicationId(String),
+    #[error("invalid application kind: {0:?}")]
+    InvalidApplicationKind(String),
+    #[error("application launch URL must not be empty")]
+    EmptyApplicationLaunchUrl,
+    #[error("application client ID must not be empty")]
+    EmptyApplicationClientId,
+    #[error("application redirect URI must not be empty")]
+    EmptyApplicationRedirectUri,
+    #[error("application redirect URI is duplicated: {0:?}")]
+    DuplicateApplicationRedirectUri(String),
+    #[error("application scope must not be empty")]
+    EmptyApplicationScope,
+    #[error("application scopes are invalid")]
+    InvalidApplicationScopes,
+    #[error("application is disabled: {0}")]
+    ApplicationDisabled(ApplicationId),
+    #[error("application client ID is already registered: {0:?}")]
+    ApplicationClientIdConflict(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ApplicationId(String);
+
+impl ApplicationId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ApplicationId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ApplicationId {
+    type Err = PlatformStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() || value.len() > 64 {
+            return Err(PlatformStoreError::InvalidApplicationId(value.to_owned()));
+        }
+        let valid = value.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_lowercase()
+            } else {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            }
+        });
+        if !valid {
+            return Err(PlatformStoreError::InvalidApplicationId(value.to_owned()));
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationKind {
+    Frontend,
+    FullStack,
+}
+
+impl ApplicationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Frontend => "frontend",
+            Self::FullStack => "full_stack",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, PlatformStoreError> {
+        match value {
+            "frontend" => Ok(Self::Frontend),
+            "full_stack" => Ok(Self::FullStack),
+            _ => Err(PlatformStoreError::InvalidApplicationKind(value.to_owned())),
+        }
+    }
+}
+
+impl std::str::FromStr for ApplicationKind {
+    type Err = PlatformStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientId(String);
+
+impl ClientId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for ClientId {
+    type Err = PlatformStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() {
+            return Err(PlatformStoreError::EmptyApplicationClientId);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RedirectUri(String);
+
+impl RedirectUri {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for RedirectUri {
+    type Err = PlatformStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() {
+            return Err(PlatformStoreError::EmptyApplicationRedirectUri);
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewApplication {
+    pub app_id: ApplicationId,
+    pub kind: ApplicationKind,
+    pub launch_url: String,
+    pub client_id: ClientId,
+    pub redirect_uris: Vec<RedirectUri>,
+    pub allowed_scopes: Vec<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationRecord {
+    pub app_id: ApplicationId,
+    pub kind: ApplicationKind,
+    pub launch_url: String,
+    pub client_id: ClientId,
+    pub redirect_uris: Vec<RedirectUri>,
+    pub allowed_scopes: Vec<String>,
+    pub enabled: bool,
+}
+
+pub trait ApplicationRepository: Send + Sync {
+    fn upsert_application<'a>(
+        &'a self,
+        application: NewApplication,
+    ) -> Pin<Box<dyn Future<Output = Result<ApplicationRecord, PlatformStoreError>> + Send + 'a>>;
+    fn find_application_by_app_id<'a>(
+        &'a self,
+        app_id: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<ApplicationRecord>, PlatformStoreError>> + Send + 'a>,
+    >;
+    fn find_application_by_client_id<'a>(
+        &'a self,
+        client_id: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<ApplicationRecord>, PlatformStoreError>> + Send + 'a>,
+    >;
 }
 
 pub trait TopologyRepository: Send + Sync {
@@ -664,6 +847,241 @@ impl PlatformStore {
             Self::Sqlite(_) => None,
             Self::Timescale(pool) => Some(pool),
         }
+    }
+
+    pub async fn upsert_application(
+        &self,
+        mut application: NewApplication,
+    ) -> Result<ApplicationRecord, PlatformStoreError> {
+        validate_application(&mut application)?;
+        match self {
+            Self::Sqlite(store) => {
+                let conflicting_app_id = sqlx::query_scalar::<_, String>(
+                    "SELECT app_id FROM applications
+                     WHERE client_id = ? AND app_id <> ?",
+                )
+                .bind(application.client_id.as_str())
+                .bind(application.app_id.as_str())
+                .fetch_optional(store.pool())
+                .await?;
+                if conflicting_app_id.is_some() {
+                    return Err(PlatformStoreError::ApplicationClientIdConflict(
+                        application.client_id.as_str().to_owned(),
+                    ));
+                }
+            }
+            Self::Timescale(pool) => {
+                let conflicting_app_id = sqlx::query_scalar::<_, String>(
+                    "SELECT app_id FROM applications
+                     WHERE client_id = $1 AND app_id <> $2",
+                )
+                .bind(application.client_id.as_str())
+                .bind(application.app_id.as_str())
+                .fetch_optional(pool)
+                .await?;
+                if conflicting_app_id.is_some() {
+                    return Err(PlatformStoreError::ApplicationClientIdConflict(
+                        application.client_id.as_str().to_owned(),
+                    ));
+                }
+            }
+        }
+        let scopes = serde_json::to_string(&application.allowed_scopes)
+            .map_err(|_| PlatformStoreError::InvalidApplicationScopes)?;
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin().await?;
+                sqlx::query(
+                    "INSERT INTO applications (
+                        app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     ) VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (app_id) DO UPDATE SET
+                        kind = excluded.kind,
+                        launch_url = excluded.launch_url,
+                        client_id = excluded.client_id,
+                        allowed_scopes_json = excluded.allowed_scopes_json,
+                        enabled = excluded.enabled",
+                )
+                .bind(application.app_id.as_str())
+                .bind(application.kind.as_str())
+                .bind(&application.launch_url)
+                .bind(application.client_id.as_str())
+                .bind(&scopes)
+                .bind(application.enabled)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query("DELETE FROM application_redirect_uris WHERE app_id = ?")
+                    .bind(application.app_id.as_str())
+                    .execute(&mut *transaction)
+                    .await?;
+                for redirect_uri in &application.redirect_uris {
+                    sqlx::query(
+                        "INSERT INTO application_redirect_uris (app_id, redirect_uri)
+                         VALUES (?, ?)",
+                    )
+                    .bind(application.app_id.as_str())
+                    .bind(redirect_uri.as_str())
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                transaction.commit().await?;
+                self.find_application_by_app_id(application.app_id.as_str())
+                    .await?
+                    .ok_or_else(|| {
+                        PlatformStoreError::InvalidApplicationId(
+                            application.app_id.as_str().to_owned(),
+                        )
+                    })
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(
+                    "INSERT INTO applications (
+                        app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                     ON CONFLICT (app_id) DO UPDATE SET
+                        kind = EXCLUDED.kind,
+                        launch_url = EXCLUDED.launch_url,
+                        client_id = EXCLUDED.client_id,
+                        allowed_scopes_json = EXCLUDED.allowed_scopes_json,
+                        enabled = EXCLUDED.enabled",
+                )
+                .bind(application.app_id.as_str())
+                .bind(application.kind.as_str())
+                .bind(&application.launch_url)
+                .bind(application.client_id.as_str())
+                .bind(&scopes)
+                .bind(application.enabled)
+                .execute(&mut *transaction)
+                .await?;
+                sqlx::query("DELETE FROM application_redirect_uris WHERE app_id = $1")
+                    .bind(application.app_id.as_str())
+                    .execute(&mut *transaction)
+                    .await?;
+                for redirect_uri in &application.redirect_uris {
+                    sqlx::query(
+                        "INSERT INTO application_redirect_uris (app_id, redirect_uri)
+                         VALUES ($1, $2)",
+                    )
+                    .bind(application.app_id.as_str())
+                    .bind(redirect_uri.as_str())
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                transaction.commit().await?;
+                self.find_application_by_app_id(application.app_id.as_str())
+                    .await?
+                    .ok_or_else(|| {
+                        PlatformStoreError::InvalidApplicationId(
+                            application.app_id.as_str().to_owned(),
+                        )
+                    })
+            }
+        }
+    }
+
+    pub async fn find_application_by_app_id(
+        &self,
+        app_id: &str,
+    ) -> Result<Option<ApplicationRecord>, PlatformStoreError> {
+        let app_id = app_id.parse::<ApplicationId>()?;
+        match self {
+            Self::Sqlite(store) => {
+                let row = sqlx::query(
+                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     FROM applications WHERE app_id = ?",
+                )
+                .bind(app_id.as_str())
+                .fetch_optional(store.pool())
+                .await?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let redirects = sqlx::query_scalar(
+                    "SELECT redirect_uri FROM application_redirect_uris
+                     WHERE app_id = ? ORDER BY redirect_uri",
+                )
+                .bind(app_id.as_str())
+                .fetch_all(store.pool())
+                .await?;
+                sqlite_application_record(row, redirects).map(Some)
+            }
+            Self::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     FROM applications WHERE app_id = $1",
+                )
+                .bind(app_id.as_str())
+                .fetch_optional(pool)
+                .await?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let redirects = sqlx::query_scalar(
+                    "SELECT redirect_uri FROM application_redirect_uris
+                     WHERE app_id = $1 ORDER BY redirect_uri",
+                )
+                .bind(app_id.as_str())
+                .fetch_all(pool)
+                .await?;
+                postgres_application_record(row, redirects).map(Some)
+            }
+        }
+    }
+
+    pub async fn find_application_by_client_id(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<ApplicationRecord>, PlatformStoreError> {
+        let client_id = client_id.parse::<ClientId>()?;
+        let application = match self {
+            Self::Sqlite(store) => {
+                let row = sqlx::query(
+                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     FROM applications WHERE client_id = ?",
+                )
+                .bind(client_id.as_str())
+                .fetch_optional(store.pool())
+                .await?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let app_id: String = row.try_get("app_id")?;
+                let redirects = sqlx::query_scalar(
+                    "SELECT redirect_uri FROM application_redirect_uris
+                     WHERE app_id = ? ORDER BY redirect_uri",
+                )
+                .bind(&app_id)
+                .fetch_all(store.pool())
+                .await?;
+                sqlite_application_record(row, redirects)?
+            }
+            Self::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     FROM applications WHERE client_id = $1",
+                )
+                .bind(client_id.as_str())
+                .fetch_optional(pool)
+                .await?;
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let app_id: String = row.try_get("app_id")?;
+                let redirects = sqlx::query_scalar(
+                    "SELECT redirect_uri FROM application_redirect_uris
+                     WHERE app_id = $1 ORDER BY redirect_uri",
+                )
+                .bind(&app_id)
+                .fetch_all(pool)
+                .await?;
+                postgres_application_record(row, redirects)?
+            }
+        };
+        if !application.enabled {
+            return Err(PlatformStoreError::ApplicationDisabled(application.app_id));
+        }
+        Ok(Some(application))
     }
 
     pub async fn register_device(&self, device_id: &str) -> Result<(), PlatformStoreError> {
@@ -1873,10 +2291,115 @@ impl NotificationRepository for PlatformStore {
     }
 }
 
+impl ApplicationRepository for PlatformStore {
+    fn upsert_application<'a>(
+        &'a self,
+        application: NewApplication,
+    ) -> Pin<Box<dyn Future<Output = Result<ApplicationRecord, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { PlatformStore::upsert_application(self, application).await })
+    }
+
+    fn find_application_by_app_id<'a>(
+        &'a self,
+        app_id: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<ApplicationRecord>, PlatformStoreError>> + Send + 'a>,
+    > {
+        Box::pin(async move { PlatformStore::find_application_by_app_id(self, app_id).await })
+    }
+
+    fn find_application_by_client_id<'a>(
+        &'a self,
+        client_id: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<ApplicationRecord>, PlatformStoreError>> + Send + 'a>,
+    > {
+        Box::pin(async move { PlatformStore::find_application_by_client_id(self, client_id).await })
+    }
+}
+
 fn strongest_share_permission(rows: Vec<String>) -> Option<ResourcePermission> {
     rows.into_iter()
         .filter_map(|value| ResourcePermission::parse_share(&value))
         .max()
+}
+
+fn validate_application(application: &mut NewApplication) -> Result<(), PlatformStoreError> {
+    if application.launch_url.trim().is_empty() {
+        return Err(PlatformStoreError::EmptyApplicationLaunchUrl);
+    }
+    let mut redirect_uris =
+        std::collections::HashSet::with_capacity(application.redirect_uris.len());
+    for redirect_uri in &application.redirect_uris {
+        if !redirect_uris.insert(redirect_uri.as_str()) {
+            return Err(PlatformStoreError::DuplicateApplicationRedirectUri(
+                redirect_uri.as_str().to_owned(),
+            ));
+        }
+    }
+    for scope in &application.allowed_scopes {
+        if scope.trim().is_empty() {
+            return Err(PlatformStoreError::EmptyApplicationScope);
+        }
+    }
+    application.allowed_scopes.sort();
+    application.allowed_scopes.dedup();
+    Ok(())
+}
+
+fn canonical_application_scopes(scopes: Vec<String>) -> Result<Vec<String>, PlatformStoreError> {
+    if scopes.iter().any(|scope| scope.trim().is_empty()) {
+        return Err(PlatformStoreError::InvalidApplicationScopes);
+    }
+    let mut scopes = scopes;
+    scopes.sort();
+    scopes.dedup();
+    Ok(scopes)
+}
+
+fn sqlite_application_record(
+    row: SqliteRow,
+    redirects: Vec<String>,
+) -> Result<ApplicationRecord, PlatformStoreError> {
+    let scopes = canonical_application_scopes(
+        serde_json::from_str(&row.try_get::<String, _>("allowed_scopes_json")?)
+            .map_err(|_| PlatformStoreError::InvalidApplicationScopes)?,
+    )?;
+    Ok(ApplicationRecord {
+        app_id: row.try_get::<String, _>("app_id")?.parse()?,
+        kind: ApplicationKind::parse(&row.try_get::<String, _>("kind")?)?,
+        launch_url: row.try_get("launch_url")?,
+        client_id: row.try_get::<String, _>("client_id")?.parse()?,
+        redirect_uris: redirects
+            .into_iter()
+            .map(|uri| uri.parse())
+            .collect::<Result<Vec<_>, _>>()?,
+        allowed_scopes: scopes,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
+    })
+}
+
+fn postgres_application_record(
+    row: PgRow,
+    redirects: Vec<String>,
+) -> Result<ApplicationRecord, PlatformStoreError> {
+    let scopes = canonical_application_scopes(
+        row.try_get::<Json<Vec<String>>, _>("allowed_scopes_json")?
+            .0,
+    )?;
+    Ok(ApplicationRecord {
+        app_id: row.try_get::<String, _>("app_id")?.parse()?,
+        kind: ApplicationKind::parse(&row.try_get::<String, _>("kind")?)?,
+        launch_url: row.try_get("launch_url")?,
+        client_id: row.try_get::<String, _>("client_id")?.parse()?,
+        redirect_uris: redirects
+            .into_iter()
+            .map(|uri| uri.parse())
+            .collect::<Result<Vec<_>, _>>()?,
+        allowed_scopes: scopes,
+        enabled: row.try_get("enabled")?,
+    })
 }
 
 async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {

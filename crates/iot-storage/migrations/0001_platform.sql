@@ -25,6 +25,21 @@ CREATE TABLE IF NOT EXISTS user_app_grants (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, app_key)
 );
+CREATE TABLE IF NOT EXISTS applications (
+    app_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('frontend', 'full_stack')),
+    launch_url TEXT NOT NULL,
+    client_id TEXT NOT NULL UNIQUE,
+    allowed_scopes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE TABLE IF NOT EXISTS application_redirect_uris (
+    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    redirect_uri TEXT NOT NULL,
+    PRIMARY KEY (app_id, redirect_uri)
+);
+CREATE INDEX IF NOT EXISTS application_redirect_uris_lookup_index
+    ON application_redirect_uris (app_id, redirect_uri);
 CREATE TABLE IF NOT EXISTS asset_profiles (
     id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE,
     fields JSONB NOT NULL DEFAULT '{}'::jsonb,

@@ -400,6 +400,8 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "alert_rule_event_evaluations",
             "alert_rules",
             "api_access_tokens",
+            "application_redirect_uris",
+            "applications",
             "asset_profiles",
             "assets",
             "audit_events",
