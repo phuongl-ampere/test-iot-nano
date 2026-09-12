@@ -1754,6 +1754,7 @@ dependencies = [
 name = "iot-nano-monolith"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "fs2",
  "iot-core",
@@ -1764,6 +1765,7 @@ dependencies = [
  "iot-storage",
  "rusqlite",
  "rustix",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",

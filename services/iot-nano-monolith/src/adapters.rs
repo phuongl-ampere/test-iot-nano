@@ -1,8 +1,10 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
+use chrono::Utc;
 use iot_nano_mqttd::{
-    AuthenticatedDevice, AuthorizationError, DeviceAuthorizationPort, GatewayAuthorization,
-    GatewayAuthorizationRequest, TransportAuthRequest,
+    AuthenticatedDevice, AuthorizationError, CommandResponseError, CommandResponsePort,
+    DeviceAuthorizationPort, GatewayAuthorization, GatewayAuthorizationRequest,
+    TransportAuthRequest, TransportRpcResponse,
 };
 use iot_storage::{
     DeviceAuthorizationRepository, IdentityRepository, PlatformStore, PlatformStoreError,
@@ -10,6 +12,41 @@ use iot_storage::{
 
 const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
 const STORAGE_UNAVAILABLE: &str = "platform storage unavailable";
+
+pub struct PlatformCommandResponse {
+    store: Arc<PlatformStore>,
+}
+
+impl PlatformCommandResponse {
+    pub fn new(store: Arc<PlatformStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl CommandResponsePort for PlatformCommandResponse {
+    fn record_response(
+        &self,
+        response: TransportRpcResponse,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CommandResponseError>> + Send + '_>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            let response_json = serde_json::to_string(&response.response)
+                .map_err(|_| CommandResponseError::Unavailable(STORAGE_UNAVAILABLE.to_owned()))?;
+            store
+                .mark_command_responded(
+                    response.command_id,
+                    &response.device_id,
+                    response.token_id,
+                    &response_json,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|_| CommandResponseError::Unavailable(STORAGE_UNAVAILABLE.to_owned()))?
+                .ok_or_else(|| CommandResponseError::Unavailable(STORAGE_UNAVAILABLE.to_owned()))?;
+            Ok(())
+        })
+    }
+}
 
 pub struct PlatformDeviceAuthorization {
     store: Arc<PlatformStore>,
