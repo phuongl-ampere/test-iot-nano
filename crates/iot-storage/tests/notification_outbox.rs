@@ -58,6 +58,43 @@ async fn insert_notification(store: &PlatformStore, id: &str, next_attempt_at: &
     .unwrap();
 }
 
+async fn insert_notification_with_default_next_attempt_at(store: &PlatformStore, id: &str) {
+    let pool = store.sqlite_pool().unwrap();
+    let rule_id = uuid::Uuid::now_v7().to_string();
+    let incident_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold
+         ) VALUES (?, ?, 'temperature_c', 'event_threshold', 'gt', 30)",
+    )
+    .bind(&rule_id)
+    .bind(format!("rule-{id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, rule_id, device_id, status, condition_started_at
+         ) VALUES (?, ?, 'notification-device', 'open', CURRENT_TIMESTAMP)",
+    )
+    .bind(&incident_id)
+    .bind(&rule_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO notification_outbox (
+            id, incident_id, kind, dedupe_key, subject, body
+         ) VALUES (?, ?, 'opened', ?, 'subject', 'body')",
+    )
+    .bind(id)
+    .bind(&incident_id)
+    .bind(format!("dedupe-{id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn timescale_notification_store() -> (PgConnection, PlatformStore) {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
@@ -70,7 +107,7 @@ async fn timescale_notification_store() -> (PgConnection, PlatformStore) {
         database_name.starts_with("iot_nano_test_"),
         "refusing to reset non-test database {database_name:?}"
     );
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:notification-outbox-test'))")
+    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
         .execute(&mut connection)
         .await
         .unwrap();
@@ -123,16 +160,24 @@ async fn sqlite_notification_outbox_claims_and_completes_only_the_current_lease(
         .iter()
         .find(|record| record.id.to_string() == first_id)
         .unwrap();
-    let sent = NotificationRepository::mark_notification_sent(&store, first.id, now)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(sent.state, NotificationOutboxState::Sent);
-    assert!(
-        NotificationRepository::release_notification_for_retry(&store, sent.id, "late retry", now,)
+    let first_lease_until = first.lease_until.unwrap();
+    let sent =
+        NotificationRepository::mark_notification_sent(&store, first.id, first_lease_until, now)
             .await
             .unwrap()
-            .is_none()
+            .unwrap();
+    assert_eq!(sent.state, NotificationOutboxState::Sent);
+    assert!(
+        NotificationRepository::release_notification_for_retry(
+            &store,
+            sent.id,
+            first_lease_until,
+            "late retry",
+            now,
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
 
     let second = claimed
@@ -142,6 +187,7 @@ async fn sqlite_notification_outbox_claims_and_completes_only_the_current_lease(
     let released = NotificationRepository::release_notification_for_retry(
         &store,
         second.id,
+        second.lease_until.unwrap(),
         "temporary failure",
         now,
     )
@@ -158,10 +204,15 @@ async fn sqlite_notification_outbox_claims_and_completes_only_the_current_lease(
     assert_eq!(retried[0].id.to_string(), second_id);
     assert_eq!(retried[0].attempt_count, 2);
     assert!(
-        NotificationRepository::mark_notification_sent(&store, retried[0].id, now)
-            .await
-            .unwrap()
-            .is_some()
+        NotificationRepository::mark_notification_sent(
+            &store,
+            retried[0].id,
+            retried[0].lease_until.unwrap(),
+            now,
+        )
+        .await
+        .unwrap()
+        .is_some()
     );
 
     let third = NotificationRepository::claim_notifications(
@@ -176,8 +227,9 @@ async fn sqlite_notification_outbox_claims_and_completes_only_the_current_lease(
     assert_eq!(third[0].id.to_string(), third_id);
     assert_eq!(third[0].attempt_count, 2);
     let stale_id = third[0].id;
+    let stale_lease_until = third[0].lease_until.unwrap();
     assert!(
-        NotificationRepository::mark_notification_sent(&store, stale_id, now)
+        NotificationRepository::mark_notification_sent(&store, stale_id, stale_lease_until, now)
             .await
             .unwrap()
             .is_some()
@@ -186,6 +238,7 @@ async fn sqlite_notification_outbox_claims_and_completes_only_the_current_lease(
         NotificationRepository::release_notification_for_retry(
             &store,
             stale_id,
+            stale_lease_until,
             "stale",
             now + Duration::seconds(1),
         )
@@ -201,6 +254,93 @@ async fn sqlite_notification_outbox_claims_and_completes_only_the_current_lease(
         .unwrap();
     assert_eq!(row.get::<String, _>("state"), "sent");
     assert_eq!(row.get::<i64, _>("attempt_count"), 1);
+}
+
+#[tokio::test]
+async fn sqlite_notification_outbox_rejects_stale_lease_finalization_after_reclaim() {
+    let (_directory, store) = notification_store().await;
+    let now = Utc::now();
+    let notification_id = uuid::Uuid::now_v7();
+    insert_notification(
+        &store,
+        &notification_id.to_string(),
+        &(now - Duration::seconds(1)).to_rfc3339(),
+    )
+    .await;
+
+    let first_lease =
+        NotificationRepository::claim_notifications(&store, now, now + Duration::seconds(1), 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+    let first_lease_until = first_lease.lease_until.unwrap();
+    let reclaimed_at = now + Duration::seconds(2);
+    let current_lease = NotificationRepository::claim_notifications(
+        &store,
+        reclaimed_at,
+        reclaimed_at + Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
+    let current_lease_until = current_lease.lease_until.unwrap();
+    assert_eq!(current_lease.attempt_count, 2);
+
+    assert!(
+        NotificationRepository::mark_notification_sent(
+            &store,
+            notification_id,
+            first_lease_until,
+            reclaimed_at,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        NotificationRepository::release_notification_for_retry(
+            &store,
+            notification_id,
+            first_lease_until,
+            "stale worker",
+            reclaimed_at,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        NotificationRepository::mark_notification_sent(
+            &store,
+            notification_id,
+            current_lease_until,
+            reclaimed_at,
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_notification_outbox_claims_rows_with_default_timestamps() {
+    let (_directory, store) = notification_store().await;
+    let notification_id = uuid::Uuid::now_v7();
+    insert_notification_with_default_next_attempt_at(&store, &notification_id.to_string()).await;
+
+    let claimed = NotificationRepository::claim_notifications(
+        &store,
+        Utc::now() + Duration::seconds(1),
+        Utc::now() + Duration::seconds(31),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, notification_id);
 }
 
 #[tokio::test]
@@ -246,43 +386,66 @@ async fn timescale_notification_outbox_matches_sqlite_lease_contract() {
     .await
     .unwrap();
 
-    let claimed =
-        NotificationRepository::claim_notifications(&store, now, now + Duration::seconds(30), 1)
-            .await
-            .unwrap();
-    assert_eq!(claimed[0].attempt_count, 1);
-    assert!(
-        NotificationRepository::claim_notifications(&store, now, now, 1)
+    let first_lease =
+        NotificationRepository::claim_notifications(&store, now, now + Duration::seconds(1), 1)
             .await
             .unwrap()
-            .is_empty()
-    );
-    let released = NotificationRepository::release_notification_for_retry(
+            .pop()
+            .unwrap();
+    assert_eq!(first_lease.attempt_count, 1);
+    let first_lease_until = first_lease.lease_until.unwrap();
+    let reclaimed_at = now + Duration::seconds(2);
+    let current_lease = NotificationRepository::claim_notifications(
         &store,
-        notification_id,
-        "temporary failure",
-        now,
+        reclaimed_at,
+        reclaimed_at + Duration::seconds(30),
+        1,
     )
     .await
     .unwrap()
+    .pop()
     .unwrap();
-    assert_eq!(released.state, NotificationOutboxState::Pending);
-    assert_eq!(released.attempt_count, 1);
-    let retried =
-        NotificationRepository::claim_notifications(&store, now, now + Duration::seconds(30), 1)
-            .await
-            .unwrap();
-    assert_eq!(retried[0].attempt_count, 2);
+    assert_eq!(current_lease.attempt_count, 2);
+    let current_lease_until = current_lease.lease_until.unwrap();
     assert!(
-        NotificationRepository::mark_notification_sent(&store, notification_id, now)
-            .await
-            .unwrap()
-            .is_some()
+        NotificationRepository::mark_notification_sent(
+            &store,
+            notification_id,
+            first_lease_until,
+            reclaimed_at,
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
     assert!(
         NotificationRepository::release_notification_for_retry(
             &store,
             notification_id,
+            first_lease_until,
+            "stale worker",
+            reclaimed_at,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        NotificationRepository::mark_notification_sent(
+            &store,
+            notification_id,
+            current_lease_until,
+            reclaimed_at,
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        NotificationRepository::release_notification_for_retry(
+            &store,
+            notification_id,
+            current_lease_until,
             "sent rows cannot be retried",
             now,
         )

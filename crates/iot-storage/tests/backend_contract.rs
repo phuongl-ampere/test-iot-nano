@@ -339,7 +339,7 @@ async fn timescale_test_store() -> (TimescaleTestLock, PlatformStore) {
         database_name.starts_with("iot_nano_test_"),
         "refusing to reset non-test database {database_name:?}"
     );
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:backend-contract-test'))")
+    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
         .execute(&mut connection)
         .await
         .unwrap();

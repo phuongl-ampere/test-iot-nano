@@ -5,7 +5,7 @@ use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use chrono::{DateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
 use iot_core::{
     DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent, device_token_prefix,
     verify_device_token,
@@ -430,6 +430,7 @@ pub trait NotificationRepository: Send + Sync {
     fn mark_notification_sent<'a>(
         &'a self,
         notification_id: uuid::Uuid,
+        expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
     ) -> Pin<
         Box<
@@ -441,6 +442,7 @@ pub trait NotificationRepository: Send + Sync {
     fn release_notification_for_retry<'a>(
         &'a self,
         notification_id: uuid::Uuid,
+        expected_lease_until: DateTime<Utc>,
         error: &'a str,
         next_attempt_at: DateTime<Utc>,
     ) -> Pin<
@@ -1178,14 +1180,21 @@ impl PlatformStore {
     pub async fn mark_notification_sent(
         &self,
         notification_id: uuid::Uuid,
+        expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
     ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
         match self {
             Self::Sqlite(store) => Ok(store
-                .mark_notification_sent(&notification_id.to_string(), sent_at)
+                .mark_notification_sent(&notification_id.to_string(), expected_lease_until, sent_at)
                 .await?),
             Self::Timescale(pool) => {
-                mark_timescale_notification_sent(pool, notification_id, sent_at).await
+                mark_timescale_notification_sent(
+                    pool,
+                    notification_id,
+                    expected_lease_until,
+                    sent_at,
+                )
+                .await
             }
         }
     }
@@ -1193,6 +1202,7 @@ impl PlatformStore {
     pub async fn release_notification_for_retry(
         &self,
         notification_id: uuid::Uuid,
+        expected_lease_until: DateTime<Utc>,
         error: &str,
         next_attempt_at: DateTime<Utc>,
     ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
@@ -1200,6 +1210,7 @@ impl PlatformStore {
             Self::Sqlite(store) => Ok(store
                 .release_notification_for_retry(
                     &notification_id.to_string(),
+                    expected_lease_until,
                     error,
                     next_attempt_at,
                 )
@@ -1208,6 +1219,7 @@ impl PlatformStore {
                 release_timescale_notification_for_retry(
                     pool,
                     notification_id,
+                    expected_lease_until,
                     error,
                     next_attempt_at,
                 )
@@ -1505,18 +1517,20 @@ async fn claim_timescale_notifications(
 async fn mark_timescale_notification_sent(
     pool: &PgPool,
     notification_id: uuid::Uuid,
+    expected_lease_until: DateTime<Utc>,
     sent_at: DateTime<Utc>,
 ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
     let row = sqlx::query(
         "UPDATE notification_outbox
          SET state = 'sent', sent_at = $1, lease_until = NULL
-         WHERE id = $2 AND state = 'leased'
+         WHERE id = $2 AND state = 'leased' AND lease_until = $3
          RETURNING
             id, incident_id, kind, dedupe_key, subject, body, state,
             next_attempt_at, lease_until, attempt_count, last_error, sent_at",
     )
     .bind(sent_at)
     .bind(notification_id)
+    .bind(expected_lease_until)
     .fetch_optional(pool)
     .await?;
     row.map(postgres_notification_outbox_record).transpose()
@@ -1525,13 +1539,14 @@ async fn mark_timescale_notification_sent(
 async fn release_timescale_notification_for_retry(
     pool: &PgPool,
     notification_id: uuid::Uuid,
+    expected_lease_until: DateTime<Utc>,
     error: &str,
     next_attempt_at: DateTime<Utc>,
 ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
     let row = sqlx::query(
         "UPDATE notification_outbox
          SET state = 'pending', next_attempt_at = $1, last_error = $2, lease_until = NULL
-         WHERE id = $3 AND state = 'leased'
+         WHERE id = $3 AND state = 'leased' AND lease_until = $4
          RETURNING
             id, incident_id, kind, dedupe_key, subject, body, state,
             next_attempt_at, lease_until, attempt_count, last_error, sent_at",
@@ -1539,6 +1554,7 @@ async fn release_timescale_notification_for_retry(
     .bind(next_attempt_at)
     .bind(error)
     .bind(notification_id)
+    .bind(expected_lease_until)
     .fetch_optional(pool)
     .await?;
     row.map(postgres_notification_outbox_record).transpose()
@@ -1811,6 +1827,7 @@ impl NotificationRepository for PlatformStore {
     fn mark_notification_sent<'a>(
         &'a self,
         notification_id: uuid::Uuid,
+        expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
     ) -> Pin<
         Box<
@@ -1820,13 +1837,20 @@ impl NotificationRepository for PlatformStore {
         >,
     > {
         Box::pin(async move {
-            PlatformStore::mark_notification_sent(self, notification_id, sent_at).await
+            PlatformStore::mark_notification_sent(
+                self,
+                notification_id,
+                expected_lease_until,
+                sent_at,
+            )
+            .await
         })
     }
 
     fn release_notification_for_retry<'a>(
         &'a self,
         notification_id: uuid::Uuid,
+        expected_lease_until: DateTime<Utc>,
         error: &'a str,
         next_attempt_at: DateTime<Utc>,
     ) -> Pin<
@@ -1840,6 +1864,7 @@ impl NotificationRepository for PlatformStore {
             PlatformStore::release_notification_for_retry(
                 self,
                 notification_id,
+                expected_lease_until,
                 error,
                 next_attempt_at,
             )
@@ -2286,19 +2311,21 @@ impl SqliteStore {
     pub async fn mark_notification_sent(
         &self,
         notification_id: &str,
+        expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
     ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
         let sent_at = sent_at.to_rfc3339();
         let row = sqlx::query(
             "UPDATE notification_outbox
              SET state = 'sent', sent_at = ?, lease_until = NULL
-             WHERE id = ? AND state = 'leased'
+             WHERE id = ? AND state = 'leased' AND lease_until = ?
              RETURNING
                 id, incident_id, kind, dedupe_key, subject, body, state,
                 next_attempt_at, lease_until, attempt_count, last_error, sent_at",
         )
         .bind(&sent_at)
         .bind(notification_id)
+        .bind(expected_lease_until.to_rfc3339())
         .fetch_optional(&self.pool)
         .await?;
         row.map(notification_outbox_record).transpose()
@@ -2307,6 +2334,7 @@ impl SqliteStore {
     pub async fn release_notification_for_retry(
         &self,
         notification_id: &str,
+        expected_lease_until: DateTime<Utc>,
         error: &str,
         next_attempt_at: DateTime<Utc>,
     ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
@@ -2314,7 +2342,7 @@ impl SqliteStore {
         let row = sqlx::query(
             "UPDATE notification_outbox
              SET state = 'pending', next_attempt_at = ?, last_error = ?, lease_until = NULL
-             WHERE id = ? AND state = 'leased'
+             WHERE id = ? AND state = 'leased' AND lease_until = ?
              RETURNING
                 id, incident_id, kind, dedupe_key, subject, body, state,
                 next_attempt_at, lease_until, attempt_count, last_error, sent_at",
@@ -2322,6 +2350,7 @@ impl SqliteStore {
         .bind(&next_attempt_at)
         .bind(error)
         .bind(notification_id)
+        .bind(expected_lease_until.to_rfc3339())
         .fetch_optional(&self.pool)
         .await?;
         row.map(notification_outbox_record).transpose()
@@ -2797,13 +2826,7 @@ fn notification_timestamp(
     column: &'static str,
 ) -> Result<DateTime<Utc>, PlatformStoreError> {
     let value: String = row.try_get(column)?;
-    DateTime::parse_from_rfc3339(&value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|source| PlatformStoreError::InvalidNotificationTimestamp {
-            column,
-            value,
-            source,
-        })
+    parse_notification_timestamp(value, column)
 }
 
 fn notification_optional_timestamp(
@@ -2811,16 +2834,25 @@ fn notification_optional_timestamp(
     column: &'static str,
 ) -> Result<Option<DateTime<Utc>>, PlatformStoreError> {
     row.try_get::<Option<String>, _>(column)?
-        .map(|value| {
-            DateTime::parse_from_rfc3339(&value)
-                .map(|timestamp| timestamp.with_timezone(&Utc))
-                .map_err(|source| PlatformStoreError::InvalidNotificationTimestamp {
-                    column,
-                    value,
-                    source,
-                })
-        })
+        .map(|value| parse_notification_timestamp(value, column))
         .transpose()
+}
+
+fn parse_notification_timestamp(
+    value: String,
+    column: &'static str,
+) -> Result<DateTime<Utc>, PlatformStoreError> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
+                .map(|timestamp| timestamp.and_utc())
+        })
+        .map_err(|source| PlatformStoreError::InvalidNotificationTimestamp {
+            column,
+            value,
+            source,
+        })
 }
 
 fn command_mode_value(mode: RpcMode) -> &'static str {
