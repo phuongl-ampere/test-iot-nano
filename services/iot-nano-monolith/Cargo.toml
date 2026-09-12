@@ -14,11 +14,13 @@ iot-nano-core = { path = "../iot-nano-core" }
 iot-nano-mqttd = { path = "../iot-nano-mqttd" }
 iot-nano-stream = { path = "../iot-nano-stream" }
 iot-storage = { path = "../../crates/iot-storage" }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+rusqlite = "0.37.0"
 tempfile.workspace = true
 
 [lib]

@@ -1762,6 +1762,8 @@ dependencies = [
  "iot-nano-mqttd",
  "iot-nano-stream",
  "iot-storage",
+ "rusqlite",
+ "rustix",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
