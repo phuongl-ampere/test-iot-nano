@@ -24,6 +24,7 @@ use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 mod config;
 mod management;
 mod policy;
+mod ports;
 mod storage;
 mod transport;
 
@@ -38,6 +39,11 @@ pub use management::{
     management_router_with_config_and_runtime_and_policy,
 };
 pub use policy::{PolicyAdapters, PolicyError, build_policy};
+pub use ports::{
+    AuthorizationError, CommandResponseError, CommandResponsePort, DeviceAuthorizationPort,
+    GatewayAuthorization, GatewayAuthorizationRequest, LocalDeviceAuthenticator,
+    LocalRpcResponseForwarder, LocalStreamUplinkForwarder, LocalUplinkForwarder,
+};
 pub use rumqttd::{
     BrokerStorage, BrokerStorageState, InboundQos2CommitResult, InboundQos2CompletionResult,
     InboundQos2JournalEntry, InboundQos2JournalState, InboundQos2PrepareResult, MemoryStorage,

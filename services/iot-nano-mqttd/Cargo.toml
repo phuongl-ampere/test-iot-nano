@@ -12,6 +12,7 @@ clap.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 iot-core = { path = "../../crates/iot-core" }
+iot-nano-stream = { path = "../iot-nano-stream" }
 rumqttd = { package = "iot-mqtt-core", path = "vendor/rumqttd" }
 reqwest.workspace = true
 rumqttc.workspace = true
@@ -29,7 +30,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-tungstenite = { version = "0.25.1", default-features = false, features = ["tokio-runtime"] }
-iot-nano-stream = { path = "../iot-nano-stream" }
 tempfile.workspace = true
 tokio-util = { workspace = true, features = ["compat"] }
 tower.workspace = true

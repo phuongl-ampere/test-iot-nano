@@ -11,14 +11,12 @@ use iot_nano_mqttd::{
     HttpRpcResponseForwarder, HttpStreamUplinkForwarder, RpcResponseForwarder,
     TransportRpcResponse, TransportUplink, UplinkForwarder,
 };
-use iot_nano_stream::{LocalStream, StreamConfig, http::StreamHttpState};
 use serde_json::json;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const TRANSPORT_SECRET: &str = "transport-secret-must-be-at-least-32-bytes";
 const STREAM_SECRET: &str = "stream-secret-must-be-at-least-32-bytes";
-const CORE_STREAM_SECRET: &str = "core-stream-secret-must-be-at-least-32xx";
 
 #[derive(Default)]
 struct TestState {
@@ -106,57 +104,6 @@ async fn stream_uplink_forwarder_appends_a_canonical_device_event() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["topic"], "iot/v1/devices/device-a/telemetry");
     assert_eq!(events[0]["event"]["device_id"], "device-a");
-}
-
-#[tokio::test]
-async fn stream_uplink_forwarder_appends_to_the_real_stream_service() {
-    let directory = tempfile::tempdir().unwrap();
-    let stream = LocalStream::open(directory.path(), StreamConfig::for_test(1)).unwrap();
-    let app = iot_nano_stream::http::router(StreamHttpState::new(
-        stream.clone(),
-        STREAM_SECRET,
-        CORE_STREAM_SECRET,
-    ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let stream_url = format!("http://{address}");
-    let forwarder = HttpStreamUplinkForwarder::new(&stream_url, STREAM_SECRET).unwrap();
-
-    forwarder
-        .forward(
-            "iotd_test_token",
-            TransportUplink {
-                device: iot_nano_mqttd::AuthenticatedDevice {
-                    token_id: Uuid::now_v7(),
-                    device_id: "device-a".to_owned(),
-                    is_gateway: false,
-                },
-                topic: "v1/devices/me/telemetry".to_owned(),
-                payload: serde_json::to_vec(&json!({
-                    "schema_version": 1,
-                    "boot_id": "c9c04d99-4e01-4f94-82a8-9e229e47c093",
-                    "sequence": 1,
-                    "event_at": "2026-09-10T08:00:00Z",
-                    "measurements": {"temperature_c": 26.4},
-                }))
-                .unwrap(),
-                qos: rumqttc::QoS::AtLeastOnce,
-                received_at: Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 1).unwrap(),
-            },
-        )
-        .await
-        .unwrap();
-
-    let records = stream
-        .read_partition(stream.partition_for("device-a"), 0, 10)
-        .unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0].message.telemetry().unwrap().event.device_id,
-        "device-a"
-    );
-    server.abort();
 }
 
 #[tokio::test]

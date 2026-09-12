@@ -11,6 +11,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use iot_core::{DeviceTelemetryPayload, GatewayTelemetryPayload, RpcMode, RpcRequest};
+use iot_nano_stream::StreamPort;
 use rumqttc::v5::mqttbytes::{
     QoS as V5QoS,
     v5::{
@@ -33,6 +34,11 @@ use tokio::{
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
+use crate::ports::{
+    CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization, LocalDeviceAuthenticator,
+    LocalRpcResponseForwarder, LocalStreamUplinkForwarder,
+};
+
 const MAX_PACKET_BYTES: usize = 1024 * 1024;
 const SESSION_COMMAND_CAPACITY: usize = 64;
 const COMMAND_PUBACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,8 +46,8 @@ const DIRECT_RPC_FILTER: &str = "v1/devices/me/rpc/request/+";
 const GATEWAY_RPC_FILTER: &str = "v1/gateways/me/rpc/request/+";
 const DIRECT_RPC_RESPONSE_PREFIX: &str = "v1/devices/me/rpc/response/";
 const GATEWAY_RPC_RESPONSE_PREFIX: &str = "v1/gateways/me/rpc/response/";
-const DIRECT_TELEMETRY_TOPIC: &str = "v1/devices/me/telemetry";
-const GATEWAY_TOPICS: [&str; 3] = [
+pub(crate) const DIRECT_TELEMETRY_TOPIC: &str = "v1/devices/me/telemetry";
+pub(crate) const GATEWAY_TOPICS: [&str; 3] = [
     "v1/gateways/me/connect",
     "v1/gateways/me/disconnect",
     "v1/gateways/me/telemetry",
@@ -316,31 +322,6 @@ pub struct AuthenticatedDevice {
     pub token_id: Uuid,
     pub device_id: String,
     pub is_gateway: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct GatewayAuthorization {
-    gateway_device_id: String,
-    token_id: Uuid,
-    child_device_id: Option<String>,
-    topic: String,
-    event_kind: String,
-}
-
-impl GatewayAuthorization {
-    fn matches(
-        &self,
-        device: &AuthenticatedDevice,
-        topic: &str,
-        event_kind: &str,
-        child_device_id: Option<&str>,
-    ) -> bool {
-        self.gateway_device_id == device.device_id
-            && self.token_id == device.token_id
-            && self.topic == topic
-            && self.event_kind == event_kind
-            && self.child_device_id.as_deref() == child_device_id
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -740,8 +721,12 @@ pub enum TransportError {
     Configuration(String),
     #[error("MQTT authentication service returned status {0}")]
     AuthenticationServiceUnavailable(u16),
+    #[error("MQTT authorization port is unavailable: {0}")]
+    AuthorizationUnavailable(String),
     #[error("uplink webhook returned status {0}")]
     UplinkRejected(u16),
+    #[error("durable stream append failed: {0}")]
+    StreamAppendFailed(String),
     #[error("uplink payload must be UTF-8 JSON")]
     InvalidUplinkPayload,
     #[error("RPC response payload must be JSON")]
@@ -750,6 +735,8 @@ pub enum TransportError {
     RpcResponseRejected(u16),
     #[error("RPC response callback is not configured")]
     RpcResponseForwarderUnavailable,
+    #[error("command response port is unavailable: {0}")]
+    CommandResponseUnavailable(String),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     #[error(transparent)]
@@ -790,6 +777,18 @@ pub struct MqttdDeviceTransport {
 }
 
 impl MqttdDeviceTransport {
+    pub fn with_local_ports(
+        authorization: Arc<dyn DeviceAuthorizationPort>,
+        stream: Arc<dyn StreamPort>,
+        command_responses: Arc<dyn CommandResponsePort>,
+    ) -> Self {
+        Self::new(
+            LocalDeviceAuthenticator::new(Arc::clone(&authorization)),
+            LocalStreamUplinkForwarder::new(authorization, stream),
+        )
+        .with_rpc_response_forwarder(LocalRpcResponseForwarder::new(command_responses))
+    }
+
     pub fn new(
         authenticator: impl DeviceAuthenticator + 'static,
         uplink: impl UplinkForwarder + 'static,
