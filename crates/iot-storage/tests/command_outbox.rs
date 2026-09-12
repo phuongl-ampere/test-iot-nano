@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
-use iot_storage::{CommandOutboxState, NewCommandOutboxEntry, SqliteStore};
+use iot_storage::{CommandOutboxState, NewCommandOutboxEntry, PlatformStore, SqliteStore};
 use sqlx::Row;
 
 async fn store() -> (tempfile::TempDir, SqliteStore) {
@@ -73,6 +73,27 @@ async fn sqlite_command_outbox_claim_leases_a_command_only_once() {
             .unwrap(),
         Vec::new()
     );
+}
+
+#[tokio::test]
+async fn sqlite_platform_store_command_lifecycle_port_claims_a_command() {
+    let (_directory, sqlite) = store().await;
+    let platform = PlatformStore::Sqlite(sqlite);
+    let now = at(1_800_000_000);
+    let command_id = uuid::Uuid::now_v7().to_string();
+    platform
+        .enqueue_command(command(&command_id, now, now + Duration::minutes(5)))
+        .await
+        .unwrap();
+
+    let claimed = platform
+        .claim_commands(now, now + Duration::seconds(30), 1)
+        .await
+        .unwrap();
+
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, command_id);
+    assert_eq!(claimed[0].state, CommandOutboxState::Leased);
 }
 
 #[tokio::test]
@@ -220,6 +241,18 @@ async fn sqlite_command_outbox_records_one_two_way_response_after_broker_publica
         Some(r#"{"ok":true,"sampled_at":"2027-01-15T08:00:01Z"}"#)
     );
     assert_eq!(responded.responded_at, Some(now + Duration::seconds(2)));
+    let retry = store
+        .mark_command_responded(
+            "two-way",
+            "device-1",
+            "active-token",
+            r#"{"ok":true,"sampled_at":"2027-01-15T08:00:01Z"}"#,
+            now + Duration::seconds(3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry, responded);
     assert!(
         store
             .mark_command_responded(

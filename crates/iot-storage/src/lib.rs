@@ -401,6 +401,71 @@ pub trait CommandRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<CommandOutboxRecord, PlatformStoreError>> + Send + 'a>>;
 }
 
+pub trait CommandLifecycleRepository: Send + Sync {
+    fn claim_commands<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<CommandOutboxRecord>, PlatformStoreError>> + Send + 'a>,
+    >;
+    fn mark_command_published<'a>(
+        &'a self,
+        command_id: &'a str,
+        published_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn mark_command_failed<'a>(
+        &'a self,
+        command_id: &'a str,
+        error: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn release_command_for_retry<'a>(
+        &'a self,
+        command_id: &'a str,
+        error: &'a str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn expire_commands<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<CommandOutboxRecord>, PlatformStoreError>> + Send + 'a>,
+    >;
+    fn mark_command_responded<'a>(
+        &'a self,
+        command_id: &'a str,
+        device_id: &'a str,
+        token_id: &'a str,
+        response: &'a str,
+        responded_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+}
+
 pub trait TelemetryRepository: Send + Sync {
     fn write_telemetry<'a>(
         &'a self,
@@ -892,6 +957,151 @@ impl PlatformStore {
         }
     }
 
+    pub async fn claim_commands(
+        &self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<CommandOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.claim_commands(now, lease_until, limit).await?),
+            Self::Timescale(pool) => claim_timescale_commands(pool, now, lease_until, limit).await,
+        }
+    }
+
+    pub async fn mark_command_published(
+        &self,
+        command_id: &str,
+        published_at: DateTime<Utc>,
+    ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .mark_command_published(command_id, published_at)
+                .await?),
+            Self::Timescale(pool) => {
+                mark_timescale_command_published(pool, command_id, published_at).await
+            }
+        }
+    }
+
+    pub async fn mark_command_failed(
+        &self,
+        command_id: &str,
+        error: &str,
+    ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.mark_command_failed(command_id, error).await?),
+            Self::Timescale(pool) => mark_timescale_command_failed(pool, command_id, error).await,
+        }
+    }
+
+    pub async fn release_command_for_retry(
+        &self,
+        command_id: &str,
+        error: &str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .release_command_for_retry(command_id, error, next_attempt_at)
+                .await?),
+            Self::Timescale(pool) => {
+                release_timescale_command_for_retry(pool, command_id, error, next_attempt_at).await
+            }
+        }
+    }
+
+    pub async fn expire_commands(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<CommandOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.expire_commands(now).await?),
+            Self::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "UPDATE command_outbox
+                     SET state = 'expired', lease_until = NULL
+                     WHERE (
+                            state IN ('queued', 'leased')
+                            OR (state = 'published_to_broker' AND mode = 'two_way')
+                           )
+                       AND expires_at <= $1
+                     RETURNING
+                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                        lease_until, attempt_count, last_error, published_at, response, responded_at",
+                )
+                .bind(now)
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(postgres_command_outbox_record)
+                    .collect()
+            }
+        }
+    }
+
+    pub async fn mark_command_responded(
+        &self,
+        command_id: &str,
+        device_id: &str,
+        token_id: &str,
+        response: &str,
+        responded_at: DateTime<Utc>,
+    ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+        let response_value = serde_json::from_str::<serde_json::Value>(response)
+            .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
+        let response = serde_json::to_string(&response_value)
+            .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .mark_command_responded(command_id, device_id, token_id, &response, responded_at)
+                .await?),
+            Self::Timescale(pool) => {
+                let row = sqlx::query(
+                    "UPDATE command_outbox AS command
+                     SET state = CASE
+                            WHEN command.state = 'responded' THEN command.state
+                            ELSE 'responded'
+                         END,
+                         response = CASE
+                            WHEN command.state = 'responded' THEN command.response
+                            ELSE $1::jsonb
+                         END,
+                         responded_at = CASE
+                            WHEN command.state = 'responded' THEN command.responded_at
+                            ELSE $2
+                         END,
+                         lease_until = NULL
+                     WHERE command.id = $3::uuid
+                       AND command.device_id = $4
+                       AND command.mode = 'two_way'
+                       AND (
+                            (command.state = 'published_to_broker' AND command.expires_at > $2)
+                            OR (command.state = 'responded' AND command.response = $1::jsonb)
+                           )
+                       AND EXISTS (
+                            SELECT 1
+                            FROM device_tokens
+                            WHERE id::text = $5
+                              AND device_id = command.device_id
+                              AND revoked_at IS NULL
+                       )
+                     RETURNING
+                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                        lease_until, attempt_count, last_error, published_at, response, responded_at",
+                )
+                .bind(Json(response_value))
+                .bind(responded_at)
+                .bind(command_id)
+                .bind(device_id)
+                .bind(token_id)
+                .fetch_optional(pool)
+                .await?;
+                row.map(postgres_command_outbox_record).transpose()
+            }
+        }
+    }
+
     pub async fn write_telemetry(
         &self,
         event: &TelemetryEvent,
@@ -1093,6 +1303,112 @@ async fn timescale_device_is_locked(
     .map(|device| device.is_some())
 }
 
+async fn claim_timescale_commands(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    lease_until: DateTime<Utc>,
+    limit: u32,
+) -> Result<Vec<CommandOutboxRecord>, PlatformStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "WITH due AS (
+            SELECT id
+            FROM command_outbox
+            WHERE expires_at > $1
+              AND (
+                    (state = 'queued' AND next_attempt_at <= $1)
+                    OR (state = 'leased' AND lease_until <= $1)
+                  )
+            ORDER BY next_attempt_at, created_at, id
+            FOR UPDATE SKIP LOCKED
+            LIMIT $2
+         )
+         UPDATE command_outbox AS command
+         SET state = 'leased',
+             lease_until = $3,
+             attempt_count = command.attempt_count + 1
+         FROM due
+         WHERE command.id = due.id
+         RETURNING
+            command.id, command.device_id, command.method, command.params, command.mode,
+            command.state, command.expires_at, command.next_attempt_at, command.lease_until,
+            command.attempt_count, command.last_error, command.published_at, command.response,
+            command.responded_at",
+    )
+    .bind(now)
+    .bind(i64::from(limit))
+    .bind(lease_until)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(postgres_command_outbox_record)
+        .collect()
+}
+
+async fn mark_timescale_command_published(
+    pool: &PgPool,
+    command_id: &str,
+    published_at: DateTime<Utc>,
+) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+    let row = sqlx::query(
+        "UPDATE command_outbox
+         SET state = 'published_to_broker', published_at = $1, lease_until = NULL
+         WHERE id::text = $2 AND state = 'leased' AND expires_at > $1
+         RETURNING
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at",
+    )
+    .bind(published_at)
+    .bind(command_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(postgres_command_outbox_record).transpose()
+}
+
+async fn mark_timescale_command_failed(
+    pool: &PgPool,
+    command_id: &str,
+    error: &str,
+) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+    let row = sqlx::query(
+        "UPDATE command_outbox
+         SET state = 'failed', last_error = $1, lease_until = NULL
+         WHERE id::text = $2 AND state = 'leased'
+         RETURNING
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at",
+    )
+    .bind(error)
+    .bind(command_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(postgres_command_outbox_record).transpose()
+}
+
+async fn release_timescale_command_for_retry(
+    pool: &PgPool,
+    command_id: &str,
+    error: &str,
+    next_attempt_at: DateTime<Utc>,
+) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+    let row = sqlx::query(
+        "UPDATE command_outbox
+         SET state = 'queued', next_attempt_at = $1, last_error = $2, lease_until = NULL
+         WHERE id::text = $3 AND state = 'leased' AND expires_at > $1
+         RETURNING
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at",
+    )
+    .bind(next_attempt_at)
+    .bind(error)
+    .bind(command_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(postgres_command_outbox_record).transpose()
+}
+
 fn command_payload_matches(
     existing: &CommandOutboxRecord,
     command: &NewCommandOutboxEntry,
@@ -1139,6 +1455,102 @@ impl CommandRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<CommandOutboxRecord, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move { PlatformStore::enqueue_command(self, command).await })
+    }
+}
+
+impl CommandLifecycleRepository for PlatformStore {
+    fn claim_commands<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<CommandOutboxRecord>, PlatformStoreError>> + Send + 'a>,
+    > {
+        Box::pin(async move { PlatformStore::claim_commands(self, now, lease_until, limit).await })
+    }
+
+    fn mark_command_published<'a>(
+        &'a self,
+        command_id: &'a str,
+        published_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::mark_command_published(self, command_id, published_at).await
+        })
+    }
+
+    fn mark_command_failed<'a>(
+        &'a self,
+        command_id: &'a str,
+        error: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { PlatformStore::mark_command_failed(self, command_id, error).await })
+    }
+
+    fn release_command_for_retry<'a>(
+        &'a self,
+        command_id: &'a str,
+        error: &'a str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::release_command_for_retry(self, command_id, error, next_attempt_at).await
+        })
+    }
+
+    fn expire_commands<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<CommandOutboxRecord>, PlatformStoreError>> + Send + 'a>,
+    > {
+        Box::pin(async move { PlatformStore::expire_commands(self, now).await })
+    }
+
+    fn mark_command_responded<'a>(
+        &'a self,
+        command_id: &'a str,
+        device_id: &'a str,
+        token_id: &'a str,
+        response: &'a str,
+        responded_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::mark_command_responded(
+                self,
+                command_id,
+                device_id,
+                token_id,
+                response,
+                responded_at,
+            )
+            .await
+        })
     }
 }
 
@@ -1539,14 +1951,22 @@ impl SqliteStore {
         let row = sqlx::query(
             "UPDATE command_outbox AS command
              SET state = 'responded',
-                 response = ?,
-                 responded_at = ?,
+                 response = CASE
+                    WHEN command.state = 'responded' THEN command.response
+                    ELSE ?
+                 END,
+                 responded_at = CASE
+                    WHEN command.state = 'responded' THEN command.responded_at
+                    ELSE ?
+                 END,
                  lease_until = NULL
              WHERE command.id = ?
                AND command.device_id = ?
                AND command.mode = 'two_way'
-               AND command.state = 'published_to_broker'
-               AND command.expires_at > ?
+               AND (
+                    (command.state = 'published_to_broker' AND command.expires_at > ?)
+                    OR (command.state = 'responded' AND command.response = ?)
+               )
                AND EXISTS (
                     SELECT 1
                     FROM device_tokens
@@ -1563,6 +1983,7 @@ impl SqliteStore {
         .bind(command_id)
         .bind(device_id)
         .bind(&responded_at)
+        .bind(response)
         .bind(token_id)
         .fetch_optional(&self.pool)
         .await?;
