@@ -8,6 +8,8 @@ Implemented Task 4c within `crates/iot-storage` and
 ## Changes
 
 - Added typed-UUID storage operations for exact device-session and gateway-token authorization.
+- PostgreSQL existence predicates decode `SELECT 1` as `i32` before normalizing to
+  boolean presence; SQLite retains its `i64` decoding.
 - Device sessions require an active, non-deleted device with no gateway child association.
   Both direct devices and gateways are valid sessions.
 - Gateway authorization requires an active, non-deleted gateway and exact gateway/token

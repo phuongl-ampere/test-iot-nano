@@ -1238,9 +1238,8 @@ impl PlatformStore {
         device_id: &str,
     ) -> Result<(), PlatformStoreError> {
         let authorized = match self {
-            Self::Sqlite(store) => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT 1
+            Self::Sqlite(store) => sqlx::query_scalar::<_, i64>(
+                "SELECT 1
                      FROM device_tokens
                      JOIN devices ON devices.device_id = device_tokens.device_id
                      WHERE device_tokens.id = ?
@@ -1248,15 +1247,14 @@ impl PlatformStore {
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL
                        AND devices.gateway_device_id IS NULL",
-                )
-                .bind(token_id.to_string())
-                .bind(device_id)
-                .fetch_optional(store.pool())
-                .await?
-            }
-            Self::Timescale(pool) => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT 1
+            )
+            .bind(token_id.to_string())
+            .bind(device_id)
+            .fetch_optional(store.pool())
+            .await?
+            .is_some(),
+            Self::Timescale(pool) => sqlx::query_scalar::<_, i32>(
+                "SELECT 1
                      FROM device_tokens
                      JOIN devices ON devices.device_id = device_tokens.device_id
                      WHERE device_tokens.id = $1
@@ -1264,16 +1262,18 @@ impl PlatformStore {
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL
                        AND devices.gateway_device_id IS NULL",
-                )
-                .bind(token_id)
-                .bind(device_id)
-                .fetch_optional(pool)
-                .await?
-            }
+            )
+            .bind(token_id)
+            .bind(device_id)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
         };
-        authorized
-            .map(|_| ())
-            .ok_or(PlatformStoreError::DeviceTokenDenied)
+        if authorized {
+            Ok(())
+        } else {
+            Err(PlatformStoreError::DeviceTokenDenied)
+        }
     }
 
     pub async fn authorize_gateway_token(
@@ -1283,9 +1283,8 @@ impl PlatformStore {
         child_device_id: Option<&str>,
     ) -> Result<(), PlatformStoreError> {
         let authorized = match self {
-            Self::Sqlite(store) => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT 1
+            Self::Sqlite(store) => sqlx::query_scalar::<_, i64>(
+                "SELECT 1
                      FROM device_tokens
                      JOIN devices AS gateways
                        ON gateways.device_id = device_tokens.device_id
@@ -1304,17 +1303,16 @@ impl PlatformStore {
                                  AND children.deleted_at IS NULL
                            )
                        )",
-                )
-                .bind(token_id.to_string())
-                .bind(gateway_device_id)
-                .bind(child_device_id)
-                .bind(child_device_id)
-                .fetch_optional(store.pool())
-                .await?
-            }
-            Self::Timescale(pool) => {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT 1
+            )
+            .bind(token_id.to_string())
+            .bind(gateway_device_id)
+            .bind(child_device_id)
+            .bind(child_device_id)
+            .fetch_optional(store.pool())
+            .await?
+            .is_some(),
+            Self::Timescale(pool) => sqlx::query_scalar::<_, i32>(
+                "SELECT 1
                      FROM device_tokens
                      JOIN devices AS gateways
                        ON gateways.device_id = device_tokens.device_id
@@ -1333,17 +1331,19 @@ impl PlatformStore {
                                  AND children.deleted_at IS NULL
                            )
                        )",
-                )
-                .bind(token_id)
-                .bind(gateway_device_id)
-                .bind(child_device_id)
-                .fetch_optional(pool)
-                .await?
-            }
+            )
+            .bind(token_id)
+            .bind(gateway_device_id)
+            .bind(child_device_id)
+            .fetch_optional(pool)
+            .await?
+            .is_some(),
         };
-        authorized
-            .map(|_| ())
-            .ok_or(PlatformStoreError::DeviceTokenDenied)
+        if authorized {
+            Ok(())
+        } else {
+            Err(PlatformStoreError::DeviceTokenDenied)
+        }
     }
 
     pub async fn device_permission(
