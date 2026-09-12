@@ -195,6 +195,49 @@ CREATE INDEX IF NOT EXISTS command_outbox_due_index ON command_outbox (state, ne
 CREATE INDEX IF NOT EXISTS command_outbox_expiring_index ON command_outbox (expires_at) WHERE state IN ('queued', 'leased');
 CREATE INDEX IF NOT EXISTS command_outbox_two_way_expiring_index ON command_outbox (expires_at)
     WHERE state = 'published_to_broker' AND mode = 'two_way';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'command_outbox_device_id_fkey'
+          AND conrelid = 'command_outbox'::regclass
+    ) THEN
+        ALTER TABLE command_outbox
+            ADD CONSTRAINT command_outbox_device_id_fkey
+            FOREIGN KEY (device_id)
+            REFERENCES devices(device_id)
+            ON DELETE CASCADE;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'device_runtime_state_device_id_fkey'
+          AND conrelid = 'device_runtime_state'::regclass
+    ) THEN
+        ALTER TABLE device_runtime_state
+            ADD CONSTRAINT device_runtime_state_device_id_fkey
+            FOREIGN KEY (device_id)
+            REFERENCES devices(device_id)
+            ON DELETE CASCADE;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'telemetry_device_id_fkey'
+          AND conrelid = 'telemetry'::regclass
+    ) THEN
+        ALTER TABLE telemetry
+            ADD CONSTRAINT telemetry_device_id_fkey
+            FOREIGN KEY (device_id)
+            REFERENCES devices(device_id);
+    END IF;
+END
+$$;
+
 CREATE TABLE IF NOT EXISTS gateway_event_receipts (
     gateway_device_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, event_at TIMESTAMPTZ NOT NULL,
     received_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (gateway_device_id, idempotency_key)

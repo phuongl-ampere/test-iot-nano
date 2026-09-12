@@ -730,6 +730,79 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn platform_store_repairs_legacy_timescale_device_ownership_foreign_keys() {
+    let (_test_lock, store) = timescale_test_store().await;
+    let pool = store.timescale_pool().unwrap();
+
+    for statement in [
+        "ALTER TABLE command_outbox DROP CONSTRAINT command_outbox_device_id_fkey",
+        "ALTER TABLE device_runtime_state DROP CONSTRAINT device_runtime_state_device_id_fkey",
+        "ALTER TABLE telemetry DROP CONSTRAINT telemetry_device_id_fkey",
+    ] {
+        sqlx::query(statement).execute(pool).await.unwrap();
+    }
+    drop(store);
+
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
+    let repaired_store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let repaired_pool = repaired_store.timescale_pool().unwrap();
+
+    let constraints = sqlx::query(
+        "SELECT relation.relname AS table_name, constraint_row.conname,
+                constraint_row.confdeltype::text AS confdeltype
+         FROM pg_constraint AS constraint_row
+         JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+         WHERE constraint_row.conname IN (
+            'command_outbox_device_id_fkey',
+            'device_runtime_state_device_id_fkey',
+            'telemetry_device_id_fkey'
+         )
+         ORDER BY relation.relname",
+    )
+    .fetch_all(repaired_pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("table_name"),
+            row.get::<String, _>("conname"),
+            row.get::<String, _>("confdeltype"),
+        )
+    })
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        constraints,
+        [
+            (
+                "command_outbox".to_owned(),
+                "command_outbox_device_id_fkey".to_owned(),
+                "c".to_owned(),
+            ),
+            (
+                "device_runtime_state".to_owned(),
+                "device_runtime_state_device_id_fkey".to_owned(),
+                "c".to_owned(),
+            ),
+            (
+                "telemetry".to_owned(),
+                "telemetry_device_id_fkey".to_owned(),
+                "a".to_owned(),
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn platform_store_timescale_serializes_device_deletion_with_command_and_telemetry_writes() {
     let (_test_lock, store) = timescale_test_store().await;
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();

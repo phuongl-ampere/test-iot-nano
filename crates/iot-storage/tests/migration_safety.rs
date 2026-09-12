@@ -10,6 +10,13 @@ fn platform_store_owns_its_postgres_migration_source() {
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS devices"));
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS telemetry"));
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS command_outbox"));
+    assert!(migration.contains("DO $$"));
+    assert!(migration.contains("command_outbox_device_id_fkey"));
+    assert!(migration.contains("device_runtime_state_device_id_fkey"));
+    assert!(migration.contains("telemetry_device_id_fkey"));
+    assert!(migration.contains("ALTER TABLE command_outbox"));
+    assert!(migration.contains("ALTER TABLE device_runtime_state"));
+    assert!(migration.contains("ALTER TABLE telemetry"));
     assert!(!storage_source.contains("services/iot-nano-api/migrations"));
     assert!(!storage_source.contains("services/iot-nano-core/migrations"));
 }
