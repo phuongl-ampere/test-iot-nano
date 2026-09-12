@@ -410,6 +410,97 @@ pub trait TelemetryRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountClass {
+    System,
+    Admin,
+    User,
+}
+
+impl AccountClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Admin => "admin",
+            Self::User => "user",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResourcePermission {
+    Viewer,
+    Controller,
+    Manager,
+    Owner,
+}
+
+impl ResourcePermission {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Viewer => "viewer",
+            Self::Controller => "controller",
+            Self::Manager => "manager",
+            Self::Owner => "owner",
+        }
+    }
+
+    pub const fn allows(self, required: Self) -> bool {
+        self as u8 >= required as u8
+    }
+
+    fn parse_share(value: &str) -> Option<Self> {
+        match value {
+            "viewer" => Some(Self::Viewer),
+            "controller" => Some(Self::Controller),
+            "manager" => Some(Self::Manager),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Asset,
+    Device,
+}
+
+impl ResourceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asset => "asset",
+            Self::Device => "device",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizationSubject {
+    pub user_id: uuid::Uuid,
+    pub account_class: AccountClass,
+}
+
+pub trait AuthorizationRepository: Send + Sync {
+    fn device_permission<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        device_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ResourcePermission>, PlatformStoreError>> + Send + 'a,
+        >,
+    >;
+    fn asset_permission<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        asset_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ResourcePermission>, PlatformStoreError>> + Send + 'a,
+        >,
+    >;
+}
+
 impl PlatformStore {
     pub async fn open(configuration: &StorageConfiguration) -> Result<Self, PlatformStoreError> {
         match configuration.storage {
@@ -580,6 +671,197 @@ impl PlatformStore {
                 }
                 transaction.commit().await?;
                 Ok(authenticated)
+            }
+        }
+    }
+
+    pub async fn device_permission(
+        &self,
+        subject: &AuthorizationSubject,
+        device_id: &str,
+    ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+        if subject.account_class == AccountClass::Admin {
+            return Ok(Some(ResourcePermission::Owner));
+        }
+
+        match self {
+            Self::Sqlite(store) => {
+                let exists = sqlx::query_scalar::<_, String>(
+                    "SELECT device_id FROM devices
+                     WHERE device_id = ? AND deleted_at IS NULL",
+                )
+                .bind(device_id)
+                .fetch_optional(store.pool())
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let owner = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT owner_user_id FROM devices
+                     WHERE device_id = ? AND deleted_at IS NULL",
+                )
+                .bind(device_id)
+                .fetch_optional(store.pool())
+                .await?
+                .flatten();
+                if owner.as_deref() == Some(&subject.user_id.to_string()) {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
+                let rows = sqlx::query_scalar::<_, String>(
+                    "WITH RECURSIVE ancestors(id, depth) AS (
+                        SELECT asset_id, 0 FROM devices
+                        WHERE device_id = ? AND deleted_at IS NULL AND asset_id IS NOT NULL
+                        UNION ALL
+                        SELECT assets.parent_asset_id, ancestors.depth + 1
+                        FROM ancestors JOIN assets ON assets.id = ancestors.id
+                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     )
+                     SELECT permission FROM resource_shares
+                     WHERE resource_type = 'device' AND resource_id = ?
+                       AND target_user_id = ? AND state = 'active'
+                     UNION ALL
+                     SELECT shares.permission FROM resource_shares AS shares
+                     JOIN ancestors ON shares.resource_id = ancestors.id
+                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = ?
+                       AND shares.state = 'active' AND shares.inherit_children = 1",
+                )
+                .bind(device_id)
+                .bind(device_id)
+                .bind(subject.user_id.to_string())
+                .bind(subject.user_id.to_string())
+                .fetch_all(store.pool())
+                .await?;
+                Ok(strongest_share_permission(rows))
+            }
+            Self::Timescale(pool) => {
+                let exists = sqlx::query_scalar::<_, String>(
+                    "SELECT device_id FROM devices
+                     WHERE device_id = $1 AND deleted_at IS NULL",
+                )
+                .bind(device_id)
+                .fetch_optional(pool)
+                .await?;
+                if exists.is_none() {
+                    return Ok(None);
+                }
+                let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                    "SELECT owner_user_id FROM devices
+                     WHERE device_id = $1 AND deleted_at IS NULL",
+                )
+                .bind(device_id)
+                .fetch_optional(pool)
+                .await?
+                .flatten();
+                if owner == Some(subject.user_id) {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
+                let rows = sqlx::query_scalar::<_, String>(
+                    "WITH RECURSIVE ancestors(id, depth) AS (
+                        SELECT asset_id, 0 FROM devices
+                        WHERE device_id = $1 AND deleted_at IS NULL AND asset_id IS NOT NULL
+                        UNION ALL
+                        SELECT assets.parent_asset_id, ancestors.depth + 1
+                        FROM ancestors JOIN assets ON assets.id = ancestors.id
+                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     )
+                     SELECT permission FROM resource_shares
+                     WHERE resource_type = 'device' AND resource_id = $1
+                       AND target_user_id = $2 AND state = 'active'
+                     UNION ALL
+                     SELECT shares.permission FROM resource_shares AS shares
+                     JOIN ancestors ON shares.resource_id = ancestors.id::text
+                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = $2
+                       AND shares.state = 'active' AND shares.inherit_children = TRUE",
+                )
+                .bind(device_id)
+                .bind(subject.user_id)
+                .fetch_all(pool)
+                .await?;
+                Ok(strongest_share_permission(rows))
+            }
+        }
+    }
+
+    pub async fn asset_permission(
+        &self,
+        subject: &AuthorizationSubject,
+        asset_id: uuid::Uuid,
+    ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+        if subject.account_class == AccountClass::Admin {
+            return Ok(Some(ResourcePermission::Owner));
+        }
+
+        match self {
+            Self::Sqlite(store) => {
+                let asset_id = asset_id.to_string();
+                let owner = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT owner_user_id FROM assets WHERE id = ?",
+                )
+                .bind(&asset_id)
+                .fetch_optional(store.pool())
+                .await?
+                .flatten();
+                if owner.as_deref() == Some(&subject.user_id.to_string()) {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
+                let rows = sqlx::query_scalar::<_, String>(
+                    "WITH RECURSIVE ancestors(id, depth) AS (
+                        SELECT ?, 0
+                        UNION ALL
+                        SELECT assets.parent_asset_id, ancestors.depth + 1
+                        FROM ancestors JOIN assets ON assets.id = ancestors.id
+                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     )
+                     SELECT permission FROM resource_shares
+                     WHERE resource_type = 'asset' AND resource_id = ?
+                       AND target_user_id = ? AND state = 'active'
+                     UNION ALL
+                     SELECT shares.permission FROM resource_shares AS shares
+                     JOIN ancestors ON shares.resource_id = ancestors.id
+                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = ?
+                       AND shares.state = 'active' AND shares.inherit_children = 1",
+                )
+                .bind(&asset_id)
+                .bind(&asset_id)
+                .bind(subject.user_id.to_string())
+                .bind(subject.user_id.to_string())
+                .fetch_all(store.pool())
+                .await?;
+                Ok(strongest_share_permission(rows))
+            }
+            Self::Timescale(pool) => {
+                let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                    "SELECT owner_user_id FROM assets WHERE id = $1",
+                )
+                .bind(asset_id)
+                .fetch_optional(pool)
+                .await?
+                .flatten();
+                if owner == Some(subject.user_id) {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
+                let rows = sqlx::query_scalar::<_, String>(
+                    "WITH RECURSIVE ancestors(id, depth) AS (
+                        SELECT $1::uuid, 0
+                        UNION ALL
+                        SELECT assets.parent_asset_id, ancestors.depth + 1
+                        FROM ancestors JOIN assets ON assets.id = ancestors.id
+                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     )
+                     SELECT permission FROM resource_shares
+                     WHERE resource_type = 'asset' AND resource_id = $1::text
+                       AND target_user_id = $2 AND state = 'active'
+                     UNION ALL
+                     SELECT shares.permission FROM resource_shares AS shares
+                     JOIN ancestors ON shares.resource_id = ancestors.id::text
+                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = $2
+                       AND shares.state = 'active' AND shares.inherit_children = TRUE",
+                )
+                .bind(asset_id)
+                .bind(subject.user_id)
+                .fetch_all(pool)
+                .await?;
+                Ok(strongest_share_permission(rows))
             }
         }
     }
@@ -871,6 +1153,38 @@ impl TelemetryRepository for PlatformStore {
             async move { PlatformStore::write_telemetry(self, event, received_at, topic).await },
         )
     }
+}
+
+impl AuthorizationRepository for PlatformStore {
+    fn device_permission<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        device_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ResourcePermission>, PlatformStoreError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move { PlatformStore::device_permission(self, subject, device_id).await })
+    }
+
+    fn asset_permission<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        asset_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<ResourcePermission>, PlatformStoreError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move { PlatformStore::asset_permission(self, subject, asset_id).await })
+    }
+}
+
+fn strongest_share_permission(rows: Vec<String>) -> Option<ResourcePermission> {
+    rows.into_iter()
+        .filter_map(|value| ResourcePermission::parse_share(&value))
+        .max()
 }
 
 async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
