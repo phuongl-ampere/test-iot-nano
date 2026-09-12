@@ -10,14 +10,21 @@ const OTHER_USER_ID: Uuid = Uuid::from_u128(2);
 const ROOT_ASSET_ID: Uuid = Uuid::from_u128(10);
 const CHILD_ASSET_ID: Uuid = Uuid::from_u128(11);
 const OWNED_ASSET_ID: Uuid = Uuid::from_u128(12);
+const UNSHARED_ASSET_ID: Uuid = Uuid::from_u128(13);
+const PENDING_ASSET_ID: Uuid = Uuid::from_u128(14);
 const DEVICE_ASSET_ID: &str = "device-asset";
 const DEVICE_DIRECT_ID: &str = "device-direct";
 const DEVICE_OWNER_ID: &str = "device-owner";
+const DEVICE_UNSHARED_ID: &str = "device-unshared";
+const DEVICE_PENDING_ID: &str = "device-pending";
 const DEVICE_DELETED_ID: &str = "device-deleted";
+const ANCESTOR_CAP_LEAF_ID: Uuid = Uuid::from_u128(5_000);
 
 struct AuthorizationFixtures {
     root_asset_id: Uuid,
     child_asset_id: Uuid,
+    unshared_asset_id: Uuid,
+    pending_asset_id: Uuid,
 }
 
 fn user_subject(account_class: AccountClass) -> AuthorizationSubject {
@@ -54,7 +61,12 @@ async fn seed_sqlite(store: &PlatformStore) -> AuthorizationFixtures {
     .unwrap();
     sqlx::query(
         "INSERT INTO assets (id, name, parent_asset_id, owner_user_id)
-         VALUES (?, 'root', NULL, ?), (?, 'child', ?, NULL), (?, 'owned', NULL, ?)",
+         VALUES
+            (?, 'root', NULL, ?),
+            (?, 'child', ?, NULL),
+            (?, 'owned', NULL, ?),
+            (?, 'unshared', NULL, ?),
+            (?, 'pending', NULL, ?)",
     )
     .bind(ROOT_ASSET_ID.to_string())
     .bind(OTHER_USER_ID.to_string())
@@ -62,12 +74,22 @@ async fn seed_sqlite(store: &PlatformStore) -> AuthorizationFixtures {
     .bind(ROOT_ASSET_ID.to_string())
     .bind(OWNED_ASSET_ID.to_string())
     .bind(USER_ID.to_string())
+    .bind(UNSHARED_ASSET_ID.to_string())
+    .bind(OTHER_USER_ID.to_string())
+    .bind(PENDING_ASSET_ID.to_string())
+    .bind(OTHER_USER_ID.to_string())
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO devices (device_id, asset_id, owner_user_id)
-         VALUES (?, ?, NULL), (?, NULL, ?), (?, NULL, ?), (?, ?, ?)",
+         VALUES
+            (?, ?, NULL),
+            (?, NULL, ?),
+            (?, NULL, ?),
+            (?, ?, NULL),
+            (?, NULL, ?),
+            (?, ?, ?)",
     )
     .bind(DEVICE_ASSET_ID)
     .bind(CHILD_ASSET_ID.to_string())
@@ -75,6 +97,10 @@ async fn seed_sqlite(store: &PlatformStore) -> AuthorizationFixtures {
     .bind(OTHER_USER_ID.to_string())
     .bind(DEVICE_OWNER_ID)
     .bind(USER_ID.to_string())
+    .bind(DEVICE_UNSHARED_ID)
+    .bind(UNSHARED_ASSET_ID.to_string())
+    .bind(DEVICE_PENDING_ID)
+    .bind(OTHER_USER_ID.to_string())
     .bind(DEVICE_DELETED_ID)
     .bind(CHILD_ASSET_ID.to_string())
     .bind(OTHER_USER_ID.to_string())
@@ -95,6 +121,8 @@ async fn seed_sqlite(store: &PlatformStore) -> AuthorizationFixtures {
             ('asset-stronger', 'asset', ?, ?, 'manager', 1, 'active', ?),
             ('device-direct', 'device', ?, ?, 'controller', 0, 'active', ?),
             ('device-pending', 'device', ?, ?, 'manager', 0, 'pending', ?),
+            ('asset-pending-only', 'asset', ?, ?, 'manager', 1, 'pending', ?),
+            ('device-pending-only', 'device', ?, ?, 'manager', 0, 'pending', ?),
             ('device-deleted', 'device', ?, ?, 'manager', 0, 'active', ?)",
     )
     .bind(ROOT_ASSET_ID.to_string())
@@ -109,6 +137,12 @@ async fn seed_sqlite(store: &PlatformStore) -> AuthorizationFixtures {
     .bind(DEVICE_DIRECT_ID)
     .bind(USER_ID.to_string())
     .bind(OTHER_USER_ID.to_string())
+    .bind(PENDING_ASSET_ID.to_string())
+    .bind(USER_ID.to_string())
+    .bind(OTHER_USER_ID.to_string())
+    .bind(DEVICE_PENDING_ID)
+    .bind(USER_ID.to_string())
+    .bind(OTHER_USER_ID.to_string())
     .bind(DEVICE_DELETED_ID)
     .bind(USER_ID.to_string())
     .bind(OTHER_USER_ID.to_string())
@@ -119,10 +153,15 @@ async fn seed_sqlite(store: &PlatformStore) -> AuthorizationFixtures {
     AuthorizationFixtures {
         root_asset_id: ROOT_ASSET_ID,
         child_asset_id: CHILD_ASSET_ID,
+        unshared_asset_id: UNSHARED_ASSET_ID,
+        pending_asset_id: PENDING_ASSET_ID,
     }
 }
 
-async fn assert_contract(store: &PlatformStore, fixtures: AuthorizationFixtures) {
+async fn assert_approved_authorization_contract(
+    store: &PlatformStore,
+    fixtures: &AuthorizationFixtures,
+) {
     let admin = user_subject(AccountClass::Admin);
     let user = user_subject(AccountClass::User);
     let system = user_subject(AccountClass::System);
@@ -175,13 +214,6 @@ async fn assert_contract(store: &PlatformStore, fixtures: AuthorizationFixtures)
     );
     assert_eq!(
         store
-            .device_permission(&user, DEVICE_DELETED_ID)
-            .await
-            .unwrap(),
-        None
-    );
-    assert_eq!(
-        store
             .device_permission(&system, "missing-device")
             .await
             .unwrap(),
@@ -196,10 +228,159 @@ async fn assert_contract(store: &PlatformStore, fixtures: AuthorizationFixtures)
 }
 
 #[tokio::test]
-async fn sqlite_resource_authorization_repository_matches_api_contract() {
+async fn sqlite_resource_authorization_repository_matches_approved_storage_contract() {
     let (_directory, store) = sqlite_store().await;
     let fixtures = seed_sqlite(&store).await;
-    assert_contract(&store, fixtures).await;
+    assert_approved_authorization_contract(&store, &fixtures).await;
+}
+
+async fn assert_existing_unshared_resources_have_no_permission(
+    store: &PlatformStore,
+    fixtures: &AuthorizationFixtures,
+) {
+    let user = user_subject(AccountClass::User);
+    assert_eq!(
+        store
+            .asset_permission(&user, fixtures.unshared_asset_id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .device_permission(&user, DEVICE_UNSHARED_ID)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn sqlite_resource_authorization_returns_none_for_existing_unshared_resources() {
+    let (_directory, store) = sqlite_store().await;
+    let fixtures = seed_sqlite(&store).await;
+    assert_existing_unshared_resources_have_no_permission(&store, &fixtures).await;
+}
+
+async fn assert_pending_only_shares_have_no_permission(
+    store: &PlatformStore,
+    fixtures: &AuthorizationFixtures,
+) {
+    let user = user_subject(AccountClass::User);
+    assert_eq!(
+        store
+            .asset_permission(&user, fixtures.pending_asset_id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .device_permission(&user, DEVICE_PENDING_ID)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn sqlite_resource_authorization_ignores_pending_only_shares() {
+    let (_directory, store) = sqlite_store().await;
+    let fixtures = seed_sqlite(&store).await;
+    assert_pending_only_shares_have_no_permission(&store, &fixtures).await;
+}
+
+async fn assert_deleted_device_direct_share_has_no_permission(store: &PlatformStore) {
+    let user = user_subject(AccountClass::User);
+    assert_eq!(
+        store
+            .device_permission(&user, DEVICE_DELETED_ID)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn sqlite_resource_authorization_denies_deleted_device_direct_active_share() {
+    let (_directory, store) = sqlite_store().await;
+    seed_sqlite(&store).await;
+    assert_deleted_device_direct_share_has_no_permission(&store).await;
+}
+
+const fn ancestor_cap_asset_id(depth: u128) -> Uuid {
+    Uuid::from_u128(5_000 + depth)
+}
+
+async fn seed_sqlite_ancestor_cap(store: &PlatformStore) {
+    let pool = store.sqlite_pool().unwrap();
+    for depth in (1..=65_u128).rev() {
+        let parent_asset_id = if depth == 65 {
+            None
+        } else {
+            Some(ancestor_cap_asset_id(depth + 1).to_string())
+        };
+        sqlx::query("INSERT INTO assets (id, name, parent_asset_id) VALUES (?, ?, ?)")
+            .bind(ancestor_cap_asset_id(depth).to_string())
+            .bind(format!("ancestor-cap-{depth}"))
+            .bind(parent_asset_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO assets (id, name, parent_asset_id) VALUES (?, 'cap-leaf', ?)")
+        .bind(ANCESTOR_CAP_LEAF_ID.to_string())
+        .bind(ancestor_cap_asset_id(1).to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_shares
+            (id, resource_type, resource_id, target_user_id, permission,
+             inherit_children, state, created_by_user_id)
+         VALUES
+            ('cap-included', 'asset', ?, ?, 'viewer', 1, 'active', ?),
+            ('cap-excluded', 'asset', ?, ?, 'manager', 1, 'active', ?)",
+    )
+    .bind(ancestor_cap_asset_id(64).to_string())
+    .bind(USER_ID.to_string())
+    .bind(OTHER_USER_ID.to_string())
+    .bind(ancestor_cap_asset_id(65).to_string())
+    .bind(OTHER_USER_ID.to_string())
+    .bind(USER_ID.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn assert_64_ancestor_cap(store: &PlatformStore) {
+    let included_subject = user_subject(AccountClass::User);
+    let excluded_subject = AuthorizationSubject {
+        user_id: OTHER_USER_ID,
+        account_class: AccountClass::User,
+    };
+    assert_eq!(
+        store
+            .asset_permission(&included_subject, ANCESTOR_CAP_LEAF_ID)
+            .await
+            .unwrap(),
+        Some(ResourcePermission::Viewer)
+    );
+    assert_eq!(
+        store
+            .asset_permission(&excluded_subject, ANCESTOR_CAP_LEAF_ID)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn sqlite_resource_authorization_limits_inheritance_to_64_ancestors() {
+    let (_directory, store) = sqlite_store().await;
+    seed_sqlite(&store).await;
+    seed_sqlite_ancestor_cap(&store).await;
+    assert_64_ancestor_cap(&store).await;
 }
 
 struct TimescaleTestLock {
@@ -256,19 +437,32 @@ async fn seed_timescale(store: &PlatformStore) -> AuthorizationFixtures {
     .unwrap();
     sqlx::query(
         "INSERT INTO assets (id, name, parent_asset_id, owner_user_id)
-         VALUES ($1, 'root', NULL, $2), ($3, 'child', $1, NULL), ($4, 'owned', NULL, $5)",
+         VALUES
+            ($1, 'root', NULL, $2),
+            ($3, 'child', $1, NULL),
+            ($4, 'owned', NULL, $5),
+            ($6, 'unshared', NULL, $2),
+            ($7, 'pending', NULL, $2)",
     )
     .bind(ROOT_ASSET_ID)
     .bind(OTHER_USER_ID)
     .bind(CHILD_ASSET_ID)
     .bind(OWNED_ASSET_ID)
     .bind(USER_ID)
+    .bind(UNSHARED_ASSET_ID)
+    .bind(PENDING_ASSET_ID)
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO devices (device_id, asset_id, owner_user_id)
-         VALUES ($1, $2, NULL), ($3, NULL, $4), ($5, NULL, $6), ($7, $2, $4)",
+         VALUES
+            ($1, $2, NULL),
+            ($3, NULL, $4),
+            ($5, NULL, $6),
+            ($7, $8, NULL),
+            ($9, NULL, $4),
+            ($10, $2, $4)",
     )
     .bind(DEVICE_ASSET_ID)
     .bind(CHILD_ASSET_ID)
@@ -276,6 +470,9 @@ async fn seed_timescale(store: &PlatformStore) -> AuthorizationFixtures {
     .bind(OTHER_USER_ID)
     .bind(DEVICE_OWNER_ID)
     .bind(USER_ID)
+    .bind(DEVICE_UNSHARED_ID)
+    .bind(UNSHARED_ASSET_ID)
+    .bind(DEVICE_PENDING_ID)
     .bind(DEVICE_DELETED_ID)
     .execute(pool)
     .await
@@ -294,7 +491,9 @@ async fn seed_timescale(store: &PlatformStore) -> AuthorizationFixtures {
             ($5, 'asset', $6::text, $3, 'manager', TRUE, 'active', $4),
             ($7, 'device', $8, $3, 'controller', FALSE, 'active', $4),
             ($9, 'device', $8, $3, 'manager', FALSE, 'pending', $4),
-            ($10, 'device', $11, $3, 'manager', FALSE, 'active', $4)",
+            ($10, 'asset', $11::text, $3, 'manager', TRUE, 'pending', $4),
+            ($12, 'device', $13, $3, 'manager', FALSE, 'pending', $4),
+            ($14, 'device', $15, $3, 'manager', FALSE, 'active', $4)",
     )
     .bind(Uuid::from_u128(101))
     .bind(ROOT_ASSET_ID)
@@ -306,6 +505,10 @@ async fn seed_timescale(store: &PlatformStore) -> AuthorizationFixtures {
     .bind(DEVICE_DIRECT_ID)
     .bind(Uuid::from_u128(104))
     .bind(Uuid::from_u128(105))
+    .bind(PENDING_ASSET_ID)
+    .bind(Uuid::from_u128(106))
+    .bind(DEVICE_PENDING_ID)
+    .bind(Uuid::from_u128(107))
     .bind(DEVICE_DELETED_ID)
     .execute(pool)
     .await
@@ -314,13 +517,61 @@ async fn seed_timescale(store: &PlatformStore) -> AuthorizationFixtures {
     AuthorizationFixtures {
         root_asset_id: ROOT_ASSET_ID,
         child_asset_id: CHILD_ASSET_ID,
+        unshared_asset_id: UNSHARED_ASSET_ID,
+        pending_asset_id: PENDING_ASSET_ID,
     }
+}
+
+async fn seed_timescale_ancestor_cap(store: &PlatformStore) {
+    let pool = store.timescale_pool().unwrap();
+    for depth in (1..=65_u128).rev() {
+        let parent_asset_id = if depth == 65 {
+            None
+        } else {
+            Some(ancestor_cap_asset_id(depth + 1))
+        };
+        sqlx::query("INSERT INTO assets (id, name, parent_asset_id) VALUES ($1, $2, $3)")
+            .bind(ancestor_cap_asset_id(depth))
+            .bind(format!("ancestor-cap-{depth}"))
+            .bind(parent_asset_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("INSERT INTO assets (id, name, parent_asset_id) VALUES ($1, 'cap-leaf', $2)")
+        .bind(ANCESTOR_CAP_LEAF_ID)
+        .bind(ancestor_cap_asset_id(1))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_shares
+            (id, resource_type, resource_id, target_user_id, permission,
+             inherit_children, state, created_by_user_id)
+         VALUES
+            ($1, 'asset', $2::text, $3, 'viewer', TRUE, 'active', $4),
+            ($5, 'asset', $6::text, $4, 'manager', TRUE, 'active', $3)",
+    )
+    .bind(Uuid::from_u128(201))
+    .bind(ancestor_cap_asset_id(64))
+    .bind(USER_ID)
+    .bind(OTHER_USER_ID)
+    .bind(Uuid::from_u128(202))
+    .bind(ancestor_cap_asset_id(65))
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
-async fn timescale_resource_authorization_repository_matches_sqlite_contract() {
+async fn timescale_resource_authorization_repository_matches_approved_storage_contract() {
     let (_lock, store) = timescale_store().await;
     let fixtures = seed_timescale(&store).await;
-    assert_contract(&store, fixtures).await;
+    assert_approved_authorization_contract(&store, &fixtures).await;
+    assert_existing_unshared_resources_have_no_permission(&store, &fixtures).await;
+    assert_pending_only_shares_have_no_permission(&store, &fixtures).await;
+    assert_deleted_device_direct_share_has_no_permission(&store).await;
+    seed_timescale_ancestor_cap(&store).await;
+    assert_64_ancestor_cap(&store).await;
 }
