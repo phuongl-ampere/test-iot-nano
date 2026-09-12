@@ -360,6 +360,19 @@ pub enum PlatformStoreError {
     InvalidCommandParams,
     #[error("command payload conflicts with existing command ID: {0:?}")]
     CommandConflict(String),
+    #[error("notification ID is not a UUID: {0:?}")]
+    InvalidNotificationId(String),
+    #[error("invalid notification outbox kind: {0:?}")]
+    InvalidNotificationKind(String),
+    #[error("invalid notification outbox state: {0:?}")]
+    InvalidNotificationState(String),
+    #[error("invalid notification outbox {column} timestamp: {value}")]
+    InvalidNotificationTimestamp {
+        column: &'static str,
+        value: String,
+        #[source]
+        source: chrono::ParseError,
+    },
     #[error("device is not registered: {0:?}")]
     UnknownDevice(String),
     #[error("device token authentication denied")]
@@ -399,6 +412,44 @@ pub trait CommandRepository: Send + Sync {
         &'a self,
         command: NewCommandOutboxEntry,
     ) -> Pin<Box<dyn Future<Output = Result<CommandOutboxRecord, PlatformStoreError>> + Send + 'a>>;
+}
+
+pub trait NotificationRepository: Send + Sync {
+    fn claim_notifications<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<NotificationOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn mark_notification_sent<'a>(
+        &'a self,
+        notification_id: uuid::Uuid,
+        sent_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<NotificationOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn release_notification_for_retry<'a>(
+        &'a self,
+        notification_id: uuid::Uuid,
+        error: &'a str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<NotificationOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }
 
 pub trait CommandLifecycleRepository: Send + Sync {
@@ -1110,6 +1161,61 @@ impl PlatformStore {
         }
     }
 
+    pub async fn claim_notifications(
+        &self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<NotificationOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.claim_notifications(now, lease_until, limit).await?),
+            Self::Timescale(pool) => {
+                claim_timescale_notifications(pool, now, lease_until, limit).await
+            }
+        }
+    }
+
+    pub async fn mark_notification_sent(
+        &self,
+        notification_id: uuid::Uuid,
+        sent_at: DateTime<Utc>,
+    ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .mark_notification_sent(&notification_id.to_string(), sent_at)
+                .await?),
+            Self::Timescale(pool) => {
+                mark_timescale_notification_sent(pool, notification_id, sent_at).await
+            }
+        }
+    }
+
+    pub async fn release_notification_for_retry(
+        &self,
+        notification_id: uuid::Uuid,
+        error: &str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .release_notification_for_retry(
+                    &notification_id.to_string(),
+                    error,
+                    next_attempt_at,
+                )
+                .await?),
+            Self::Timescale(pool) => {
+                release_timescale_notification_for_retry(
+                    pool,
+                    notification_id,
+                    error,
+                    next_attempt_at,
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn write_telemetry(
         &self,
         event: &TelemetryEvent,
@@ -1353,6 +1459,89 @@ async fn claim_timescale_commands(
     rows.into_iter()
         .map(postgres_command_outbox_record)
         .collect()
+}
+
+async fn claim_timescale_notifications(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    lease_until: DateTime<Utc>,
+    limit: u32,
+) -> Result<Vec<NotificationOutboxRecord>, PlatformStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "WITH due AS (
+            SELECT id
+            FROM notification_outbox
+            WHERE (state = 'pending' AND next_attempt_at <= $1)
+               OR (state = 'leased' AND lease_until <= $1)
+            ORDER BY next_attempt_at, created_at, id
+            FOR UPDATE SKIP LOCKED
+            LIMIT $2
+         )
+         UPDATE notification_outbox AS notification
+         SET state = 'leased',
+             lease_until = $3,
+             attempt_count = notification.attempt_count + 1
+         FROM due
+         WHERE notification.id = due.id
+         RETURNING
+            notification.id, notification.incident_id, notification.kind,
+            notification.dedupe_key, notification.subject, notification.body,
+            notification.state, notification.next_attempt_at, notification.lease_until,
+            notification.attempt_count, notification.last_error, notification.sent_at",
+    )
+    .bind(now)
+    .bind(i64::from(limit))
+    .bind(lease_until)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(postgres_notification_outbox_record)
+        .collect()
+}
+
+async fn mark_timescale_notification_sent(
+    pool: &PgPool,
+    notification_id: uuid::Uuid,
+    sent_at: DateTime<Utc>,
+) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
+    let row = sqlx::query(
+        "UPDATE notification_outbox
+         SET state = 'sent', sent_at = $1, lease_until = NULL
+         WHERE id = $2 AND state = 'leased'
+         RETURNING
+            id, incident_id, kind, dedupe_key, subject, body, state,
+            next_attempt_at, lease_until, attempt_count, last_error, sent_at",
+    )
+    .bind(sent_at)
+    .bind(notification_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(postgres_notification_outbox_record).transpose()
+}
+
+async fn release_timescale_notification_for_retry(
+    pool: &PgPool,
+    notification_id: uuid::Uuid,
+    error: &str,
+    next_attempt_at: DateTime<Utc>,
+) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
+    let row = sqlx::query(
+        "UPDATE notification_outbox
+         SET state = 'pending', next_attempt_at = $1, last_error = $2, lease_until = NULL
+         WHERE id = $3 AND state = 'leased'
+         RETURNING
+            id, incident_id, kind, dedupe_key, subject, body, state,
+            next_attempt_at, lease_until, attempt_count, last_error, sent_at",
+    )
+    .bind(next_attempt_at)
+    .bind(error)
+    .bind(notification_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(postgres_notification_outbox_record).transpose()
 }
 
 async fn mark_timescale_command_published(
@@ -1601,6 +1790,64 @@ impl AuthorizationRepository for PlatformStore {
     }
 }
 
+impl NotificationRepository for PlatformStore {
+    fn claim_notifications<'a>(
+        &'a self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<NotificationOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(
+            async move { PlatformStore::claim_notifications(self, now, lease_until, limit).await },
+        )
+    }
+
+    fn mark_notification_sent<'a>(
+        &'a self,
+        notification_id: uuid::Uuid,
+        sent_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<NotificationOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::mark_notification_sent(self, notification_id, sent_at).await
+        })
+    }
+
+    fn release_notification_for_retry<'a>(
+        &'a self,
+        notification_id: uuid::Uuid,
+        error: &'a str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<NotificationOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::release_notification_for_retry(
+                self,
+                notification_id,
+                error,
+                next_attempt_at,
+            )
+            .await
+        })
+    }
+}
+
 fn strongest_share_permission(rows: Vec<String>) -> Option<ResourcePermission> {
     rows.into_iter()
         .filter_map(|value| ResourcePermission::parse_share(&value))
@@ -1648,6 +1895,25 @@ fn postgres_command_outbox_record(row: PgRow) -> Result<CommandOutboxRecord, Pla
             .try_get::<Option<Json<serde_json::Value>>, _>("response")?
             .map(|response| response.0.to_string()),
         responded_at: row.try_get("responded_at")?,
+    })
+}
+
+fn postgres_notification_outbox_record(
+    row: PgRow,
+) -> Result<NotificationOutboxRecord, PlatformStoreError> {
+    Ok(NotificationOutboxRecord {
+        id: row.try_get("id")?,
+        incident_id: row.try_get("incident_id")?,
+        kind: NotificationKind::from_database(&row.try_get::<String, _>("kind")?)?,
+        dedupe_key: row.try_get("dedupe_key")?,
+        subject: row.try_get("subject")?,
+        body: row.try_get("body")?,
+        state: NotificationOutboxState::from_database(&row.try_get::<String, _>("state")?)?,
+        next_attempt_at: row.try_get("next_attempt_at")?,
+        lease_until: row.try_get("lease_until")?,
+        attempt_count: i64::from(row.try_get::<i32, _>("attempt_count")?),
+        last_error: row.try_get("last_error")?,
+        sent_at: row.try_get("sent_at")?,
     })
 }
 
@@ -1702,6 +1968,62 @@ pub struct CommandOutboxRecord {
     pub published_at: Option<DateTime<Utc>>,
     pub response: Option<String>,
     pub responded_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationKind {
+    Opened,
+    Resolved,
+    Reminder,
+}
+
+impl NotificationKind {
+    fn from_database(value: &str) -> Result<Self, PlatformStoreError> {
+        match value {
+            "opened" => Ok(Self::Opened),
+            "resolved" => Ok(Self::Resolved),
+            "reminder" => Ok(Self::Reminder),
+            _ => Err(PlatformStoreError::InvalidNotificationKind(
+                value.to_owned(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationOutboxState {
+    Pending,
+    Leased,
+    Sent,
+}
+
+impl NotificationOutboxState {
+    fn from_database(value: &str) -> Result<Self, PlatformStoreError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "leased" => Ok(Self::Leased),
+            "sent" => Ok(Self::Sent),
+            _ => Err(PlatformStoreError::InvalidNotificationState(
+                value.to_owned(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationOutboxRecord {
+    pub id: uuid::Uuid,
+    pub incident_id: uuid::Uuid,
+    pub kind: NotificationKind,
+    pub dedupe_key: String,
+    pub subject: String,
+    pub body: String,
+    pub state: NotificationOutboxState,
+    pub next_attempt_at: DateTime<Utc>,
+    pub lease_until: Option<DateTime<Utc>>,
+    pub attempt_count: i64,
+    pub last_error: Option<String>,
+    pub sent_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1922,6 +2244,87 @@ impl SqliteStore {
         .fetch_optional(&self.pool)
         .await?;
         row.map(command_outbox_record).transpose()
+    }
+
+    pub async fn claim_notifications(
+        &self,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<NotificationOutboxRecord>, PlatformStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = now.to_rfc3339();
+        let rows = sqlx::query(
+            "WITH due AS (
+                SELECT id
+                FROM notification_outbox
+                WHERE (state = 'pending' AND next_attempt_at <= ?)
+                   OR (state = 'leased' AND lease_until <= ?)
+                ORDER BY next_attempt_at, created_at, id
+                LIMIT ?
+             )
+             UPDATE notification_outbox
+             SET state = 'leased',
+                 lease_until = ?,
+                 attempt_count = attempt_count + 1
+             WHERE id IN (SELECT id FROM due)
+             RETURNING
+                id, incident_id, kind, dedupe_key, subject, body, state,
+                next_attempt_at, lease_until, attempt_count, last_error, sent_at",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(i64::from(limit))
+        .bind(lease_until.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(notification_outbox_record).collect()
+    }
+
+    pub async fn mark_notification_sent(
+        &self,
+        notification_id: &str,
+        sent_at: DateTime<Utc>,
+    ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
+        let sent_at = sent_at.to_rfc3339();
+        let row = sqlx::query(
+            "UPDATE notification_outbox
+             SET state = 'sent', sent_at = ?, lease_until = NULL
+             WHERE id = ? AND state = 'leased'
+             RETURNING
+                id, incident_id, kind, dedupe_key, subject, body, state,
+                next_attempt_at, lease_until, attempt_count, last_error, sent_at",
+        )
+        .bind(&sent_at)
+        .bind(notification_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(notification_outbox_record).transpose()
+    }
+
+    pub async fn release_notification_for_retry(
+        &self,
+        notification_id: &str,
+        error: &str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
+        let next_attempt_at = next_attempt_at.to_rfc3339();
+        let row = sqlx::query(
+            "UPDATE notification_outbox
+             SET state = 'pending', next_attempt_at = ?, last_error = ?, lease_until = NULL
+             WHERE id = ? AND state = 'leased'
+             RETURNING
+                id, incident_id, kind, dedupe_key, subject, body, state,
+                next_attempt_at, lease_until, attempt_count, last_error, sent_at",
+        )
+        .bind(&next_attempt_at)
+        .bind(error)
+        .bind(notification_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(notification_outbox_record).transpose()
     }
 
     pub async fn expire_commands(
@@ -2364,6 +2767,60 @@ fn command_outbox_record(row: SqliteRow) -> Result<CommandOutboxRecord, SqliteSt
         response: row.try_get("response")?,
         responded_at: command_optional_timestamp(&row, "responded_at")?,
     })
+}
+
+fn notification_outbox_record(
+    row: SqliteRow,
+) -> Result<NotificationOutboxRecord, PlatformStoreError> {
+    let id: String = row.try_get("id")?;
+    let incident_id: String = row.try_get("incident_id")?;
+    Ok(NotificationOutboxRecord {
+        id: uuid::Uuid::parse_str(&id)
+            .map_err(|_| PlatformStoreError::InvalidNotificationId(id))?,
+        incident_id: uuid::Uuid::parse_str(&incident_id)
+            .map_err(|_| PlatformStoreError::InvalidNotificationId(incident_id))?,
+        kind: NotificationKind::from_database(&row.try_get::<String, _>("kind")?)?,
+        dedupe_key: row.try_get("dedupe_key")?,
+        subject: row.try_get("subject")?,
+        body: row.try_get("body")?,
+        state: NotificationOutboxState::from_database(&row.try_get::<String, _>("state")?)?,
+        next_attempt_at: notification_timestamp(&row, "next_attempt_at")?,
+        lease_until: notification_optional_timestamp(&row, "lease_until")?,
+        attempt_count: row.try_get("attempt_count")?,
+        last_error: row.try_get("last_error")?,
+        sent_at: notification_optional_timestamp(&row, "sent_at")?,
+    })
+}
+
+fn notification_timestamp(
+    row: &SqliteRow,
+    column: &'static str,
+) -> Result<DateTime<Utc>, PlatformStoreError> {
+    let value: String = row.try_get(column)?;
+    DateTime::parse_from_rfc3339(&value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|source| PlatformStoreError::InvalidNotificationTimestamp {
+            column,
+            value,
+            source,
+        })
+}
+
+fn notification_optional_timestamp(
+    row: &SqliteRow,
+    column: &'static str,
+) -> Result<Option<DateTime<Utc>>, PlatformStoreError> {
+    row.try_get::<Option<String>, _>(column)?
+        .map(|value| {
+            DateTime::parse_from_rfc3339(&value)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(|source| PlatformStoreError::InvalidNotificationTimestamp {
+                    column,
+                    value,
+                    source,
+                })
+        })
+        .transpose()
 }
 
 fn command_mode_value(mode: RpcMode) -> &'static str {
