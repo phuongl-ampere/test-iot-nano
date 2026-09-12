@@ -591,6 +591,20 @@ pub trait IdentityRepository: Send + Sync {
     >;
 }
 
+pub trait DeviceAuthorizationRepository: Send + Sync {
+    fn authorize_device_session<'a>(
+        &'a self,
+        token_id: uuid::Uuid,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
+    fn authorize_gateway_token<'a>(
+        &'a self,
+        token_id: uuid::Uuid,
+        gateway_device_id: &'a str,
+        child_device_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
+}
+
 pub trait CommandRepository: Send + Sync {
     fn enqueue_command<'a>(
         &'a self,
@@ -1216,6 +1230,120 @@ impl PlatformStore {
                 Ok(authenticated)
             }
         }
+    }
+
+    pub async fn authorize_device_session(
+        &self,
+        token_id: uuid::Uuid,
+        device_id: &str,
+    ) -> Result<(), PlatformStoreError> {
+        let authorized = match self {
+            Self::Sqlite(store) => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT 1
+                     FROM device_tokens
+                     JOIN devices ON devices.device_id = device_tokens.device_id
+                     WHERE device_tokens.id = ?
+                       AND device_tokens.device_id = ?
+                       AND device_tokens.revoked_at IS NULL
+                       AND devices.deleted_at IS NULL
+                       AND devices.gateway_device_id IS NULL",
+                )
+                .bind(token_id.to_string())
+                .bind(device_id)
+                .fetch_optional(store.pool())
+                .await?
+            }
+            Self::Timescale(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT 1
+                     FROM device_tokens
+                     JOIN devices ON devices.device_id = device_tokens.device_id
+                     WHERE device_tokens.id = $1
+                       AND device_tokens.device_id = $2
+                       AND device_tokens.revoked_at IS NULL
+                       AND devices.deleted_at IS NULL
+                       AND devices.gateway_device_id IS NULL",
+                )
+                .bind(token_id)
+                .bind(device_id)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        authorized
+            .map(|_| ())
+            .ok_or(PlatformStoreError::DeviceTokenDenied)
+    }
+
+    pub async fn authorize_gateway_token(
+        &self,
+        token_id: uuid::Uuid,
+        gateway_device_id: &str,
+        child_device_id: Option<&str>,
+    ) -> Result<(), PlatformStoreError> {
+        let authorized = match self {
+            Self::Sqlite(store) => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT 1
+                     FROM device_tokens
+                     JOIN devices AS gateways
+                       ON gateways.device_id = device_tokens.device_id
+                     WHERE device_tokens.id = ?
+                       AND device_tokens.device_id = ?
+                       AND device_tokens.revoked_at IS NULL
+                       AND gateways.deleted_at IS NULL
+                       AND gateways.is_gateway = 1
+                       AND (
+                           ? IS NULL
+                           OR EXISTS (
+                               SELECT 1
+                               FROM devices AS children
+                               WHERE children.device_id = ?
+                                 AND children.gateway_device_id = gateways.device_id
+                                 AND children.deleted_at IS NULL
+                           )
+                       )",
+                )
+                .bind(token_id.to_string())
+                .bind(gateway_device_id)
+                .bind(child_device_id)
+                .bind(child_device_id)
+                .fetch_optional(store.pool())
+                .await?
+            }
+            Self::Timescale(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT 1
+                     FROM device_tokens
+                     JOIN devices AS gateways
+                       ON gateways.device_id = device_tokens.device_id
+                     WHERE device_tokens.id = $1
+                       AND device_tokens.device_id = $2
+                       AND device_tokens.revoked_at IS NULL
+                       AND gateways.deleted_at IS NULL
+                       AND gateways.is_gateway = TRUE
+                       AND (
+                           $3 IS NULL
+                           OR EXISTS (
+                               SELECT 1
+                               FROM devices AS children
+                               WHERE children.device_id = $3
+                                 AND children.gateway_device_id = gateways.device_id
+                                 AND children.deleted_at IS NULL
+                           )
+                       )",
+                )
+                .bind(token_id)
+                .bind(gateway_device_id)
+                .bind(child_device_id)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        authorized
+            .map(|_| ())
+            .ok_or(PlatformStoreError::DeviceTokenDenied)
     }
 
     pub async fn device_permission(
@@ -2083,6 +2211,35 @@ impl IdentityRepository for PlatformStore {
         Box<dyn Future<Output = Result<AuthenticatedDeviceToken, PlatformStoreError>> + Send + 'a>,
     > {
         Box::pin(async move { PlatformStore::resolve_active_device_token(self, token).await })
+    }
+}
+
+impl DeviceAuthorizationRepository for PlatformStore {
+    fn authorize_device_session<'a>(
+        &'a self,
+        token_id: uuid::Uuid,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>> {
+        Box::pin(
+            async move { PlatformStore::authorize_device_session(self, token_id, device_id).await },
+        )
+    }
+
+    fn authorize_gateway_token<'a>(
+        &'a self,
+        token_id: uuid::Uuid,
+        gateway_device_id: &'a str,
+        child_device_id: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            PlatformStore::authorize_gateway_token(
+                self,
+                token_id,
+                gateway_device_id,
+                child_device_id,
+            )
+            .await
+        })
     }
 }
 

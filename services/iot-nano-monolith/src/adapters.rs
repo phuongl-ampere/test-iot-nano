@@ -1,0 +1,93 @@
+use std::{future::Future, pin::Pin, sync::Arc};
+
+use iot_nano_mqttd::{
+    AuthenticatedDevice, AuthorizationError, DeviceAuthorizationPort, GatewayAuthorization,
+    GatewayAuthorizationRequest, TransportAuthRequest,
+};
+use iot_storage::{
+    DeviceAuthorizationRepository, IdentityRepository, PlatformStore, PlatformStoreError,
+};
+
+const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
+const STORAGE_UNAVAILABLE: &str = "platform storage unavailable";
+
+pub struct PlatformDeviceAuthorization {
+    store: Arc<PlatformStore>,
+}
+
+impl PlatformDeviceAuthorization {
+    pub fn new(store: Arc<PlatformStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl DeviceAuthorizationPort for PlatformDeviceAuthorization {
+    fn authenticate(
+        &self,
+        request: TransportAuthRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AuthenticatedDevice, AuthorizationError>> + Send + '_>>
+    {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            if request.username != DEVICE_TOKEN_USERNAME {
+                return Err(AuthorizationError::Denied);
+            }
+            IdentityRepository::resolve_active_device_token(store.as_ref(), &request.password)
+                .await
+                .map(|device| AuthenticatedDevice {
+                    token_id: device.token_id,
+                    device_id: device.device_id,
+                    is_gateway: device.is_gateway,
+                })
+                .map_err(map_storage_error)
+        })
+    }
+
+    fn authorize_session(
+        &self,
+        device: AuthenticatedDevice,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthorizationError>> + Send + '_>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            DeviceAuthorizationRepository::authorize_device_session(
+                store.as_ref(),
+                device.token_id,
+                &device.device_id,
+            )
+            .await
+            .map_err(map_storage_error)
+        })
+    }
+
+    fn authorize_gateway_uplink(
+        &self,
+        request: GatewayAuthorizationRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GatewayAuthorization, AuthorizationError>> + Send + '_>>
+    {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            DeviceAuthorizationRepository::authorize_gateway_token(
+                store.as_ref(),
+                request.token_id,
+                &request.gateway_device_id,
+                request.child_device_id.as_deref(),
+            )
+            .await
+            .map_err(map_storage_error)?;
+            Ok(GatewayAuthorization {
+                gateway_device_id: request.gateway_device_id,
+                token_id: request.token_id,
+                child_device_id: request.child_device_id,
+                topic: request.topic,
+                event_kind: request.event_kind,
+            })
+        })
+    }
+}
+
+fn map_storage_error(error: PlatformStoreError) -> AuthorizationError {
+    match error {
+        PlatformStoreError::DeviceTokenDenied => AuthorizationError::Denied,
+        _ => AuthorizationError::Unavailable(STORAGE_UNAVAILABLE.to_owned()),
+    }
+}

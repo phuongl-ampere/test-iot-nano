@@ -21,7 +21,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
+sqlx.workspace = true
 tempfile.workspace = true
+uuid.workspace = true
 
 [lib]
 name = "iot_nano_monolith"
