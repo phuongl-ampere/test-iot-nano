@@ -1,14 +1,17 @@
 use std::{
     future::Future,
+    io,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Instant,
 };
 
 use chrono::{TimeZone, Utc};
+use futures_util::{SinkExt, StreamExt};
 use iot_nano_mqttd::{
     AuthenticatedDevice, AuthorizationError, CommandResponseError, CommandResponsePort,
     DeviceAuthenticator, DeviceAuthorizationPort, GatewayAuthorization,
@@ -20,9 +23,24 @@ use iot_nano_stream::{
     AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment,
     HeartbeatRequest, PartitionId, StreamError, StreamMessage, StreamPort,
 };
-use rumqttc::QoS;
+use rumqttc::{
+    Connect as V311Connect, ConnectReturnCode as V311ConnectReturnCode, Packet as V311Packet,
+    Publish as V311Publish, QoS,
+    mqttbytes::v4::Codec as V311Codec,
+    v5::mqttbytes::{
+        QoS as V5QoS,
+        v5::{
+            Codec as V5Codec, Connect as V5Connect, ConnectReturnCode as V5ConnectReturnCode,
+            Login as V5Login, Packet as V5Packet, PubAck as V5PubAck, Publish as V5Publish,
+        },
+    },
+};
 use serde_json::json;
-use tokio::sync::{Mutex, Notify};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex},
+    sync::{Mutex, Notify, mpsc},
+};
+use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 #[derive(Clone, Default)]
@@ -65,18 +83,75 @@ impl DeviceAuthorizationPort for RecordingAuthorization {
 }
 
 #[derive(Clone)]
+struct GatewayAuthorizationStub {
+    result: Result<GatewayAuthorization, AuthorizationError>,
+    requests: Arc<Mutex<Vec<GatewayAuthorizationRequest>>>,
+}
+
+impl GatewayAuthorizationStub {
+    fn new(result: Result<GatewayAuthorization, AuthorizationError>) -> Self {
+        Self {
+            result,
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl DeviceAuthorizationPort for GatewayAuthorizationStub {
+    fn authenticate(
+        &self,
+        _request: TransportAuthRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AuthenticatedDevice, AuthorizationError>> + Send + '_>>
+    {
+        Box::pin(async { Ok(gateway_device()) })
+    }
+
+    fn authorize_session(
+        &self,
+        _authenticated: AuthenticatedDevice,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuthorizationError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn authorize_gateway_uplink(
+        &self,
+        request: GatewayAuthorizationRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GatewayAuthorization, AuthorizationError>> + Send + '_>>
+    {
+        let requests = Arc::clone(&self.requests);
+        let result = self.result.clone();
+        Box::pin(async move {
+            requests.lock().await.push(request);
+            result
+        })
+    }
+}
+
+#[derive(Clone)]
 struct BlockingStream {
     append_started: Arc<Notify>,
     release_append: Arc<Notify>,
     appended: Arc<AtomicUsize>,
+    attempted: Arc<AtomicUsize>,
+    failure: bool,
 }
 
 impl BlockingStream {
     fn new() -> Self {
+        Self::with_failure(false)
+    }
+
+    fn failing() -> Self {
+        Self::with_failure(true)
+    }
+
+    fn with_failure(failure: bool) -> Self {
         Self {
             append_started: Arc::new(Notify::new()),
             release_append: Arc::new(Notify::new()),
             appended: Arc::new(AtomicUsize::new(0)),
+            attempted: Arc::new(AtomicUsize::new(0)),
+            failure,
         }
     }
 }
@@ -89,8 +164,18 @@ impl StreamPort for BlockingStream {
         let append_started = Arc::clone(&self.append_started);
         let release_append = Arc::clone(&self.release_append);
         let appended = Arc::clone(&self.appended);
+        let attempted = Arc::clone(&self.attempted);
+        let failure = self.failure;
         Box::pin(async move {
+            attempted.fetch_add(1, Ordering::SeqCst);
             append_started.notify_one();
+            if failure {
+                return Err(StreamError::CapacityExceeded {
+                    max_bytes: 1,
+                    current_bytes: 1,
+                    requested_bytes: 1,
+                });
+            }
             release_append.notified().await;
             appended.fetch_add(1, Ordering::SeqCst);
             Ok(AppendReceipt {
@@ -131,6 +216,54 @@ impl StreamPort for BlockingStream {
         _deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
         Box::pin(async { Ok(()) })
+    }
+}
+
+struct WriteObservedSocket {
+    inner: DuplexStream,
+    writes: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl WriteObservedSocket {
+    fn new(inner: DuplexStream, writes: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+        Self { inner, writes }
+    }
+}
+
+impl AsyncRead for WriteObservedSocket {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for WriteObservedSocket {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) => {
+                this.writes
+                    .send(buffer[..written].to_vec())
+                    .expect("the test must retain its server-write receiver");
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
     }
 }
 
@@ -194,6 +327,110 @@ async fn local_uplink_returns_only_after_durable_stream_append() {
 }
 
 #[tokio::test]
+async fn local_gateway_uplink_authorizes_and_appends_exactly_once() {
+    let authorization = Arc::new(GatewayAuthorizationStub::new(Ok(
+        matching_gateway_authorization(),
+    )));
+    let stream = BlockingStream::new();
+    let uplink = LocalStreamUplinkForwarder::new(authorization.clone(), Arc::new(stream.clone()));
+    let forwarding = tokio::spawn(async move { uplink.forward("unused", gateway_uplink()).await });
+
+    stream.append_started.notified().await;
+    assert_eq!(stream.appended.load(Ordering::SeqCst), 0);
+    stream.release_append.notify_one();
+    forwarding.await.unwrap().unwrap();
+
+    assert_eq!(stream.appended.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        authorization.requests.lock().await.as_slice(),
+        &[GatewayAuthorizationRequest {
+            gateway_device_id: "gateway-a".to_owned(),
+            token_id: gateway_device().token_id,
+            child_device_id: Some("child-a".to_owned()),
+            topic: "v1/gateways/me/telemetry".to_owned(),
+            event_kind: "child_telemetry".to_owned(),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn local_gateway_uplink_denial_does_not_append() {
+    let authorization = Arc::new(GatewayAuthorizationStub::new(Err(
+        AuthorizationError::Denied,
+    )));
+    let stream = BlockingStream::new();
+    let uplink = LocalStreamUplinkForwarder::new(authorization.clone(), Arc::new(stream.clone()));
+
+    assert!(matches!(
+        uplink
+            .forward("unused", gateway_uplink())
+            .await
+            .unwrap_err(),
+        iot_nano_mqttd::TransportError::Unauthorized
+    ));
+    assert_eq!(authorization.requests.lock().await.len(), 1);
+    assert_eq!(stream.appended.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn local_gateway_uplink_unavailability_does_not_append() {
+    let authorization = Arc::new(GatewayAuthorizationStub::new(Err(
+        AuthorizationError::Unavailable("core offline".to_owned()),
+    )));
+    let stream = BlockingStream::new();
+    let uplink = LocalStreamUplinkForwarder::new(authorization.clone(), Arc::new(stream.clone()));
+
+    assert!(matches!(
+        uplink.forward("unused", gateway_uplink()).await.unwrap_err(),
+        iot_nano_mqttd::TransportError::AuthorizationUnavailable(reason) if reason == "core offline"
+    ));
+    assert_eq!(authorization.requests.lock().await.len(), 1);
+    assert_eq!(stream.appended.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn local_gateway_uplink_identity_mismatches_do_not_append() {
+    let mut mismatches = Vec::new();
+
+    let mut authorization = matching_gateway_authorization();
+    authorization.gateway_device_id = "other-gateway".to_owned();
+    mismatches.push(authorization);
+
+    let mut authorization = matching_gateway_authorization();
+    authorization.token_id = Uuid::now_v7();
+    mismatches.push(authorization);
+
+    let mut authorization = matching_gateway_authorization();
+    authorization.topic = "v1/gateways/me/connect".to_owned();
+    mismatches.push(authorization);
+
+    let mut authorization = matching_gateway_authorization();
+    authorization.event_kind = "connect".to_owned();
+    mismatches.push(authorization);
+
+    let mut authorization = matching_gateway_authorization();
+    authorization.child_device_id = Some("other-child".to_owned());
+    mismatches.push(authorization);
+
+    for authorization in mismatches {
+        let authorization = Arc::new(GatewayAuthorizationStub::new(Ok(authorization)));
+        let stream = BlockingStream::new();
+        let uplink =
+            LocalStreamUplinkForwarder::new(authorization.clone(), Arc::new(stream.clone()));
+
+        assert!(matches!(
+            uplink
+                .forward("unused", gateway_uplink())
+                .await
+                .unwrap_err(),
+            iot_nano_mqttd::TransportError::Unauthorized
+        ));
+        assert_eq!(authorization.requests.lock().await.len(), 1);
+        assert_eq!(stream.appended.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn local_rpc_response_forwarder_uses_the_typed_port_without_http() {
     let responses = Arc::new(RecordingResponses::default());
     let forwarder = LocalRpcResponseForwarder::new(responses.clone());
@@ -217,6 +454,146 @@ fn device_transport_composes_the_local_typed_ports() {
     let _transport = MqttdDeviceTransport::with_local_ports(authorization, stream, responses);
 }
 
+#[tokio::test]
+async fn local_mqtt311_qos1_puback_waits_for_stream_append_release() {
+    let stream = BlockingStream::new();
+    let transport = MqttdDeviceTransport::with_local_ports(
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(stream.clone()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let (server, client) = duplex(8 * 1024);
+    let (write_sender, mut server_writes) = mpsc::unbounded_channel();
+    let server_task = tokio::spawn(async move {
+        transport
+            .serve_connection(WriteObservedSocket::new(server, write_sender))
+            .await
+    });
+    let mut client = Framed::new(client, v311_codec());
+
+    connect_v311(&mut client).await;
+    drain_server_writes(&mut server_writes);
+    client
+        .send(V311Packet::Publish(v311_telemetry_publish(41)))
+        .await
+        .unwrap();
+
+    stream.append_started.notified().await;
+    assert_no_server_writes(&mut server_writes);
+    assert!(!server_task.is_finished());
+
+    stream.release_append.notify_one();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        V311Packet::PubAck(ack) if ack.pkid == 41
+    ));
+
+    drop(client);
+    assert!(server_task.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn local_mqtt311_qos1_append_failure_never_writes_puback() {
+    let stream = BlockingStream::failing();
+    let transport = MqttdDeviceTransport::with_local_ports(
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(stream.clone()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let (server, client) = duplex(8 * 1024);
+    let (write_sender, mut server_writes) = mpsc::unbounded_channel();
+    let server_task = tokio::spawn(async move {
+        transport
+            .serve_connection(WriteObservedSocket::new(server, write_sender))
+            .await
+    });
+    let mut client = Framed::new(client, v311_codec());
+
+    connect_v311(&mut client).await;
+    drain_server_writes(&mut server_writes);
+    client
+        .send(V311Packet::Publish(v311_telemetry_publish(42)))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(iot_nano_mqttd::TransportError::StreamAppendFailed(_))
+    ));
+    assert_eq!(stream.attempted.load(Ordering::SeqCst), 1);
+    assert_no_server_writes(&mut server_writes);
+}
+
+#[tokio::test]
+async fn local_mqtt5_qos1_puback_waits_for_stream_append_release() {
+    let stream = BlockingStream::new();
+    let transport = MqttdDeviceTransport::with_local_ports(
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(stream.clone()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let (server, client) = duplex(8 * 1024);
+    let (write_sender, mut server_writes) = mpsc::unbounded_channel();
+    let server_task = tokio::spawn(async move {
+        transport
+            .serve_v5_connection(WriteObservedSocket::new(server, write_sender))
+            .await
+    });
+    let mut client = Framed::new(client, v5_codec());
+
+    connect_v5(&mut client).await;
+    drain_server_writes(&mut server_writes);
+    client
+        .send(V5Packet::Publish(v5_telemetry_publish(51)))
+        .await
+        .unwrap();
+
+    stream.append_started.notified().await;
+    assert_no_server_writes(&mut server_writes);
+    assert!(!server_task.is_finished());
+
+    stream.release_append.notify_one();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        V5Packet::PubAck(V5PubAck { pkid: 51, .. })
+    ));
+
+    drop(client);
+    assert!(server_task.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn local_mqtt5_qos1_append_failure_never_writes_puback() {
+    let stream = BlockingStream::failing();
+    let transport = MqttdDeviceTransport::with_local_ports(
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(stream.clone()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let (server, client) = duplex(8 * 1024);
+    let (write_sender, mut server_writes) = mpsc::unbounded_channel();
+    let server_task = tokio::spawn(async move {
+        transport
+            .serve_v5_connection(WriteObservedSocket::new(server, write_sender))
+            .await
+    });
+    let mut client = Framed::new(client, v5_codec());
+
+    connect_v5(&mut client).await;
+    drain_server_writes(&mut server_writes);
+    client
+        .send(V5Packet::Publish(v5_telemetry_publish(52)))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(iot_nano_mqttd::TransportError::StreamAppendFailed(_))
+    ));
+    assert_eq!(stream.attempted.load(Ordering::SeqCst), 1);
+    assert_no_server_writes(&mut server_writes);
+}
+
 #[test]
 fn local_port_implementations_contain_no_http_boundary() {
     let source =
@@ -237,6 +614,24 @@ fn device() -> AuthenticatedDevice {
     }
 }
 
+fn gateway_device() -> AuthenticatedDevice {
+    AuthenticatedDevice {
+        token_id: Uuid::parse_str("019a5114-0674-7bd7-8486-50b6ebbd7245").unwrap(),
+        device_id: "gateway-a".to_owned(),
+        is_gateway: true,
+    }
+}
+
+fn matching_gateway_authorization() -> GatewayAuthorization {
+    GatewayAuthorization {
+        gateway_device_id: "gateway-a".to_owned(),
+        token_id: gateway_device().token_id,
+        child_device_id: Some("child-a".to_owned()),
+        topic: "v1/gateways/me/telemetry".to_owned(),
+        event_kind: "child_telemetry".to_owned(),
+    }
+}
+
 fn direct_uplink() -> TransportUplink {
     TransportUplink {
         device: device(),
@@ -251,5 +646,100 @@ fn direct_uplink() -> TransportUplink {
         .unwrap(),
         qos: QoS::AtLeastOnce,
         received_at: Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 1).unwrap(),
+    }
+}
+
+fn gateway_uplink() -> TransportUplink {
+    TransportUplink {
+        device: gateway_device(),
+        topic: "v1/gateways/me/telemetry".to_owned(),
+        payload: serde_json::to_vec(&json!({
+            "kind": "child_telemetry",
+            "schema_version": 1,
+            "boot_id": "c9c04d99-4e01-4f94-82a8-9e229e47c093",
+            "sequence": 1,
+            "event_at": "2026-09-10T08:00:00Z",
+            "child_device_id": "child-a",
+            "measurements": {"temperature_c": 26.4},
+        }))
+        .unwrap(),
+        qos: QoS::AtLeastOnce,
+        received_at: Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 1).unwrap(),
+    }
+}
+
+fn v311_codec() -> V311Codec {
+    V311Codec {
+        max_incoming_size: 1024 * 1024,
+        max_outgoing_size: 1024 * 1024,
+    }
+}
+
+fn v5_codec() -> V5Codec {
+    V5Codec {
+        max_incoming_size: Some(1024 * 1024),
+        max_outgoing_size: Some(1024 * 1024),
+    }
+}
+
+async fn connect_v311(client: &mut Framed<DuplexStream, V311Codec>) {
+    let mut connect = V311Connect::new("local-v311-client");
+    connect.set_login("iotd_local_device_token", "");
+    client.send(V311Packet::Connect(connect)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        V311Packet::ConnAck(ack) if ack.code == V311ConnectReturnCode::Success
+    ));
+}
+
+async fn connect_v5(client: &mut Framed<DuplexStream, V5Codec>) {
+    client
+        .send(V5Packet::Connect(
+            V5Connect {
+                keep_alive: 60,
+                client_id: "local-v5-client".to_owned(),
+                clean_start: true,
+                properties: None,
+            },
+            None,
+            Some(V5Login::new("iotd_local_device_token", "")),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        V5Packet::ConnAck(ack) if ack.code == V5ConnectReturnCode::Success
+    ));
+}
+
+fn v311_telemetry_publish(packet_id: u16) -> V311Publish {
+    let mut publish = V311Publish::new(
+        "v1/devices/me/telemetry",
+        QoS::AtLeastOnce,
+        direct_uplink().payload,
+    );
+    publish.pkid = packet_id;
+    publish
+}
+
+fn v5_telemetry_publish(packet_id: u16) -> V5Publish {
+    let mut publish = V5Publish::new(
+        "v1/devices/me/telemetry",
+        V5QoS::AtLeastOnce,
+        direct_uplink().payload,
+        None,
+    );
+    publish.pkid = packet_id;
+    publish
+}
+
+fn drain_server_writes(writes: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
+    while writes.try_recv().is_ok() {}
+}
+
+fn assert_no_server_writes(writes: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
+    match writes.try_recv() {
+        Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {}
+        Ok(bytes) => panic!("server wrote MQTT bytes before the append outcome: {bytes:?}"),
     }
 }
