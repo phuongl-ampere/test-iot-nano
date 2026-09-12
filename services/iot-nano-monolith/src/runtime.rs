@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io,
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -14,6 +14,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{MonolithConfig, Readiness};
+
+const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
+const INTERNAL_DIRECTORY_MARKER_CONTENT: &[u8] = b"iot-nano-monolith-state-v1\n";
 
 pub struct MonolithRuntime {
     internal_directory: Option<InternalDirectory>,
@@ -170,7 +173,7 @@ struct InternalDirectory {
 impl InternalDirectory {
     fn prepare_state_file(&self, name: &str) -> io::Result<PathBuf> {
         self.open_state_file(name)?;
-        Ok(self.state_path(name))
+        self.state_path(name)
     }
 
     #[cfg(unix)]
@@ -213,13 +216,13 @@ impl InternalDirectory {
     }
 
     #[cfg(unix)]
-    fn state_path(&self, name: &str) -> PathBuf {
-        self.path.join(name)
+    fn state_path(&self, name: &str) -> io::Result<PathBuf> {
+        anchored_state_path(&self.directory, name)
     }
 
     #[cfg(not(unix))]
-    fn state_path(&self, name: &str) -> PathBuf {
-        self.path.join(name)
+    fn state_path(&self, name: &str) -> io::Result<PathBuf> {
+        Ok(self.path.join(name))
     }
 }
 
@@ -248,7 +251,7 @@ fn prepare_internal_directory(path: &Path) -> Result<InternalDirectory, StartupE
 #[cfg(unix)]
 fn prepare_internal_directory_unix(path: &Path) -> io::Result<InternalDirectory> {
     use rustix::{
-        fs::{Mode, OFlags, fchmod, fstat, mkdirat, openat},
+        fs::{Mode, OFlags, fchmod, mkdirat, openat},
         io::Errno,
         process::geteuid,
     };
@@ -256,6 +259,25 @@ fn prepare_internal_directory_unix(path: &Path) -> io::Result<InternalDirectory>
     if !path.is_absolute() {
         return Err(invalid_internal_state_path(path, "path must be absolute"));
     }
+
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(Ok(name)),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => Some(Err(())),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|()| {
+            invalid_internal_state_path(path, "path components must not contain `.` or `..`")
+        })?;
+    if components.is_empty() {
+        return Err(invalid_internal_state_path(
+            path,
+            "filesystem root cannot be the internal state directory",
+        ));
+    }
+    let component_count = components.len();
 
     let current_uid = geteuid().as_raw();
     let mut directory = File::from(
@@ -268,24 +290,22 @@ fn prepare_internal_directory_unix(path: &Path) -> io::Result<InternalDirectory>
         .map_err(io::Error::from)?,
     );
     let mut current_path = PathBuf::from("/");
-    for component in path.components() {
-        let Component::Normal(name) = component else {
-            if matches!(component, Component::RootDir) {
-                continue;
-            }
-            return Err(invalid_internal_state_path(
-                path,
-                "path components must not contain `.` or `..`",
-            ));
-        };
-
+    let mut created_internal_directory = false;
+    for (index, name) in components.into_iter().enumerate() {
         ensure_parent_directory_is_not_replaceable(&directory, &current_path, current_uid)?;
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
         let child = match openat(&directory, name, flags, Mode::empty()) {
             Ok(child) => child,
             Err(Errno::NOENT) => {
+                if index + 1 != component_count {
+                    return Err(invalid_internal_state_path(
+                        path,
+                        "internal state parent directory does not exist",
+                    ));
+                }
                 match mkdirat(&directory, name, Mode::from(0o700)) {
-                    Ok(()) | Err(Errno::EXIST) => {}
+                    Ok(()) => created_internal_directory = true,
+                    Err(Errno::EXIST) => {}
                     Err(error) => return Err(error.into()),
                 }
                 openat(&directory, name, flags, Mode::empty()).map_err(io::Error::from)?
@@ -296,17 +316,14 @@ fn prepare_internal_directory_unix(path: &Path) -> io::Result<InternalDirectory>
         current_path.push(name);
     }
 
-    let metadata = fstat(&directory).map_err(io::Error::from)?;
-    if metadata.st_uid != current_uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "internal state directory is not owned by the current user: {}",
-                path.display()
-            ),
-        ));
+    if created_internal_directory {
+        ensure_new_internal_directory(&directory, path, current_uid)?;
+        fchmod(&directory, Mode::from(0o700)).map_err(io::Error::from)?;
+        create_internal_directory_marker(&directory, path, current_uid)?;
+    } else {
+        ensure_reusable_internal_directory(&directory, path, current_uid)?;
+        verify_internal_directory_marker(&directory, path, current_uid)?;
     }
-    fchmod(&directory, Mode::from(0o700)).map_err(io::Error::from)?;
 
     Ok(InternalDirectory {
         path: path.to_path_buf(),
@@ -327,12 +344,134 @@ fn ensure_parent_directory_is_not_replaceable(
     let writable_by_group_or_other = mode & 0o022 != 0;
     let sticky = mode & 0o1000 != 0;
     let trusted_owner = metadata.st_uid == current_uid || metadata.st_uid == 0;
-    if writable_by_group_or_other && (!sticky || !trusted_owner) {
+    if !trusted_owner {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "internal state parent is not owned by the current user or root: {}",
+                path.display()
+            ),
+        ));
+    }
+    if writable_by_group_or_other && !sticky {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
                 "internal state parent can be replaced by another user: {}",
                 path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_new_internal_directory(
+    directory: &File,
+    path: &Path,
+    current_uid: rustix::process::RawUid,
+) -> io::Result<()> {
+    let metadata = rustix::fs::fstat(directory).map_err(io::Error::from)?;
+    if metadata.st_uid != current_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "new internal state directory is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_reusable_internal_directory(
+    directory: &File,
+    path: &Path,
+    current_uid: rustix::process::RawUid,
+) -> io::Result<()> {
+    use rustix::fs::fstat;
+
+    let metadata = fstat(directory).map_err(io::Error::from)?;
+    if metadata.st_uid != current_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "internal state directory is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.st_mode as u32 & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "internal state directory must retain owner-only permissions: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_internal_directory_marker(
+    directory: &File,
+    path: &Path,
+    current_uid: rustix::process::RawUid,
+) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags, fchmod, openat};
+
+    let marker_path = path.join(INTERNAL_DIRECTORY_MARKER);
+    let marker = openat(
+        directory,
+        INTERNAL_DIRECTORY_MARKER,
+        OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from(0o600),
+    )
+    .map_err(io::Error::from)?;
+    ensure_owned_regular_file(&marker, &marker_path, current_uid)?;
+    fchmod(&marker, Mode::from(0o600)).map_err(io::Error::from)?;
+    let mut marker = File::from(marker);
+    marker.write_all(INTERNAL_DIRECTORY_MARKER_CONTENT)?;
+    marker.sync_all()
+}
+
+#[cfg(unix)]
+fn verify_internal_directory_marker(
+    directory: &File,
+    path: &Path,
+    current_uid: rustix::process::RawUid,
+) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags, fstat, openat};
+
+    let marker_path = path.join(INTERNAL_DIRECTORY_MARKER);
+    let marker = openat(
+        directory,
+        INTERNAL_DIRECTORY_MARKER,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    ensure_owned_regular_file(&marker, &marker_path, current_uid)?;
+    if fstat(&marker).map_err(io::Error::from)?.st_mode as u32 & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "internal state marker must retain owner-only permissions: {}",
+                marker_path.display()
+            ),
+        ));
+    }
+    let mut marker = File::from(marker);
+    let mut contents = Vec::new();
+    marker.read_to_end(&mut contents)?;
+    if contents != INTERNAL_DIRECTORY_MARKER_CONTENT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "internal state marker is invalid: {}",
+                marker_path.display()
             ),
         ));
     }
@@ -378,6 +517,42 @@ fn ensure_owned_regular_file(
     Ok(())
 }
 
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+fn anchored_state_path(directory: &File, name: &str) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+
+    Ok(PathBuf::from(format!(
+        "/proc/self/fd/{}/{name}",
+        directory.as_raw_fd()
+    )))
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "ios")))]
+fn anchored_state_path(directory: &File, name: &str) -> io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = rustix::fs::getpath(directory)
+        .map_err(io::Error::from)?
+        .into_bytes();
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(path)).join(name))
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn anchored_state_path(_directory: &File, _name: &str) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor-anchored internal state paths are unsupported on this platform",
+    ))
+}
+
 #[cfg(unix)]
 fn invalid_internal_state_path(path: &Path, reason: &str) -> io::Error {
     io::Error::new(
@@ -394,4 +569,33 @@ fn recover_mqtt_storage(path: PathBuf) -> Result<SqliteStorage, iot_nano_mqttd::
     storage.load(now_ms)?;
     storage.prune(now_ms, RetentionPolicy::default())?;
     Ok(storage)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::prepare_internal_directory_unix;
+
+    #[test]
+    fn state_paths_stay_anchored_to_the_open_directory_after_parent_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let internal = parent.join("internal");
+        std::fs::create_dir(&parent).unwrap();
+        let directory = prepare_internal_directory_unix(&internal).unwrap();
+
+        let relocated_parent = root.join("relocated-parent");
+        std::fs::rename(&parent, &relocated_parent).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(parent.join("internal")).unwrap();
+
+        let state_path = directory.prepare_state_file("stream.sqlite").unwrap();
+        std::fs::write(&state_path, b"anchored").unwrap();
+
+        assert_eq!(
+            std::fs::read(relocated_parent.join("internal/stream.sqlite")).unwrap(),
+            b"anchored"
+        );
+        assert!(!parent.join("internal/stream.sqlite").exists());
+    }
 }
