@@ -2,6 +2,18 @@ use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::PlatformStore;
 use sqlx::Row;
 
+#[test]
+fn platform_store_owns_its_postgres_migration_source() {
+    let migration = include_str!("../migrations/0001_platform.sql");
+    let storage_source = include_str!("../src/lib.rs");
+
+    assert!(migration.contains("CREATE TABLE IF NOT EXISTS devices"));
+    assert!(migration.contains("CREATE TABLE IF NOT EXISTS telemetry"));
+    assert!(migration.contains("CREATE TABLE IF NOT EXISTS command_outbox"));
+    assert!(!storage_source.contains("services/iot-nano-api/migrations"));
+    assert!(!storage_source.contains("services/iot-nano-core/migrations"));
+}
+
 fn sqlite_configuration(path: std::path::PathBuf) -> StorageConfiguration {
     StorageConfiguration {
         storage: DatabaseStorage::Sqlite,

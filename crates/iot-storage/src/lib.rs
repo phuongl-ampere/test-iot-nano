@@ -15,10 +15,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
-const API_POSTGRES_SCHEMA: &str =
-    include_str!("../../../services/iot-nano-api/migrations/0001_api.sql");
-const CORE_POSTGRES_SCHEMA: &str =
-    include_str!("../../../services/iot-nano-core/migrations/0001_core.sql");
+const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform.sql");
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS devices (
@@ -748,65 +745,10 @@ async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("SET LOCAL search_path TO iot_nano, public")
         .execute(&mut *transaction)
         .await?;
-    sqlx::raw_sql(API_POSTGRES_SCHEMA)
+    sqlx::raw_sql(PLATFORM_POSTGRES_SCHEMA)
         .execute(&mut *transaction)
         .await?;
-    sqlx::raw_sql(CORE_POSTGRES_SCHEMA)
-        .execute(&mut *transaction)
-        .await?;
-    migrate_timescale_device_ownership(&mut transaction).await?;
     transaction.commit().await
-}
-
-async fn migrate_timescale_device_ownership(
-    transaction: &mut Transaction<'_, Postgres>,
-) -> Result<(), sqlx::Error> {
-    sqlx::raw_sql(
-        "DO $$
-         BEGIN
-             IF NOT EXISTS (
-                 SELECT 1
-                 FROM pg_constraint
-                 WHERE conname = 'command_outbox_device_id_fkey'
-                   AND conrelid = 'command_outbox'::regclass
-             ) THEN
-                 ALTER TABLE command_outbox
-                     ADD CONSTRAINT command_outbox_device_id_fkey
-                     FOREIGN KEY (device_id)
-                     REFERENCES devices(device_id)
-                     ON DELETE CASCADE;
-             END IF;
-
-             IF NOT EXISTS (
-                 SELECT 1
-                 FROM pg_constraint
-                 WHERE conname = 'device_runtime_state_device_id_fkey'
-                   AND conrelid = 'device_runtime_state'::regclass
-             ) THEN
-                 ALTER TABLE device_runtime_state
-                     ADD CONSTRAINT device_runtime_state_device_id_fkey
-                     FOREIGN KEY (device_id)
-                     REFERENCES devices(device_id)
-                     ON DELETE CASCADE;
-             END IF;
-
-             IF NOT EXISTS (
-                 SELECT 1
-                 FROM pg_constraint
-                 WHERE conname = 'telemetry_device_id_fkey'
-                   AND conrelid = 'telemetry'::regclass
-             ) THEN
-                 ALTER TABLE telemetry
-                     ADD CONSTRAINT telemetry_device_id_fkey
-                     FOREIGN KEY (device_id)
-                     REFERENCES devices(device_id);
-             END IF;
-         END
-         $$;",
-    )
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
 }
 
 fn postgres_command_outbox_record(row: PgRow) -> Result<CommandOutboxRecord, PlatformStoreError> {
