@@ -12,6 +12,7 @@ use iot_core::{
 };
 use sqlx::{
     Executor, PgPool, Postgres, Row, Sqlite, SqlitePool, Transaction,
+    error::DatabaseError,
     postgres::{PgPoolOptions, PgRow},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
     types::Json,
@@ -909,7 +910,10 @@ impl PlatformStore {
                 .bind(&scopes)
                 .bind(application.enabled)
                 .execute(&mut *transaction)
-                .await?;
+                .await
+                .map_err(|error| {
+                    map_application_client_id_conflict(error, application.client_id.as_str())
+                })?;
                 sqlx::query("DELETE FROM application_redirect_uris WHERE app_id = ?")
                     .bind(application.app_id.as_str())
                     .execute(&mut *transaction)
@@ -953,7 +957,10 @@ impl PlatformStore {
                 .bind(&scopes)
                 .bind(application.enabled)
                 .execute(&mut *transaction)
-                .await?;
+                .await
+                .map_err(|error| {
+                    map_application_client_id_conflict(error, application.client_id.as_str())
+                })?;
                 sqlx::query("DELETE FROM application_redirect_uris WHERE app_id = $1")
                     .bind(application.app_id.as_str())
                     .execute(&mut *transaction)
@@ -2346,6 +2353,35 @@ fn validate_application(application: &mut NewApplication) -> Result<(), Platform
     application.allowed_scopes.sort();
     application.allowed_scopes.dedup();
     Ok(())
+}
+
+fn map_application_client_id_conflict(error: sqlx::Error, client_id: &str) -> PlatformStoreError {
+    if error
+        .as_database_error()
+        .is_some_and(is_application_client_id_unique_violation)
+    {
+        PlatformStoreError::ApplicationClientIdConflict(client_id.to_owned())
+    } else {
+        PlatformStoreError::Database(error)
+    }
+}
+
+fn is_application_client_id_unique_violation(
+    database_error: &(dyn DatabaseError + 'static),
+) -> bool {
+    let code = database_error.code();
+    match code.as_deref() {
+        Some("23505") => {
+            database_error.constraint() == Some("applications_client_id_key")
+                || database_error
+                    .message()
+                    .contains("applications_client_id_key")
+        }
+        Some("19") | Some("2067") => database_error
+            .message()
+            .contains("UNIQUE constraint failed: applications.client_id"),
+        _ => false,
+    }
 }
 
 fn canonical_application_scopes(scopes: Vec<String>) -> Result<Vec<String>, PlatformStoreError> {

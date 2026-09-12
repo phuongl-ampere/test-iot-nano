@@ -133,6 +133,47 @@ async fn sqlite_application_registry_rejects_domain_invalid_values() {
 }
 
 #[tokio::test]
+async fn sqlite_application_registry_maps_write_time_client_id_conflicts_to_typed_errors() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER application_client_id_race
+         BEFORE INSERT ON applications
+         WHEN NEW.app_id = 'race-app'
+         BEGIN
+             INSERT INTO applications (
+                 app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+             ) VALUES (
+                 'competing-app', 'frontend', 'https://apps.example.test/competing',
+                 NEW.client_id, '[]', 1
+             );
+         END;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut racing_application = application(true);
+    racing_application.app_id = "race-app".parse().unwrap();
+    let result = ApplicationRepository::upsert_application(&store, racing_application).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(PlatformStoreError::ApplicationClientIdConflict(ref client_id))
+                if client_id == "client-power-monitor"
+        ),
+        "unexpected result: {result:?}"
+    );
+    assert!(
+        ApplicationRepository::find_application_by_app_id(&store, "competing-app")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL"]
 async fn timescale_application_registry_matches_sqlite_contract() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
@@ -167,6 +208,42 @@ async fn timescale_application_registry_matches_sqlite_contract() {
         .await
         .unwrap();
     assert_application_shape(record, true);
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION application_client_id_race() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.app_id = 'race-app' THEN
+                 INSERT INTO applications (
+                     app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                 ) VALUES (
+                     'competing-app', 'frontend', 'https://apps.example.test/competing',
+                     NEW.client_id, '[]'::jsonb, TRUE
+                 );
+             END IF;
+             RETURN NEW;
+         END;
+         $$;
+         CREATE TRIGGER application_client_id_race_trigger
+         BEFORE INSERT ON applications
+         FOR EACH ROW EXECUTE FUNCTION application_client_id_race();",
+    )
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let mut racing_application = application(true);
+    racing_application.app_id = "race-app".parse().unwrap();
+    assert!(matches!(
+        ApplicationRepository::upsert_application(&store, racing_application).await,
+        Err(PlatformStoreError::ApplicationClientIdConflict(ref client_id))
+            if client_id == "client-power-monitor"
+    ));
+    assert!(
+        ApplicationRepository::find_application_by_app_id(&store, "competing-app")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     sqlx::raw_sql(
         "CREATE FUNCTION reject_application_redirect() RETURNS trigger
