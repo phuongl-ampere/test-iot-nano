@@ -1,15 +1,17 @@
 use std::{
     env,
     fs::{File, OpenOptions},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use iot_core::TelemetryEvent;
-use iot_nano_core::{AlertEvaluator, TelemetryWriter, connect_core_database, migrate};
-use iot_stream::{GroupStart, LocalStream, StreamConfig, TelemetryMessage};
+use iot_nano_core::{
+    AlertEvaluator, CoreStreamConsumer, TelemetryWriter, connect_core_database, migrate,
+};
+use iot_stream::{LocalStream, StreamConfig, TelemetryMessage};
 use serde_json::json;
 use sqlx::{PgPool, query, query_scalar};
 use uuid::Uuid;
@@ -76,18 +78,12 @@ async fn configured_events_drain_to_telemetry_and_alert_groups() {
     .unwrap();
 
     let tempdir = tempfile::tempdir().unwrap();
-    let stream = LocalStream::open(
-        tempdir.path().join("stream"),
-        StreamConfig {
-            partition_count: 8,
-            segment_max_bytes: 8 * 1024 * 1024,
-            retention_max_bytes: 512 * 1024 * 1024,
-            retention_max_age: StdDuration::from_secs(24 * 60 * 60),
-            max_record_bytes: 1024 * 1024,
-            index_stride: 128,
-        },
-    )
-    .unwrap();
+    let mut stream_config =
+        StreamConfig::sqlite(tempdir.path().join("stream.sqlite")).with_partitions(8);
+    stream_config.retention_max_bytes = 512 * 1024 * 1024;
+    stream_config.retention_max_age = StdDuration::from_secs(24 * 60 * 60);
+    stream_config.max_record_bytes = 1024 * 1024;
+    let stream = LocalStream::open(stream_config).await.unwrap();
     let now = Utc::now();
     for index in 0..event_count {
         let device_number = index % device_count;
@@ -114,40 +110,31 @@ async fn configured_events_drain_to_telemetry_and_alert_groups() {
                 event,
                 received_at,
             })
+            .await
             .unwrap();
     }
 
-    let group_started_at = Utc::now();
-    let mut writer_consumer = stream
-        .join_group(
-            "timescaledb-writer",
-            "stress-writer",
-            GroupStart::Earliest,
-            group_started_at,
-        )
-        .unwrap();
-    let mut alert_consumer = stream
-        .join_group(
-            "alert-evaluator",
-            "stress-alert",
-            GroupStart::Earliest,
-            group_started_at,
-        )
-        .unwrap();
+    let writer_consumer = CoreStreamConsumer::new(
+        Arc::new(stream.clone()),
+        "timescaledb-writer",
+        "stress-writer",
+    );
+    let alert_consumer =
+        CoreStreamConsumer::new(Arc::new(stream), "alert-evaluator", "stress-alert");
 
     let writer = TelemetryWriter::new(pool.clone(), 1_000);
     let evaluator = AlertEvaluator::new(pool.clone(), 1_000);
     let deadline = Instant::now() + StdDuration::from_secs(120);
     loop {
         let evaluation_time = Utc::now();
-        writer_consumer.heartbeat(evaluation_time).unwrap();
-        alert_consumer.heartbeat(evaluation_time).unwrap();
+        writer_consumer.heartbeat().await.unwrap();
+        alert_consumer.heartbeat().await.unwrap();
         let written = writer
-            .flush_once(&mut writer_consumer, evaluation_time)
+            .flush_once(&writer_consumer, evaluation_time)
             .await
             .unwrap();
         let evaluated = evaluator
-            .flush_event_rules(&mut alert_consumer, evaluation_time)
+            .flush_event_rules(&alert_consumer, evaluation_time)
             .await
             .unwrap();
         if written.read == 0 && evaluated.read == 0 {
@@ -174,8 +161,6 @@ async fn configured_events_drain_to_telemetry_and_alert_groups() {
             .count(),
     )
     .unwrap();
-    let writer_lag = writer_consumer.group_stats().unwrap().total_lag();
-    let alert_lag = alert_consumer.group_stats().unwrap().total_lag();
     let elapsed = started.elapsed();
     let per_second = event_count as f64 / elapsed.as_secs_f64();
 
@@ -185,7 +170,7 @@ async fn configured_events_drain_to_telemetry_and_alert_groups() {
     );
     assert_eq!(telemetry_rows, i64::try_from(event_count).unwrap());
     assert_eq!(incident_rows, expected_incidents);
-    assert_eq!(writer_lag, 0);
-    assert_eq!(alert_lag, 0);
+    assert!(writer_consumer.claim(1).await.unwrap().is_empty());
+    assert!(alert_consumer.claim(1).await.unwrap().is_empty());
     assert!(elapsed < StdDuration::from_secs(120));
 }

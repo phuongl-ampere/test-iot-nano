@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use iot_core::TelemetryEvent;
-use iot_stream::{LocalStream, StreamError, TelemetryMessage};
+use iot_stream::{StreamError, StreamPort, TelemetryMessage};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use thiserror::Error;
 
@@ -16,17 +18,17 @@ pub enum MqttConsumerError {
     Stream(#[from] StreamError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MqttStreamProducer {
-    stream: LocalStream,
+    stream: Arc<dyn StreamPort>,
 }
 
 impl MqttStreamProducer {
-    pub fn new(stream: LocalStream) -> Self {
+    pub fn new(stream: Arc<dyn StreamPort>) -> Self {
         Self { stream }
     }
 
-    pub fn ingest(
+    pub async fn ingest(
         &self,
         topic: &str,
         payload: &[u8],
@@ -38,9 +40,10 @@ impl MqttStreamProducer {
         };
 
         self.ingest_event(topic, payload.to_vec(), event, received_at)
+            .await
     }
 
-    pub fn ingest_event(
+    pub async fn ingest_event(
         &self,
         topic: &str,
         payload: Vec<u8>,
@@ -53,15 +56,11 @@ impl MqttStreamProducer {
             event,
             received_at,
         };
-        match self.stream.append(message) {
+        match self.stream.append(message.into()).await {
             Ok(_) => Ok(IngestOutcome::Accepted),
             Err(StreamError::InvalidTelemetry(_)) => Ok(IngestOutcome::Rejected),
             Err(error) => Err(MqttConsumerError::Stream(error)),
         }
-    }
-
-    pub fn stream(&self) -> &LocalStream {
-        &self.stream
     }
 }
 
@@ -92,7 +91,7 @@ pub struct MqttRuntime {
 }
 
 impl MqttRuntime {
-    pub fn new(config: MqttRuntimeConfig, stream: LocalStream) -> Self {
+    pub fn new(config: MqttRuntimeConfig, stream: Arc<dyn StreamPort>) -> Self {
         let mut options =
             MqttOptions::new(config.client_id, config.broker_host, config.broker_port);
         options.set_clean_session(false);
@@ -128,21 +127,14 @@ impl MqttRuntime {
                 Ok(None)
             }
             Event::Incoming(Packet::Publish(publish)) => {
-                let producer = self.producer.clone();
-                let topic = publish.topic.clone();
-                let payload = publish.payload.to_vec();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    producer.ingest(&topic, &payload, received_at)
-                })
-                .await??;
+                let outcome = self
+                    .producer
+                    .ingest(&publish.topic, &publish.payload, received_at)
+                    .await?;
                 self.client.ack(&publish).await?;
                 Ok(Some(outcome))
             }
             _ => Ok(None),
         }
-    }
-
-    pub fn stream(&self) -> &LocalStream {
-        self.producer.stream()
     }
 }

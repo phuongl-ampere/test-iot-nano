@@ -267,3 +267,20 @@ async fn stream_port_runs_the_typed_in_process_workflow() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn zero_limit_claim_joins_the_group_for_a_later_heartbeat() {
+    let directory = tempdir().unwrap();
+    let stream = LocalStream::open(StreamConfig::sqlite(directory.path().join("stream.sqlite")))
+        .await
+        .unwrap();
+
+    let mut request = claim("writer", "writer-a");
+    request.limit = 0;
+    assert!(stream.claim(request).await.unwrap().is_empty());
+
+    stream
+        .heartbeat(HeartbeatRequest::new("writer", "writer-a"))
+        .await
+        .unwrap();
+}

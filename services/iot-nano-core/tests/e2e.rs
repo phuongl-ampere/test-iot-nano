@@ -3,6 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     net::{TcpListener, TcpStream},
     process::{Child, Command, Stdio},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -11,9 +12,10 @@ use chrono::Utc;
 use device_simulator::{SimulationConfig, publish_simulation};
 use fs2::FileExt;
 use iot_nano_core::{
-    IngestOutcome, MqttRuntime, MqttRuntimeConfig, TelemetryWriter, connect_core_database, migrate,
+    CoreStreamConsumer, IngestOutcome, MqttRuntime, MqttRuntimeConfig, TelemetryWriter,
+    connect_core_database, migrate,
 };
-use iot_stream::{GroupStart, LocalStream, StreamConfig};
+use iot_stream::{LocalStream, StreamConfig};
 use sqlx::Row;
 
 struct TestBroker {
@@ -79,24 +81,22 @@ async fn simulated_telemetry_flows_from_mqtt_to_timescaledb() {
 
     let broker = TestBroker::start();
     let tempdir = tempfile::tempdir().unwrap();
-    let mut stream_config = StreamConfig::for_test(8);
-    stream_config.max_record_bytes = 2 * 1024;
-    let stream = LocalStream::open(tempdir.path().join("stream"), stream_config).unwrap();
-    let mut consumer = stream
-        .join_group(
-            "timescaledb-writer",
-            "e2e-writer",
-            GroupStart::Earliest,
-            Utc::now(),
-        )
-        .unwrap();
+    let stream = LocalStream::open(
+        StreamConfig::sqlite(tempdir.path().join("stream.sqlite"))
+            .with_partitions(8)
+            .with_max_record_bytes(2 * 1024),
+    )
+    .await
+    .unwrap();
+    let consumer =
+        CoreStreamConsumer::new(Arc::new(stream.clone()), "timescaledb-writer", "e2e-writer");
     let mut runtime = MqttRuntime::new(
         MqttRuntimeConfig {
             client_id: "e2e-ingest".to_owned(),
             broker_host: "127.0.0.1".to_owned(),
             broker_port: broker.port,
         },
-        stream,
+        Arc::new(stream),
     );
     runtime.subscribe().await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -120,7 +120,7 @@ async fn simulated_telemetry_flows_from_mqtt_to_timescaledb() {
         let mut accepted = 0;
         while accepted < 2 {
             if runtime.poll_once(Utc::now()).await.unwrap() == Some(IngestOutcome::Accepted) {
-                writer.flush_once(&mut consumer, Utc::now()).await.unwrap();
+                writer.flush_once(&consumer, Utc::now()).await.unwrap();
                 accepted += 1;
             }
         }
@@ -138,5 +138,5 @@ async fn simulated_telemetry_flows_from_mqtt_to_timescaledb() {
 
     assert_eq!(accepted, 2);
     assert_eq!(count, 2);
-    assert_eq!(consumer.group_stats().unwrap().total_lag(), 0);
+    assert!(consumer.claim(1).await.unwrap().is_empty());
 }

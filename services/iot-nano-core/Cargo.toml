@@ -13,7 +13,6 @@ iot-core = { path = "../../crates/iot-core" }
 iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
 iot-stream = { package = "iot-nano-stream", path = "../../services/iot-nano-stream" }
 lettre.workspace = true
-reqwest.workspace = true
 rumqttc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

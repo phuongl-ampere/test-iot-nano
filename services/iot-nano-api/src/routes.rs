@@ -37,8 +37,8 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
-    CoreClient, CoreClientError, CoreCommandCreateRequest, CoreCommandRecord,
-    CoreCommandResponseRequest, CoreTelemetryBucket, TokenVault,
+    CoreClient, CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest,
+    CoreFacade, CoreFacadeError, CoreTelemetryBucket, CoreTelemetryQuery, TokenVault,
     auth::{
         AccountClass, Admin, AuthContext, AuthError, AuthenticatedUser, POWER_MONITOR_APP, Role,
         System, authenticate_credentials, authenticate_credentials_sqlite, change_password,
@@ -172,7 +172,7 @@ pub struct ApiState {
     mqttd_device_transport_session_revoker: Arc<dyn MqttdDeviceTransportSessionRevoker>,
     system_configuration: Arc<dyn SystemConfigurationService>,
     token_vault: TokenVault,
-    core_command_client: Option<CoreClient>,
+    core_facade: Option<Arc<dyn CoreFacade>>,
 }
 
 #[derive(Clone)]
@@ -184,7 +184,7 @@ pub struct SqliteApiState {
     mqttd_device_transport_session_revoker: Arc<dyn MqttdDeviceTransportSessionRevoker>,
     system_configuration: Arc<dyn SystemConfigurationService>,
     token_vault: TokenVault,
-    core_command_client: Option<CoreClient>,
+    core_facade: Option<Arc<dyn CoreFacade>>,
 }
 
 #[derive(Clone)]
@@ -210,7 +210,7 @@ impl ApiState {
             ),
             system_configuration: default_system_configuration_service(),
             token_vault: TokenVault::from_key_material("iot-api-default-device-token-vault"),
-            core_command_client: None,
+            core_facade: None,
         }
     }
 
@@ -253,9 +253,13 @@ impl ApiState {
         self
     }
 
-    pub fn with_core_client(mut self, client: CoreClient) -> Self {
-        self.core_command_client = Some(client);
+    pub fn with_core_facade(mut self, facade: Arc<dyn CoreFacade>) -> Self {
+        self.core_facade = Some(facade);
         self
+    }
+
+    pub fn with_core_client(self, client: CoreClient) -> Self {
+        self.with_core_facade(Arc::new(client))
     }
 
     pub fn with_session(
@@ -362,7 +366,7 @@ impl SqliteApiState {
             ),
             system_configuration: default_system_configuration_service(),
             token_vault: TokenVault::from_key_material("iot-api-default-device-token-vault"),
-            core_command_client: None,
+            core_facade: None,
         }
     }
 
@@ -405,9 +409,13 @@ impl SqliteApiState {
         self
     }
 
-    pub fn with_core_client(mut self, client: CoreClient) -> Self {
-        self.core_command_client = Some(client);
+    pub fn with_core_facade(mut self, facade: Arc<dyn CoreFacade>) -> Self {
+        self.core_facade = Some(facade);
         self
+    }
+
+    pub fn with_core_client(self, client: CoreClient) -> Self {
+        self.with_core_facade(Arc::new(client))
     }
 
     fn require_mqttd_device_transport_secret(&self, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -3000,7 +3008,7 @@ async fn sqlite_mqttd_device_transport_rpc_response(
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
     let now = Utc::now();
-    if let Some(client) = &state.core_command_client {
+    if let Some(facade) = &state.core_facade {
         let authorized = sqlx::query_scalar::<_, i64>(
             "SELECT 1 FROM device_tokens
              WHERE id = ? AND device_id = ? AND revoked_at IS NULL",
@@ -3013,15 +3021,15 @@ async fn sqlite_mqttd_device_transport_rpc_response(
         if !authorized {
             return Err(ApiError::Unauthorized);
         }
-        client
-            .record_response(CoreCommandResponseRequest {
+        facade
+            .record_command_response(CoreCommandResponseRequest {
                 command_id: request.command_id,
                 device_id: request.device_id,
                 response: request.response,
                 responded_at: now,
             })
             .await
-            .map_err(core_command_client_error)?;
+            .map_err(core_facade_command_error)?;
         return Ok(StatusCode::NO_CONTENT);
     }
     let response = serde_json::to_string(&request.response).map_err(ApiError::Serialization)?;
@@ -3155,20 +3163,20 @@ async fn sqlite_device_telemetry(
     }
 
     let bucket = query.bucket.unwrap_or(TelemetryBucket::FiveMinutes);
-    let points = if let Some(client) = &state.core_command_client {
-        client
-            .telemetry(
-                &device_id,
-                query.from,
-                query.to,
-                match bucket {
+    let points = if let Some(facade) = &state.core_facade {
+        facade
+            .telemetry(CoreTelemetryQuery {
+                device_id: device_id.clone(),
+                from: query.from,
+                to: query.to,
+                bucket: match bucket {
                     TelemetryBucket::Raw => CoreTelemetryBucket::Raw,
                     TelemetryBucket::FiveMinutes => CoreTelemetryBucket::FiveMinutes,
                     TelemetryBucket::OneHour => CoreTelemetryBucket::OneHour,
                 },
-            )
+            })
             .await
-            .map_err(core_telemetry_client_error)?
+            .map_err(core_facade_telemetry_error)?
             .into_iter()
             .map(|point| TelemetryPoint {
                 at: point.at,
@@ -3223,9 +3231,9 @@ async fn sqlite_send_command(
     let expires_at = command.expires_at;
     let issued_at = command.issued_at;
     let (device_id, method, params, mode) = target.into_command_parts(command);
-    if let Some(client) = &state.core_command_client {
-        let record = client
-            .create(CoreCommandCreateRequest {
+    if let Some(facade) = &state.core_facade {
+        let record = facade
+            .create_command(CoreCommandCreateRequest {
                 id: command_id,
                 device_id,
                 method,
@@ -3277,8 +3285,11 @@ async fn sqlite_get_device_command(
     Extension(context): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CommandLifecycleResponse>, ApiError> {
-    if let Some(client) = &state.core_command_client {
-        let record = client.get(id).await.map_err(core_command_client_error)?;
+    if let Some(facade) = &state.core_facade {
+        let record = facade
+            .get_command(id)
+            .await
+            .map_err(core_facade_command_error)?;
         if !sqlite_device_permission(state.store.pool(), &context, &record.device_id)
             .await?
             .is_some_and(|access| access.allows(ResourcePermission::Viewer))
@@ -6007,7 +6018,7 @@ async fn mqttd_device_transport_rpc_response(
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
     let now = Utc::now();
-    if let Some(client) = &state.core_command_client {
+    if let Some(facade) = &state.core_facade {
         let authorized = sqlx::query_scalar::<_, i32>(
             "SELECT 1 FROM device_tokens
              WHERE id = $1 AND device_id = $2 AND revoked_at IS NULL",
@@ -6020,15 +6031,15 @@ async fn mqttd_device_transport_rpc_response(
         if !authorized {
             return Err(ApiError::Unauthorized);
         }
-        client
-            .record_response(CoreCommandResponseRequest {
+        facade
+            .record_command_response(CoreCommandResponseRequest {
                 command_id: request.command_id,
                 device_id: request.device_id,
                 response: request.response,
                 responded_at: now,
             })
             .await
-            .map_err(core_command_client_error)?;
+            .map_err(core_facade_command_error)?;
         return Ok(StatusCode::NO_CONTENT);
     }
     let response = sqlx::types::Json(request.response);
@@ -6267,20 +6278,20 @@ async fn device_telemetry(
     }
 
     let bucket = query.bucket.unwrap_or(TelemetryBucket::FiveMinutes);
-    let points = if let Some(client) = &state.core_command_client {
-        client
-            .telemetry(
-                &device_id,
-                query.from,
-                query.to,
-                match bucket {
+    let points = if let Some(facade) = &state.core_facade {
+        facade
+            .telemetry(CoreTelemetryQuery {
+                device_id: device_id.clone(),
+                from: query.from,
+                to: query.to,
+                bucket: match bucket {
                     TelemetryBucket::Raw => CoreTelemetryBucket::Raw,
                     TelemetryBucket::FiveMinutes => CoreTelemetryBucket::FiveMinutes,
                     TelemetryBucket::OneHour => CoreTelemetryBucket::OneHour,
                 },
-            )
+            })
             .await
-            .map_err(core_telemetry_client_error)?
+            .map_err(core_facade_telemetry_error)?
             .into_iter()
             .map(|point| TelemetryPoint {
                 at: point.at,
@@ -6345,9 +6356,9 @@ async fn send_command(
     let expires_at = command.expires_at;
     let issued_at = command.issued_at;
     let (device_id, method, params, mode) = target.into_command_parts(command);
-    if let Some(client) = &state.core_command_client {
-        let record = client
-            .create(CoreCommandCreateRequest {
+    if let Some(facade) = &state.core_facade {
+        let record = facade
+            .create_command(CoreCommandCreateRequest {
                 id: command_id,
                 device_id,
                 method,
@@ -6406,8 +6417,11 @@ async fn get_device_command(
     Extension(context): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CommandLifecycleResponse>, ApiError> {
-    if let Some(client) = &state.core_command_client {
-        let record = client.get(id).await.map_err(core_command_client_error)?;
+    if let Some(facade) = &state.core_facade {
+        let record = facade
+            .get_command(id)
+            .await
+            .map_err(core_facade_command_error)?;
         if !device_permission(&state.pool, &context, &record.device_id)
             .await?
             .is_some_and(|access| access.allows(ResourcePermission::Viewer))
@@ -7030,27 +7044,27 @@ fn core_command_lifecycle_response(
     )
 }
 
-fn core_command_client_error(error: CoreClientError) -> ApiError {
+fn core_facade_command_error(error: CoreFacadeError) -> ApiError {
     match error {
-        CoreClientError::NotFound => ApiError::NotFound("device command"),
-        CoreClientError::Rejected(409) => {
+        CoreFacadeError::NotFound => ApiError::NotFound("device command"),
+        CoreFacadeError::Rejected(409) => {
             ApiError::Conflict("core command operation conflicted".to_owned())
         }
-        CoreClientError::Configuration(_)
-        | CoreClientError::Request(_)
-        | CoreClientError::Rejected(_) => ApiError::CoreCommandUnavailable,
+        CoreFacadeError::Rejected(_) | CoreFacadeError::Unavailable => {
+            ApiError::CoreCommandUnavailable
+        }
     }
 }
 
-fn core_telemetry_client_error(error: CoreClientError) -> ApiError {
+fn core_facade_telemetry_error(error: CoreFacadeError) -> ApiError {
     match error {
-        CoreClientError::NotFound => ApiError::NotFound("device"),
-        CoreClientError::Rejected(409) => {
+        CoreFacadeError::NotFound => ApiError::NotFound("device"),
+        CoreFacadeError::Rejected(409) => {
             ApiError::Conflict("core telemetry query conflicted".to_owned())
         }
-        CoreClientError::Configuration(_)
-        | CoreClientError::Request(_)
-        | CoreClientError::Rejected(_) => ApiError::CoreCommandUnavailable,
+        CoreFacadeError::Rejected(_) | CoreFacadeError::Unavailable => {
+            ApiError::CoreCommandUnavailable
+        }
     }
 }
 

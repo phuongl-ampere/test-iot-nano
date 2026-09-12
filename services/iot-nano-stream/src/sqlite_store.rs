@@ -110,9 +110,6 @@ impl SqliteStore {
     ) -> Result<Vec<ClaimedRecord>, StreamError> {
         validate_identifier("name", &request.group)?;
         validate_identifier("member ID", &request.member_id)?;
-        if request.limit == 0 {
-            return Ok(Vec::new());
-        }
         let now = chrono::Utc::now().timestamp_millis();
         let lease_until = expires_at(now, config.lease_duration, "lease_duration")?;
         let mut connection = self.locked()?;

@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{File, OpenOptions},
+    sync::Arc,
     sync::{LazyLock, Mutex},
     time::Duration as StdDuration,
 };
@@ -8,9 +9,11 @@ use std::{
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use fs2::FileExt;
 use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
-use iot_nano_core::CoreSqliteStore;
-use iot_nano_core::{AlertEvaluator, SqliteAlertEvaluator, connect_core_database, migrate};
-use iot_stream::{GroupStart, LocalStream, StreamConfig, StreamConsumer, TelemetryMessage};
+use iot_nano_core::{
+    AlertEvaluator, CoreSqliteStore, CoreStreamConsumer, SqliteAlertEvaluator,
+    connect_core_database, migrate,
+};
+use iot_stream::{LocalStream, StreamConfig, TelemetryMessage};
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use tempfile::TempDir;
@@ -49,11 +52,14 @@ async fn prepared_pool() -> PgPool {
     pool
 }
 
-fn alert_consumer(dir: &TempDir, now: DateTime<Utc>) -> (LocalStream, StreamConsumer) {
-    let stream = LocalStream::open(dir.path().join("stream"), StreamConfig::for_test(1)).unwrap();
-    let consumer = stream
-        .join_group("alert-evaluator", "alert-test", GroupStart::Earliest, now)
-        .unwrap();
+async fn alert_consumer(dir: &TempDir, _now: DateTime<Utc>) -> (LocalStream, CoreStreamConsumer) {
+    let mut configuration =
+        StreamConfig::sqlite(dir.path().join("stream.sqlite")).with_partitions(1);
+    configuration.retention_max_age = StdDuration::from_secs(365 * 24 * 60 * 60);
+    let stream = LocalStream::open(configuration).await.unwrap();
+    let consumer =
+        CoreStreamConsumer::new(Arc::new(stream.clone()), "alert-evaluator", "alert-test");
+    consumer.heartbeat().await.unwrap();
     (stream, consumer)
 }
 
@@ -197,11 +203,14 @@ async fn sqlite_event_threshold_opens_incident_and_enqueues_notification() {
     let tempdir = tempfile::tempdir().unwrap();
     let store = sqlite_store(&tempdir).await;
     insert_sqlite_event_rule(&store).await;
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
-    stream.append(temperature_message(41.0, at(0))).unwrap();
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
+    stream
+        .append(temperature_message(41.0, at(0)))
+        .await
+        .unwrap();
 
     let result = SqliteAlertEvaluator::new(store.clone(), 100)
-        .flush_event_rules(&mut consumer, at(0))
+        .flush_event_rules(&consumer, at(0))
         .await
         .unwrap();
 
@@ -221,11 +230,11 @@ async fn sqlite_event_threshold_opens_incident_and_enqueues_notification() {
     assert_eq!(result.opened, 1);
     assert_eq!(status, "open");
     assert_eq!(opened, 1);
-    assert!(consumer.poll(1, at(0)).unwrap().records.is_empty());
+    assert!(consumer.claim(1).await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn sqlite_event_threshold_deduplicates_replayed_telemetry_per_rule() {
+async fn sqlite_event_threshold_handles_stream_deduplicated_telemetry() {
     let tempdir = tempfile::tempdir().unwrap();
     let store = sqlite_store(&tempdir).await;
     let rule_id = insert_sqlite_event_rule(&store).await;
@@ -238,15 +247,15 @@ async fn sqlite_event_threshold_deduplicates_replayed_telemetry_per_rule() {
     .execute(store.pool())
     .await
     .unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let original = temperature_message(41.0, at(0));
     let mut replay = original.clone();
     replay.received_at = at(2);
-    stream.append(original).unwrap();
-    stream.append(replay).unwrap();
+    stream.append(original).await.unwrap();
+    stream.append(replay).await.unwrap();
 
     let result = SqliteAlertEvaluator::new(store.clone(), 100)
-        .flush_event_rules(&mut consumer, at(2))
+        .flush_event_rules(&consumer, at(2))
         .await
         .unwrap();
     let outbox_rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_outbox")
@@ -254,7 +263,7 @@ async fn sqlite_event_threshold_deduplicates_replayed_telemetry_per_rule() {
         .await
         .unwrap();
 
-    assert_eq!(result.read, 2);
+    assert_eq!(result.read, 1);
     assert_eq!(result.evaluated, 1);
     assert_eq!(result.opened, 1);
     assert_eq!(result.reminders, 0);
@@ -275,20 +284,20 @@ async fn sqlite_event_threshold_sends_reminder_for_unacknowledged_open_incident(
     .execute(store.pool())
     .await
     .unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = SqliteAlertEvaluator::new(store.clone(), 100);
 
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
-    stream.append(temperature_message(41.0, at(2))).unwrap();
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    stream
+        .append(temperature_message(41.0, at(2)))
+        .await
+        .unwrap();
 
-    let result = evaluator
-        .flush_event_rules(&mut consumer, at(2))
-        .await
-        .unwrap();
+    let result = evaluator.flush_event_rules(&consumer, at(2)).await.unwrap();
     let reminders = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM notification_outbox WHERE kind = 'reminder'",
     )
@@ -305,20 +314,20 @@ async fn sqlite_event_threshold_resolves_incident_and_enqueues_notification() {
     let tempdir = tempfile::tempdir().unwrap();
     let store = sqlite_store(&tempdir).await;
     insert_sqlite_event_rule(&store).await;
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = SqliteAlertEvaluator::new(store.clone(), 100);
 
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
-    stream.append(temperature_message(39.0, at(1))).unwrap();
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    stream
+        .append(temperature_message(39.0, at(1)))
+        .await
+        .unwrap();
 
-    let result = evaluator
-        .flush_event_rules(&mut consumer, at(1))
-        .await
-        .unwrap();
+    let result = evaluator.flush_event_rules(&consumer, at(1)).await.unwrap();
     let status =
         sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE device_id = ?")
             .bind(DEVICE_ID)
@@ -342,31 +351,40 @@ async fn sqlite_event_threshold_honors_breach_and_recovery_durations() {
     let tempdir = tempfile::tempdir().unwrap();
     let store = sqlite_store(&tempdir).await;
     insert_sqlite_event_rule_with_timing(&store, 60, 60).await;
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = SqliteAlertEvaluator::new(store.clone(), 100);
 
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    let first_breach = evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
-    consumer.heartbeat(at(29)).unwrap();
-    consumer.heartbeat(at(58)).unwrap();
-    stream.append(temperature_message(41.0, at(61))).unwrap();
+    let first_breach = evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    consumer.heartbeat().await.unwrap();
+    consumer.heartbeat().await.unwrap();
+    stream
+        .append(temperature_message(41.0, at(61)))
+        .await
+        .unwrap();
     let sustained_breach = evaluator
-        .flush_event_rules(&mut consumer, at(61))
+        .flush_event_rules(&consumer, at(61))
         .await
         .unwrap();
-    stream.append(temperature_message(39.0, at(62))).unwrap();
+    stream
+        .append(temperature_message(39.0, at(62)))
+        .await
+        .unwrap();
     let first_normal = evaluator
-        .flush_event_rules(&mut consumer, at(62))
+        .flush_event_rules(&consumer, at(62))
         .await
         .unwrap();
-    consumer.heartbeat(at(87)).unwrap();
-    consumer.heartbeat(at(116)).unwrap();
-    stream.append(temperature_message(39.0, at(123))).unwrap();
+    consumer.heartbeat().await.unwrap();
+    consumer.heartbeat().await.unwrap();
+    stream
+        .append(temperature_message(39.0, at(123)))
+        .await
+        .unwrap();
     let sustained_normal = evaluator
-        .flush_event_rules(&mut consumer, at(123))
+        .flush_event_rules(&consumer, at(123))
         .await
         .unwrap();
     let status =
@@ -393,35 +411,35 @@ async fn sqlite_event_threshold_applies_hysteresis_and_reopens_within_grace() {
         .execute(store.pool())
         .await
         .unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = SqliteAlertEvaluator::new(store.clone(), 100);
 
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
-    stream.append(temperature_message(39.0, at(1))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(1))
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    stream
+        .append(temperature_message(39.0, at(1)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(1)).await.unwrap();
     let status_after_indeterminate =
         sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE rule_id = ?")
             .bind(rule_id.to_string())
             .fetch_one(store.pool())
             .await
             .unwrap();
-    stream.append(temperature_message(38.0, at(2))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(2))
+    stream
+        .append(temperature_message(38.0, at(2)))
         .await
         .unwrap();
-    stream.append(temperature_message(41.0, at(3))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(3))
+    evaluator.flush_event_rules(&consumer, at(2)).await.unwrap();
+    stream
+        .append(temperature_message(41.0, at(3)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(3)).await.unwrap();
     let incidents =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM alert_incidents WHERE rule_id = ?")
             .bind(rule_id.to_string())
@@ -490,14 +508,20 @@ async fn breach_opens_after_for_duration_and_enqueues_one_email() {
     let pool = prepared_pool().await;
     insert_event_rule(&pool, 60, 300).await;
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    stream.append(temperature_message(41.0, at(61))).unwrap();
-    consumer.heartbeat(at(29)).unwrap();
-    consumer.heartbeat(at(58)).unwrap();
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
+    stream
+        .append(temperature_message(41.0, at(0)))
+        .await
+        .unwrap();
+    stream
+        .append(temperature_message(41.0, at(61)))
+        .await
+        .unwrap();
+    consumer.heartbeat().await.unwrap();
+    consumer.heartbeat().await.unwrap();
 
     AlertEvaluator::new(pool.clone(), 100)
-        .flush_event_rules(&mut consumer, at(61))
+        .flush_event_rules(&consumer, at(61))
         .await
         .unwrap();
 
@@ -524,7 +548,7 @@ async fn breach_opens_after_for_duration_and_enqueues_one_email() {
             .is_some()
     );
     assert_eq!(opened, 1);
-    assert!(consumer.poll(1, at(61)).unwrap().records.is_empty());
+    assert!(consumer.claim(1).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -536,19 +560,19 @@ async fn normal_value_resolves_open_incident_and_enqueues_one_email() {
     let pool = prepared_pool().await;
     insert_event_rule(&pool, 0, 0).await;
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
-    stream.append(temperature_message(41.0, at(0))).unwrap();
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
+    stream
+        .append(temperature_message(41.0, at(0)))
+        .await
+        .unwrap();
 
     let evaluator = AlertEvaluator::new(pool.clone(), 100);
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    stream
+        .append(temperature_message(39.0, at(1)))
         .await
         .unwrap();
-    stream.append(temperature_message(39.0, at(1))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(1))
-        .await
-        .unwrap();
+    evaluator.flush_event_rules(&consumer, at(1)).await.unwrap();
 
     let status =
         sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE device_id = $1")
@@ -610,13 +634,13 @@ async fn acknowledged_open_incident_does_not_enqueue_reminder() {
     .await
     .unwrap();
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = AlertEvaluator::new(pool.clone(), 100);
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
     sqlx::query(
         "UPDATE alert_incidents
          SET acknowledged_at = $1, acknowledged_by = 'dashboard'
@@ -627,11 +651,11 @@ async fn acknowledged_open_incident_does_not_enqueue_reminder() {
     .execute(&pool)
     .await
     .unwrap();
-    stream.append(temperature_message(41.0, at(2))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(2))
+    stream
+        .append(temperature_message(41.0, at(2)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(2)).await.unwrap();
 
     let reminders = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM notification_outbox WHERE kind = 'reminder'",
@@ -661,18 +685,18 @@ async fn open_unacknowledged_incident_enqueues_periodic_reminder() {
     .await
     .unwrap();
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = AlertEvaluator::new(pool.clone(), 100);
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
-    stream.append(temperature_message(41.0, at(2))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(2))
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    stream
+        .append(temperature_message(41.0, at(2)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(2)).await.unwrap();
 
     let reminders = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM notification_outbox WHERE kind = 'reminder'",
@@ -693,14 +717,14 @@ async fn breach_within_reopen_grace_reuses_resolved_incident() {
     let pool = prepared_pool().await;
     insert_event_rule(&pool, 0, 0).await;
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = AlertEvaluator::new(pool.clone(), 100);
 
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
     let incident_id =
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM alert_incidents WHERE device_id = $1")
             .bind(DEVICE_ID)
@@ -708,16 +732,16 @@ async fn breach_within_reopen_grace_reuses_resolved_incident() {
             .await
             .unwrap();
 
-    stream.append(temperature_message(39.0, at(1))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(1))
+    stream
+        .append(temperature_message(39.0, at(1)))
         .await
         .unwrap();
-    stream.append(temperature_message(41.0, at(2))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(2))
+    evaluator.flush_event_rules(&consumer, at(1)).await.unwrap();
+    stream
+        .append(temperature_message(41.0, at(2)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(2)).await.unwrap();
 
     let reopened_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM alert_incidents WHERE device_id = $1 AND status = 'open'",
@@ -751,19 +775,19 @@ async fn hysteresis_requires_recovery_boundary_before_resolving() {
         .await
         .unwrap();
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
     let evaluator = AlertEvaluator::new(pool.clone(), 100);
 
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
-    stream.append(temperature_message(39.0, at(1))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(1))
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    stream
+        .append(temperature_message(39.0, at(1)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(1)).await.unwrap();
     let status_after_indeterminate =
         sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE rule_id = $1")
             .bind(rule_id)
@@ -771,11 +795,11 @@ async fn hysteresis_requires_recovery_boundary_before_resolving() {
             .await
             .unwrap();
 
-    stream.append(temperature_message(38.0, at(2))).unwrap();
-    evaluator
-        .flush_event_rules(&mut consumer, at(2))
+    stream
+        .append(temperature_message(38.0, at(2)))
         .await
         .unwrap();
+    evaluator.flush_event_rules(&consumer, at(2)).await.unwrap();
     let status_after_recovery =
         sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE rule_id = $1")
             .bind(rule_id)
@@ -801,11 +825,14 @@ async fn disabled_rule_does_not_create_incident() {
         .await
         .unwrap();
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
-    stream.append(temperature_message(41.0, at(0))).unwrap();
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
+    stream
+        .append(temperature_message(41.0, at(0)))
+        .await
+        .unwrap();
 
     let result = AlertEvaluator::new(pool.clone(), 100)
-        .flush_event_rules(&mut consumer, at(0))
+        .flush_event_rules(&consumer, at(0))
         .await
         .unwrap();
     let incidents = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM alert_incidents")
@@ -831,11 +858,14 @@ async fn archived_rule_does_not_create_incident() {
         .await
         .unwrap();
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
-    stream.append(temperature_message(41.0, at(0))).unwrap();
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
+    stream
+        .append(temperature_message(41.0, at(0)))
+        .await
+        .unwrap();
 
     let result = AlertEvaluator::new(pool.clone(), 100)
-        .flush_event_rules(&mut consumer, at(0))
+        .flush_event_rules(&consumer, at(0))
         .await
         .unwrap();
     let incidents = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM alert_incidents")
@@ -856,14 +886,17 @@ async fn evaluator_waits_for_an_archive_rule_lock_before_transitioning_incidents
     let pool = prepared_pool().await;
     let rule_id = insert_event_rule(&pool, 0, 300).await;
     let tempdir = tempfile::tempdir().unwrap();
-    let (stream, mut consumer) = alert_consumer(&tempdir, at(0));
-    stream.append(temperature_message(41.0, at(0))).unwrap();
-    let evaluator = AlertEvaluator::new(pool.clone(), 100);
-    evaluator
-        .flush_event_rules(&mut consumer, at(0))
+    let (stream, consumer) = alert_consumer(&tempdir, at(0)).await;
+    stream
+        .append(temperature_message(41.0, at(0)))
         .await
         .unwrap();
-    stream.append(temperature_message(41.0, at(1))).unwrap();
+    let evaluator = AlertEvaluator::new(pool.clone(), 100);
+    evaluator.flush_event_rules(&consumer, at(0)).await.unwrap();
+    stream
+        .append(temperature_message(41.0, at(1)))
+        .await
+        .unwrap();
 
     let mut archive_transaction = pool.begin().await.unwrap();
     sqlx::query("SELECT id FROM alert_rules WHERE id = $1 FOR UPDATE")
@@ -874,16 +907,13 @@ async fn evaluator_waits_for_an_archive_rule_lock_before_transitioning_incidents
 
     let blocked = tokio::time::timeout(
         StdDuration::from_millis(100),
-        evaluator.flush_event_rules(&mut consumer, at(1)),
+        evaluator.flush_event_rules(&consumer, at(1)),
     )
     .await;
 
     assert!(blocked.is_err(), "evaluator must wait for archive lock");
 
     archive_transaction.rollback().await.unwrap();
-    let result = evaluator
-        .flush_event_rules(&mut consumer, at(1))
-        .await
-        .unwrap();
+    let result = evaluator.flush_event_rules(&consumer, at(1)).await.unwrap();
     assert_eq!(result.evaluated, 1);
 }

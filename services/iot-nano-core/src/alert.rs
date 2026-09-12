@@ -1,11 +1,11 @@
 use crate::CoreSqliteStore;
 use chrono::{DateTime, Duration, Utc};
-use iot_stream::{PollBatch, StreamConsumer, StreamError, StreamRecord};
+use iot_stream::{ClaimedRecord, StreamError};
 use sqlx::{PgPool, Postgres, Row, Sqlite, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{HttpStreamConsumer, HttpStreamConsumerError};
+use crate::{ClaimedBatch, CoreStreamConsumer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleKind {
@@ -84,8 +84,6 @@ pub enum AlertError {
     #[error(transparent)]
     Stream(#[from] StreamError),
     #[error(transparent)]
-    HttpStream(#[from] HttpStreamConsumerError),
-    #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error("invalid stored alert rule: {0}")]
     InvalidRule(String),
@@ -107,18 +105,7 @@ impl AlertEvaluator {
 
     pub async fn flush_event_rules(
         &self,
-        consumer: &mut StreamConsumer,
-        now: DateTime<Utc>,
-    ) -> Result<AlertFlushResult, AlertError> {
-        let batch = consumer.poll(self.batch_size, now)?;
-        let result = self.evaluate_event_batch(&batch, now).await?;
-        consumer.commit(batch, now)?;
-        Ok(result)
-    }
-
-    pub async fn flush_http_event_rules(
-        &self,
-        consumer: &HttpStreamConsumer,
+        consumer: &CoreStreamConsumer,
         now: DateTime<Utc>,
     ) -> Result<AlertFlushResult, AlertError> {
         let batch = consumer.claim(self.batch_size).await?;
@@ -129,24 +116,24 @@ impl AlertEvaluator {
 
     async fn evaluate_event_batch(
         &self,
-        batch: &PollBatch,
+        batch: &ClaimedBatch,
         _now: DateTime<Utc>,
     ) -> Result<AlertFlushResult, AlertError> {
-        if batch.records.is_empty() {
+        if batch.is_empty() {
             return Ok(empty_alert_flush_result());
         }
 
         let mut transaction = self.pool.begin().await?;
         let rules = load_rules(&mut transaction, RuleKind::EventThreshold).await?;
         let mut result = AlertFlushResult {
-            read: batch.records.len(),
+            read: batch.records().len(),
             evaluated: 0,
             opened: 0,
             resolved: 0,
             reminders: 0,
         };
 
-        for record in &batch.records {
+        for record in batch.records() {
             let Some(message) = record.message.telemetry() else {
                 continue;
             };
@@ -242,18 +229,7 @@ impl SqliteAlertEvaluator {
 
     pub async fn flush_event_rules(
         &self,
-        consumer: &mut StreamConsumer,
-        now: DateTime<Utc>,
-    ) -> Result<AlertFlushResult, AlertError> {
-        let batch = consumer.poll(self.batch_size, now)?;
-        let result = self.evaluate_event_batch(&batch, now).await?;
-        consumer.commit(batch, now)?;
-        Ok(result)
-    }
-
-    pub async fn flush_http_event_rules(
-        &self,
-        consumer: &HttpStreamConsumer,
+        consumer: &CoreStreamConsumer,
         now: DateTime<Utc>,
     ) -> Result<AlertFlushResult, AlertError> {
         let batch = consumer.claim(self.batch_size).await?;
@@ -264,24 +240,24 @@ impl SqliteAlertEvaluator {
 
     async fn evaluate_event_batch(
         &self,
-        batch: &PollBatch,
+        batch: &ClaimedBatch,
         _now: DateTime<Utc>,
     ) -> Result<AlertFlushResult, AlertError> {
-        if batch.records.is_empty() {
+        if batch.is_empty() {
             return Ok(empty_alert_flush_result());
         }
 
         let mut transaction = self.store.pool().begin().await?;
         let rules = load_sqlite_rules(&mut transaction, RuleKind::EventThreshold).await?;
         let mut result = AlertFlushResult {
-            read: batch.records.len(),
+            read: batch.records().len(),
             evaluated: 0,
             opened: 0,
             resolved: 0,
             reminders: 0,
         };
 
-        for record in &batch.records {
+        for record in batch.records() {
             let Some(message) = record.message.telemetry() else {
                 continue;
             };
@@ -382,7 +358,7 @@ fn empty_alert_flush_result() -> AlertFlushResult {
 async fn sqlite_claim_event_evaluation(
     transaction: &mut Transaction<'_, Sqlite>,
     rule_id: Uuid,
-    record: &StreamRecord,
+    record: &ClaimedRecord,
 ) -> Result<bool, AlertError> {
     let Some(event) = record.message.telemetry().map(|message| &message.event) else {
         return Ok(false);
@@ -1124,7 +1100,7 @@ fn rule_from_row(row: sqlx::postgres::PgRow) -> Result<AlertRule, AlertError> {
     })
 }
 
-fn rule_applies_to(rule: &AlertRule, record: &StreamRecord) -> bool {
+fn rule_applies_to(rule: &AlertRule, record: &ClaimedRecord) -> bool {
     record.message.telemetry().is_some_and(|message| {
         rule.device_id
             .as_deref()
@@ -1132,7 +1108,7 @@ fn rule_applies_to(rule: &AlertRule, record: &StreamRecord) -> bool {
     })
 }
 
-fn measurement_value(record: &StreamRecord, metric_key: &str) -> Option<f64> {
+fn measurement_value(record: &ClaimedRecord, metric_key: &str) -> Option<f64> {
     record
         .message
         .telemetry()

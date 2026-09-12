@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_nano_core::{
-    CommandDispatcher, SqliteCommandDispatcher, TransportRpcClient, TransportRpcClientError,
+    CommandDispatcher, CommandTransport, CommandTransportError, SqliteCommandDispatcher,
     TransportRpcPublishRequest, connect_core_database, migrate,
 };
 use iot_nano_core::{CoreSqliteStore, NewCommandOutboxEntry};
@@ -23,7 +23,7 @@ static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(())
 #[derive(Clone)]
 struct RecordingTransport {
     requests: Arc<tokio::sync::Mutex<Vec<TransportRpcPublishRequest>>>,
-    result: Result<(), TransportRpcClientError>,
+    result: Result<(), CommandTransportError>,
 }
 
 impl RecordingTransport {
@@ -37,23 +37,23 @@ impl RecordingTransport {
     fn fails(message: &str) -> Self {
         Self {
             requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            result: Err(TransportRpcClientError::Unavailable(message.to_owned())),
+            result: Err(CommandTransportError::Unavailable(message.to_owned())),
         }
     }
 
     fn unavailable_session() -> Self {
         Self {
             requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            result: Err(TransportRpcClientError::UnexpectedStatus(503)),
+            result: Err(CommandTransportError::NoActiveSession),
         }
     }
 }
 
-impl TransportRpcClient for RecordingTransport {
+impl CommandTransport for RecordingTransport {
     fn publish(
         &self,
         request: TransportRpcPublishRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TransportRpcClientError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), CommandTransportError>> + Send + '_>> {
         Box::pin(async move {
             self.requests.lock().await.push(request);
             self.result.clone()
@@ -66,11 +66,11 @@ struct WaitUntilExpiredTransport {
     requests: Arc<tokio::sync::Mutex<Vec<TransportRpcPublishRequest>>>,
 }
 
-impl TransportRpcClient for WaitUntilExpiredTransport {
+impl CommandTransport for WaitUntilExpiredTransport {
     fn publish(
         &self,
         request: TransportRpcPublishRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TransportRpcClientError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), CommandTransportError>> + Send + '_>> {
         Box::pin(async move {
             self.requests.lock().await.push(request.clone());
             while Utc::now() < request.expires_at {

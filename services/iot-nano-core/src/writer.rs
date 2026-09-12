@@ -1,12 +1,10 @@
 use crate::{CoreSqliteStore, CoreSqliteStoreError};
 use chrono::{DateTime, Utc};
-use iot_stream::{
-    GatewayEventKind, GatewayMessage, PollBatch, StreamConsumer, StreamError, StreamMessage,
-};
+use iot_stream::{GatewayEventKind, GatewayMessage, StreamError, StreamMessage};
 use sqlx::{Executor, PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 use thiserror::Error;
 
-use crate::{HttpStreamConsumer, HttpStreamConsumerError};
+use crate::{ClaimedBatch, CoreStreamConsumer};
 
 const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_core.sql")];
 
@@ -34,8 +32,6 @@ pub struct FlushResult {
 pub enum WriterError {
     #[error(transparent)]
     Stream(#[from] StreamError),
-    #[error(transparent)]
-    HttpStream(#[from] HttpStreamConsumerError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -80,32 +76,19 @@ impl TelemetryWriter {
 
     pub async fn flush_once(
         &self,
-        consumer: &mut StreamConsumer,
-        now: DateTime<Utc>,
-    ) -> Result<FlushResult, WriterError> {
-        let batch = consumer.poll(self.batch_size, now)?;
-        let mut result = self.flush_batch(&batch).await?;
-        let committed_partitions = batch.commits.len();
-        consumer.commit(batch, now)?;
-        result.committed_partitions = committed_partitions;
-        Ok(result)
-    }
-
-    pub async fn flush_http_once(
-        &self,
-        consumer: &HttpStreamConsumer,
+        consumer: &CoreStreamConsumer,
         _now: DateTime<Utc>,
     ) -> Result<FlushResult, WriterError> {
         let batch = consumer.claim(self.batch_size).await?;
         let mut result = self.flush_batch(&batch).await?;
-        let committed_partitions = batch.commits.len();
+        let committed_partitions = batch.committed_partitions();
         consumer.acknowledge(&batch).await?;
         result.committed_partitions = committed_partitions;
         Ok(result)
     }
 
-    async fn flush_batch(&self, batch: &PollBatch) -> Result<FlushResult, WriterError> {
-        if batch.records.is_empty() {
+    async fn flush_batch(&self, batch: &ClaimedBatch) -> Result<FlushResult, WriterError> {
+        if batch.is_empty() {
             return Ok(empty_flush_result());
         }
 
@@ -113,7 +96,7 @@ impl TelemetryWriter {
         let mut inserted = 0;
         let mut telemetry_records = 0;
 
-        for record in &batch.records {
+        for record in batch.records() {
             if let StreamMessage::Gateway(message) = &record.message {
                 let receipt = sqlx::query(
                     "INSERT INTO gateway_event_receipts (
@@ -209,7 +192,7 @@ impl TelemetryWriter {
             );
         }
         transaction.commit().await?;
-        let record_count = batch.records.len();
+        let record_count = batch.records().len();
 
         Ok(FlushResult {
             read: record_count,
@@ -274,38 +257,25 @@ impl SqliteTelemetryWriter {
 
     pub async fn flush_once(
         &self,
-        consumer: &mut StreamConsumer,
-        now: DateTime<Utc>,
-    ) -> Result<FlushResult, WriterError> {
-        let batch = consumer.poll(self.batch_size, now)?;
-        let mut result = self.flush_batch(&batch).await?;
-        let committed_partitions = batch.commits.len();
-        consumer.commit(batch, now)?;
-        result.committed_partitions = committed_partitions;
-        Ok(result)
-    }
-
-    pub async fn flush_http_once(
-        &self,
-        consumer: &HttpStreamConsumer,
+        consumer: &CoreStreamConsumer,
         _now: DateTime<Utc>,
     ) -> Result<FlushResult, WriterError> {
         let batch = consumer.claim(self.batch_size).await?;
         let mut result = self.flush_batch(&batch).await?;
-        let committed_partitions = batch.commits.len();
+        let committed_partitions = batch.committed_partitions();
         consumer.acknowledge(&batch).await?;
         result.committed_partitions = committed_partitions;
         Ok(result)
     }
 
-    async fn flush_batch(&self, batch: &PollBatch) -> Result<FlushResult, WriterError> {
-        if batch.records.is_empty() {
+    async fn flush_batch(&self, batch: &ClaimedBatch) -> Result<FlushResult, WriterError> {
+        if batch.is_empty() {
             return Ok(empty_flush_result());
         }
 
         let mut inserted = 0;
         let mut telemetry_records = 0;
-        for record in &batch.records {
+        for record in batch.records() {
             if let StreamMessage::Gateway(message) = &record.message {
                 let (_, telemetry_inserted) = self.write_gateway_message(message).await?;
                 if message.telemetry_event.is_some() {
@@ -324,7 +294,7 @@ impl SqliteTelemetryWriter {
                     .await?,
             );
         }
-        let record_count = batch.records.len();
+        let record_count = batch.records().len();
 
         Ok(FlushResult {
             read: record_count,

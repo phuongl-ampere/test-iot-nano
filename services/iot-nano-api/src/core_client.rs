@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use iot_core::RpcMode;
@@ -6,6 +6,8 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::{CoreFacade, CoreFacadeError, CoreTelemetryQuery};
 
 const CORE_SECRET_HEADER: &str = "x-iot-nano-api-core-secret";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,7 +42,7 @@ pub struct CoreCommandRecord {
     pub responded_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreTelemetryBucket {
     Raw,
     FiveMinutes,
@@ -191,6 +193,59 @@ impl CoreClient {
             response.json().await.map_err(Into::into)
         } else {
             Err(status_error(response.status()))
+        }
+    }
+}
+
+impl CoreFacade for CoreClient {
+    fn create_command(
+        &self,
+        request: CoreCommandCreateRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        Box::pin(async move {
+            CoreClient::create(self, request)
+                .await
+                .map_err(core_facade_error)
+        })
+    }
+
+    fn get_command(
+        &self,
+        id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        Box::pin(async move { CoreClient::get(self, id).await.map_err(core_facade_error) })
+    }
+
+    fn record_command_response(
+        &self,
+        request: CoreCommandResponseRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoreFacadeError>> + Send + '_>> {
+        Box::pin(async move {
+            CoreClient::record_response(self, request)
+                .await
+                .map_err(core_facade_error)
+        })
+    }
+
+    fn telemetry(
+        &self,
+        query: CoreTelemetryQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CoreTelemetryPoint>, CoreFacadeError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            CoreClient::telemetry(self, &query.device_id, query.from, query.to, query.bucket)
+                .await
+                .map_err(core_facade_error)
+        })
+    }
+}
+
+fn core_facade_error(error: CoreClientError) -> CoreFacadeError {
+    match error {
+        CoreClientError::NotFound => CoreFacadeError::NotFound,
+        CoreClientError::Rejected(status) => CoreFacadeError::Rejected(status),
+        CoreClientError::Configuration(_) | CoreClientError::Request(_) => {
+            CoreFacadeError::Unavailable
         }
     }
 }

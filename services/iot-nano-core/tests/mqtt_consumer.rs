@@ -1,13 +1,16 @@
 use std::{
     net::{TcpListener, TcpStream},
     process::{Child, Command, Stdio},
+    sync::Arc,
     thread,
     time::Duration,
 };
 
 use chrono::{TimeZone, Utc};
 use iot_core::TelemetryEvent;
-use iot_nano_core::{IngestOutcome, MqttRuntime, MqttRuntimeConfig, MqttStreamProducer};
+use iot_nano_core::{
+    CoreStreamConsumer, IngestOutcome, MqttRuntime, MqttRuntimeConfig, MqttStreamProducer,
+};
 use iot_stream::{LocalStream, StreamConfig};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use serde_json::json;
@@ -52,10 +55,14 @@ impl Drop for TestBroker {
     }
 }
 
-fn stream(dir: &TempDir) -> LocalStream {
-    let mut config = StreamConfig::for_test(8);
-    config.max_record_bytes = 2 * 1024;
-    LocalStream::open(dir.path().join("stream"), config).unwrap()
+async fn stream(dir: &TempDir) -> LocalStream {
+    LocalStream::open(
+        StreamConfig::sqlite(dir.path().join("stream.sqlite"))
+            .with_partitions(8)
+            .with_max_record_bytes(2 * 1024),
+    )
+    .await
+    .unwrap()
 }
 
 fn telemetry_payload(device_id: &str) -> Vec<u8> {
@@ -74,37 +81,40 @@ fn telemetry_payload(device_id: &str) -> Vec<u8> {
     serde_json::to_vec(&event).unwrap()
 }
 
-#[test]
-fn valid_mqtt_payload_is_durably_appended_to_the_stream() {
+#[tokio::test]
+async fn valid_mqtt_payload_is_durably_appended_to_the_stream() {
     let tempdir = tempfile::tempdir().unwrap();
-    let stream = stream(&tempdir);
-    let consumer = MqttStreamProducer::new(stream.clone());
+    let stream = stream(&tempdir).await;
+    let consumer = MqttStreamProducer::new(Arc::new(stream.clone()));
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
 
     let outcome = consumer
         .ingest(TOPIC, &telemetry_payload("esp-000123"), now)
+        .await
         .unwrap();
 
     assert_eq!(outcome, IngestOutcome::Accepted);
-    let partition = stream.partition_for("esp-000123");
-    assert_eq!(stream.read_partition(partition, 0, 10).unwrap().len(), 1);
+    let reader = CoreStreamConsumer::new(Arc::new(stream), "mqtt-test", "reader");
+    assert_eq!(reader.claim(10).await.unwrap().records().len(), 1);
 }
 
-#[test]
-fn device_id_mismatch_is_rejected_without_appending_to_the_stream() {
+#[tokio::test]
+async fn device_id_mismatch_is_rejected_without_appending_to_the_stream() {
     let tempdir = tempfile::tempdir().unwrap();
-    let stream = stream(&tempdir);
-    let consumer = MqttStreamProducer::new(stream.clone());
+    let stream = stream(&tempdir).await;
+    let consumer = MqttStreamProducer::new(Arc::new(stream.clone()));
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
 
     let outcome = consumer
         .ingest(TOPIC, &telemetry_payload("esp-000456"), now)
+        .await
         .unwrap();
 
     assert_eq!(outcome, IngestOutcome::Rejected);
     assert!(
         stream
             .stats()
+            .await
             .unwrap()
             .partitions
             .iter()
@@ -116,13 +126,14 @@ fn device_id_mismatch_is_rejected_without_appending_to_the_stream() {
 async fn manual_ack_runtime_persists_a_qos_one_publish_before_acknowledging_it() {
     let broker = TestBroker::start();
     let tempdir = tempfile::tempdir().unwrap();
+    let stream = stream(&tempdir).await;
     let mut runtime = MqttRuntime::new(
         MqttRuntimeConfig {
             client_id: "ingest-runtime-test".to_owned(),
             broker_host: "127.0.0.1".to_owned(),
             broker_port: broker.port,
         },
-        stream(&tempdir),
+        Arc::new(stream.clone()),
     );
     runtime.subscribe().await.unwrap();
 
@@ -159,13 +170,6 @@ async fn manual_ack_runtime_persists_a_qos_one_publish_before_acknowledging_it()
     .unwrap();
 
     assert_eq!(outcome, IngestOutcome::Accepted);
-    let partition = runtime.stream().partition_for("esp-000123");
-    assert_eq!(
-        runtime
-            .stream()
-            .read_partition(partition, 0, 10)
-            .unwrap()
-            .len(),
-        1
-    );
+    let reader = CoreStreamConsumer::new(Arc::new(stream), "mqtt-runtime-test", "reader");
+    assert_eq!(reader.claim(10).await.unwrap().records().len(), 1);
 }

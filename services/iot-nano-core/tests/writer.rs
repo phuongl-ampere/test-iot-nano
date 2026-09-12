@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{File, OpenOptions},
+    sync::Arc,
     sync::{LazyLock, Mutex},
 };
 
@@ -8,11 +9,11 @@ use chrono::{TimeZone, Utc};
 use fs2::FileExt;
 use iot_core::TelemetryEvent;
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_nano_core::CoreSqliteStore;
-use iot_nano_core::{TelemetryWriter, connect_core_database, migrate};
+use iot_nano_core::{
+    CoreSqliteStore, CoreStreamConsumer, TelemetryWriter, connect_core_database, migrate,
+};
 use iot_stream::{
-    GatewayEvent, GatewayEventKind, GatewayMessage, GroupStart, LocalStream, StreamConfig,
-    StreamConsumer, TelemetryMessage,
+    GatewayEvent, GatewayEventKind, GatewayMessage, LocalStream, StreamConfig, TelemetryMessage,
 };
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -53,16 +54,17 @@ async fn prepared_pool() -> PgPool {
     pool
 }
 
-fn consumer(dir: &TempDir, now: chrono::DateTime<Utc>) -> (LocalStream, StreamConsumer) {
-    let stream = LocalStream::open(dir.path().join("stream"), StreamConfig::for_test(1)).unwrap();
-    let consumer = stream
-        .join_group(
-            "timescaledb-writer",
-            "writer-test",
-            GroupStart::Earliest,
-            now,
-        )
-        .unwrap();
+async fn consumer(dir: &TempDir, _now: chrono::DateTime<Utc>) -> (LocalStream, CoreStreamConsumer) {
+    let stream = LocalStream::open(
+        StreamConfig::sqlite(dir.path().join("stream.sqlite")).with_partitions(1),
+    )
+    .await
+    .unwrap();
+    let consumer = CoreStreamConsumer::new(
+        Arc::new(stream.clone()),
+        "timescaledb-writer",
+        "writer-test",
+    );
     (stream, consumer)
 }
 
@@ -86,7 +88,7 @@ fn event() -> TelemetryEvent {
 }
 
 #[tokio::test]
-async fn flush_once_commits_unique_events_and_advances_group_offsets() {
+async fn flush_once_commits_stream_deduplicated_events_and_advances_group_offsets() {
     let _database_lock = DATABASE_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -94,7 +96,7 @@ async fn flush_once_commits_unique_events_and_advances_group_offsets() {
     let pool = prepared_pool().await;
     let tempdir = tempfile::tempdir().unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
-    let (stream, mut consumer) = consumer(&tempdir, now);
+    let (stream, consumer) = consumer(&tempdir, now).await;
     let event = event();
     for _ in 0..2 {
         stream
@@ -104,11 +106,12 @@ async fn flush_once_commits_unique_events_and_advances_group_offsets() {
                 event: event.clone(),
                 received_at: now,
             })
+            .await
             .unwrap();
     }
 
     let writer = TelemetryWriter::new(pool.clone(), 1_000);
-    let result = writer.flush_once(&mut consumer, now).await.unwrap();
+    let result = writer.flush_once(&consumer, now).await.unwrap();
 
     let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry")
         .fetch_one(&pool)
@@ -116,11 +119,11 @@ async fn flush_once_commits_unique_events_and_advances_group_offsets() {
         .unwrap()
         .get::<i64, _>("count");
 
-    assert_eq!(result.read, 2);
+    assert_eq!(result.read, 1);
     assert_eq!(result.inserted, 1);
-    assert_eq!(result.duplicates, 1);
+    assert_eq!(result.duplicates, 0);
     assert_eq!(telemetry_rows, 1);
-    assert_eq!(consumer.poll(1, now).unwrap().records.len(), 0);
+    assert!(consumer.claim(1).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -133,7 +136,7 @@ async fn writer_persists_gateway_child_telemetry_and_one_receipt() {
 
     let tempdir = tempfile::tempdir().unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
-    let (stream, mut consumer) = consumer(&tempdir, now);
+    let (stream, consumer) = consumer(&tempdir, now).await;
     let mut event = event();
     event.device_id = "child-001".to_owned();
     event.gateway_device_id = Some("gateway-001".to_owned());
@@ -154,11 +157,11 @@ async fn writer_persists_gateway_child_telemetry_and_one_receipt() {
         telemetry_event: Some(event),
         received_at: now,
     };
-    stream.append(gateway_message.clone()).unwrap();
-    stream.append(gateway_message).unwrap();
+    stream.append(gateway_message.clone()).await.unwrap();
+    stream.append(gateway_message).await.unwrap();
 
     let writer = TelemetryWriter::new(pool.clone(), 1_000);
-    let result = writer.flush_once(&mut consumer, now).await.unwrap();
+    let result = writer.flush_once(&consumer, now).await.unwrap();
 
     let gateway_device_id = sqlx::query_scalar::<_, Option<String>>(
         "SELECT gateway_device_id FROM telemetry WHERE device_id = 'child-001'",
@@ -167,7 +170,7 @@ async fn writer_persists_gateway_child_telemetry_and_one_receipt() {
     .await
     .unwrap();
     assert_eq!(gateway_device_id.as_deref(), Some("gateway-001"));
-    assert_eq!(result.read, 2);
+    assert_eq!(result.read, 1);
     assert_eq!(result.inserted, 1);
     let receipt_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM gateway_event_receipts
@@ -192,7 +195,7 @@ async fn sqlite_writer_commits_stream_records_and_rollups() {
     .await
     .unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
-    let (stream, mut consumer) = consumer(&tempdir, now);
+    let (stream, consumer) = consumer(&tempdir, now).await;
     stream
         .append(TelemetryMessage {
             topic: TOPIC.to_owned(),
@@ -200,10 +203,11 @@ async fn sqlite_writer_commits_stream_records_and_rollups() {
             event: event(),
             received_at: now,
         })
+        .await
         .unwrap();
 
     let writer = iot_nano_core::SqliteTelemetryWriter::new(store.clone(), 1_000);
-    let result = writer.flush_once(&mut consumer, now).await.unwrap();
+    let result = writer.flush_once(&consumer, now).await.unwrap();
     let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry")
         .fetch_one(store.pool())
         .await
@@ -213,7 +217,7 @@ async fn sqlite_writer_commits_stream_records_and_rollups() {
     assert_eq!(result.read, 1);
     assert_eq!(result.inserted, 1);
     assert_eq!(telemetry_rows, 1);
-    assert_eq!(consumer.poll(1, now).unwrap().records.len(), 0);
+    assert!(consumer.claim(1).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -228,7 +232,7 @@ async fn sqlite_writer_acknowledges_gateway_records_without_writing_telemetry() 
     .await
     .unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
-    let (stream, mut consumer) = consumer(&tempdir, now);
+    let (stream, consumer) = consumer(&tempdir, now).await;
     stream
         .append(GatewayMessage {
             topic: "iot/v1/gateways/gateway-001/events".to_owned(),
@@ -247,10 +251,11 @@ async fn sqlite_writer_acknowledges_gateway_records_without_writing_telemetry() 
             telemetry_event: None,
             received_at: now,
         })
+        .await
         .unwrap();
 
     let writer = iot_nano_core::SqliteTelemetryWriter::new(store.clone(), 1_000);
-    let result = writer.flush_once(&mut consumer, now).await.unwrap();
+    let result = writer.flush_once(&consumer, now).await.unwrap();
     let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry")
         .fetch_one(store.pool())
         .await
@@ -271,7 +276,7 @@ async fn sqlite_writer_acknowledges_gateway_records_without_writing_telemetry() 
     .unwrap()
     .flatten();
     assert!(gateway_last_seen.is_some());
-    assert_eq!(consumer.poll(1, now).unwrap().records.len(), 0);
+    assert!(consumer.claim(1).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -286,7 +291,7 @@ async fn sqlite_writer_persists_canonical_child_telemetry_and_one_gateway_receip
     .await
     .unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
-    let (stream, mut consumer) = consumer(&tempdir, now);
+    let (stream, consumer) = consumer(&tempdir, now).await;
     let mut child_event = event();
     child_event.device_id = "child-001".to_owned();
     child_event.gateway_device_id = Some("gateway-001".to_owned());
@@ -307,11 +312,11 @@ async fn sqlite_writer_persists_canonical_child_telemetry_and_one_gateway_receip
         telemetry_event: Some(child_event),
         received_at: now,
     };
-    stream.append(gateway_message.clone()).unwrap();
-    stream.append(gateway_message).unwrap();
+    stream.append(gateway_message.clone()).await.unwrap();
+    stream.append(gateway_message).await.unwrap();
 
     let writer = iot_nano_core::SqliteTelemetryWriter::new(store.clone(), 1_000);
-    let result = writer.flush_once(&mut consumer, now).await.unwrap();
+    let result = writer.flush_once(&consumer, now).await.unwrap();
     let row = sqlx::query(
         "SELECT device_id, gateway_device_id FROM telemetry WHERE device_id = 'child-001'",
     )
@@ -320,7 +325,7 @@ async fn sqlite_writer_persists_canonical_child_telemetry_and_one_gateway_receip
     .unwrap();
 
     assert_eq!(result.inserted, 1);
-    assert_eq!(result.read, 2);
+    assert_eq!(result.read, 1);
     assert_eq!(row.get::<String, _>("device_id"), "child-001");
     assert_eq!(
         row.get::<Option<String>, _>("gateway_device_id").as_deref(),
@@ -349,7 +354,7 @@ async fn sqlite_writer_marks_disconnected_gateway_child_unavailable() {
     .await
     .unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
-    let (stream, mut consumer) = consumer(&tempdir, now);
+    let (stream, consumer) = consumer(&tempdir, now).await;
     stream
         .append(GatewayMessage {
             topic: "iot/v1/gateways/gateway-001/events".to_owned(),
@@ -368,10 +373,11 @@ async fn sqlite_writer_marks_disconnected_gateway_child_unavailable() {
             telemetry_event: None,
             received_at: now,
         })
+        .await
         .unwrap();
 
     iot_nano_core::SqliteTelemetryWriter::new(store.clone(), 1_000)
-        .flush_once(&mut consumer, now)
+        .flush_once(&consumer, now)
         .await
         .unwrap();
     let quality = sqlx::query_scalar::<_, Option<String>>(
@@ -394,7 +400,7 @@ async fn writer_does_not_advance_group_offset_when_database_conversion_fails() {
     let pool = prepared_pool().await;
     let tempdir = tempfile::tempdir().unwrap();
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
-    let (stream, mut consumer) = consumer(&tempdir, now);
+    let (stream, consumer) = consumer(&tempdir, now).await;
     let event = event_with_sequence(u64::MAX);
     stream
         .append(TelemetryMessage {
@@ -403,14 +409,15 @@ async fn writer_does_not_advance_group_offset_when_database_conversion_fails() {
             event,
             received_at: now,
         })
+        .await
         .unwrap();
 
     let writer = TelemetryWriter::new(pool, 1_000);
-    assert!(writer.flush_once(&mut consumer, now).await.is_err());
+    assert!(writer.flush_once(&consumer, now).await.is_err());
 
-    let replay = consumer.poll(1, now).unwrap();
-    assert_eq!(replay.records.len(), 1);
-    assert_eq!(replay.records[0].offset, 0);
+    let replay = consumer.claim(1).await.unwrap();
+    assert_eq!(replay.records().len(), 1);
+    assert_eq!(replay.records()[0].offset, 0);
 }
 
 #[tokio::test]
@@ -470,7 +477,7 @@ async fn migration_installs_alert_rules_incidents_and_outbox() {
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT table_name
          FROM information_schema.tables
-         WHERE table_schema = 'public'
+         WHERE table_schema = 'iot_nano_core'
            AND table_name IN ('alert_rules', 'alert_incidents', 'notification_outbox')
          ORDER BY table_name",
     )
