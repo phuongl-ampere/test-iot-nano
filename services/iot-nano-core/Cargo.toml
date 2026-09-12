@@ -1,0 +1,32 @@
+[package]
+name = "iot-nano-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+iot-core = { path = "../../crates/iot-core" }
+iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
+iot-stream = { package = "iot-nano-stream", path = "../../services/iot-nano-stream" }
+lettre.workspace = true
+reqwest.workspace = true
+rumqttc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+device-simulator = { path = "../../crates/device-simulator" }
+fs2.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+
+[lib]
+name = "iot_nano_core"

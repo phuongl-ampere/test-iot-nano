@@ -12,5 +12,5 @@ until docker compose --file "$compose_file" exec --no-TTY timescaledb pg_isready
 done
 
 STRESS_EVENTS="$events" STRESS_DEVICES="$devices" DATABASE_URL="$database_url" \
-  cargo test -p iot-ingest --test stress configured_events_drain_to_telemetry_and_alert_groups \
+  cargo test -p iot-nano-core --test stress configured_events_drain_to_telemetry_and_alert_groups \
   -- --ignored --test-threads=1 --nocapture

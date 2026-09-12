@@ -15,15 +15,108 @@ services:
     volumes:
       - timescaledb-data:/var/lib/postgresql/data
 
-  nanomq:
-    image: emqx/nanomq:0.25.6
-    command: ["nanomq", "start", "--conf", "/etc/nanomq/nanomq.conf"]
+  iot-nano-stream:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile
+    command: ["/opt/rush-iot-nano/iot-nano-stream"]
+    environment:
+      IOT_NANO_STREAM_ADDRESS: 0.0.0.0:8090
+      IOT_NANO_STREAM_DIR: /var/lib/iot-nano-stream
+      IOT_NANO_MQTTD_STREAM_SECRET: development-mqttd-stream-secret-must-have-32-bytes
+      IOT_NANO_CORE_STREAM_SECRET: development-core-stream-secret-must-have-32-bytes
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8090/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - stream-data:/var/lib/iot-nano-stream
+
+  iot-nano-core:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile
+    command: ["/opt/rush-iot-nano/iot-nano-core", "--health-address", "0.0.0.0:8081"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      iot-nano-stream:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://iot:iot@timescaledb:5432/iot
+      IOT_NANO_STREAM_URL: http://iot-nano-stream:8090
+      IOT_NANO_CORE_STREAM_SECRET: development-core-stream-secret-must-have-32-bytes
+      IOT_NANO_API_CORE_SECRET: development-api-core-secret-must-have-32-bytes
+      IOT_NANO_MQTTD_INTERNAL_URL: http://iot-nano-mqttd:8083
+      IOT_NANO_CORE_MQTTD_SECRET: development-core-mqttd-secret-must-have-32-bytes
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  iot-nano-api:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile
+    command: ["/opt/rush-iot-nano/iot-nano-api", "--address", "0.0.0.0:8080"]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      iot-nano-core:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://iot:iot@timescaledb:5432/iot
+      IOT_NANO_MQTTD_API_SECRET: development-mqttd-api-secret-must-have-32-bytes
+      IOT_NANO_API_MQTTD_SECRET: development-api-mqttd-secret-must-have-32-bytes
+      IOT_NANO_MQTTD_INTERNAL_URL: http://iot-nano-mqttd:8083
+      IOT_NANO_CORE_URL: http://iot-nano-core:8081
+      IOT_NANO_API_CORE_SECRET: development-api-core-secret-must-have-32-bytes
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  iot-nano-mqttd:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile
+    command: ["/opt/rush-iot-nano/iot-nano-mqttd"]
+    depends_on:
+      iot-nano-stream:
+        condition: service_healthy
+      iot-nano-core:
+        condition: service_healthy
+      iot-nano-api:
+        condition: service_healthy
+    environment:
+      IOT_MQTTD_PLAIN_ADDRESS: 0.0.0.0:1883
+      IOT_MQTTD_TLS_ADDRESS: 0.0.0.0:8883
+      IOT_MQTTD_MANAGEMENT_ADDRESS: 0.0.0.0:8082
+      IOT_MQTTD_TRANSPORT_INTERNAL_ADDRESS: 0.0.0.0:8083
+      IOT_MQTTD_TLS_CERT_PATH: /run/tls/mqtt-cert.pem
+      IOT_MQTTD_TLS_KEY_PATH: /run/tls/mqtt-key.pem
+      IOT_MQTTD_API_BASE_URL: http://iot-nano-api:8080
+      IOT_NANO_MQTTD_API_SECRET: development-mqttd-api-secret-must-have-32-bytes
+      IOT_NANO_API_MQTTD_SECRET: development-api-mqttd-secret-must-have-32-bytes
+      IOT_NANO_CORE_MQTTD_SECRET: development-core-mqttd-secret-must-have-32-bytes
+      IOT_NANO_STREAM_URL: http://iot-nano-stream:8090
+      IOT_NANO_MQTTD_STREAM_SECRET: development-mqttd-stream-secret-must-have-32-bytes
     ports:
       - "1883:1883"
+      - "8883:8883"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8082/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     volumes:
-      - ${NANOMQ_CONFIG:-./nanomq/nanomq.dev.conf}:/etc/nanomq/nanomq.conf:ro
-      - nanomq-data:/var/lib/nanomq
+      - mqttd-data:/var/lib/iot-nano-mqttd
+      - ./tls:/run/tls:ro
 
 volumes:
-  nanomq-data:
   timescaledb-data:
+  stream-data:
+  mqttd-data:

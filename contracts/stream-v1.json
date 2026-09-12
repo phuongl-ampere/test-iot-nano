@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "iot-nano/stream-v1",
+  "title": "NanoStreamInternalApiV1",
+  "append": {
+    "method": "POST",
+    "path": "/internal/streams/telemetry/append",
+    "secret_header": "x-iot-nano-mqttd-stream-secret",
+    "request": {
+      "required": ["topic", "payload", "event", "received_at"],
+      "properties": {
+        "topic": { "type": "string", "minLength": 1 },
+        "payload": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+        "event": { "$ref": "telemetry-v1.json" },
+        "received_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "response": {
+      "required": ["partition", "offset"],
+      "properties": {
+        "partition": { "type": "integer", "minimum": 0 },
+        "offset": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "groups": {
+    "claim_path": "/internal/groups/{group}/claim",
+    "ack_path": "/internal/groups/{group}/ack",
+    "secret_header": "x-iot-nano-core-stream-secret"
+  }
+}

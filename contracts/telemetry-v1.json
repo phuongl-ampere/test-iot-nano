@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "iot-nano/telemetry-v1",
+  "title": "TelemetryEventV1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "device_id",
+    "boot_id",
+    "sequence",
+    "event_at",
+    "measurements"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "device_id": { "type": "string", "minLength": 1 },
+    "boot_id": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "event_at": { "type": "string", "format": "date-time" },
+    "measurements": { "type": "object", "minProperties": 1 },
+    "gateway_device_id": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

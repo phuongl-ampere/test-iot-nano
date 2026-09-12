@@ -2,6 +2,7 @@
 """Exercise the public TLS MQTT RPC transport against a locally started stack."""
 
 import argparse
+from datetime import datetime, timezone
 import json
 import queue
 import ssl
@@ -98,6 +99,26 @@ class RpcDevice:
     def receive(self, timeout_seconds=5):
         return self.messages.get(timeout=timeout_seconds)
 
+    def publish_telemetry(self):
+        event_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        result = self.client.publish(
+            "v1/devices/me/telemetry",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "boot_id": str(uuid.uuid4()),
+                    "sequence": 1,
+                    "event_at": event_at,
+                    "measurements": {"temperature_c": 26.4, "humidity_pct": 51.0},
+                }
+            ),
+            qos=1,
+        )
+        result.wait_for_publish(timeout=5)
+        if not result.is_published():
+            raise RuntimeError("telemetry publish did not receive MQTT PUBACK")
+        return event_at
+
     def assert_no_message(self, timeout_seconds=1):
         try:
             message = self.messages.get(timeout=timeout_seconds)
@@ -128,6 +149,22 @@ def send_command(base_url, session_id, device_id):
         session_id,
     )
     return command
+
+
+def wait_for_telemetry(base_url, session_id, device_id, timeout_seconds=10):
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        _, points = api_request(
+            base_url,
+            "GET",
+            f"/api/devices/{device_id}/telemetry"
+            "?from=2020-01-01T00:00:00Z&to=2030-01-01T00:00:00Z&bucket=raw",
+            session_id=session_id,
+        )
+        if points:
+            return points
+        time.sleep(0.2)
+    raise RuntimeError(f"telemetry for {device_id} did not reach the Core/API path")
 
 
 def main():
@@ -166,6 +203,15 @@ def main():
     try:
         device_a_client.start()
         device_b_client.start()
+
+        device_a_client.publish_telemetry()
+        telemetry = wait_for_telemetry(
+            args.api_base_url,
+            session_id,
+            device_a["device_id"],
+        )
+        if telemetry[0]["temperature_c"] != 26.4:
+            raise RuntimeError(f"unexpected telemetry response: {telemetry}")
 
         command_a = send_command(args.api_base_url, session_id, device_a["device_id"])
         topic, payload = device_a_client.receive()
@@ -221,7 +267,10 @@ def main():
         device_a_client.stop()
         device_b_client.stop()
 
-    print("RPC transport E2E passed: isolation, publication, revoke, rotate, and offline expiry")
+    print(
+        "Four-service E2E passed: token telemetry, Core/API query, RPC isolation, "
+        "publication, revoke, rotate, and offline expiry"
+    )
 
 
 if __name__ == "__main__":

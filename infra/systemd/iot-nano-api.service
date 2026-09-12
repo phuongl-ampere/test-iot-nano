@@ -1,0 +1,18 @@
+[Unit]
+Description=Rush IoT Nano control-plane API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iot
+Group=iot
+UMask=0077
+EnvironmentFile=/etc/rush-iot-nano/iot-nano-api.env
+ExecStart=/opt/rush-iot-nano/iot-nano-api
+Restart=always
+RestartSec=3
+WorkingDirectory=/opt/rush-iot-nano
+
+[Install]
+WantedBy=multi-user.target

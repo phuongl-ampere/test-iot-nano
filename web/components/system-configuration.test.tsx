@@ -82,7 +82,9 @@ describe("SystemConfigurationPanel", () => {
     });
     expect(screen.getByText("SMTP changes apply live")).not.toBeNull();
     expect(screen.queryByText("Restart required for tuning changes")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Restart iot-ingest" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Restart retired ingestion service" }),
+    ).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 

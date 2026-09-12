@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "iot-nano/gateway-telemetry-v1",
+  "title": "GatewayTelemetryEventV1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "gateway_device_id",
+    "token_id",
+    "event_kind",
+    "event_at",
+    "payload",
+    "idempotency_key"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "gateway_device_id": { "type": "string", "minLength": 1 },
+    "child_device_id": { "type": ["string", "null"], "minLength": 1 },
+    "token_id": { "type": "string", "format": "uuid" },
+    "session_id": { "type": ["string", "null"], "minLength": 1 },
+    "event_kind": {
+      "enum": ["connect", "disconnect", "heartbeat", "child_telemetry"]
+    },
+    "event_at": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" },
+    "idempotency_key": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}

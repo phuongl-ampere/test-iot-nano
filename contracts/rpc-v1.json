@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "iot-nano/rpc-v1",
+  "title": "RpcRequestV1",
+  "type": "object",
+  "required": ["id", "method", "params", "issued_at", "expires_at", "mode"],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "method": { "type": "string", "minLength": 1 },
+    "params": { "type": "object" },
+    "issued_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "mode": { "enum": ["one_way", "two_way"] }
+  },
+  "additionalProperties": false
+}

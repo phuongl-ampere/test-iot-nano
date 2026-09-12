@@ -2,11 +2,13 @@
 members = [
     "crates/device-simulator",
     "crates/iot-admin-helper",
-    "crates/iot-api",
+    "crates/iot-sqldb-common",
+    "services/iot-nano-api",
     "crates/iot-core",
-    "crates/iot-ingest",
-    "crates/iot-mqtt-transport",
-    "crates/iot-stream",
+    "services/iot-nano-core",
+    "services/iot-nano-mqttd",
+    "services/iot-nano-mqttd/vendor/rumqttd",
+    "services/iot-nano-stream",
     "crates/iot-storage",
 ]
 resolver = "3"
@@ -32,11 +34,13 @@ reqwest = { version = "0.12.28", default-features = false, features = ["json", "
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
+subtle = "2.5"
 rumqttc = "0.25.1"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rustls-pemfile = "2.2.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "json", "postgres", "runtime-tokio", "sqlite", "uuid"] }
 thiserror = "2.0.17"
+toml = "0.8.23"
 tempfile = "3.27.0"
 tokio = { version = "1.50.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = "0.26.5"

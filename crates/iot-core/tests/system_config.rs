@@ -10,10 +10,6 @@ fn environment() -> BTreeMap<String, String> {
         ("DATABASE_URL".to_owned(), "postgres://secret".to_owned()),
         ("MQTT_BROKER_HOST".to_owned(), "broker.internal".to_owned()),
         ("MQTT_BROKER_PORT".to_owned(), "1883".to_owned()),
-        (
-            "IOT_STREAM_DIR".to_owned(),
-            "/var/lib/iot-ingest/stream".to_owned(),
-        ),
         ("IOT_STREAM_PARTITIONS".to_owned(), "8".to_owned()),
         ("SMTP_HOST".to_owned(), "smtp.internal".to_owned()),
         ("SMTP_PORT".to_owned(), "465".to_owned()),

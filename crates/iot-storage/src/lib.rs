@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use chrono::{DateTime, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use sqlx::{
-    Row, SqlitePool,
+    Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow},
 };
 use thiserror::Error;
@@ -52,6 +52,14 @@ CREATE INDEX IF NOT EXISTS telemetry_device_event_at_index
 CREATE INDEX IF NOT EXISTS telemetry_gateway_device_event_at_index
     ON telemetry (gateway_device_id, event_at DESC)
     WHERE gateway_device_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS gateway_event_receipts (
+    gateway_device_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    event_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (gateway_device_id, idempotency_key)
+);
 
 CREATE TABLE IF NOT EXISTS telemetry_rollups_5m (
     bucket_at TEXT NOT NULL,
@@ -645,6 +653,20 @@ impl SqliteStore {
         topic: &str,
     ) -> Result<bool, SqliteStoreError> {
         let mut transaction = self.pool.begin().await?;
+        let inserted = self
+            .write_telemetry_in_transaction(&mut transaction, event, received_at, topic)
+            .await?;
+        transaction.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn write_telemetry_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        event: &TelemetryEvent,
+        received_at: DateTime<Utc>,
+        topic: &str,
+    ) -> Result<bool, SqliteStoreError> {
         let received_at = received_at.to_rfc3339();
         sqlx::query(
             "INSERT INTO devices (device_id, last_seen_at)
@@ -658,7 +680,7 @@ impl SqliteStore {
         )
         .bind(&event.device_id)
         .bind(&received_at)
-        .execute(&mut *transaction)
+        .execute(transaction.as_mut())
         .await?;
         let insert = sqlx::query(
             "INSERT OR IGNORE INTO telemetry (
@@ -674,13 +696,13 @@ impl SqliteStore {
         .bind(serde_json::to_string(&event.measurements).map_err(SqliteStoreError::Serialization)?)
         .bind(topic)
         .bind(&event.gateway_device_id)
-        .execute(&mut *transaction)
+        .execute(transaction.as_mut())
         .await?;
         let inserted = insert.rows_affected() == 1;
         if inserted {
             let metrics = MetricAverages::from_event(event);
             upsert_rollup(
-                &mut transaction,
+                transaction,
                 RollupTable::FiveMinute,
                 bucket_start(event.event_at, 5 * 60),
                 &event.device_id,
@@ -688,7 +710,7 @@ impl SqliteStore {
             )
             .await?;
             upsert_rollup(
-                &mut transaction,
+                transaction,
                 RollupTable::OneHour,
                 bucket_start(event.event_at, 60 * 60),
                 &event.device_id,
@@ -696,7 +718,6 @@ impl SqliteStore {
             )
             .await?;
         }
-        transaction.commit().await?;
         Ok(inserted)
     }
 

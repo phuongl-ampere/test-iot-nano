@@ -1,0 +1,21 @@
+[Unit]
+Description=Rush IoT Nano durable stream service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iot
+Group=iot
+UMask=0077
+EnvironmentFile=/etc/rush-iot-nano/iot-nano-stream.env
+ExecStart=/opt/rush-iot-nano/iot-nano-stream
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+WorkingDirectory=/var/lib/iot-nano-stream
+StateDirectory=iot-nano-stream
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

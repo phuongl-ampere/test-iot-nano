@@ -20,9 +20,29 @@
 .env.*
 !.env.example
 debug/.demo_lighting_switcher.env
+/infra/dev/*.local.env
 
 # Logs
 *.log
+
+# Local service state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/.data/
+/data/
+/var/
+
+# Local TLS material
+/infra/tls/*
+!/infra/tls/.gitkeep
+
+# Browser test artifacts
+/web/playwright-report/
+/web/test-results/
 
 # Editor and OS files
 .DS_Store
