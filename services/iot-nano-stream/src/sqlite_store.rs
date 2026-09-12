@@ -247,12 +247,30 @@ impl SqliteStore {
             }
             let current = group_offset(&transaction, &request.group, partition)?;
             let (_, high_watermark) = partition_bounds(&transaction, partition)?;
-            if next_offset < current || next_offset > high_watermark {
+            let Some(inflight_next_offset) = lease.inflight_next_offset else {
+                return Err(StreamError::NoInflightClaim {
+                    group: request.group.clone(),
+                    member_id: request.member_id.clone(),
+                    partition,
+                });
+            };
+            if lease
+                .inflight_until_ms
+                .is_none_or(|until_ms| until_ms <= now)
+            {
+                return Err(StreamError::NoInflightClaim {
+                    group: request.group.clone(),
+                    member_id: request.member_id.clone(),
+                    partition,
+                });
+            }
+            let maximum_committable_offset = high_watermark.min(inflight_next_offset);
+            if next_offset < current || next_offset > maximum_committable_offset {
                 return Err(StreamError::InvalidCommit {
                     partition,
                     current,
                     requested: next_offset,
-                    high_watermark,
+                    high_watermark: maximum_committable_offset,
                 });
             }
             transaction.execute(
@@ -269,11 +287,11 @@ impl SqliteStore {
                 "UPDATE stream_group_leases
                  SET inflight_until_ms = CASE
                          WHEN inflight_next_offset IS NOT NULL
-                              AND ?1 >= inflight_next_offset
+                              AND ?1 = inflight_next_offset
                          THEN NULL ELSE inflight_until_ms END,
                      inflight_next_offset = CASE
                          WHEN inflight_next_offset IS NOT NULL
-                              AND ?1 >= inflight_next_offset
+                              AND ?1 = inflight_next_offset
                          THEN NULL ELSE inflight_next_offset END
                  WHERE group_name = ?2 AND partition = ?3",
                 params![
@@ -379,7 +397,7 @@ impl SqliteStore {
         from_i64(count)
     }
 
-    fn locked(&self) -> Result<MutexGuard<'_, Connection>, StreamError> {
+    pub(crate) fn locked(&self) -> Result<MutexGuard<'_, Connection>, StreamError> {
         self.connection
             .lock()
             .map_err(|_| StreamError::LockPoisoned)
@@ -476,10 +494,20 @@ fn enforce_retention_locked(
         }
     }
     let mut current_bytes = total_bytes(transaction)?;
-    while current_bytes
-        .checked_add(requested_bytes)
-        .is_none_or(|total| total > config.retention_max_bytes)
-    {
+    if requested_bytes > 0 {
+        if current_bytes
+            .checked_add(requested_bytes)
+            .is_none_or(|total| total > config.retention_max_bytes)
+        {
+            return Err(StreamError::CapacityExceeded {
+                max_bytes: config.retention_max_bytes,
+                current_bytes,
+                requested_bytes,
+            });
+        }
+        return Ok(result);
+    }
+    while current_bytes > config.retention_max_bytes {
         let record: Option<(i64, i64, i64)> = transaction
             .query_row(
                 "SELECT partition, offset, payload_bytes
@@ -541,6 +569,8 @@ struct Lease {
     owner: String,
     until_ms: i64,
     generation: u64,
+    inflight_until_ms: Option<i64>,
+    inflight_next_offset: Option<Offset>,
 }
 
 fn join_group(
@@ -725,22 +755,35 @@ fn get_lease(
     group: &str,
     partition: PartitionId,
 ) -> Result<Option<Lease>, StreamError> {
-    let row: Option<(String, i64, i64)> = connection
+    let row: Option<(String, i64, i64, Option<i64>, Option<i64>)> = connection
         .query_row(
-            "SELECT lease_owner, lease_until_ms, generation
+            "SELECT lease_owner, lease_until_ms, generation, inflight_until_ms,
+                    inflight_next_offset
              FROM stream_group_leases
              WHERE group_name = ?1 AND partition = ?2",
             params![group, i64::from(partition.get())],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    row.map(|(owner, until_ms, generation)| {
-        Ok(Lease {
-            owner,
-            until_ms,
-            generation: from_i64(generation)?,
-        })
-    })
+    row.map(
+        |(owner, until_ms, generation, inflight_until_ms, inflight_next_offset)| {
+            Ok(Lease {
+                owner,
+                until_ms,
+                generation: from_i64(generation)?,
+                inflight_until_ms,
+                inflight_next_offset: inflight_next_offset.map(from_i64).transpose()?,
+            })
+        },
+    )
     .transpose()
 }
 
@@ -792,9 +835,7 @@ fn migrate(connection: &Connection, config: &StreamConfig) -> Result<(), StreamE
         CREATE TABLE IF NOT EXISTS stream_idempotency (
             idempotency_key TEXT PRIMARY KEY NOT NULL,
             partition INTEGER NOT NULL,
-            offset INTEGER NOT NULL,
-            FOREIGN KEY (partition, offset)
-                REFERENCES stream_records(partition, offset) ON DELETE CASCADE
+            offset INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS stream_groups (
             group_name TEXT PRIMARY KEY NOT NULL,
@@ -833,6 +874,7 @@ fn migrate(connection: &Connection, config: &StreamConfig) -> Result<(), StreamE
             ON stream_group_leases(inflight_until_ms);
         ",
     )?;
+    migrate_idempotency_tombstones(&transaction)?;
     let stored_partitions: Option<String> = transaction
         .query_row(
             "SELECT value FROM stream_metadata WHERE key = 'partition_count'",
@@ -862,6 +904,34 @@ fn migrate(connection: &Connection, config: &StreamConfig) -> Result<(), StreamE
         }
     }
     transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_idempotency_tombstones(transaction: &Transaction<'_>) -> Result<(), StreamError> {
+    let mut statement = transaction.prepare("PRAGMA foreign_key_list(stream_idempotency)")?;
+    let references_records = statement
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|table| table == "stream_records");
+    drop(statement);
+    if !references_records {
+        return Ok(());
+    }
+
+    transaction.execute_batch(
+        "
+        CREATE TABLE stream_idempotency_tombstones (
+            idempotency_key TEXT PRIMARY KEY NOT NULL,
+            partition INTEGER NOT NULL,
+            offset INTEGER NOT NULL
+        );
+        INSERT INTO stream_idempotency_tombstones(idempotency_key, partition, offset)
+            SELECT idempotency_key, partition, offset FROM stream_idempotency;
+        DROP TABLE stream_idempotency;
+        ALTER TABLE stream_idempotency_tombstones RENAME TO stream_idempotency;
+        ",
+    )?;
     Ok(())
 }
 

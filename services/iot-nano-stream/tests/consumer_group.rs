@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use chrono::{TimeZone, Utc};
 use iot_core::TelemetryEvent;
 use iot_nano_stream::{
-    AcknowledgeRequest, ClaimRequest, GroupStart, HeartbeatRequest, LocalStream, StreamConfig,
-    StreamError, StreamMessage, StreamPort, TelemetryMessage,
+    AcknowledgeRequest, ClaimRequest, GroupStart, HeartbeatRequest, LocalStream, PartitionCommit,
+    StreamConfig, StreamError, StreamMessage, StreamPort, TelemetryMessage,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -66,6 +66,83 @@ async fn unacknowledged_records_are_redelivered_until_the_caller_acknowledges() 
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn acknowledge_cannot_commit_beyond_the_active_claim() {
+    let directory = tempdir().unwrap();
+    let stream =
+        LocalStream::open(test_config(directory.path().join("stream.sqlite")).with_partitions(1))
+            .await
+            .unwrap();
+    stream.append(message(1)).await.unwrap();
+    stream.append(message(2)).await.unwrap();
+
+    let mut request = claim("writer", "writer-a");
+    request.limit = 1;
+    let claimed = stream.claim(request).await.unwrap();
+    let first = &claimed[0];
+
+    assert!(matches!(
+        stream
+            .acknowledge(AcknowledgeRequest {
+                group: "writer".to_owned(),
+                member_id: "writer-a".to_owned(),
+                generation: first.generation,
+                commits: vec![PartitionCommit {
+                    partition: first.partition,
+                    next_offset: 2,
+                }],
+            })
+            .await,
+        Err(StreamError::InvalidCommit { requested: 2, .. })
+    ));
+
+    let replay = stream.claim(claim("writer", "writer-a")).await.unwrap();
+    assert_eq!(
+        replay
+            .iter()
+            .map(|record| record.offset)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+}
+
+#[tokio::test]
+async fn acknowledge_requires_an_active_inflight_claim() {
+    let directory = tempdir().unwrap();
+    let stream =
+        LocalStream::open(test_config(directory.path().join("stream.sqlite")).with_partitions(1))
+            .await
+            .unwrap();
+
+    assert!(
+        stream
+            .claim(claim("writer", "writer-a"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let assignment = stream
+        .heartbeat(HeartbeatRequest::new("writer", "writer-a"))
+        .await
+        .unwrap();
+    stream.append(message(1)).await.unwrap();
+
+    assert!(matches!(
+        stream
+            .acknowledge(AcknowledgeRequest {
+                group: "writer".to_owned(),
+                member_id: "writer-a".to_owned(),
+                generation: assignment.generation,
+                commits: vec![PartitionCommit {
+                    partition: iot_nano_stream::PartitionId::new(0),
+                    next_offset: 1,
+                }],
+            })
+            .await,
+        Err(StreamError::NoInflightClaim { .. })
+    ));
 }
 
 #[tokio::test]
@@ -158,7 +235,10 @@ async fn drain_succeeds_immediately_when_no_claim_is_in_flight() {
         .await
         .unwrap();
 
-    stream.drain_until(Instant::now()).await.unwrap();
+    stream
+        .drain_until(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

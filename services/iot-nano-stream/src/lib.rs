@@ -108,6 +108,14 @@ pub enum StreamError {
         requested: Offset,
         high_watermark: Offset,
     },
+    #[error(
+        "consumer member {member_id:?} has no active in-flight claim for partition {partition:?} in group {group:?}"
+    )]
+    NoInflightClaim {
+        group: String,
+        member_id: String,
+        partition: PartitionId,
+    },
     #[error("stream offset overflowed")]
     OffsetOverflow,
     #[error("stream is draining and no longer accepts claims")]
@@ -232,18 +240,29 @@ impl LocalStream {
 
     pub async fn drain_until(&self, deadline: Instant) -> Result<(), StreamError> {
         self.inner.accepting.store(false, Ordering::Release);
+        let mut remaining = 0;
         loop {
-            let remaining = self
-                .blocking(|store| store.inflight_count(chrono::Utc::now().timestamp_millis()))
-                .await?;
-            if remaining == 0 {
-                return Ok(());
-            }
             let now = Instant::now();
             if now >= deadline {
                 return Err(StreamError::DrainTimeout { remaining });
             }
-            tokio::time::sleep((deadline - now).min(Duration::from_millis(25))).await;
+            remaining = match tokio::time::timeout(
+                deadline - now,
+                self.blocking(|store| store.inflight_count(chrono::Utc::now().timestamp_millis())),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => return Err(StreamError::DrainTimeout { remaining }),
+            };
+            let after_query = Instant::now();
+            if after_query >= deadline {
+                return Err(StreamError::DrainTimeout { remaining });
+            }
+            if remaining == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep((deadline - after_query).min(Duration::from_millis(25))).await;
         }
     }
 
@@ -293,5 +312,51 @@ impl StreamPort for LocalStream {
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
         Box::pin(LocalStream::drain_until(self, deadline))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_until_honors_deadline_while_sqlite_work_is_contended() {
+        let directory = tempdir().unwrap();
+        let stream =
+            LocalStream::open(StreamConfig::sqlite(directory.path().join("stream.sqlite")))
+                .await
+                .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let store = stream.inner.store.clone();
+        let blocker = tokio::task::spawn_blocking({
+            let barrier = barrier.clone();
+            move || {
+                let _guard = store.locked().unwrap();
+                barrier.wait();
+                barrier.wait();
+            }
+        });
+
+        let barrier_for_ready = barrier.clone();
+        tokio::task::spawn_blocking(move || barrier_for_ready.wait())
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            stream.drain_until(Instant::now() + Duration::from_millis(20)),
+        )
+        .await;
+
+        let barrier_for_release = barrier.clone();
+        tokio::task::spawn_blocking(move || barrier_for_release.wait())
+            .await
+            .unwrap();
+        blocker.await.unwrap();
+        assert!(matches!(result, Ok(Err(StreamError::DrainTimeout { .. }))));
     }
 }

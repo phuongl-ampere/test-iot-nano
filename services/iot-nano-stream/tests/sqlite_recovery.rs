@@ -3,7 +3,8 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use iot_core::TelemetryEvent;
 use iot_nano_stream::{
-    AcknowledgeRequest, ClaimRequest, GroupStart, LocalStream, StreamConfig, TelemetryMessage,
+    AcknowledgeRequest, ClaimRequest, GroupStart, LocalStream, StreamConfig, StreamError,
+    StreamMessage, TelemetryMessage,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -74,6 +75,97 @@ async fn duplicate_idempotency_key_returns_the_original_record() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn duplicate_idempotency_key_returns_the_original_receipt_after_retention() {
+    let directory = tempdir().unwrap();
+    let mut config = StreamConfig::sqlite(directory.path().join("stream.sqlite"));
+    config.retention_max_age = Duration::from_secs(1);
+    let stream = LocalStream::open(config).await.unwrap();
+    let mut expired = message("device-a", 7);
+    expired.received_at = Utc::now() - ChronoDuration::seconds(2);
+    expired.event.event_at = expired.received_at;
+
+    let original = stream.append(expired).await.unwrap();
+    stream.enforce_retention(Utc::now()).await.unwrap();
+
+    let duplicate = stream.append(message("device-a", 7)).await.unwrap();
+    assert_eq!(duplicate, original);
+}
+
+#[tokio::test]
+async fn opening_a_legacy_stream_database_preserves_idempotency_tombstones() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("stream.sqlite");
+    let mut config = StreamConfig::sqlite(&path);
+    config.retention_max_age = Duration::from_secs(1);
+    let stream = LocalStream::open(config.clone()).await.unwrap();
+    let mut expired = message("device-a", 7);
+    expired.received_at = Utc::now() - ChronoDuration::seconds(2);
+    expired.event.event_at = expired.received_at;
+    let original = stream.append(expired).await.unwrap();
+    drop(stream);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE stream_idempotency;
+            CREATE TABLE stream_idempotency (
+                idempotency_key TEXT PRIMARY KEY NOT NULL,
+                partition INTEGER NOT NULL,
+                offset INTEGER NOT NULL,
+                FOREIGN KEY (partition, offset)
+                    REFERENCES stream_records(partition, offset) ON DELETE CASCADE
+            );
+            ",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO stream_idempotency(idempotency_key, partition, offset)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "telemetry:device-a:c9c04d99-4e01-4f94-82a8-9e229e47c093:7",
+                i64::from(original.partition.get()),
+                i64::try_from(original.offset).unwrap(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = LocalStream::open(config).await.unwrap();
+    reopened.enforce_retention(Utc::now()).await.unwrap();
+    let duplicate = reopened.append(message("device-a", 7)).await.unwrap();
+    assert_eq!(duplicate, original);
+}
+
+#[tokio::test]
+async fn capacity_rejection_preserves_unexpired_records() {
+    let directory = tempdir().unwrap();
+    let first = message("device-a", 1);
+    let first_bytes = u64::try_from(
+        serde_json::to_string(&StreamMessage::from(first.clone()))
+            .unwrap()
+            .len(),
+    )
+    .unwrap();
+    let mut config = StreamConfig::sqlite(directory.path().join("stream.sqlite"));
+    config.retention_max_age = Duration::from_secs(365 * 24 * 60 * 60);
+    config.retention_max_bytes = first_bytes;
+    let stream = LocalStream::open(config).await.unwrap();
+
+    stream.append(first).await.unwrap();
+    assert!(matches!(
+        stream.append(message("device-a", 2)).await,
+        Err(StreamError::CapacityExceeded { .. })
+    ));
+
+    let records = stream.claim(claim("writer", "writer-a")).await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].offset, 0);
 }
 
 #[tokio::test]
