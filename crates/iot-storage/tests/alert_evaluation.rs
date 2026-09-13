@@ -236,6 +236,96 @@ async fn sqlite_window_evaluation_uses_semantic_inclusive_ranges_and_finite_json
 }
 
 #[tokio::test]
+async fn sqlite_window_evaluation_keeps_near_max_finite_averages_finite() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            window_seconds, for_seconds
+         ) VALUES (?, 'temperature average high', 'device-1', 'temperature_c',
+                   'window_average', 'gt', 1.6e308, 60, 0)",
+    )
+    .bind(rule_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let evaluated_at = Utc.timestamp_opt(1_700_000_060, 0).unwrap();
+    for sequence in 1..=2 {
+        insert_sqlite_window_telemetry(
+            &store,
+            &evaluated_at.to_rfc3339(),
+            "device-1",
+            sequence,
+            r#"{"temperature_c":1.7e308}"#,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        store.evaluate_alert_windows(evaluated_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let last_value =
+        sqlx::query_scalar::<_, f64>("SELECT last_value FROM alert_incidents WHERE rule_id = ?")
+            .bind(rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert!(last_value.is_finite());
+    assert!((last_value / 1.7e308 - 1.0).abs() <= 2.0 * f64::EPSILON);
+}
+
+#[tokio::test]
+async fn sqlite_window_evaluation_handles_all_zero_finite_averages() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            window_seconds, for_seconds
+         ) VALUES (?, 'temperature average nonnegative', 'device-1', 'temperature_c',
+                   'window_average', 'gte', 0, 60, 0)",
+    )
+    .bind(rule_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let evaluated_at = Utc.timestamp_opt(1_700_000_120, 0).unwrap();
+    for sequence in 1..=2 {
+        insert_sqlite_window_telemetry(
+            &store,
+            &evaluated_at.to_rfc3339(),
+            "device-1",
+            sequence,
+            r#"{"temperature_c":0}"#,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        store.evaluate_alert_windows(evaluated_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, f64>("SELECT last_value FROM alert_incidents WHERE rule_id = ?")
+            .bind(rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0.0
+    );
+}
+
+#[tokio::test]
 async fn sqlite_window_evaluation_selects_wildcard_and_scoped_devices_and_excludes_rules() {
     let (_directory, store) = store().await;
     let wildcard_rule_id = uuid::Uuid::now_v7();
@@ -1973,4 +2063,51 @@ async fn timescale_concurrent_multi_device_window_evaluations_do_not_deadlock() 
         .unwrap(),
         2
     );
+}
+
+#[tokio::test]
+#[ignore = "requires the guarded disposable Timescale URL"]
+async fn timescale_window_evaluation_keeps_near_max_finite_averages_finite() {
+    let (_lock, store) = timescale_store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            window_seconds, for_seconds
+         ) VALUES ($1, 'temperature average high', 'device-1', 'temperature_c',
+                   'window_average', 'gt', $2, 60, 0)",
+    )
+    .bind(rule_id)
+    .bind(1.6e308_f64)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let evaluated_at = Utc.timestamp_opt(1_700_003_600, 0).unwrap();
+    for sequence in 1..=2 {
+        insert_timescale_window_telemetry(
+            &store,
+            evaluated_at,
+            "device-1",
+            sequence,
+            r#"{"temperature_c":1.7e308}"#,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        store.evaluate_alert_windows(evaluated_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let last_value =
+        sqlx::query_scalar::<_, f64>("SELECT last_value FROM alert_incidents WHERE rule_id = $1")
+            .bind(rule_id)
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap();
+    assert!(last_value.is_finite());
+    assert!((last_value / 1.7e308 - 1.0).abs() <= 2.0 * f64::EPSILON);
 }

@@ -4215,17 +4215,33 @@ async fn sqlite_window_aggregates(
                        )
                    END AS event_at_micros
             FROM telemetry
+         ),
+         finite_telemetry AS (
+             SELECT device_id, json_extract(measurements, ?) AS finite_value
+             FROM canonical_telemetry
+             WHERE event_at_micros >= ?
+               AND event_at_micros <= ?
+               AND (? IS NULL OR device_id = ?)
+               AND json_type(measurements, ?) IN ('integer', 'real')
+               AND json_extract(measurements, ?) > -1.0e999
+               AND json_extract(measurements, ?) < 1.0e999
+         ),
+         device_scales AS (
+             SELECT device_id, MAX(ABS(finite_value)) AS scale
+             FROM finite_telemetry
+             GROUP BY device_id
          )
-         SELECT device_id, AVG(json_extract(measurements, ?)) AS average
-         FROM canonical_telemetry
-         WHERE event_at_micros >= ?
-           AND event_at_micros <= ?
-           AND (? IS NULL OR device_id = ?)
-           AND json_type(measurements, ?) IN ('integer', 'real')
-           AND json_extract(measurements, ?) > -1.0e999
-           AND json_extract(measurements, ?) < 1.0e999
-         GROUP BY device_id
-         ORDER BY device_id",
+         SELECT finite_telemetry.device_id,
+                CASE
+                    WHEN device_scales.scale = 0.0 THEN 0.0
+                    ELSE AVG(
+                        1.0 * finite_telemetry.finite_value / NULLIF(device_scales.scale, 0.0)
+                    ) * device_scales.scale
+                END AS average
+         FROM finite_telemetry
+         JOIN device_scales ON device_scales.device_id = finite_telemetry.device_id
+         GROUP BY finite_telemetry.device_id, device_scales.scale
+         ORDER BY finite_telemetry.device_id",
     )
     .bind(&path)
     .bind(from.timestamp_micros())
