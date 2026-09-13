@@ -15,7 +15,7 @@ pub use alert::{AlertError, AlertEvaluator, AlertFlushResult, SqliteAlertEvaluat
 pub use command::{
     CommandDispatchResult, CommandDispatcher, CommandError, CommandTransport,
     CommandTransport as TransportRpcClient, CommandTransportError, HttpTransportRpcClient,
-    SqliteCommandDispatcher, TransportRpcPublishRequest,
+    PlatformCommandDispatcher, SqliteCommandDispatcher, TransportRpcPublishRequest,
 };
 pub use control::{CoreControlState, core_control_router};
 pub use metrics::IngestMetrics;

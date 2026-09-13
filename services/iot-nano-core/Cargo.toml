@@ -11,6 +11,7 @@ chrono.workspace = true
 clap.workspace = true
 iot-core = { path = "../../crates/iot-core" }
 iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
+iot-storage = { path = "../../crates/iot-storage" }
 iot-stream = { package = "iot-nano-stream", path = "../../services/iot-nano-stream" }
 lettre.workspace = true
 reqwest.workspace = true

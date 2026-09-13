@@ -1737,6 +1737,7 @@ dependencies = [
  "iot-core",
  "iot-nano-stream",
  "iot-sqldb-common",
+ "iot-storage",
  "lettre",
  "reqwest",
  "rumqttc",

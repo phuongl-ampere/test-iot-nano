@@ -10,10 +10,11 @@ use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_nano_core::{
-    CommandDispatcher, CommandTransport, CommandTransportError, SqliteCommandDispatcher,
-    TransportRpcPublishRequest, connect_core_database, migrate,
+    CommandDispatcher, CommandTransport, CommandTransportError, PlatformCommandDispatcher,
+    SqliteCommandDispatcher, TransportRpcPublishRequest, connect_core_database, migrate,
 };
 use iot_nano_core::{CoreSqliteStore, NewCommandOutboxEntry};
+use iot_storage::{NewCommandOutboxEntry as PlatformCommand, PlatformStore};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -45,6 +46,15 @@ impl RecordingTransport {
         Self {
             requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             result: Err(CommandTransportError::NoActiveSession),
+        }
+    }
+
+    fn configuration_error() -> Self {
+        Self {
+            requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            result: Err(CommandTransportError::Configuration(
+                "invalid route".to_owned(),
+            )),
         }
     }
 }
@@ -335,6 +345,164 @@ async fn sqlite_dispatcher_expires_stale_commands_before_they_are_sent() {
         .await
         .unwrap();
     assert_eq!(state, "expired");
+}
+
+async fn platform_store() -> (tempfile::TempDir, PlatformStore) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    store.register_device("device-a").await.unwrap();
+    (directory, store)
+}
+
+#[tokio::test]
+async fn platform_dispatcher_claims_and_publishes_through_the_platform_store() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let command_id = Uuid::now_v7();
+    store
+        .enqueue_command(PlatformCommand {
+            id: command_id.to_string(),
+            device_id: "device-a".to_owned(),
+            method: "sample_now".to_owned(),
+            params: json!({ "source": "dashboard" }).to_string(),
+            mode: RpcMode::TwoWay,
+            expires_at: now + Duration::seconds(30),
+            next_attempt_at: now,
+        })
+        .await
+        .unwrap();
+    let transport = RecordingTransport::succeeds();
+    let dispatcher = PlatformCommandDispatcher::new(Arc::new(store.clone()), transport.clone(), 10);
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+
+    assert_eq!(result.expired, 0);
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.published, 1);
+    assert_eq!(result.failed, 0);
+    let requests = transport.requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].device_id, "device-a");
+    assert_eq!(requests[0].id, command_id);
+    assert_eq!(requests[0].method, "sample_now");
+    assert_eq!(requests[0].params, json!({ "source": "dashboard" }));
+    assert_eq!(requests[0].mode, RpcMode::TwoWay);
+    assert_eq!(requests[0].issued_at, now);
+    assert_eq!(requests[0].expires_at, now + Duration::seconds(30));
+}
+
+#[tokio::test]
+async fn platform_dispatcher_releases_unavailable_commands_for_retry() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let command_id = Uuid::now_v7();
+    store
+        .enqueue_command(PlatformCommand {
+            id: command_id.to_string(),
+            device_id: "device-a".to_owned(),
+            method: "sample_now".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: now + Duration::seconds(30),
+            next_attempt_at: now,
+        })
+        .await
+        .unwrap();
+    let dispatcher = PlatformCommandDispatcher::new(
+        Arc::new(store.clone()),
+        RecordingTransport::fails("broker unavailable"),
+        10,
+    );
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+    drop(dispatcher);
+    let reclaimed = store
+        .claim_commands(now + Duration::seconds(2), now + Duration::seconds(32), 1)
+        .await
+        .unwrap();
+
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.published, 0);
+    assert_eq!(result.failed, 0);
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].id, command_id.to_string());
+}
+
+#[tokio::test]
+async fn platform_dispatcher_marks_configuration_errors_terminal() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let command_id = Uuid::now_v7();
+    store
+        .enqueue_command(PlatformCommand {
+            id: command_id.to_string(),
+            device_id: "device-a".to_owned(),
+            method: "sample_now".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: now + Duration::seconds(30),
+            next_attempt_at: now,
+        })
+        .await
+        .unwrap();
+    let dispatcher = PlatformCommandDispatcher::new(
+        Arc::new(store.clone()),
+        RecordingTransport::configuration_error(),
+        10,
+    );
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+    drop(dispatcher);
+    let claimed_again = store
+        .claim_commands(now + Duration::seconds(2), now + Duration::seconds(32), 1)
+        .await
+        .unwrap();
+
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.published, 0);
+    assert_eq!(result.failed, 1);
+    assert!(claimed_again.is_empty());
+}
+
+#[tokio::test]
+async fn platform_dispatcher_does_not_publish_after_transport_returned_past_expiry() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let command_id = Uuid::now_v7();
+    store
+        .enqueue_command(PlatformCommand {
+            id: command_id.to_string(),
+            device_id: "device-a".to_owned(),
+            method: "sample_now".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: now + Duration::milliseconds(250),
+            next_attempt_at: now,
+        })
+        .await
+        .unwrap();
+    let transport = WaitUntilExpiredTransport::default();
+    let dispatcher = PlatformCommandDispatcher::new(Arc::new(store.clone()), transport.clone(), 10);
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+    let published = store
+        .mark_command_published(command_id, Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.published, 0);
+    assert_eq!(result.failed, 0);
+    assert_eq!(result.expired, 1);
+    assert_eq!(transport.requests.lock().await.len(), 1);
+    assert!(published.is_none());
 }
 
 fn lock_database_file() -> File {
