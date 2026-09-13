@@ -4,7 +4,7 @@ use std::{
     future::Future,
     path::Path,
     pin::Pin,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration as StdDuration,
 };
 
@@ -19,6 +19,7 @@ use iot_nano_core::{
 };
 use iot_storage::{NotificationRepository, PlatformStore};
 use sqlx::{PgPool, Row, SqlitePool};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -61,6 +62,28 @@ impl EmailSender for SlowSender {
         Box::pin(async {
             tokio::time::sleep(StdDuration::from_secs(1)).await;
             Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct InFlightFailingSender {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl EmailSender for InFlightFailingSender {
+    fn send(
+        &self,
+        _subject: String,
+        _body: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NotificationError>> + Send + '_>> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            Err(NotificationError::Send("in-flight SMTP failure".to_owned()))
         })
     }
 }
@@ -278,6 +301,66 @@ async fn platform_dispatcher_releases_failed_delivery_with_exponential_backoff()
         row.get::<Option<String>, _>("last_error").as_deref(),
         Some("test SMTP failure")
     );
+}
+
+#[tokio::test]
+async fn platform_dispatcher_does_not_count_a_retry_after_lease_reclaim() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let id = Uuid::new_v4();
+    seed_platform_outbox(&store, id, now).await;
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let dispatcher = PlatformNotificationDispatcher::new(
+        Arc::new(store.clone()),
+        InFlightFailingSender {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+        10,
+    )
+    .with_delivery_policy(
+        Duration::seconds(1),
+        Duration::seconds(7),
+        Duration::seconds(60),
+    );
+
+    let dispatch = tokio::spawn(async move { dispatcher.dispatch_once(now).await.unwrap() });
+    entered.notified().await;
+
+    let reclaimed_at = now + Duration::seconds(2);
+    let reclaimed = NotificationRepository::claim_notifications(
+        &store,
+        reclaimed_at,
+        reclaimed_at + Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    let current_lease_until = reclaimed[0].lease_until.unwrap();
+
+    release.notify_one();
+    let result = dispatch.await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, attempt_count, lease_until, last_error
+         FROM notification_outbox WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_one(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.sent, 0);
+    assert_eq!(result.retried, 0);
+    assert_eq!(row.get::<String, _>("state"), "leased");
+    assert_eq!(row.get::<i64, _>("attempt_count"), 2);
+    assert_eq!(
+        row.get::<Option<String>, _>("lease_until").as_deref(),
+        Some(current_lease_until.to_rfc3339().as_str())
+    );
+    assert!(row.get::<Option<String>, _>("last_error").is_none());
 }
 
 #[tokio::test]

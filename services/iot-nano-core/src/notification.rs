@@ -409,26 +409,32 @@ where
                     }
                 }
                 Ok(Err(error)) => {
-                    self.release_for_retry(
-                        notification.id,
-                        notification.attempt_count,
-                        expected_lease_until,
-                        now,
-                        error,
-                    )
-                    .await?;
-                    result.retried += 1;
+                    if self
+                        .release_for_retry(
+                            notification.id,
+                            notification.attempt_count,
+                            expected_lease_until,
+                            now,
+                            error,
+                        )
+                        .await?
+                    {
+                        result.retried += 1;
+                    }
                 }
                 Err(_) => {
-                    self.release_for_retry(
-                        notification.id,
-                        notification.attempt_count,
-                        expected_lease_until,
-                        now,
-                        NotificationError::Send("SMTP send timed out".to_owned()),
-                    )
-                    .await?;
-                    result.retried += 1;
+                    if self
+                        .release_for_retry(
+                            notification.id,
+                            notification.attempt_count,
+                            expected_lease_until,
+                            now,
+                            NotificationError::Send("SMTP send timed out".to_owned()),
+                        )
+                        .await?
+                    {
+                        result.retried += 1;
+                    }
                 }
             }
         }
@@ -443,7 +449,7 @@ where
         expected_lease_until: DateTime<Utc>,
         now: DateTime<Utc>,
         error: NotificationError,
-    ) -> Result<(), NotificationError> {
+    ) -> Result<bool, NotificationError> {
         let exponent = u32::try_from((attempt_count - 1).clamp(0, 11)).unwrap_or(0);
         let delay_seconds = self
             .retry_base
@@ -451,15 +457,15 @@ where
             .max(1)
             .saturating_mul(2_i64.pow(exponent))
             .min(self.retry_max.num_seconds().max(1));
-        NotificationRepository::release_notification_for_retry(
+        Ok(NotificationRepository::release_notification_for_retry(
             self.store.as_ref(),
             id,
             expected_lease_until,
             &error.to_string(),
             now + Duration::seconds(delay_seconds),
         )
-        .await?;
-        Ok(())
+        .await?
+        .is_some())
     }
 }
 
