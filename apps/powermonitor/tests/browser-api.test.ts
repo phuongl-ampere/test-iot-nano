@@ -114,6 +114,40 @@ describe("browser PowerMonitor API", () => {
     await expect(getAssetTelemetry("asset-1", "1h", now)).resolves.toHaveLength(2);
   });
 
+  it("rejects an endlessly unique cursor stream at the pagination page budget", async () => {
+    let page = 0;
+    const fetcher = vi.fn(() => {
+      page += 1;
+      if (page > 25) {
+        throw new Error("test exhausted unique cursors");
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        has_more: true,
+        items: [{ id: "device-" + page }],
+        next_cursor: "cursor-" + page,
+      }), { status: 200 }));
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listDevices()).rejects.toThrow("Platform pagination page budget exceeded.");
+    expect(fetcher).toHaveBeenCalledTimes(25);
+  });
+
+  it("retains the repeated-cursor guard", async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ has_more: true, items: [{ id: "device-1" }], next_cursor: "again" }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ has_more: true, items: [{ id: "device-2" }], next_cursor: "again" }), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listDevices()).rejects.toThrow("Platform pagination cursor repeated.");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("sends a two-way brightness command and polls its lifecycle through getCommand", async () => {
     const wait = vi.fn().mockResolvedValue(undefined);
     const fetcher = vi

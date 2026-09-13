@@ -155,8 +155,13 @@ async function listResponse<T>(path: string): Promise<T[]> {
   const items: T[] = [];
   const seenCursors = new Set<string>();
   let nextPath = path;
+  let pageCount = 0;
 
   for (;;) {
+    if (pageCount >= maxPaginationPages) {
+      throw new Error("Platform pagination page budget exceeded.");
+    }
+    pageCount += 1;
     const payload = await request<T[] | CursorPage<T>>(nextPath);
     if (Array.isArray(payload)) {
       return items.concat(payload);
@@ -209,6 +214,8 @@ type CursorPage<T> = {
   items?: T[];
   next_cursor?: string | null;
 };
+
+const maxPaginationPages = 25;
 
 type CommandPollingOptions = {
   maxAttempts?: number;

@@ -51,6 +51,7 @@ export function PowerMonitorDashboard({
   const [workingAlertId, setWorkingAlertId] = useState<string | null>(null);
   const selectedAssetIdRef = useRef<string | null>(initialAssetId ?? null);
   const selectedDeviceIdRef = useRef<string | null>(initialDeviceId ?? null);
+  const telemetryRequestIdRef = useRef(0);
 
   const selectedDevice = useMemo(
     () => devices.find((device) => device.id === selectedDeviceId) ?? null,
@@ -62,7 +63,7 @@ export function PowerMonitorDashboard({
   );
   const onlineCount = devices.filter((device) => device.online).length;
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<boolean> => {
     setLoading(true);
     setError(null);
     try {
@@ -88,8 +89,10 @@ export function PowerMonitorDashboard({
       selectedDeviceIdRef.current = nextDeviceId;
       setSelectedAssetId(nextAssetId);
       setSelectedDeviceId(nextDeviceId);
+      return true;
     } catch (reason) {
       setError(errorMessage(reason));
+      return false;
     } finally {
       setLoading(false);
     }
@@ -99,36 +102,38 @@ export function PowerMonitorDashboard({
     void refresh();
   }, [refresh]);
 
-  useEffect(() => {
-    if (selectedAssetId === null && selectedDeviceId === null) {
+  const refreshTelemetry = useCallback(async (): Promise<void> => {
+    const assetId = selectedAssetIdRef.current;
+    const deviceId = selectedDeviceIdRef.current;
+    if (assetId === null && deviceId === null) {
+      telemetryRequestIdRef.current += 1;
       setTelemetry([]);
       return;
     }
-    let cancelled = false;
+    const requestId = telemetryRequestIdRef.current + 1;
+    telemetryRequestIdRef.current = requestId;
     setTelemetryLoading(true);
-    const requestTelemetry = selectedAssetId !== null
-      ? getAssetTelemetry(selectedAssetId, range)
-      : getDeviceTelemetry(selectedDeviceId as string, range);
-    void requestTelemetry
-      .then((points) => {
-        if (!cancelled) {
-          setTelemetry(points);
-        }
-      })
-      .catch((reason) => {
-        if (!cancelled) {
-          setError(errorMessage(reason));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setTelemetryLoading(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [range, selectedAssetId, selectedDeviceId]);
+    try {
+      const points = assetId !== null
+        ? await getAssetTelemetry(assetId, range)
+        : await getDeviceTelemetry(deviceId as string, range);
+      if (telemetryRequestIdRef.current === requestId) {
+        setTelemetry(points);
+      }
+    } catch (reason) {
+      if (telemetryRequestIdRef.current === requestId) {
+        setError(errorMessage(reason));
+      }
+    } finally {
+      if (telemetryRequestIdRef.current === requestId) {
+        setTelemetryLoading(false);
+      }
+    }
+  }, [range]);
+
+  useEffect(() => {
+    void refreshTelemetry();
+  }, [refreshTelemetry, selectedAssetId, selectedDeviceId]);
 
   const sendCommand = async (
     method: string,
@@ -141,13 +146,17 @@ export function PowerMonitorDashboard({
     setCommandBusy(true);
     setError(null);
     try {
-      setCommand(await sendDeviceCommandAndWait(
+      const lifecycle = await sendDeviceCommandAndWait(
         selectedDevice.id,
         method,
         params,
         mode,
         { onProgress: setCommand },
-      ));
+      );
+      setCommand(lifecycle);
+      if (await refresh()) {
+        await refreshTelemetry();
+      }
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
