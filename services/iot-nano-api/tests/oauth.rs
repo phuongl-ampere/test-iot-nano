@@ -788,24 +788,6 @@ async fn authorization_endpoint_rejects_an_unregistered_redirect_uri_without_iss
 #[tokio::test]
 async fn authorization_endpoint_rejects_a_fragment_redirect_uri_before_issuing_a_code() {
     let (_directory, store, state) = oauth_test_state(true).await;
-    ApplicationRepository::upsert_application(
-        &store,
-        NewApplication {
-            app_id: "oauth-test-app".parse().unwrap(),
-            kind: ApplicationKind::FullStack,
-            launch_url: "https://client.example.test".to_owned(),
-            client_id: CLIENT_ID.parse().unwrap(),
-            redirect_uris: vec![
-                "https://client.example.test/callback#fragment"
-                    .parse()
-                    .unwrap(),
-            ],
-            allowed_scopes: vec!["devices:read".to_owned()],
-            enabled: true,
-        },
-    )
-    .await
-    .unwrap();
     let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
     let request = Request::builder()
         .uri(format!(
