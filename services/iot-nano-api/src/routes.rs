@@ -1124,29 +1124,37 @@ fn management_router(state: ApiState) -> Router {
         .with_state(state)
 }
 
+#[derive(Clone)]
+pub struct SqliteApiRouters {
+    pub public: Router,
+    pub management: Router,
+}
+
+pub fn sqlite_routers(state: SqliteApiState) -> SqliteApiRouters {
+    SqliteApiRouters {
+        public: sqlite_public_router(state.clone()),
+        management: sqlite_management_router(state),
+    }
+}
+
 pub fn sqlite_router(state: SqliteApiState) -> Router {
-    let public = Router::new()
+    let SqliteApiRouters { public, management } = sqlite_routers(state.clone());
+    public
+        .merge(management)
+        .merge(sqlite_internal_router(state))
+}
+
+fn sqlite_public_router(state: SqliteApiState) -> Router {
+    Router::new()
         .route("/healthz", get(healthz))
         .route("/oauth/authorize", get(crate::oauth::sqlite_authorize))
         .route("/oauth/token", post(crate::oauth::sqlite_token))
         .route("/api/v1/devices", get(sqlite_public_list_devices))
-        .route("/api/auth/login", post(sqlite_login))
-        .route(
-            "/internal/mqttd/session-resolution",
-            post(sqlite_mqttd_device_transport_session_resolution),
-        )
-        .route(
-            "/internal/mqttd/session-authorization",
-            post(sqlite_mqttd_device_transport_session_authorization),
-        )
-        .route(
-            "/internal/mqttd/gateway-authorization",
-            post(sqlite_mqttd_gateway_authorization),
-        )
-        .route(
-            "/internal/mqttd/rpc-response",
-            post(sqlite_mqttd_device_transport_rpc_response),
-        );
+        .with_state(state)
+}
+
+fn sqlite_management_router(state: SqliteApiState) -> Router {
+    let management = Router::new().route("/api/auth/login", post(sqlite_login));
     let protected = Router::new()
         .route("/api/auth/me", get(current_role))
         .route("/api/auth/logout", post(sqlite_logout))
@@ -1280,9 +1288,30 @@ pub fn sqlite_router(state: SqliteApiState) -> Router {
             state.clone(),
             authenticate_sqlite_request,
         ));
-    public
+    management
         .merge(protected)
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .with_state(state)
+}
+
+fn sqlite_internal_router(state: SqliteApiState) -> Router {
+    Router::new()
+        .route(
+            "/internal/mqttd/session-resolution",
+            post(sqlite_mqttd_device_transport_session_resolution),
+        )
+        .route(
+            "/internal/mqttd/session-authorization",
+            post(sqlite_mqttd_device_transport_session_authorization),
+        )
+        .route(
+            "/internal/mqttd/gateway-authorization",
+            post(sqlite_mqttd_gateway_authorization),
+        )
+        .route(
+            "/internal/mqttd/rpc-response",
+            post(sqlite_mqttd_device_transport_rpc_response),
+        )
         .with_state(state)
 }
 

@@ -2,7 +2,9 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use iot_api::{ApiState, router, routers};
+use iot_api::{ApiState, SqliteApiState, router, routers, sqlite_routers};
+use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_storage::SqliteStore;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 
@@ -11,6 +13,18 @@ fn test_state() -> ApiState {
         .connect_lazy("postgres://router-split:router-split@localhost/router-split")
         .expect("the lazy test database URL is valid");
     ApiState::new(pool)
+}
+
+async fn sqlite_test_state() -> (tempfile::TempDir, SqliteApiState) {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("router-split.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    };
+    let store = SqliteStore::open(&configuration).await.unwrap();
+    (directory, SqliteApiState::new(store))
 }
 
 #[tokio::test]
@@ -94,4 +108,84 @@ async fn legacy_router_keeps_management_and_internal_routes() {
         StatusCode::SERVICE_UNAVAILABLE,
         "the legacy internal route must be matched before its unconfigured authentication fails"
     );
+}
+
+#[tokio::test]
+async fn sqlite_public_router_excludes_session_management_docs_and_internal_routes() {
+    let (_directory, state) = sqlite_test_state().await;
+    let app = sqlite_routers(state).public;
+
+    for (method, uri) in [
+        ("POST", "/api/auth/login"),
+        ("GET", "/api/auth/me"),
+        ("GET", "/api/management/devices"),
+        ("GET", "/docs/"),
+        ("GET", "/api-docs/openapi.json"),
+        ("POST", "/internal/mqttd/session-resolution"),
+        ("POST", "/internal/mqttd/session-authorization"),
+        ("POST", "/internal/mqttd/gateway-authorization"),
+        ("POST", "/internal/mqttd/rpc-response"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must not be public"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_management_router_keeps_protected_management_without_public_or_internal_routes() {
+    let (_directory, state) = sqlite_test_state().await;
+    let routers = sqlite_routers(state);
+
+    let protected = routers
+        .management
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+
+    for (method, uri) in [
+        ("GET", "/oauth/authorize"),
+        ("GET", "/api/v1/devices"),
+        ("POST", "/internal/mqttd/session-resolution"),
+    ] {
+        let response = routers
+            .management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must not be a management route"
+        );
+    }
 }
