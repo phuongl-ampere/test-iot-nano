@@ -76,6 +76,13 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
         .unwrap()
         .is_none()
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
 
     let open_id = uuid::Uuid::now_v7();
     let opened_at = Utc::now().with_nanosecond(123_456_789).unwrap();
@@ -165,23 +172,40 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
         .await
         .unwrap()
         .unwrap();
-    let recovering =
-        AlertIncidentRepository::recover_incident(&store, id, opened.state_version, Utc::now())
-            .await
-            .unwrap()
-            .unwrap();
+    let recovery_started_at = Utc::now().with_nanosecond(222_333_444).unwrap();
+    let recovering = AlertIncidentRepository::recover_incident(
+        &store,
+        id,
+        opened.state_version,
+        recovery_started_at,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let recovery_started_at = recovering.recovery_started_at;
     let resolved = AlertIncidentRepository::resolve_incident(
         &store,
         id,
         recovering.state_version,
-        Utc::now() + Duration::seconds(1),
+        recovery_started_at.unwrap() + Duration::seconds(1),
     )
     .await
     .unwrap()
     .unwrap();
     assert_eq!(resolved.status, AlertIncidentStatus::Resolved);
     assert_eq!(resolved.recovery_started_at, recovery_started_at);
+    let persisted_recovery_started_at: String =
+        sqlx::query_scalar("SELECT recovery_started_at FROM alert_incidents WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&persisted_recovery_started_at)
+            .unwrap()
+            .timestamp_subsec_nanos(),
+        222_333_000
+    );
     assert!(
         AlertIncidentRepository::remind_incident(&store, id, resolved.state_version, Utc::now(),)
             .await
@@ -536,17 +560,31 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     .await
     .unwrap()
     .unwrap();
+    let opened_at = Utc::now().with_nanosecond(123_456_789).unwrap();
     assert!(
         AlertIncidentRepository::create_incident(
             &store,
             incident(rule_id, uuid::Uuid::now_v7(), AlertIncidentStatus::Pending),
-            None,
+            Some(NewNotificationOutboxEntry {
+                id: uuid::Uuid::now_v7(),
+                kind: NotificationKind::Opened,
+                dedupe_key: "incident-pending:timescale-duplicate".to_owned(),
+                subject: "duplicate".to_owned(),
+                body: "body".to_owned(),
+                next_attempt_at: opened_at,
+            }),
         )
         .await
         .unwrap()
         .is_none()
     );
-    let opened_at = Utc::now().with_nanosecond(123_456_789).unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
     let opened = AlertIncidentRepository::open_incident_with_notification(
         &store,
         incident_id,
@@ -568,6 +606,17 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     assert_eq!(
         opened.opened_at.unwrap().timestamp_subsec_nanos(),
         123_456_000
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT EXTRACT(MICROSECONDS FROM next_attempt_at)::BIGINT % 1000000
+             FROM notification_outbox WHERE dedupe_key = $1",
+        )
+        .bind("incident-opened:timescale")
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        123_456
     );
     assert!(
         AlertIncidentRepository::remind_incident_with_notification(
@@ -652,11 +701,21 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
         .await
         .unwrap()
         .unwrap();
-    let resolved_at = Utc::now() + Duration::seconds(1);
-    let resolved = AlertIncidentRepository::resolve_incident_with_notification(
+    let recovery_started_at = Utc::now().with_nanosecond(333_444_555).unwrap();
+    let recovering = AlertIncidentRepository::recover_incident(
         &store,
         direct_id,
         opened.state_version,
+        recovery_started_at,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let resolved_at = recovery_started_at + Duration::seconds(1);
+    let resolved = AlertIncidentRepository::resolve_incident_with_notification(
+        &store,
+        direct_id,
+        recovering.state_version,
         resolved_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
@@ -670,5 +729,18 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(resolved.recovery_started_at, Some(resolved_at));
+    assert_eq!(
+        resolved.recovery_started_at,
+        Some(recovery_started_at.with_nanosecond(333_444_000).unwrap())
+    );
+    let persisted_recovery_started_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT recovery_started_at FROM alert_incidents WHERE id = $1")
+            .bind(direct_id)
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(
+        persisted_recovery_started_at,
+        recovery_started_at.with_nanosecond(333_444_000).unwrap()
+    );
 }
