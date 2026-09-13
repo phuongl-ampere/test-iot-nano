@@ -5,7 +5,7 @@ use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Timelike, Utc};
 use iot_core::{
     DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent, device_token_prefix,
     verify_device_token,
@@ -417,6 +417,25 @@ pub enum PlatformStoreError {
     ApplicationDisabled(ApplicationId),
     #[error("application client ID is already registered: {0:?}")]
     ApplicationClientIdConflict(String),
+    #[error("alert rule ID must be a UUID, got {0:?}")]
+    InvalidAlertRuleId(String),
+    #[error("invalid alert rule kind: {0:?}")]
+    InvalidAlertRuleKind(String),
+    #[error("invalid alert rule comparison: {0:?}")]
+    InvalidAlertRuleComparison(String),
+    #[error("invalid alert rule severity: {0:?}")]
+    InvalidAlertRuleSeverity(String),
+    #[error("invalid alert rule duration for {field}: {seconds}")]
+    InvalidAlertRuleDuration { field: &'static str, seconds: i64 },
+    #[error("invalid alert rule timestamp for {field}: {value}")]
+    InvalidAlertRuleTimestamp {
+        field: &'static str,
+        value: String,
+        #[source]
+        source: chrono::ParseError,
+    },
+    #[error("alert rule event sequence does not fit PostgreSQL BIGINT")]
+    AlertRuleSequenceOverflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -726,6 +745,60 @@ pub trait TelemetryRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertRule {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub enabled: bool,
+    pub kind: AlertRuleKind,
+    pub device_id: Option<String>,
+    pub metric_key: String,
+    pub comparison: AlertComparison,
+    pub threshold: f64,
+    pub window: Option<ChronoDuration>,
+    pub for_duration: ChronoDuration,
+    pub resolve_after: ChronoDuration,
+    pub reopen_grace: ChronoDuration,
+    pub hysteresis: Option<f64>,
+    pub severity: AlertSeverity,
+    pub reminder_interval: ChronoDuration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertRuleKind {
+    EventThreshold,
+    WindowAverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertComparison {
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+pub trait AlertRepository: Send + Sync {
+    fn load_active_rules<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AlertRule>, PlatformStoreError>> + Send + 'a>>;
+    fn claim_rule_event<'a>(
+        &'a self,
+        rule_id: uuid::Uuid,
+        event_at: DateTime<Utc>,
+        device_id: &'a str,
+        boot_id: uuid::Uuid,
+        sequence: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountClass {
     System,
@@ -861,6 +934,85 @@ impl PlatformStore {
         match self {
             Self::Sqlite(_) => None,
             Self::Timescale(pool) => Some(pool),
+        }
+    }
+
+    pub async fn load_active_alert_rules(&self) -> Result<Vec<AlertRule>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let rows = sqlx::query(
+                    "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison,
+                            threshold, window_seconds, for_seconds, resolve_after_seconds,
+                            reopen_grace_seconds, hysteresis, severity, reminder_interval_seconds
+                     FROM alert_rules
+                     WHERE enabled = 1 AND archived_at IS NULL
+                     ORDER BY created_at DESC, id",
+                )
+                .fetch_all(store.pool())
+                .await?;
+                rows.into_iter().map(sqlite_alert_rule_record).collect()
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison,
+                            threshold, window_seconds, for_seconds, resolve_after_seconds,
+                            reopen_grace_seconds, hysteresis, severity, reminder_interval_seconds
+                     FROM alert_rules
+                     WHERE enabled AND archived_at IS NULL
+                     ORDER BY created_at DESC, id",
+                )
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter().map(postgres_alert_rule_record).collect()
+            }
+        }
+    }
+
+    pub async fn claim_alert_rule_event(
+        &self,
+        rule_id: uuid::Uuid,
+        event_at: DateTime<Utc>,
+        device_id: &str,
+        boot_id: uuid::Uuid,
+        sequence: u64,
+    ) -> Result<bool, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let result = sqlx::query(
+                    "INSERT INTO alert_rule_event_evaluations
+                        (rule_id, event_at, device_id, boot_id, sequence)
+                     VALUES (?, ?, ?, ?, ?)
+                     ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence)
+                     DO NOTHING",
+                )
+                .bind(rule_id.to_string())
+                .bind(event_at.to_rfc3339())
+                .bind(device_id)
+                .bind(boot_id.to_string())
+                .bind(sequence.to_string())
+                .execute(store.pool())
+                .await?;
+                Ok(result.rows_affected() == 1)
+            }
+            Self::Timescale(pool) => {
+                let sequence = i64::try_from(sequence)
+                    .map_err(|_| PlatformStoreError::AlertRuleSequenceOverflow)?;
+                let result = sqlx::query(
+                    "INSERT INTO alert_rule_event_evaluations
+                        (rule_id, event_at, device_id, boot_id, sequence)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence)
+                     DO NOTHING",
+                )
+                .bind(rule_id)
+                .bind(event_at)
+                .bind(device_id)
+                .bind(boot_id)
+                .bind(sequence)
+                .execute(pool)
+                .await?;
+                Ok(result.rows_affected() == 1)
+            }
         }
     }
 
@@ -2194,6 +2346,28 @@ fn canonical_command_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
         .expect("a valid UTC timestamp can be represented at microsecond precision")
 }
 
+impl AlertRepository for PlatformStore {
+    fn load_active_rules<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AlertRule>, PlatformStoreError>> + Send + 'a>> {
+        Box::pin(async move { self.load_active_alert_rules().await })
+    }
+
+    fn claim_rule_event<'a>(
+        &'a self,
+        rule_id: uuid::Uuid,
+        event_at: DateTime<Utc>,
+        device_id: &'a str,
+        boot_id: uuid::Uuid,
+        sequence: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.claim_alert_rule_event(rule_id, event_at, device_id, boot_id, sequence)
+                .await
+        })
+    }
+}
+
 impl TopologyRepository for PlatformStore {
     fn register_device<'a>(
         &'a self,
@@ -2593,6 +2767,153 @@ fn postgres_application_record(
         allowed_scopes: scopes,
         enabled: row.try_get("enabled")?,
     })
+}
+
+fn sqlite_alert_rule_record(row: SqliteRow) -> Result<AlertRule, PlatformStoreError> {
+    let id: String = row.try_get("id")?;
+    let rule = AlertRule {
+        id: uuid::Uuid::parse_str(&id).map_err(|_| PlatformStoreError::InvalidAlertRuleId(id))?,
+        name: row.try_get("name")?,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
+        kind: alert_rule_kind(&row.try_get::<String, _>("rule_type")?)?,
+        device_id: row.try_get("device_id")?,
+        metric_key: row.try_get("metric_key")?,
+        comparison: alert_comparison(&row.try_get::<String, _>("comparison")?)?,
+        threshold: row.try_get("threshold")?,
+        window: row
+            .try_get::<Option<i64>, _>("window_seconds")?
+            .map(alert_duration)
+            .transpose()?,
+        for_duration: alert_duration(row.try_get("for_seconds")?)?,
+        resolve_after: alert_duration(row.try_get("resolve_after_seconds")?)?,
+        reopen_grace: alert_duration(row.try_get("reopen_grace_seconds")?)?,
+        hysteresis: row.try_get("hysteresis")?,
+        severity: alert_severity(&row.try_get::<String, _>("severity")?)?,
+        reminder_interval: alert_positive_duration(
+            row.try_get("reminder_interval_seconds")?,
+            "reminder_interval_seconds",
+        )?,
+    };
+    validate_alert_rule(&rule)
+}
+
+fn postgres_alert_rule_record(row: PgRow) -> Result<AlertRule, PlatformStoreError> {
+    let rule = AlertRule {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        enabled: row.try_get("enabled")?,
+        kind: alert_rule_kind(&row.try_get::<String, _>("rule_type")?)?,
+        device_id: row.try_get("device_id")?,
+        metric_key: row.try_get("metric_key")?,
+        comparison: alert_comparison(&row.try_get::<String, _>("comparison")?)?,
+        threshold: row.try_get("threshold")?,
+        window: row
+            .try_get::<Option<i32>, _>("window_seconds")?
+            .map(i64::from)
+            .map(alert_duration)
+            .transpose()?,
+        for_duration: alert_duration(i64::from(row.try_get::<i32, _>("for_seconds")?))?,
+        resolve_after: alert_duration(i64::from(row.try_get::<i32, _>("resolve_after_seconds")?))?,
+        reopen_grace: alert_duration(i64::from(row.try_get::<i32, _>("reopen_grace_seconds")?))?,
+        hysteresis: row.try_get("hysteresis")?,
+        severity: alert_severity(&row.try_get::<String, _>("severity")?)?,
+        reminder_interval: alert_positive_duration(
+            i64::from(row.try_get::<i32, _>("reminder_interval_seconds")?),
+            "reminder_interval_seconds",
+        )?,
+    };
+    validate_alert_rule(&rule)
+}
+
+fn alert_rule_kind(value: &str) -> Result<AlertRuleKind, PlatformStoreError> {
+    match value {
+        "event_threshold" => Ok(AlertRuleKind::EventThreshold),
+        "window_average" => Ok(AlertRuleKind::WindowAverage),
+        _ => Err(PlatformStoreError::InvalidAlertRuleKind(value.to_owned())),
+    }
+}
+
+fn alert_comparison(value: &str) -> Result<AlertComparison, PlatformStoreError> {
+    match value {
+        "gt" => Ok(AlertComparison::GreaterThan),
+        "gte" => Ok(AlertComparison::GreaterThanOrEqual),
+        "lt" => Ok(AlertComparison::LessThan),
+        "lte" => Ok(AlertComparison::LessThanOrEqual),
+        _ => Err(PlatformStoreError::InvalidAlertRuleComparison(
+            value.to_owned(),
+        )),
+    }
+}
+
+fn alert_severity(value: &str) -> Result<AlertSeverity, PlatformStoreError> {
+    match value {
+        "info" => Ok(AlertSeverity::Info),
+        "warning" => Ok(AlertSeverity::Warning),
+        "critical" => Ok(AlertSeverity::Critical),
+        _ => Err(PlatformStoreError::InvalidAlertRuleSeverity(
+            value.to_owned(),
+        )),
+    }
+}
+
+fn alert_duration(seconds: i64) -> Result<ChronoDuration, PlatformStoreError> {
+    if seconds < 0 {
+        return Err(PlatformStoreError::InvalidAlertRuleDuration {
+            field: "duration",
+            seconds,
+        });
+    }
+    Ok(ChronoDuration::seconds(seconds))
+}
+
+fn alert_positive_duration(
+    seconds: i64,
+    field: &'static str,
+) -> Result<ChronoDuration, PlatformStoreError> {
+    if seconds <= 0 {
+        return Err(PlatformStoreError::InvalidAlertRuleDuration { field, seconds });
+    }
+    Ok(ChronoDuration::seconds(seconds))
+}
+
+fn validate_alert_rule(rule: &AlertRule) -> Result<AlertRule, PlatformStoreError> {
+    match (rule.kind, rule.window) {
+        (AlertRuleKind::EventThreshold, Some(window)) => {
+            return Err(PlatformStoreError::InvalidAlertRuleDuration {
+                field: "window_seconds",
+                seconds: window.num_seconds(),
+            });
+        }
+        (AlertRuleKind::WindowAverage, None) => {
+            return Err(PlatformStoreError::InvalidAlertRuleDuration {
+                field: "window_seconds",
+                seconds: 0,
+            });
+        }
+        (AlertRuleKind::WindowAverage, Some(window)) if window < ChronoDuration::seconds(60) => {
+            return Err(PlatformStoreError::InvalidAlertRuleDuration {
+                field: "window_seconds",
+                seconds: window.num_seconds(),
+            });
+        }
+        _ => {}
+    }
+    if rule.threshold.is_nan() || rule.threshold.is_infinite() {
+        return Err(PlatformStoreError::InvalidAlertRuleDuration {
+            field: "threshold",
+            seconds: 0,
+        });
+    }
+    if rule
+        .hysteresis
+        .is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(PlatformStoreError::InvalidAlertRuleDuration {
+            field: "hysteresis",
+            seconds: 0,
+        });
+    }
+    Ok(rule.clone())
 }
 
 async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
