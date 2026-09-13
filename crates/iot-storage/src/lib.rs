@@ -3763,15 +3763,6 @@ async fn evaluate_timescale_event_transition(
     value: f64,
     evaluated_at: DateTime<Utc>,
 ) -> Result<EventTransition, PlatformStoreError> {
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(
-            hashtextextended($1, 0)
-         )",
-    )
-    .bind(format!("iot_nano:alert-event:{}:{device_id}", rule.id))
-    .execute(&mut **transaction)
-    .await?;
-
     let condition = event_condition(rule, value);
     if condition != Some(true) {
         if condition == Some(false) {
@@ -4083,6 +4074,38 @@ async fn evaluate_timescale_alert_events(
         .into_iter()
         .map(postgres_alert_rule_record)
         .collect::<Result<_, _>>()?;
+
+    // Lock every affected incident key in a stable order before any transition.
+    // This prevents opposite event-batch orders from forming an advisory-lock cycle.
+    let mut lock_keys = Vec::new();
+    for event in events {
+        for rule in &rules {
+            if rule
+                .device_id
+                .as_deref()
+                .is_some_and(|id| id != event.device_id)
+            {
+                continue;
+            }
+            if event
+                .measurements
+                .get(&rule.metric_key)
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(f64::is_finite)
+            {
+                lock_keys.push((rule.id, event.device_id.clone()));
+            }
+        }
+    }
+    lock_keys.sort_unstable();
+    lock_keys.dedup();
+    for (rule_id, device_id) in lock_keys {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("iot_nano:alert-event:{rule_id}:{device_id}"))
+            .execute(&mut *transaction)
+            .await?;
+    }
+
     let mut result = AlertEvaluationResult::default();
     for event in events {
         for rule in &rules {

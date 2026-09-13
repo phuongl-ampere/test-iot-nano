@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{Duration, TimeZone, Timelike, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
@@ -5,6 +7,7 @@ use iot_storage::{
 };
 use serde_json::{Map, Value};
 use sqlx::{Connection, PgConnection};
+use tokio::{sync::Barrier, time::Duration as TokioDuration};
 
 async fn store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -53,10 +56,20 @@ fn event(
     value: f64,
     boot_id: uuid::Uuid,
 ) -> AlertEvaluationEvent {
+    event_for_device(at, sequence, value, boot_id, "device-1")
+}
+
+fn event_for_device(
+    at: chrono::DateTime<Utc>,
+    sequence: u64,
+    value: f64,
+    boot_id: uuid::Uuid,
+    device_id: &str,
+) -> AlertEvaluationEvent {
     AlertEvaluationEvent {
         event_at: at,
         received_at: at,
-        device_id: "device-1".to_owned(),
+        device_id: device_id.to_owned(),
         boot_id,
         sequence,
         measurements: Map::from_iter([("temperature_c".to_owned(), Value::from(value))]),
@@ -1156,6 +1169,80 @@ async fn timescale_concurrent_distinct_events_serialize_first_incident_transitio
         .await
         .unwrap(),
         1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable Timescale URL"]
+async fn timescale_opposite_ordered_event_batches_do_not_deadlock() {
+    let (_lock, store) = timescale_store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
+         ) VALUES ($1, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
+    )
+    .bind(rule_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+
+    let at = Utc.timestamp_opt(1_700_002_100, 123_456_789).unwrap();
+    let first_events = [
+        event_for_device(at, 1, 31.25, uuid::Uuid::now_v7(), "device-a"),
+        event_for_device(at, 2, 31.5, uuid::Uuid::now_v7(), "device-b"),
+    ];
+    let second_events = [
+        event_for_device(at, 3, 32.0, uuid::Uuid::now_v7(), "device-b"),
+        event_for_device(at, 4, 32.25, uuid::Uuid::now_v7(), "device-a"),
+    ];
+    let barrier = Arc::new(Barrier::new(3));
+    let first_store = store.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_store.evaluate_alert_events(&first_events, at).await
+    });
+    let second_store = store.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        second_store.evaluate_alert_events(&second_events, at).await
+    });
+    barrier.wait().await;
+
+    let (first, second) = tokio::time::timeout(TokioDuration::from_secs(5), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("opposite-order batches must not deadlock");
+    let first = first.unwrap().unwrap();
+    let second = second.unwrap().unwrap();
+    assert_eq!(first.evaluated, 2);
+    assert_eq!(second.evaluated, 2);
+    assert_eq!(first.opened + second.opened, 2);
+    assert_eq!(first.reminders + second.reminders, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents
+             WHERE rule_id = $1 AND status IN ('pending', 'open')",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_rule_event_evaluations WHERE rule_id = $1",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        4
     );
 }
 
