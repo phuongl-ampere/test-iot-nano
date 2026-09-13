@@ -25,8 +25,8 @@ pub use mqtt::{
 };
 pub use notification::{
     EmailSender, NotificationDispatchResult, NotificationDispatcher, NotificationError,
-    ReloadingSmtpEmailSender, SmtpConfig, SmtpConfigInput, SmtpEmailSender,
-    SqliteNotificationDispatcher, load_live_smtp_config,
+    PlatformNotificationDispatcher, ReloadingSmtpEmailSender, SmtpConfig, SmtpConfigInput,
+    SmtpEmailSender, SqliteNotificationDispatcher, load_live_smtp_config,
 };
 pub use storage::{
     CommandOutboxRecord, CommandOutboxState, CoreSqliteStore, CoreSqliteStoreError,

@@ -13,9 +13,11 @@ use fs2::FileExt;
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_core::CoreSqliteStore;
 use iot_nano_core::{
-    EmailSender, NotificationDispatcher, NotificationError, SmtpConfig, SmtpConfigInput,
-    SqliteNotificationDispatcher, connect_core_database, load_live_smtp_config, migrate,
+    EmailSender, NotificationDispatcher, NotificationError, PlatformNotificationDispatcher,
+    SmtpConfig, SmtpConfigInput, SqliteNotificationDispatcher, connect_core_database,
+    load_live_smtp_config, migrate,
 };
+use iot_storage::{NotificationRepository, PlatformStore};
 use sqlx::{PgPool, Row, SqlitePool};
 use uuid::Uuid;
 
@@ -170,6 +172,198 @@ async fn seed_sqlite_outbox(pool: &SqlitePool, now: DateTime<Utc>) -> String {
     .await
     .unwrap();
     outbox_id
+}
+
+async fn platform_store() -> (tempfile::TempDir, PlatformStore) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    (directory, store)
+}
+
+async fn seed_platform_outbox(store: &PlatformStore, id: Uuid, now: DateTime<Utc>) {
+    let pool = store.sqlite_pool().unwrap();
+    let rule_id = Uuid::new_v4();
+    let incident_id = Uuid::new_v4();
+    let timestamp = now.to_rfc3339();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold
+         ) VALUES (?, ?, 'temperature_c', 'event_threshold', 'gt', 30)",
+    )
+    .bind(rule_id.to_string())
+    .bind(format!("rule-{id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, rule_id, device_id, status, condition_started_at
+         ) VALUES (?, ?, 'notification-device', 'open', ?)",
+    )
+    .bind(incident_id.to_string())
+    .bind(rule_id.to_string())
+    .bind(&timestamp)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO notification_outbox (
+            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES (?, ?, 'opened', ?, 'subject', 'body', ?)",
+    )
+    .bind(id.to_string())
+    .bind(incident_id.to_string())
+    .bind(format!("dedupe-{id}"))
+    .bind(timestamp)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn platform_dispatcher_marks_a_platform_outbox_row_sent() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    seed_platform_outbox(&store, Uuid::new_v4(), now).await;
+    let dispatcher =
+        PlatformNotificationDispatcher::new(std::sync::Arc::new(store), SuccessfulSender, 10);
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.sent, 1);
+    assert_eq!(result.retried, 0);
+}
+
+#[tokio::test]
+async fn platform_dispatcher_releases_failed_delivery_with_exponential_backoff() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let id = Uuid::new_v4();
+    seed_platform_outbox(&store, id, now).await;
+    let dispatcher =
+        PlatformNotificationDispatcher::new(std::sync::Arc::new(store.clone()), FailingSender, 10)
+            .with_delivery_policy(
+                Duration::seconds(120),
+                Duration::seconds(7),
+                Duration::seconds(60),
+            );
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, attempt_count, next_attempt_at, lease_until, last_error
+         FROM notification_outbox WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_one(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    assert_eq!(result.retried, 1);
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert_eq!(row.get::<i64, _>("attempt_count"), 1);
+    assert_eq!(
+        row.get::<String, _>("next_attempt_at"),
+        (now + Duration::seconds(7)).to_rfc3339()
+    );
+    assert!(row.get::<Option<String>, _>("lease_until").is_none());
+    assert_eq!(
+        row.get::<Option<String>, _>("last_error").as_deref(),
+        Some("test SMTP failure")
+    );
+}
+
+#[tokio::test]
+async fn platform_dispatcher_releases_timed_out_delivery() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let id = Uuid::new_v4();
+    seed_platform_outbox(&store, id, now).await;
+    let dispatcher =
+        PlatformNotificationDispatcher::new(std::sync::Arc::new(store.clone()), SlowSender, 10)
+            .with_timeout(StdDuration::from_millis(1));
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, lease_until, last_error
+         FROM notification_outbox WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_one(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.retried, 1);
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert!(row.get::<Option<String>, _>("lease_until").is_none());
+    assert_eq!(
+        row.get::<Option<String>, _>("last_error").as_deref(),
+        Some("SMTP send timed out")
+    );
+}
+
+#[tokio::test]
+async fn platform_dispatcher_does_not_claim_a_still_leased_notification() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let id = Uuid::new_v4();
+    seed_platform_outbox(&store, id, now).await;
+    let lease_until = now + Duration::seconds(30);
+    let claimed = NotificationRepository::claim_notifications(&store, now, lease_until, 1)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let dispatcher =
+        PlatformNotificationDispatcher::new(std::sync::Arc::new(store), SuccessfulSender, 10);
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+
+    assert_eq!(result.claimed, 0);
+    assert_eq!(result.sent, 0);
+    assert_eq!(result.retried, 0);
+}
+
+#[tokio::test]
+async fn platform_dispatcher_reclaims_an_expired_lease() {
+    let (_directory, store) = platform_store().await;
+    let claim_time = Utc::now() - Duration::seconds(31);
+    let id = Uuid::new_v4();
+    seed_platform_outbox(&store, id, claim_time).await;
+    let claimed = NotificationRepository::claim_notifications(
+        &store,
+        claim_time,
+        claim_time + Duration::seconds(1),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let dispatcher = PlatformNotificationDispatcher::new(
+        std::sync::Arc::new(store.clone()),
+        SuccessfulSender,
+        10,
+    );
+    let now = claim_time + Duration::seconds(31);
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+
+    let state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM notification_outbox WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.sent, 1);
+    assert_eq!(state, "sent");
 }
 
 #[tokio::test]

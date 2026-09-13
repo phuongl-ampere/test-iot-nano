@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, Utc};
+use iot_storage::{NotificationRepository, PlatformStore, PlatformStoreError};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox,
     transport::smtp::authentication::Credentials,
@@ -31,6 +32,8 @@ pub trait EmailSender: Send + Sync {
 pub enum NotificationError {
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    PlatformStorage(#[from] PlatformStoreError),
     #[error("{0}")]
     Send(String),
     #[error("SMTP configuration is incomplete: {0}")]
@@ -277,6 +280,17 @@ pub struct NotificationDispatchResult {
     pub retried: usize,
 }
 
+#[derive(Clone)]
+pub struct PlatformNotificationDispatcher<S> {
+    store: std::sync::Arc<PlatformStore>,
+    sender: S,
+    batch_size: usize,
+    send_timeout: StdDuration,
+    lease_duration: Duration,
+    retry_base: Duration,
+    retry_max: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct NotificationDispatcher<S> {
     pool: PgPool,
@@ -313,6 +327,140 @@ struct SqliteLeasedNotification {
     subject: String,
     body: String,
     attempt_count: i64,
+}
+
+impl<S> PlatformNotificationDispatcher<S>
+where
+    S: EmailSender,
+{
+    pub fn new(store: std::sync::Arc<PlatformStore>, sender: S, batch_size: usize) -> Self {
+        Self {
+            store,
+            sender,
+            batch_size: batch_size.max(1),
+            send_timeout: SMTP_SEND_TIMEOUT,
+            lease_duration: DEFAULT_LEASE_DURATION,
+            retry_base: Duration::seconds(1),
+            retry_max: Duration::seconds(3_600),
+        }
+    }
+
+    pub fn with_timeout(mut self, send_timeout: StdDuration) -> Self {
+        self.send_timeout = send_timeout;
+        self
+    }
+
+    pub fn with_delivery_policy(
+        mut self,
+        lease_duration: Duration,
+        retry_base: Duration,
+        retry_max: Duration,
+    ) -> Self {
+        self.lease_duration = lease_duration;
+        self.retry_base = retry_base;
+        self.retry_max = retry_max;
+        self
+    }
+
+    pub async fn dispatch_once(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<NotificationDispatchResult, NotificationError> {
+        let lease_until = now + self.lease_duration;
+        let limit = u32::try_from(self.batch_size).unwrap_or(u32::MAX);
+        let leased = NotificationRepository::claim_notifications(
+            self.store.as_ref(),
+            now,
+            lease_until,
+            limit,
+        )
+        .await?;
+        let mut result = NotificationDispatchResult {
+            claimed: leased.len(),
+            sent: 0,
+            retried: 0,
+        };
+
+        for notification in leased {
+            let expected_lease_until = notification.lease_until.ok_or_else(|| {
+                NotificationError::Configuration(format!(
+                    "claimed notification {} has no lease",
+                    notification.id
+                ))
+            })?;
+            match timeout(
+                self.send_timeout,
+                self.sender
+                    .send(notification.subject.clone(), notification.body.clone()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    if NotificationRepository::mark_notification_sent(
+                        self.store.as_ref(),
+                        notification.id,
+                        expected_lease_until,
+                        now,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        result.sent += 1;
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.release_for_retry(
+                        notification.id,
+                        notification.attempt_count,
+                        expected_lease_until,
+                        now,
+                        error,
+                    )
+                    .await?;
+                    result.retried += 1;
+                }
+                Err(_) => {
+                    self.release_for_retry(
+                        notification.id,
+                        notification.attempt_count,
+                        expected_lease_until,
+                        now,
+                        NotificationError::Send("SMTP send timed out".to_owned()),
+                    )
+                    .await?;
+                    result.retried += 1;
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn release_for_retry(
+        &self,
+        id: Uuid,
+        attempt_count: i64,
+        expected_lease_until: DateTime<Utc>,
+        now: DateTime<Utc>,
+        error: NotificationError,
+    ) -> Result<(), NotificationError> {
+        let exponent = u32::try_from((attempt_count - 1).clamp(0, 11)).unwrap_or(0);
+        let delay_seconds = self
+            .retry_base
+            .num_seconds()
+            .max(1)
+            .saturating_mul(2_i64.pow(exponent))
+            .min(self.retry_max.num_seconds().max(1));
+        NotificationRepository::release_notification_for_retry(
+            self.store.as_ref(),
+            id,
+            expected_lease_until,
+            &error.to_string(),
+            now + Duration::seconds(delay_seconds),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 impl<S> SqliteNotificationDispatcher<S>
