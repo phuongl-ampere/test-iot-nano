@@ -782,11 +782,27 @@ impl MqttdDeviceTransport {
         stream: Arc<dyn StreamPort>,
         command_responses: Arc<dyn CommandResponsePort>,
     ) -> Self {
-        Self::new(
+        Self::with_local_ports_and_router(
+            RpcSessionRouter::default(),
+            authorization,
+            stream,
+            command_responses,
+        )
+    }
+
+    pub fn with_local_ports_and_router(
+        router: RpcSessionRouter,
+        authorization: Arc<dyn DeviceAuthorizationPort>,
+        stream: Arc<dyn StreamPort>,
+        command_responses: Arc<dyn CommandResponsePort>,
+    ) -> Self {
+        let mut transport = Self::new(
             LocalDeviceAuthenticator::new(Arc::clone(&authorization)),
             LocalStreamUplinkForwarder::new(authorization, stream),
         )
-        .with_rpc_response_forwarder(LocalRpcResponseForwarder::new(command_responses))
+        .with_rpc_response_forwarder(LocalRpcResponseForwarder::new(command_responses));
+        transport.router = router;
+        transport
     }
 
     pub fn new(

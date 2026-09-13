@@ -10,14 +10,16 @@ use std::{
     time::Instant,
 };
 
-use chrono::{TimeZone, Utc};
+use chrono::{Duration, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
+use iot_core::RpcRequest;
 use iot_nano_mqttd::{
     AuthenticatedDevice, AuthorizationError, CommandResponseError, CommandResponsePort,
     DeviceAuthenticator, DeviceAuthorizationPort, GatewayAuthorization,
     GatewayAuthorizationRequest, LocalDeviceAuthenticator, LocalRpcResponseForwarder,
-    LocalStreamUplinkForwarder, MqttdDeviceTransport, RpcResponseForwarder, TransportAuthRequest,
-    TransportRpcResponse, TransportUplink, UplinkForwarder,
+    LocalStreamUplinkForwarder, MqttdDeviceTransport, RpcResponseForwarder, RpcSessionRouter,
+    SessionRegistration, TransportAuthRequest, TransportRpcResponse, TransportUplink,
+    UplinkForwarder,
 };
 use iot_nano_stream::{
     AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment,
@@ -452,6 +454,101 @@ fn device_transport_composes_the_local_typed_ports() {
     let responses = Arc::new(RecordingResponses::default());
 
     let _transport = MqttdDeviceTransport::with_local_ports(authorization, stream, responses);
+}
+
+#[tokio::test]
+async fn injected_router_routes_a_request_to_only_the_connected_transport_session() {
+    let injected_router = RpcSessionRouter::default();
+    let transport = MqttdDeviceTransport::with_local_ports_and_router(
+        injected_router.clone(),
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(BlockingStream::new()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let mut device = injected_router
+        .register(SessionRegistration {
+            token_id: device().token_id,
+            device_id: "device-a".to_owned(),
+            client_id: "local-client".to_owned(),
+            connection_id: "connection-a".to_owned(),
+            is_gateway: false,
+            connected_at: Utc::now(),
+        })
+        .await;
+    let mut other_device = injected_router
+        .register(SessionRegistration {
+            token_id: Uuid::now_v7(),
+            device_id: "device-b".to_owned(),
+            client_id: "other-client".to_owned(),
+            connection_id: "connection-b".to_owned(),
+            is_gateway: false,
+            connected_at: Utc::now(),
+        })
+        .await;
+    let issued_at = Utc::now();
+    let request = RpcRequest::new(
+        Uuid::now_v7(),
+        "sample_now",
+        json!({}),
+        issued_at,
+        issued_at + Duration::seconds(30),
+    )
+    .unwrap();
+
+    let publish = tokio::spawn({
+        let transport = transport.clone();
+        async move {
+            transport
+                .router()
+                .publish_to_device("device-a", request)
+                .await
+        }
+    });
+    let command = device.recv().await.unwrap();
+
+    assert_eq!(command.request.method, "sample_now");
+    assert!(other_device.try_recv().is_err());
+    command.acknowledge_published().unwrap();
+    assert!(publish.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn legacy_local_ports_wrapper_owns_a_usable_default_router() {
+    let transport = MqttdDeviceTransport::with_local_ports(
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(BlockingStream::new()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let mut device = transport
+        .router()
+        .register(SessionRegistration {
+            token_id: device().token_id,
+            device_id: "device-a".to_owned(),
+            client_id: "local-client".to_owned(),
+            connection_id: "connection-a".to_owned(),
+            is_gateway: false,
+            connected_at: Utc::now(),
+        })
+        .await;
+    let issued_at = Utc::now();
+    let request = RpcRequest::new(
+        Uuid::now_v7(),
+        "reboot",
+        json!({}),
+        issued_at,
+        issued_at + Duration::seconds(30),
+    )
+    .unwrap();
+
+    let publish = tokio::spawn({
+        let router = transport.router();
+        async move { router.publish_to_device("device-a", request).await }
+    });
+    let command = device.recv().await.unwrap();
+
+    assert_eq!(command.request.method, "reboot");
+    command.acknowledge_published().unwrap();
+    assert!(publish.await.unwrap().is_ok());
 }
 
 #[tokio::test]
