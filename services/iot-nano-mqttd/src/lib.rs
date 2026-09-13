@@ -1398,29 +1398,15 @@ async fn start_broker_with_timeout_storage_and_prebound_listeners(
             .map_err(|error| MqttdError::Broker(Box::new(error)))?;
         config.storage = Some(storage.clone());
     }
-    if listeners.is_none() {
-        for address in [
-            configuration.v311_backend_address,
-            configuration.v5_backend_address,
-        ] {
-            std::net::TcpListener::bind(address).map_err(|error| {
-                MqttdError::Broker(Box::new(std::io::Error::new(
-                    error.kind(),
-                    format!("MQTT backend {address} is unavailable: {error}"),
-                )))
-            })?;
-        }
-    }
     let (public_accept_stop, _public_accept_shutdown) = watch::channel(false);
     let broker = Broker::new(config).map_err(|error| MqttdError::Broker(Box::new(error)))?;
     let inner = match listeners {
-        Some(listeners) => {
-            let mut v4_listeners = HashMap::new();
-            v4_listeners.insert("v311".to_owned(), listeners.v311);
-            let mut v5_listeners = HashMap::new();
-            v5_listeners.insert("v5".to_owned(), listeners.v5);
-            broker.spawn_with_prebound_listeners(v4_listeners, v5_listeners)
-        }
+        Some(listeners) => broker
+            .spawn_with_prebound_listeners(
+                vec![("v311".to_owned(), listeners.v311)],
+                vec![("v5".to_owned(), listeners.v5)],
+            )
+            .map_err(|error| MqttdError::Broker(Box::new(error)))?,
         None => broker.spawn(),
     };
     let handle = BrokerLifecycleHandle {

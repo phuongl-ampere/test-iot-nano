@@ -313,9 +313,12 @@ async fn republish_rule_forwards_source_payload_to_target_topic() {
 }
 
 #[tokio::test]
-async fn broker_startup_fails_promptly_when_an_internal_backend_is_occupied() {
-    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let occupied_address = occupied.local_addr().unwrap();
+async fn broker_startup_binds_released_internal_backend_addresses() {
+    let v311_address = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let v5_address = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap()
@@ -327,13 +330,13 @@ async fn broker_startup_fails_promptly_when_an_internal_backend_is_occupied() {
     std::fs::write(&certificate, "certificate").unwrap();
     std::fs::write(&key, "key").unwrap();
 
-    let result = tokio::time::timeout(
+    let broker = tokio::time::timeout(
         Duration::from_secs(1),
         start_broker_with_timeout(
             ListenerConfiguration {
                 plaintext_address: "127.0.0.1:0".parse().unwrap(),
                 tls_address: "127.0.0.1:0".parse().unwrap(),
-                v311_backend_address: occupied_address,
+                v311_backend_address: v311_address,
                 v5_backend_address: v5_address,
                 tls_cert_path: certificate,
                 tls_key_path: key,
@@ -351,9 +354,11 @@ async fn broker_startup_fails_promptly_when_an_internal_backend_is_occupied() {
         ),
     )
     .await
-    .expect("occupied backend must fail without waiting for the default timeout");
+    .expect("released backends must start without waiting for the default timeout")
+    .expect("released backend addresses must be bound by the broker");
 
-    assert!(result.is_err());
+    broker.shutdown();
+    broker.join().unwrap();
 }
 
 #[tokio::test]

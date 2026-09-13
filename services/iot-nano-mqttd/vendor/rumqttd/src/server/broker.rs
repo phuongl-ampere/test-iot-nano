@@ -14,9 +14,9 @@ use crate::protocol::{Packet, Protocol};
 use crate::server::tls::{self, TLSAcceptor};
 use crate::{meters, ConnectionSettings, Meter};
 use flume::{RecvError, SendError, Sender};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use tracing::{error, field, info, warn, Instrument};
 
 #[cfg(feature = "websocket")]
@@ -66,6 +66,135 @@ pub enum Error {
     Config(String),
     #[error("Storage {0}")]
     Storage(#[from] crate::StorageError),
+    #[error(
+        "prebound {protocol} listener names are invalid: missing {missing:?}, extra {extra:?}, duplicates {duplicates:?}"
+    )]
+    PreboundListenerNames {
+        protocol: &'static str,
+        missing: Vec<String>,
+        extra: Vec<String>,
+        duplicates: Vec<String>,
+    },
+    #[error(
+        "prebound listener {name:?} was supplied for {provided} but is configured for {expected}"
+    )]
+    PreboundListenerProtocol {
+        name: String,
+        expected: &'static str,
+        provided: &'static str,
+    },
+    #[error("prebound listener startup failed: {0}")]
+    PreboundListenerStartup(String),
+}
+
+type NamedListener = (String, StdTcpListener);
+type StartupSender = mpsc::Sender<Result<(), String>>;
+
+struct PreboundListeners {
+    v4: HashMap<String, StdTcpListener>,
+    v5: HashMap<String, StdTcpListener>,
+}
+
+impl PreboundListeners {
+    fn prepare(
+        config: &Config,
+        v4_listeners: Vec<NamedListener>,
+        v5_listeners: Vec<NamedListener>,
+    ) -> Result<Self, Error> {
+        let v4_names = listener_names(&v4_listeners);
+        let v5_names = listener_names(&v5_listeners);
+        let configured_v4 = configured_listener_names(config.v4.as_ref());
+        let configured_v5 = configured_listener_names(config.v5.as_ref());
+
+        validate_listener_protocols(&v4_names, &configured_v4, &configured_v5, "v4", "v5")?;
+        validate_listener_protocols(&v5_names, &configured_v5, &configured_v4, "v5", "v4")?;
+        validate_listener_names("v4", &v4_names, &configured_v4)?;
+        validate_listener_names("v5", &v5_names, &configured_v5)?;
+
+        Ok(Self {
+            v4: prepare_listener_map(v4_listeners)?,
+            v5: prepare_listener_map(v5_listeners)?,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.v4.len() + self.v5.len()
+    }
+}
+
+fn listener_names(listeners: &[NamedListener]) -> Vec<String> {
+    listeners.iter().map(|(name, _)| name.clone()).collect()
+}
+
+fn configured_listener_names(
+    listeners: Option<&HashMap<String, ServerSettings>>,
+) -> HashSet<String> {
+    listeners
+        .into_iter()
+        .flat_map(|listeners| listeners.keys().cloned())
+        .collect()
+}
+
+fn validate_listener_protocols(
+    names: &[String],
+    configured: &HashSet<String>,
+    other_protocol: &HashSet<String>,
+    protocol: &'static str,
+    other_protocol_name: &'static str,
+) -> Result<(), Error> {
+    for name in names {
+        if !configured.contains(name) && other_protocol.contains(name) {
+            return Err(Error::PreboundListenerProtocol {
+                name: name.clone(),
+                expected: other_protocol_name,
+                provided: protocol,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_listener_names(
+    protocol: &'static str,
+    names: &[String],
+    configured: &HashSet<String>,
+) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    let mut duplicates = Vec::new();
+    for name in names {
+        if !seen.insert(name.clone()) && !duplicates.contains(name) {
+            duplicates.push(name.clone());
+        }
+    }
+
+    let supplied: HashSet<_> = names.iter().cloned().collect();
+    let mut missing: Vec<_> = configured.difference(&supplied).cloned().collect();
+    let mut extra: Vec<_> = supplied.difference(configured).cloned().collect();
+    missing.sort_unstable();
+    extra.sort_unstable();
+    duplicates.sort_unstable();
+
+    if missing.is_empty() && extra.is_empty() && duplicates.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::PreboundListenerNames {
+            protocol,
+            missing,
+            extra,
+            duplicates,
+        })
+    }
+}
+
+fn prepare_listener_map(
+    listeners: Vec<NamedListener>,
+) -> Result<HashMap<String, StdTcpListener>, Error> {
+    let mut prepared = HashMap::with_capacity(listeners.len());
+    for (name, listener) in listeners {
+        listener.set_nonblocking(true)?;
+        prepared.insert(name, listener);
+    }
+    Ok(prepared)
 }
 
 pub struct Broker {
@@ -109,25 +238,58 @@ impl Broker {
     }
 
     pub fn spawn(self) -> BrokerHandle {
-        self.spawn_with_prebound_listeners(HashMap::new(), HashMap::new())
+        self.spawn_with_listeners(None, None)
+            .expect("broker thread must start")
     }
 
     pub fn spawn_with_prebound_listeners(
+        self,
+        v4_listeners: Vec<NamedListener>,
+        v5_listeners: Vec<NamedListener>,
+    ) -> Result<BrokerHandle, Error> {
+        let listeners = PreboundListeners::prepare(&self.config, v4_listeners, v5_listeners)?;
+        let listener_count = listeners.len();
+        let (startup_sender, startup_receiver) = mpsc::channel();
+        let handle = self.spawn_with_listeners(Some(listeners), Some(startup_sender))?;
+
+        for _ in 0..listener_count {
+            match startup_receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    handle.shutdown();
+                    let _ = handle.join();
+                    return Err(Error::PreboundListenerStartup(error));
+                }
+                Err(_) => {
+                    handle.shutdown();
+                    return match handle.join() {
+                        Ok(()) => Err(Error::PreboundListenerStartup(
+                            "broker exited before prebound listeners became ready".to_owned(),
+                        )),
+                        Err(error) => Err(error),
+                    };
+                }
+            }
+        }
+
+        Ok(handle)
+    }
+
+    fn spawn_with_listeners(
         mut self,
-        v4_listeners: HashMap<String, StdTcpListener>,
-        v5_listeners: HashMap<String, StdTcpListener>,
-    ) -> BrokerHandle {
+        listeners: Option<PreboundListeners>,
+        startup: Option<StartupSender>,
+    ) -> Result<BrokerHandle, Error> {
         let (shutdown, receiver) = watch::channel(false);
         let router_tx = self.router_tx.clone();
         let join = thread::Builder::new()
             .name("iot-mqtt-core-broker".to_owned())
-            .spawn(move || self.start_with_shutdown(receiver, v4_listeners, v5_listeners))
-            .expect("broker thread must start");
-        BrokerHandle {
+            .spawn(move || self.start_with_shutdown(receiver, listeners, startup))?;
+        Ok(BrokerHandle {
             shutdown,
             join: Some(join),
             router_tx,
-        }
+        })
     }
 
     // pub fn new_local_cluster(
@@ -192,15 +354,15 @@ impl Broker {
     #[tracing::instrument(skip(self))]
     pub fn start(&mut self) -> Result<(), Error> {
         let (_shutdown, receiver) = watch::channel(false);
-        self.start_with_shutdown(receiver, HashMap::new(), HashMap::new())
+        self.start_with_shutdown(receiver, None, None)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, listeners, startup))]
     fn start_with_shutdown(
         &mut self,
         shutdown: watch::Receiver<bool>,
-        mut v4_listeners: HashMap<String, StdTcpListener>,
-        mut v5_listeners: HashMap<String, StdTcpListener>,
+        mut listeners: Option<PreboundListeners>,
+        startup: Option<StartupSender>,
     ) -> Result<(), Error> {
         if self.config.v4.is_none()
             && self.config.v5.is_none()
@@ -267,7 +429,13 @@ impl Broker {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
                 let shutdown = shutdown.clone();
-                let listener = v4_listeners.remove(&name);
+                let listener = listeners.as_mut().map(|listeners| {
+                    listeners
+                        .v4
+                        .remove(&name)
+                        .expect("prebound v4 listener names were validated")
+                });
+                let startup = startup.clone();
                 let handle = server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
@@ -280,6 +448,7 @@ impl Broker {
                                         listener,
                                         LinkType::Remote,
                                         shutdown,
+                                        startup.expect("prebound listener startup channel exists"),
                                     )
                                     .await
                             }
@@ -299,7 +468,13 @@ impl Broker {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V5);
                 let shutdown = shutdown.clone();
-                let listener = v5_listeners.remove(&name);
+                let listener = listeners.as_mut().map(|listeners| {
+                    listeners
+                        .v5
+                        .remove(&name)
+                        .expect("prebound v5 listener names were validated")
+                });
+                let startup = startup.clone();
                 let handle = server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
@@ -312,6 +487,7 @@ impl Broker {
                                         listener,
                                         LinkType::Remote,
                                         shutdown,
+                                        startup.expect("prebound listener startup channel exists"),
                                     )
                                     .await
                             }
@@ -325,6 +501,8 @@ impl Broker {
                 server_thread_handles.push(handle)
             }
         }
+
+        drop(startup);
 
         #[cfg(not(feature = "websocket"))]
         if self.config.ws.is_some() {
@@ -522,14 +700,24 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
         self.accept(listener, link_type, shutdown).await
     }
 
-    pub async fn start_with_prebound_listener(
+    async fn start_with_prebound_listener(
         &mut self,
         listener: StdTcpListener,
         link_type: LinkType,
         shutdown: watch::Receiver<bool>,
+        startup: StartupSender,
     ) -> Result<(), Error> {
-        listener.set_nonblocking(true)?;
-        let listener = TcpListener::from_std(listener)?;
+        let listener = match TcpListener::from_std(listener) {
+            Ok(listener) => {
+                let _ = startup.send(Ok(()));
+                listener
+            }
+            Err(error) => {
+                let _ = startup.send(Err(error.to_string()));
+                return Err(error.into());
+            }
+        };
+        drop(startup);
         self.accept(listener, link_type, shutdown).await
     }
 
@@ -842,7 +1030,175 @@ mod tests {
         BridgeConfig, Config, ConnectionSettings, PrometheusSetting, ServerSettings, Transport,
     };
 
-    use super::{Broker, Error};
+    use super::{Broker, BrokerHandle, Error};
+
+    #[test]
+    fn prebound_listeners_reject_missing_names_without_rebinding_configured_addresses() {
+        let (config, v4_address, v5_address) = prebound_test_config();
+        let v5_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let error = prebound_error(
+            Broker::new(config)
+                .unwrap()
+                .spawn_with_prebound_listeners(vec![], vec![("v5".to_owned(), v5_listener)]),
+        );
+
+        assert!(matches!(
+            error,
+            Error::PreboundListenerNames {
+                protocol: "v4",
+                missing,
+                extra,
+                duplicates,
+            } if missing == vec!["v311"] && extra.is_empty() && duplicates.is_empty()
+        ));
+        assert_configured_addresses_were_not_rebound(v4_address, v5_address);
+    }
+
+    #[test]
+    fn prebound_listeners_reject_extra_names_without_rebinding_configured_addresses() {
+        let (config, v4_address, v5_address) = prebound_test_config();
+        let v311_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let extra_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let v5_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let error = prebound_error(Broker::new(config).unwrap().spawn_with_prebound_listeners(
+            vec![
+                ("v311".to_owned(), v311_listener),
+                ("extra".to_owned(), extra_listener),
+            ],
+            vec![("v5".to_owned(), v5_listener)],
+        ));
+
+        assert!(matches!(
+            error,
+            Error::PreboundListenerNames {
+                protocol: "v4",
+                missing,
+                extra,
+                duplicates,
+            } if missing.is_empty() && extra == vec!["extra"] && duplicates.is_empty()
+        ));
+        assert_configured_addresses_were_not_rebound(v4_address, v5_address);
+    }
+
+    #[test]
+    fn prebound_listeners_reject_wrong_protocol_names_without_rebinding_configured_addresses() {
+        let (config, v4_address, v5_address) = prebound_test_config();
+        let v4_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let v5_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let error = prebound_error(Broker::new(config).unwrap().spawn_with_prebound_listeners(
+            vec![("v5".to_owned(), v4_listener)],
+            vec![("v311".to_owned(), v5_listener)],
+        ));
+
+        assert!(matches!(
+            error,
+            Error::PreboundListenerProtocol {
+                name,
+                expected: "v5",
+                provided: "v4",
+            } if name == "v5"
+        ));
+        assert_configured_addresses_were_not_rebound(v4_address, v5_address);
+    }
+
+    #[test]
+    fn prebound_listeners_reject_duplicate_names_without_rebinding_configured_addresses() {
+        let (config, v4_address, v5_address) = prebound_test_config();
+        let first_v311_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_v311_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let v5_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let error = prebound_error(Broker::new(config).unwrap().spawn_with_prebound_listeners(
+            vec![
+                ("v311".to_owned(), first_v311_listener),
+                ("v311".to_owned(), second_v311_listener),
+            ],
+            vec![("v5".to_owned(), v5_listener)],
+        ));
+
+        assert!(matches!(
+            error,
+            Error::PreboundListenerNames {
+                protocol: "v4",
+                missing,
+                extra,
+                duplicates,
+            } if missing.is_empty() && extra.is_empty() && duplicates == vec!["v311"]
+        ));
+        assert_configured_addresses_were_not_rebound(v4_address, v5_address);
+    }
+
+    fn prebound_test_config() -> (Config, SocketAddr, SocketAddr) {
+        let v4_address = unused_local_address();
+        let v5_address = unused_local_address();
+        let connection_settings = ConnectionSettings {
+            connection_timeout_ms: 60_000,
+            max_payload_size: 1024,
+            max_inflight_count: 10,
+            auth: None,
+            external_auth: None,
+            authorization_handler: None,
+            dynamic_filters: true,
+        };
+        let v4 = HashMap::from([(
+            "v311".to_owned(),
+            ServerSettings {
+                name: "v311".to_owned(),
+                listen: v4_address,
+                tls: None,
+                next_connection_delay_ms: 0,
+                connections: connection_settings.clone(),
+            },
+        )]);
+        let v5 = HashMap::from([(
+            "v5".to_owned(),
+            ServerSettings {
+                name: "v5".to_owned(),
+                listen: v5_address,
+                tls: None,
+                next_connection_delay_ms: 0,
+                connections: connection_settings,
+            },
+        )]);
+        (
+            Config {
+                v4: Some(v4),
+                v5: Some(v5),
+                ..Config::default()
+            },
+            v4_address,
+            v5_address,
+        )
+    }
+
+    fn unused_local_address() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        address
+    }
+
+    fn assert_configured_addresses_were_not_rebound(
+        v4_address: SocketAddr,
+        v5_address: SocketAddr,
+    ) {
+        TcpListener::bind(v4_address).unwrap();
+        TcpListener::bind(v5_address).unwrap();
+    }
+
+    fn prebound_error(result: Result<BrokerHandle, Error>) -> Error {
+        match result {
+            Ok(handle) => {
+                handle.shutdown();
+                let _ = handle.join();
+                panic!("invalid prebound listener set unexpectedly started the broker");
+            }
+            Err(error) => error,
+        }
+    }
 
     #[test]
     fn controlled_lifecycle_rejects_detached_worker_configuration() {
