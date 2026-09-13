@@ -8,6 +8,9 @@ use iot_storage::{
 use sqlx::{Connection, PgConnection, Row, SqlitePool};
 use uuid::Uuid;
 
+const S256_CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+const S256_CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -147,7 +150,7 @@ async fn sqlite_oauth_issues_digest_only_client_secret_and_authorization_code() 
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: now,
             expires_at: now + Duration::minutes(10),
@@ -193,7 +196,7 @@ async fn sqlite_oauth_issues_digest_only_client_secret_and_authorization_code() 
     );
     assert_eq!(
         code.try_get::<String, _>("code_challenge").unwrap(),
-        "s256-code-challenge"
+        S256_CODE_CHALLENGE
     );
     assert_eq!(
         code.try_get::<String, _>("scopes_json").unwrap(),
@@ -231,7 +234,7 @@ async fn sqlite_oauth_consumes_code_once_and_issues_a_digest_only_access_token()
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: code_issued_at,
             expires_at: code_issued_at + Duration::minutes(10),
@@ -246,6 +249,7 @@ async fn sqlite_oauth_consumes_code_once_and_issues_a_digest_only_access_token()
             code: "oauth-code-for-exchange".to_owned(),
             client_id: "client-power-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: None,
             access_token: "oauth-access-token-for-test".to_owned(),
             issued_at: exchange_at,
@@ -308,6 +312,7 @@ async fn sqlite_oauth_consumes_code_once_and_issues_a_digest_only_access_token()
             code: "oauth-code-for-exchange".to_owned(),
             client_id: "client-power-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: None,
             access_token: "oauth-second-access-token".to_owned(),
             issued_at: exchange_at + Duration::seconds(1),
@@ -343,7 +348,7 @@ async fn sqlite_oauth_denies_an_expired_code_without_consuming_or_issuing_a_toke
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: code_issued_at,
             expires_at,
@@ -358,6 +363,7 @@ async fn sqlite_oauth_denies_an_expired_code_without_consuming_or_issuing_a_toke
             code: "oauth-expired-code".to_owned(),
             client_id: "client-power-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: None,
             access_token: "oauth-token-for-expired-code".to_owned(),
             issued_at: expires_at,
@@ -398,7 +404,7 @@ async fn sqlite_oauth_denies_a_code_exchange_with_a_different_redirect_uri() {
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: code_issued_at,
             expires_at: code_issued_at + Duration::minutes(10),
@@ -415,6 +421,7 @@ async fn sqlite_oauth_denies_a_code_exchange_with_a_different_redirect_uri() {
             redirect_uri: "https://apps.example.test/different-callback"
                 .parse()
                 .unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: None,
             access_token: "oauth-token-for-redirect-mismatch".to_owned(),
             issued_at: code_issued_at + Duration::minutes(1),
@@ -458,7 +465,7 @@ async fn sqlite_oauth_denies_a_code_exchange_through_a_different_client_applicat
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: code_issued_at,
             expires_at: code_issued_at + Duration::minutes(10),
@@ -473,6 +480,7 @@ async fn sqlite_oauth_denies_a_code_exchange_through_a_different_client_applicat
             code: "oauth-cross-app-code".to_owned(),
             client_id: "client-other-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: None,
             access_token: "oauth-token-for-cross-app-code".to_owned(),
             issued_at: code_issued_at + Duration::minutes(1),
@@ -513,7 +521,7 @@ async fn sqlite_oauth_denies_a_code_exchange_after_the_application_is_disabled()
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: code_issued_at,
             expires_at: code_issued_at + Duration::minutes(10),
@@ -531,6 +539,7 @@ async fn sqlite_oauth_denies_a_code_exchange_after_the_application_is_disabled()
             code: "oauth-disabled-app-code".to_owned(),
             client_id: "client-power-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: None,
             access_token: "oauth-token-for-disabled-app".to_owned(),
             issued_at: code_issued_at + Duration::minutes(1),
@@ -581,7 +590,7 @@ async fn sqlite_oauth_denies_an_incorrect_confidential_client_secret() {
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: code_issued_at,
             expires_at: code_issued_at + Duration::minutes(10),
@@ -596,6 +605,7 @@ async fn sqlite_oauth_denies_an_incorrect_confidential_client_secret() {
             code: "oauth-confidential-code".to_owned(),
             client_id: "client-power-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: Some("incorrect-confidential-client-secret".to_owned()),
             access_token: "oauth-token-for-bad-client-secret".to_owned(),
             issued_at: code_issued_at + Duration::minutes(1),
@@ -756,7 +766,7 @@ async fn sqlite_oauth_rejects_a_nonfuture_access_token_expiry_before_consuming_a
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at: code_issued_at,
             expires_at: code_issued_at + Duration::minutes(10),
@@ -772,6 +782,7 @@ async fn sqlite_oauth_rejects_a_nonfuture_access_token_expiry_before_consuming_a
             code: "oauth-token-expiry-code".to_owned(),
             client_id: "client-power-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: None,
             access_token: "oauth-token-with-invalid-expiry".to_owned(),
             issued_at: exchange_at,
@@ -794,6 +805,158 @@ async fn sqlite_oauth_rejects_a_nonfuture_access_token_expiry_before_consuming_a
         .await
         .unwrap();
     assert_eq!(token_count, 0);
+}
+
+#[tokio::test]
+async fn sqlite_oauth_denies_an_incorrect_s256_verifier_without_consuming_the_code() {
+    let (_directory, store) = sqlite_store().await;
+    let issued_at = Utc
+        .with_ymd_and_hms(2026, 9, 13, 11, 12, 13)
+        .single()
+        .unwrap();
+    let user_id = Uuid::new_v4();
+    seed_user(&store, user_id).await;
+    ApplicationRepository::upsert_application(&store, application(true))
+        .await
+        .unwrap();
+    OAuthRepository::issue_authorization_code(
+        &store,
+        NewOAuthAuthorizationCode {
+            code: "oauth-pkce-retry-code".to_owned(),
+            app_id: "power-monitor".parse().unwrap(),
+            user_id,
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
+            scopes: vec!["devices:read".to_owned()],
+            issued_at,
+            expires_at: issued_at + Duration::minutes(10),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mismatch = OAuthRepository::consume_authorization_code_and_issue_access_token(
+        &store,
+        OAuthAuthorizationCodeExchange {
+            code: "oauth-pkce-retry-code".to_owned(),
+            client_id: "client-power-monitor".parse().unwrap(),
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: "wrong-pkce-verifier".to_owned(),
+            client_secret: None,
+            access_token: "oauth-pkce-mismatch-token".to_owned(),
+            issued_at: issued_at + Duration::minutes(1),
+            expires_at: issued_at + Duration::hours(1),
+        },
+    )
+    .await;
+    assert!(matches!(
+        mismatch,
+        Err(PlatformStoreError::OAuthAuthorizationCodeDenied)
+    ));
+    let consumed_at: Option<String> =
+        sqlx::query_scalar("SELECT consumed_at FROM oauth_authorization_codes")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert!(consumed_at.is_none());
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_access_tokens")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(token_count, 0);
+
+    let retried = OAuthRepository::consume_authorization_code_and_issue_access_token(
+        &store,
+        OAuthAuthorizationCodeExchange {
+            code: "oauth-pkce-retry-code".to_owned(),
+            client_id: "client-power-monitor".parse().unwrap(),
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
+            client_secret: None,
+            access_token: "oauth-pkce-correct-retry-token".to_owned(),
+            issued_at: issued_at + Duration::minutes(2),
+            expires_at: issued_at + Duration::hours(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(retried.user_id, Some(user_id));
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_access_tokens")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(token_count, 1);
+
+    let replay = OAuthRepository::consume_authorization_code_and_issue_access_token(
+        &store,
+        OAuthAuthorizationCodeExchange {
+            code: "oauth-pkce-retry-code".to_owned(),
+            client_id: "client-power-monitor".parse().unwrap(),
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
+            client_secret: None,
+            access_token: "oauth-pkce-replay-token".to_owned(),
+            issued_at: issued_at + Duration::minutes(3),
+            expires_at: issued_at + Duration::hours(1),
+        },
+    )
+    .await;
+    assert!(matches!(
+        replay,
+        Err(PlatformStoreError::OAuthAuthorizationCodeDenied)
+    ));
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_access_tokens")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(token_count, 1);
+}
+
+#[tokio::test]
+async fn sqlite_oauth_exchanges_a_code_with_the_matching_s256_verifier() {
+    let (_directory, store) = sqlite_store().await;
+    let issued_at = Utc
+        .with_ymd_and_hms(2026, 9, 13, 12, 13, 14)
+        .single()
+        .unwrap();
+    let user_id = Uuid::new_v4();
+    seed_user(&store, user_id).await;
+    ApplicationRepository::upsert_application(&store, application(true))
+        .await
+        .unwrap();
+    OAuthRepository::issue_authorization_code(
+        &store,
+        NewOAuthAuthorizationCode {
+            code: "oauth-pkce-success-code".to_owned(),
+            app_id: "power-monitor".parse().unwrap(),
+            user_id,
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
+            scopes: vec!["devices:read".to_owned()],
+            issued_at,
+            expires_at: issued_at + Duration::minutes(10),
+        },
+    )
+    .await
+    .unwrap();
+
+    let exchanged = OAuthRepository::consume_authorization_code_and_issue_access_token(
+        &store,
+        OAuthAuthorizationCodeExchange {
+            code: "oauth-pkce-success-code".to_owned(),
+            client_id: "client-power-monitor".parse().unwrap(),
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
+            client_secret: None,
+            access_token: "oauth-pkce-success-token".to_owned(),
+            issued_at: issued_at + Duration::minutes(1),
+            expires_at: issued_at + Duration::hours(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(exchanged.user_id, Some(user_id));
+    assert_eq!(exchanged.scopes, ["devices:read"]);
 }
 
 #[tokio::test]
@@ -852,7 +1015,7 @@ async fn timescale_oauth_repository_matches_sqlite_contract() {
             app_id: "power-monitor".parse().unwrap(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
-            code_challenge: "s256-code-challenge".to_owned(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
             scopes: vec!["devices:read".to_owned()],
             issued_at,
             expires_at: issued_at + Duration::minutes(10),
@@ -860,12 +1023,31 @@ async fn timescale_oauth_repository_matches_sqlite_contract() {
     )
     .await
     .unwrap();
+    let mismatch = OAuthRepository::consume_authorization_code_and_issue_access_token(
+        &store,
+        OAuthAuthorizationCodeExchange {
+            code: "timescale-authorization-code".to_owned(),
+            client_id: "client-power-monitor".parse().unwrap(),
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: "timescale-wrong-pkce-verifier".to_owned(),
+            client_secret: Some("timescale-client-secret".to_owned()),
+            access_token: "timescale-pkce-mismatch-token".to_owned(),
+            issued_at: issued_at + Duration::minutes(1),
+            expires_at: issued_at + Duration::hours(1),
+        },
+    )
+    .await;
+    assert!(matches!(
+        mismatch,
+        Err(PlatformStoreError::OAuthAuthorizationCodeDenied)
+    ));
     let code_token = OAuthRepository::consume_authorization_code_and_issue_access_token(
         &store,
         OAuthAuthorizationCodeExchange {
             code: "timescale-authorization-code".to_owned(),
             client_id: "client-power-monitor".parse().unwrap(),
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_verifier: S256_CODE_VERIFIER.to_owned(),
             client_secret: Some("timescale-client-secret".to_owned()),
             access_token: "timescale-code-access-token".to_owned(),
             issued_at: issued_at + Duration::minutes(1),

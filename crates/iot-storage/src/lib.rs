@@ -5,6 +5,7 @@ use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Timelike, Utc};
 use iot_core::{
     DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent, device_token_prefix,
@@ -696,6 +697,7 @@ pub struct OAuthAuthorizationCodeExchange {
     pub code: String,
     pub client_id: ClientId,
     pub redirect_uri: RedirectUri,
+    pub code_verifier: String,
     pub client_secret: Option<String>,
     pub access_token: String,
     pub issued_at: DateTime<Utc>,
@@ -1796,6 +1798,7 @@ impl PlatformStore {
             return Err(PlatformStoreError::OAuthAuthorizationCodeDenied);
         }
         let code_hash = sha256_hex(&exchange.code);
+        let code_challenge = s256_code_challenge(&exchange.code_verifier);
         let token_hash = sha256_hex(&exchange.access_token);
         match self {
             Self::Sqlite(store) => {
@@ -1804,6 +1807,7 @@ impl PlatformStore {
                     "SELECT app_id, user_id, scopes_json
                      FROM oauth_authorization_codes
                      WHERE code_hash = ? AND redirect_uri = ?
+                       AND code_challenge = ?
                        AND app_id = (
                            SELECT app_id FROM applications
                            WHERE client_id = ? AND enabled = 1
@@ -1812,6 +1816,7 @@ impl PlatformStore {
                 )
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
+                .bind(&code_challenge)
                 .bind(exchange.client_id.as_str())
                 .bind(exchange.issued_at.to_rfc3339())
                 .fetch_optional(&mut *transaction)
@@ -1842,6 +1847,7 @@ impl PlatformStore {
                     "UPDATE oauth_authorization_codes
                      SET consumed_at = ?
                      WHERE code_hash = ? AND redirect_uri = ?
+                       AND code_challenge = ?
                        AND app_id = (
                            SELECT app_id FROM applications
                            WHERE client_id = ? AND enabled = 1
@@ -1851,6 +1857,7 @@ impl PlatformStore {
                 .bind(exchange.issued_at.to_rfc3339())
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
+                .bind(&code_challenge)
                 .bind(exchange.client_id.as_str())
                 .bind(exchange.issued_at.to_rfc3339())
                 .execute(&mut *transaction)
@@ -1885,15 +1892,17 @@ impl PlatformStore {
                     "SELECT app_id, user_id, scopes_json::text AS scopes_json
                      FROM oauth_authorization_codes
                      WHERE code_hash = $1 AND redirect_uri = $2
+                       AND code_challenge = $3
                        AND app_id = (
                            SELECT app_id FROM applications
-                           WHERE client_id = $3 AND enabled = TRUE
+                           WHERE client_id = $4 AND enabled = TRUE
                        )
-                       AND consumed_at IS NULL AND expires_at > $4
+                       AND consumed_at IS NULL AND expires_at > $5
                      FOR UPDATE",
                 )
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
+                .bind(&code_challenge)
                 .bind(exchange.client_id.as_str())
                 .bind(exchange.issued_at)
                 .fetch_optional(&mut *transaction)
@@ -1924,15 +1933,17 @@ impl PlatformStore {
                     "UPDATE oauth_authorization_codes
                      SET consumed_at = $1
                      WHERE code_hash = $2 AND redirect_uri = $3
+                       AND code_challenge = $4
                        AND app_id = (
                            SELECT app_id FROM applications
-                           WHERE client_id = $4 AND enabled = TRUE
+                           WHERE client_id = $5 AND enabled = TRUE
                        )
-                       AND consumed_at IS NULL AND expires_at > $5",
+                       AND consumed_at IS NULL AND expires_at > $6",
                 )
                 .bind(exchange.issued_at)
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
+                .bind(&code_challenge)
                 .bind(exchange.client_id.as_str())
                 .bind(exchange.issued_at)
                 .execute(&mut *transaction)
@@ -6106,6 +6117,10 @@ fn canonical_application_scopes(scopes: Vec<String>) -> Result<Vec<String>, Plat
 
 fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+fn s256_code_challenge(code_verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
 }
 
 fn validate_oauth_access_token_expiry(
