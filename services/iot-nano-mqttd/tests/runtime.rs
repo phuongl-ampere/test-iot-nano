@@ -19,6 +19,7 @@ use iot_nano_stream::{
     StreamError, StreamMessage, StreamPort,
 };
 use rustls_pemfile::certs;
+use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -279,7 +280,104 @@ async fn runtime_denies_device_token_before_accepting_a_session() {
         .unwrap();
     assert_eq!(connack, [0x20, 0x02, 0x00, 0x05]);
 
+    drop(stream);
     shutdown(&mut runtime).await;
+}
+
+#[tokio::test]
+async fn stop_accepting_keeps_an_active_device_connection_alive_for_drain() {
+    let directory = tempfile::tempdir().unwrap();
+    let plaintext_address = reserve_address().await;
+    let tls_address = reserve_address().await;
+    let storage: Arc<dyn BrokerStorage> = Arc::new(MemoryStorage::new());
+    let mut runtime = start_runtime(
+        directory.path(),
+        plaintext_address,
+        tls_address,
+        storage,
+        Arc::new(TestAuthorization::allowing()),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(plaintext_address).await.unwrap();
+    stream
+        .write_all(&v311_connect(
+            "meter-a",
+            DEVICE_TOKEN_USERNAME,
+            "valid-token",
+        ))
+        .await
+        .unwrap();
+    let mut connack = [0_u8; 4];
+    stream.read_exact(&mut connack).await.unwrap();
+    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+    runtime.stop_accepting().await.unwrap();
+    stream
+        .write_all(&v311_qos_one_publish(
+            "v1/devices/me/telemetry",
+            &serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "boot_id": "c9c04d99-4e01-4f94-82a8-9e229e47c093",
+                "sequence": 1,
+                "event_at": "2026-09-10T08:00:00Z",
+                "measurements": {"temperature_c": 26.4},
+            }))
+            .unwrap(),
+            7,
+        ))
+        .await
+        .unwrap();
+    let mut puback = [0_u8; 4];
+    timeout(Duration::from_secs(2), stream.read_exact(&mut puback))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(puback, [0x40, 0x02, 0x00, 0x07]);
+
+    drop(stream);
+    runtime
+        .drain(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn expired_drain_closes_listeners_and_joins_runtime_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let plaintext_address = reserve_address().await;
+    let tls_address = reserve_address().await;
+    let storage: Arc<dyn BrokerStorage> = Arc::new(MemoryStorage::new());
+    let mut runtime = start_runtime(
+        directory.path(),
+        plaintext_address,
+        tls_address,
+        storage,
+        Arc::new(TestAuthorization::allowing()),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(plaintext_address).await.unwrap();
+    stream
+        .write_all(&v311_connect(
+            "meter-a",
+            DEVICE_TOKEN_USERNAME,
+            "valid-token",
+        ))
+        .await
+        .unwrap();
+    let mut connack = [0_u8; 4];
+    stream.read_exact(&mut connack).await.unwrap();
+    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+    assert!(matches!(
+        runtime.drain(Instant::now()).await,
+        Err(iot_nano_mqttd::MqttRuntimeError::DeadlineElapsed)
+    ));
+    drop(stream);
+    drop(runtime);
+    assert_bindable(plaintext_address).await;
+    assert_bindable(tls_address).await;
 }
 
 #[tokio::test]

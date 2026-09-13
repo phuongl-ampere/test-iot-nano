@@ -80,6 +80,15 @@ impl BrokerLifecycleHandle {
         self.public_accept_stop.send_replace(true);
     }
 
+    pub fn take_public_workers(&self) -> Vec<thread::JoinHandle<()>> {
+        std::mem::take(
+            &mut *self
+                .public_workers
+                .lock()
+                .expect("public worker mutex is not poisoned"),
+        )
+    }
+
     pub fn join(mut self) -> Result<(), MqttdError> {
         self.shutdown();
         for worker in self

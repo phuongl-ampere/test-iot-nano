@@ -59,7 +59,8 @@ pub struct MqttRuntime {
     broker: Option<BrokerLifecycleHandle>,
     device_workers: Vec<JoinHandle<()>>,
     session_router: RpcSessionRouter,
-    cancellation: CancellationToken,
+    accept_cancellation: CancellationToken,
+    force_cancellation: CancellationToken,
     accepting: AtomicBool,
     _cache: Arc<dyn CachePort>,
 }
@@ -116,7 +117,8 @@ impl MqttRuntime {
         .await
         .map_err(MqttRuntimeStartError::Broker)?;
 
-        let cancellation = config.cancellation.child_token();
+        let force_cancellation = config.cancellation.child_token();
+        let accept_cancellation = CancellationToken::new();
         let authorization: Arc<dyn DeviceAuthorizationPort> = Arc::new(
             CachedDeviceAuthorization::new(config.authorization, Arc::clone(&config.cache)),
         );
@@ -131,27 +133,29 @@ impl MqttRuntime {
                 device_v311_listener,
                 transport.clone(),
                 false,
-                cancellation.clone(),
+                accept_cancellation.clone(),
+                force_cancellation.clone(),
             )),
             tokio::spawn(serve_device_backend(
                 device_v5_listener,
                 transport,
                 true,
-                cancellation.clone(),
+                accept_cancellation.clone(),
+                force_cancellation.clone(),
             )),
         ];
 
         let plaintext_listener = match StdTcpListener::bind(config.listeners.plaintext_address) {
             Ok(listener) => listener,
             Err(error) => {
-                cancel_startup(&broker, &cancellation, device_workers).await;
+                cancel_startup(&broker, &force_cancellation, device_workers).await;
                 return Err(MqttRuntimeStartError::PlaintextListenerBind(error));
             }
         };
         let tls_listener = match StdTcpListener::bind(config.listeners.tls_address) {
             Ok(listener) => listener,
             Err(error) => {
-                cancel_startup(&broker, &cancellation, device_workers).await;
+                cancel_startup(&broker, &force_cancellation, device_workers).await;
                 return Err(MqttRuntimeStartError::TlsListenerBind(error));
             }
         };
@@ -166,7 +170,7 @@ impl MqttRuntime {
             backends,
             MuxSettings::default(),
         ) {
-            cancel_startup(&broker, &cancellation, device_workers).await;
+            cancel_startup(&broker, &force_cancellation, device_workers).await;
             return Err(MqttRuntimeStartError::PublicWorker(error));
         }
         if let Err(error) = broker.spawn_public_tls_device_only_mux(
@@ -175,7 +179,7 @@ impl MqttRuntime {
             backends,
             MuxSettings::default(),
         ) {
-            cancel_startup(&broker, &cancellation, device_workers).await;
+            cancel_startup(&broker, &force_cancellation, device_workers).await;
             return Err(MqttRuntimeStartError::PublicWorker(error));
         }
 
@@ -183,7 +187,8 @@ impl MqttRuntime {
             broker: Some(broker),
             device_workers,
             session_router: config.session_router,
-            cancellation,
+            accept_cancellation,
+            force_cancellation,
             accepting: AtomicBool::new(true),
             _cache: config.cache,
         })
@@ -199,9 +204,9 @@ impl MqttRuntime {
 
     pub async fn stop_accepting(&mut self) -> Result<(), MqttRuntimeError> {
         if self.accepting.swap(false, Ordering::AcqRel) {
-            self.cancellation.cancel();
+            self.accept_cancellation.cancel();
             if let Some(broker) = &self.broker {
-                broker.shutdown();
+                broker.stop_public_accepting();
             }
         }
         Ok(())
@@ -209,19 +214,65 @@ impl MqttRuntime {
 
     pub async fn drain(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
         self.stop_accepting().await?;
+        let mut public_join = self.broker.as_ref().map(|broker| {
+            let workers = broker.take_public_workers();
+            tokio::task::spawn_blocking(move || join_public_workers(workers))
+        });
+        let mut drain_result = self.drain_device_workers(deadline).await;
+        if drain_result.is_ok() {
+            if let Some(join) = public_join.as_mut() {
+                drain_result = timeout_until(deadline, join)
+                    .await
+                    .map_err(|_| MqttRuntimeError::DeadlineElapsed)
+                    .and_then(|result| {
+                        result.map_err(|error| MqttRuntimeError::Worker(error.to_string()))
+                    });
+            }
+        }
 
+        if let Err(error) = drain_result {
+            self.force_cancellation.cancel();
+            if let Some(broker) = &self.broker {
+                broker.shutdown();
+            }
+            self.abort_and_join_device_workers().await;
+            if let Some(join) = public_join.take() {
+                let _ = join.await;
+            }
+            self.join_broker_after_shutdown().await;
+            return Err(error);
+        }
+
+        drop(public_join);
+        self.force_cancellation.cancel();
+        self.join_broker_until(deadline).await
+    }
+
+    async fn drain_device_workers(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
         while let Some(mut worker) = self.device_workers.pop() {
             match timeout_until(deadline, &mut worker).await {
                 Ok(result) => {
                     result.map_err(|error| MqttRuntimeError::Worker(error.to_string()))?
                 }
                 Err(()) => {
-                    worker.abort();
+                    self.device_workers.push(worker);
                     return Err(MqttRuntimeError::DeadlineElapsed);
                 }
             }
         }
+        Ok(())
+    }
 
+    async fn abort_and_join_device_workers(&mut self) {
+        for worker in &self.device_workers {
+            worker.abort();
+        }
+        while let Some(worker) = self.device_workers.pop() {
+            let _ = worker.await;
+        }
+    }
+
+    async fn join_broker_until(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
         let Some(broker) = self.broker.take() else {
             return Ok(());
         };
@@ -231,16 +282,24 @@ impl MqttRuntime {
                 .map_err(|error| MqttRuntimeError::Worker(error.to_string()))?
                 .map_err(MqttRuntimeError::Broker),
             Err(()) => {
-                join.abort();
+                let _ = join.await;
                 Err(MqttRuntimeError::DeadlineElapsed)
             }
         }
+    }
+
+    async fn join_broker_after_shutdown(&mut self) {
+        let Some(broker) = self.broker.take() else {
+            return;
+        };
+        let _ = tokio::task::spawn_blocking(move || broker.join()).await;
     }
 }
 
 impl Drop for MqttRuntime {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.accept_cancellation.cancel();
+        self.force_cancellation.cancel();
         for worker in &self.device_workers {
             worker.abort();
         }
@@ -433,16 +492,17 @@ async fn serve_device_backend(
     listener: TcpListener,
     transport: MqttdDeviceTransport,
     mqtt5: bool,
-    cancellation: CancellationToken,
+    accept_cancellation: CancellationToken,
+    force_cancellation: CancellationToken,
 ) {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => break,
+            _ = accept_cancellation.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let transport = transport.clone();
-                    let cancellation = cancellation.clone();
+                    let force_cancellation = force_cancellation.clone();
                     connections.spawn(async move {
                         tokio::select! {
                             result = async {
@@ -456,12 +516,12 @@ async fn serve_device_backend(
                                     eprintln!("iot-mqttd device transport error: {error}");
                                 }
                             }
-                            _ = cancellation.cancelled() => {}
+                            _ = force_cancellation.cancelled() => {}
                         }
                     });
                 }
                 Err(error) => {
-                    if !cancellation.is_cancelled() {
+                    if !accept_cancellation.is_cancelled() {
                         eprintln!("iot-mqttd device backend accept error: {error}");
                     }
                     break;
@@ -487,4 +547,10 @@ where
 {
     let remaining = deadline.saturating_duration_since(Instant::now());
     timeout(remaining, future).await.map_err(|_| ())
+}
+
+fn join_public_workers(workers: Vec<std::thread::JoinHandle<()>>) {
+    for worker in workers {
+        let _ = worker.join();
+    }
 }
