@@ -51,7 +51,10 @@ export function PowerMonitorDashboard({
   const [workingAlertId, setWorkingAlertId] = useState<string | null>(null);
   const selectedAssetIdRef = useRef<string | null>(initialAssetId ?? null);
   const selectedDeviceIdRef = useRef<string | null>(initialDeviceId ?? null);
+  const selectionGenerationRef = useRef(0);
   const telemetryRequestIdRef = useRef(0);
+  const workspaceRequestIdRef = useRef(0);
+  const rangeRef = useRef<TimeRange>("1h");
 
   const selectedDevice = useMemo(
     () => devices.find((device) => device.id === selectedDeviceId) ?? null,
@@ -64,6 +67,9 @@ export function PowerMonitorDashboard({
   const onlineCount = devices.filter((device) => device.online).length;
 
   const refresh = useCallback(async (): Promise<boolean> => {
+    const requestId = workspaceRequestIdRef.current + 1;
+    const selectionGeneration = selectionGenerationRef.current;
+    workspaceRequestIdRef.current = requestId;
     setLoading(true);
     setError(null);
     try {
@@ -72,14 +78,20 @@ export function PowerMonitorDashboard({
         listAssets(),
         listAlerts(),
       ]);
+      if (
+        workspaceRequestIdRef.current !== requestId
+        || selectionGenerationRef.current !== selectionGeneration
+      ) {
+        return false;
+      }
       setDevices(nextDevices);
       setAssets(nextAssets);
       setAlerts(nextAlerts);
-      const requestedAssetId = initialAssetId ?? selectedAssetIdRef.current;
+      const requestedAssetId = selectedAssetIdRef.current;
       const nextAssetId = requestedAssetId !== null && nextAssets.some((asset) => asset.id === requestedAssetId)
         ? requestedAssetId
         : null;
-      const requestedDeviceId = initialDeviceId ?? selectedDeviceIdRef.current;
+      const requestedDeviceId = selectedDeviceIdRef.current;
       const nextDeviceId = nextAssetId !== null
         ? null
         : requestedDeviceId !== null && nextDevices.some((device) => device.id === requestedDeviceId)
@@ -91,12 +103,19 @@ export function PowerMonitorDashboard({
       setSelectedDeviceId(nextDeviceId);
       return true;
     } catch (reason) {
-      setError(errorMessage(reason));
+      if (
+        workspaceRequestIdRef.current === requestId
+        && selectionGenerationRef.current === selectionGeneration
+      ) {
+        setError(errorMessage(reason));
+      }
       return false;
     } finally {
-      setLoading(false);
+      if (workspaceRequestIdRef.current === requestId) {
+        setLoading(false);
+      }
     }
-  }, [initialAssetId, initialDeviceId]);
+  }, []);
 
   useEffect(() => {
     void refresh();
@@ -115,8 +134,8 @@ export function PowerMonitorDashboard({
     setTelemetryLoading(true);
     try {
       const points = assetId !== null
-        ? await getAssetTelemetry(assetId, range)
-        : await getDeviceTelemetry(deviceId as string, range);
+        ? await getAssetTelemetry(assetId, rangeRef.current)
+        : await getDeviceTelemetry(deviceId as string, rangeRef.current);
       if (telemetryRequestIdRef.current === requestId) {
         setTelemetry(points);
       }
@@ -129,11 +148,17 @@ export function PowerMonitorDashboard({
         setTelemetryLoading(false);
       }
     }
-  }, [range]);
+  }, []);
 
   useEffect(() => {
     void refreshTelemetry();
-  }, [refreshTelemetry, selectedAssetId, selectedDeviceId]);
+  }, [range, refreshTelemetry, selectedAssetId, selectedDeviceId]);
+
+  const refreshWorkspaceAndTelemetry = useCallback(async (): Promise<void> => {
+    if (await refresh()) {
+      await refreshTelemetry();
+    }
+  }, [refresh, refreshTelemetry]);
 
   const sendCommand = async (
     method: string,
@@ -154,9 +179,7 @@ export function PowerMonitorDashboard({
         { onProgress: setCommand },
       );
       setCommand(lifecycle);
-      if (await refresh()) {
-        await refreshTelemetry();
-      }
+      await refreshWorkspaceAndTelemetry();
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -199,12 +222,14 @@ export function PowerMonitorDashboard({
           assets={assets}
           devices={devices}
           onSelectAsset={(assetId) => {
+            selectionGenerationRef.current += 1;
             selectedAssetIdRef.current = assetId;
             selectedDeviceIdRef.current = null;
             setSelectedAssetId(assetId);
             setSelectedDeviceId(null);
           }}
           onSelectDevice={(deviceId) => {
+            selectionGenerationRef.current += 1;
             selectedAssetIdRef.current = null;
             selectedDeviceIdRef.current = deviceId;
             setSelectedDeviceId(deviceId);
@@ -223,8 +248,14 @@ export function PowerMonitorDashboard({
             <p>{selectedDevice?.id ?? selectedAsset?.id ?? "All accessible resources"}</p>
           </div>
           <div className="workspace-actions">
-            <TimeRangeControl onChange={setRange} value={range} />
-            <button aria-label="Refresh Power Monitor" disabled={loading} onClick={() => void refresh()} type="button">
+            <TimeRangeControl
+              onChange={(nextRange) => {
+                rangeRef.current = nextRange;
+                setRange(nextRange);
+              }}
+              value={range}
+            />
+            <button aria-label="Refresh Power Monitor" disabled={loading} onClick={() => void refreshWorkspaceAndTelemetry()} type="button">
               Refresh
             </button>
           </div>

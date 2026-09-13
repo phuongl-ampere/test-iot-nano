@@ -133,6 +133,37 @@ describe("browser PowerMonitor API", () => {
     expect(fetcher).toHaveBeenCalledTimes(25);
   });
 
+  it("rejects an oversized raw array at the accumulated item budget", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(Array.from({ length: 2_501 }, (_, index) => ({ id: "device-" + index }))), {
+        status: 200,
+      }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listDevices()).rejects.toThrow("Platform pagination item budget exceeded.");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects cursor pages that exceed the accumulated item budget", async () => {
+    const page = (offset: number) => Array.from(
+      { length: 1_500 },
+      (_, index) => ({ id: "device-" + (offset + index) }),
+    );
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ has_more: true, items: page(0), next_cursor: "second" }), { status: 200 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ has_more: false, items: page(1_500), next_cursor: null }), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listDevices()).rejects.toThrow("Platform pagination item budget exceeded.");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("retains the repeated-cursor guard", async () => {
     const fetcher = vi
       .fn()

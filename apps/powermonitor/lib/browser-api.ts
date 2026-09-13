@@ -164,9 +164,10 @@ async function listResponse<T>(path: string): Promise<T[]> {
     pageCount += 1;
     const payload = await request<T[] | CursorPage<T>>(nextPath);
     if (Array.isArray(payload)) {
-      return items.concat(payload);
+      appendItems(items, payload);
+      return items;
     }
-    items.push(...(payload.items ?? []));
+    appendItems(items, payload.items ?? []);
 
     const nextCursor = payload.next_cursor;
     if (nextCursor === undefined || nextCursor === null || nextCursor === "") {
@@ -216,6 +217,7 @@ type CursorPage<T> = {
 };
 
 const maxPaginationPages = 25;
+const maxPaginationItems = 2_500;
 
 type CommandPollingOptions = {
   maxAttempts?: number;
@@ -226,6 +228,13 @@ type CommandPollingOptions = {
 
 function appendCursor(path: string, cursor: string): string {
   return path + (path.includes("?") ? "&" : "?") + new URLSearchParams({ after: cursor }).toString();
+}
+
+function appendItems<T>(target: T[], page: T[]): void {
+  if (target.length + page.length > maxPaginationItems) {
+    throw new Error("Platform pagination item budget exceeded.");
+  }
+  target.push(...page);
 }
 
 function telemetryRangeQuery(range: TimeRange, now: Date): string {
