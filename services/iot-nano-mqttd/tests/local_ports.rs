@@ -632,6 +632,72 @@ async fn revoked_token_cannot_register_a_session_after_revocation() {
 }
 
 #[tokio::test]
+async fn revoked_mqtt311_connection_cannot_append_or_ack_telemetry() {
+    let router = RpcSessionRouter::default();
+    let transport = MqttdDeviceTransport::with_local_ports_and_router(
+        router.clone(),
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(BlockingStream::failing()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let (server, client) = duplex(8 * 1024);
+    let (write_sender, mut server_writes) = mpsc::unbounded_channel();
+    let server_task = tokio::spawn(async move {
+        transport
+            .serve_connection(WriteObservedSocket::new(server, write_sender))
+            .await
+    });
+    let mut client = Framed::new(client, v311_codec());
+
+    connect_v311(&mut client).await;
+    drain_server_writes(&mut server_writes);
+    assert!(!router.revoke_session("device-a", device().token_id).await);
+    client
+        .send(V311Packet::Publish(v311_telemetry_publish(71)))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(iot_nano_mqttd::TransportError::Unauthorized)
+    ));
+    assert_no_server_writes(&mut server_writes);
+}
+
+#[tokio::test]
+async fn revoked_mqtt5_connection_cannot_append_or_ack_telemetry() {
+    let router = RpcSessionRouter::default();
+    let transport = MqttdDeviceTransport::with_local_ports_and_router(
+        router.clone(),
+        Arc::new(RecordingAuthorization::default()),
+        Arc::new(BlockingStream::failing()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let (server, client) = duplex(8 * 1024);
+    let (write_sender, mut server_writes) = mpsc::unbounded_channel();
+    let server_task = tokio::spawn(async move {
+        transport
+            .serve_v5_connection(WriteObservedSocket::new(server, write_sender))
+            .await
+    });
+    let mut client = Framed::new(client, v5_codec());
+
+    connect_v5(&mut client).await;
+    drain_server_writes(&mut server_writes);
+    assert!(!router.revoke_session("device-a", device().token_id).await);
+    client
+        .send(V5Packet::Publish(v5_telemetry_publish(72)))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(iot_nano_mqttd::TransportError::Unauthorized)
+    ));
+    assert_no_server_writes(&mut server_writes);
+}
+
+#[tokio::test]
 async fn local_mqtt311_qos1_puback_waits_for_stream_append_release() {
     let stream = BlockingStream::new();
     let transport = MqttdDeviceTransport::with_local_ports(

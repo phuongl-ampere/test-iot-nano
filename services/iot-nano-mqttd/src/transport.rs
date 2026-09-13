@@ -308,6 +308,14 @@ impl RpcSessionRouter {
             .map(|snapshot| snapshot.authenticated_device())
     }
 
+    async fn is_revoked(&self, device: &AuthenticatedDevice) -> bool {
+        self.state
+            .lock()
+            .await
+            .revoked_tokens
+            .contains(&(device.device_id.clone(), device.token_id))
+    }
+
     pub async fn active_snapshot(&self, device_id: &str) -> Option<SessionSnapshot> {
         self.state
             .lock()
@@ -1147,6 +1155,9 @@ impl MqttdDeviceTransport {
                         Err(TransportError::ConnectionClosed) => break,
                         Err(error) => return Err(error),
                     };
+                    if self.router.is_revoked(device).await {
+                        return Err(TransportError::Unauthorized);
+                    }
                     match packet {
                         Packet::Subscribe(subscribe) => {
                             let expected_filter = if device.is_gateway {
@@ -1288,7 +1299,11 @@ impl MqttdDeviceTransport {
         let mut next_packet_id = 1_u16;
         loop {
             tokio::select! {
-            packet = next_v5_packet(framed) => match packet {
+            packet = next_v5_packet(framed) => {
+                if self.router.is_revoked(device).await {
+                    return Err(TransportError::Unauthorized);
+                }
+                match packet {
                 Ok(V5Packet::Subscribe(subscribe)) => {
                     let expected_filter = if device.is_gateway {
                         GATEWAY_RPC_FILTER
@@ -1401,7 +1416,8 @@ impl MqttdDeviceTransport {
                 }
                 Ok(V5Packet::Disconnect(_)) | Err(TransportError::ConnectionClosed) => break,
                 Ok(_) => return Err(TransportError::UnsupportedPacket),
-                Err(error) => return Err(error),
+                    Err(error) => return Err(error),
+                }
             },
             command = receive_command(&mut commands), if commands.is_some() => {
                 let Some(mut command) = command else {
