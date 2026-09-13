@@ -18,7 +18,7 @@ use iot_nano_mqttd::{
     DeviceAuthenticator, DeviceAuthorizationPort, GatewayAuthorization,
     GatewayAuthorizationRequest, LocalDeviceAuthenticator, LocalRpcResponseForwarder,
     LocalStreamUplinkForwarder, MqttdDeviceTransport, RpcResponseForwarder, RpcSessionRouter,
-    SessionRegistration, TransportAuthRequest, TransportRpcResponse, TransportUplink,
+    SessionError, SessionRegistration, TransportAuthRequest, TransportRpcResponse, TransportUplink,
     UplinkForwarder,
 };
 use iot_nano_stream::{
@@ -570,6 +570,45 @@ async fn legacy_local_ports_wrapper_owns_a_usable_default_router() {
     assert!(!publish.is_finished());
     command.acknowledge_published().unwrap();
     assert!(publish.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn revocation_invalidates_a_command_queued_before_device_delivery() {
+    let router = RpcSessionRouter::default();
+    let token_id = device().token_id;
+    let mut device = router
+        .register(SessionRegistration {
+            token_id,
+            device_id: "device-a".to_owned(),
+            client_id: "local-client".to_owned(),
+            connection_id: "connection-a".to_owned(),
+            is_gateway: false,
+            connected_at: Utc::now(),
+        })
+        .await;
+    let issued_at = Utc::now();
+    let request = RpcRequest::new(
+        Uuid::now_v7(),
+        "reboot",
+        json!({}),
+        issued_at,
+        issued_at + Duration::seconds(30),
+    )
+    .unwrap();
+
+    let publish = tokio::spawn({
+        let router = router.clone();
+        async move { router.publish_to_device("device-a", request).await }
+    });
+    let command = device.recv().await.unwrap();
+
+    assert!(router.revoke_session("device-a", token_id).await);
+    assert!(command.acquire_delivery_lease().await.is_none());
+    drop(command);
+    assert!(matches!(
+        publish.await.unwrap(),
+        Err(SessionError::PublicationWaiterUnavailable)
+    ));
 }
 
 #[tokio::test]

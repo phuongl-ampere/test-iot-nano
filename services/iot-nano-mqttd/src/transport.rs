@@ -1,6 +1,15 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -28,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, OwnedMutexGuard, mpsc, oneshot},
     time::timeout,
 };
 use tokio_util::codec::Framed;
@@ -67,9 +76,14 @@ pub struct SessionRegistration {
 pub struct ActiveDeviceSession {
     pub request: RpcRequest,
     published: Option<oneshot::Sender<()>>,
+    lifecycle: Arc<SessionLifecycle>,
 }
 
 impl ActiveDeviceSession {
+    pub async fn acquire_delivery_lease(&self) -> Option<SessionDeliveryLease> {
+        Arc::clone(&self.lifecycle).acquire_delivery_lease().await
+    }
+
     pub fn acknowledge_published(mut self) -> Result<(), SessionError> {
         self.published
             .take()
@@ -80,6 +94,40 @@ impl ActiveDeviceSession {
 
     pub(crate) fn take_published_acknowledgement(&mut self) -> Option<oneshot::Sender<()>> {
         self.published.take()
+    }
+}
+
+pub struct SessionDeliveryLease {
+    _guard: OwnedMutexGuard<()>,
+}
+
+#[derive(Debug)]
+struct SessionLifecycle {
+    active: AtomicBool,
+    delivery_gate: Arc<Mutex<()>>,
+}
+
+impl SessionLifecycle {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+            delivery_gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    async fn invalidate(&self) {
+        let _guard = Arc::clone(&self.delivery_gate).lock_owned().await;
+        self.active.store(false, Ordering::Release);
+    }
+
+    async fn acquire_delivery_lease(self: Arc<Self>) -> Option<SessionDeliveryLease> {
+        let guard = Arc::clone(&self.delivery_gate).lock_owned().await;
+        self.is_active()
+            .then_some(SessionDeliveryLease { _guard: guard })
     }
 }
 
@@ -107,6 +155,7 @@ pub struct RpcSessionRouter {
 struct RegisteredSession {
     registration: SessionRegistration,
     sender: mpsc::Sender<ActiveDeviceSession>,
+    lifecycle: Arc<SessionLifecycle>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +182,7 @@ impl PendingRpcResponse {
 pub struct SessionSnapshot {
     registration: SessionRegistration,
     sender: mpsc::Sender<ActiveDeviceSession>,
+    lifecycle: Arc<SessionLifecycle>,
 }
 
 impl SessionSnapshot {
@@ -148,6 +198,7 @@ impl SessionSnapshot {
         self.registration.token_id == session.registration.token_id
             && self.registration.connection_id == session.registration.connection_id
             && self.sender.same_channel(&session.sender)
+            && Arc::ptr_eq(&self.lifecycle, &session.lifecycle)
     }
 }
 
@@ -156,12 +207,23 @@ impl RpcSessionRouter {
         &self,
         registration: SessionRegistration,
     ) -> mpsc::Receiver<ActiveDeviceSession> {
+        let previous = self
+            .sessions
+            .lock()
+            .await
+            .get(&registration.device_id)
+            .map(|session| Arc::clone(&session.lifecycle));
+        if let Some(previous) = previous {
+            previous.invalidate().await;
+        }
         let (sender, receiver) = mpsc::channel(SESSION_COMMAND_CAPACITY);
+        let lifecycle = Arc::new(SessionLifecycle::new());
         self.sessions.lock().await.insert(
             registration.device_id.clone(),
             RegisteredSession {
                 registration: registration.clone(),
                 sender,
+                lifecycle,
             },
         );
         self.pending_responses.lock().await.retain(|_, pending| {
@@ -171,12 +233,30 @@ impl RpcSessionRouter {
     }
 
     pub async fn unregister(&self, device_id: &str, connection_id: &str) {
-        let mut sessions = self.sessions.lock().await;
-        if sessions
+        let lifecycle = self
+            .sessions
+            .lock()
+            .await
             .get(device_id)
-            .is_some_and(|session| session.registration.connection_id == connection_id)
-        {
-            sessions.remove(device_id);
+            .filter(|session| session.registration.connection_id == connection_id)
+            .map(|session| Arc::clone(&session.lifecycle));
+        let Some(lifecycle) = lifecycle else {
+            return;
+        };
+        lifecycle.invalidate().await;
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .get(device_id)
+                .is_some_and(|session| {
+                    session.registration.connection_id == connection_id
+                        && Arc::ptr_eq(&session.lifecycle, &lifecycle)
+                })
+                .then(|| sessions.remove(device_id))
+                .flatten()
+                .is_some()
+        };
+        if removed {
             self.pending_responses.lock().await.retain(|_, pending| {
                 pending.device_id != device_id || pending.connection_id != connection_id
             });
@@ -184,18 +264,37 @@ impl RpcSessionRouter {
     }
 
     pub async fn revoke_session(&self, device_id: &str, token_id: Uuid) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        if sessions
-            .get(device_id)
-            .is_some_and(|session| session.registration.token_id == token_id)
-        {
-            sessions.remove(device_id);
-            self.pending_responses.lock().await.retain(|_, pending| {
-                pending.device_id != device_id || pending.token_id != token_id
-            });
-            true
-        } else {
-            false
+        let mut revoked = false;
+        loop {
+            let lifecycle = self
+                .sessions
+                .lock()
+                .await
+                .get(device_id)
+                .filter(|session| session.registration.token_id == token_id)
+                .map(|session| Arc::clone(&session.lifecycle));
+            let Some(lifecycle) = lifecycle else {
+                return revoked;
+            };
+            lifecycle.invalidate().await;
+            let removed = {
+                let mut sessions = self.sessions.lock().await;
+                sessions
+                    .get(device_id)
+                    .is_some_and(|session| {
+                        session.registration.token_id == token_id
+                            && Arc::ptr_eq(&session.lifecycle, &lifecycle)
+                    })
+                    .then(|| sessions.remove(device_id))
+                    .flatten()
+                    .is_some()
+            };
+            if removed {
+                self.pending_responses.lock().await.retain(|_, pending| {
+                    pending.device_id != device_id || pending.token_id != token_id
+                });
+                revoked = true;
+            }
         }
     }
 
@@ -210,9 +309,11 @@ impl RpcSessionRouter {
             .lock()
             .await
             .get(device_id)
+            .filter(|session| session.lifecycle.is_active())
             .map(|session| SessionSnapshot {
                 registration: session.registration.clone(),
                 sender: session.sender.clone(),
+                lifecycle: Arc::clone(&session.lifecycle),
             })
     }
 
@@ -233,14 +334,17 @@ impl RpcSessionRouter {
         snapshot: &SessionSnapshot,
         request: RpcRequest,
     ) -> Result<(), SessionError> {
-        let sender = self
+        let (sender, lifecycle) = self
             .sessions
             .lock()
             .await
             .get(&snapshot.registration.device_id)
             .filter(|session| snapshot.matches(session))
-            .map(|session| session.sender.clone())
+            .map(|session| (session.sender.clone(), Arc::clone(&session.lifecycle)))
             .ok_or(SessionError::SessionUnavailable)?;
+        if !lifecycle.is_active() {
+            return Err(SessionError::SessionUnavailable);
+        }
         let pending = if request.mode == RpcMode::TwoWay {
             let pending = PendingRpcResponse {
                 command_id: request.id,
@@ -263,6 +367,7 @@ impl RpcSessionRouter {
             .send(ActiveDeviceSession {
                 request,
                 published: Some(published),
+                lifecycle,
             })
             .await
             .is_err()
@@ -1125,6 +1230,9 @@ impl MqttdDeviceTransport {
                     let Some(mut command) = command else {
                         break;
                     };
+                    let Some(_delivery_lease) = command.acquire_delivery_lease().await else {
+                        continue;
+                    };
                     let packet_id = next_packet_id;
                     next_packet_id = next_packet_id.wrapping_add(1).max(1);
                     let payload = serde_json::to_vec(&serde_json::json!({
@@ -1287,6 +1395,9 @@ impl MqttdDeviceTransport {
             command = receive_command(&mut commands), if commands.is_some() => {
                 let Some(mut command) = command else {
                     break;
+                };
+                let Some(_delivery_lease) = command.acquire_delivery_lease().await else {
+                    continue;
                 };
                 let packet_id = next_packet_id;
                 next_packet_id = next_packet_id.wrapping_add(1).max(1);
