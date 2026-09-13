@@ -2482,10 +2482,11 @@ async fn create_timescale_incident(
     opened_notification: Option<NewNotificationOutboxEntry>,
 ) -> Result<Option<AlertIncident>, PlatformStoreError> {
     let mut transaction = pool.begin().await?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO alert_incidents (
             id, rule_id, device_id, status, condition_started_at, opened_at, last_value
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT DO NOTHING",
     )
     .bind(incident.id)
     .bind(incident.rule_id)
@@ -2496,6 +2497,9 @@ async fn create_timescale_incident(
     .bind(incident.last_value)
     .execute(&mut *transaction)
     .await?;
+    if inserted.rows_affected() == 0 {
+        return Ok(None);
+    }
     if let Some(notification) = opened_notification {
         sqlx::query(
             "INSERT INTO notification_outbox (
@@ -2577,7 +2581,8 @@ async fn update_timescale_incident_transition(
         ),
         AlertIncidentTransition::Resolve(_) => sqlx::query(
             "UPDATE alert_incidents
-             SET status = 'resolved', resolved_at = $1, updated_at = $1,
+             SET status = 'resolved', resolved_at = $1,
+                 recovery_started_at = COALESCE(recovery_started_at, $1), updated_at = $1,
                  state_version = state_version + 1
              WHERE id = $2 AND state_version = $3 AND status = 'open'
              RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
@@ -3891,10 +3896,11 @@ impl SqliteStore {
         opened_notification: Option<NewNotificationOutboxEntry>,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         let mut transaction = self.pool.begin().await?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO alert_incidents (
                 id, rule_id, device_id, status, condition_started_at, opened_at, last_value
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING",
         )
         .bind(incident.id.to_string())
         .bind(incident.rule_id.to_string())
@@ -3908,6 +3914,9 @@ impl SqliteStore {
         .bind(incident.last_value)
         .execute(&mut *transaction)
         .await?;
+        if inserted.rows_affected() == 0 {
+            return Ok(None);
+        }
         if let Some(notification) = opened_notification {
             sqlx::query(
                 "INSERT INTO notification_outbox (
@@ -3994,13 +4003,15 @@ impl SqliteStore {
             .bind(&timestamp),
             AlertIncidentTransition::Resolve(_) => sqlx::query(
                 "UPDATE alert_incidents
-                 SET status = 'resolved', resolved_at = ?, updated_at = ?,
+                 SET status = 'resolved', resolved_at = ?,
+                     recovery_started_at = COALESCE(recovery_started_at, ?), updated_at = ?,
                      state_version = state_version + 1
                  WHERE id = ? AND state_version = ? AND status = 'open'
                  RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
+            .bind(&timestamp)
             .bind(&timestamp)
             .bind(&timestamp),
             AlertIncidentTransition::Remind(_) => sqlx::query(

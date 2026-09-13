@@ -58,6 +58,16 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
     .unwrap();
     assert_eq!(pending.status, AlertIncidentStatus::Pending);
     assert_eq!(pending.state_version, 0);
+    assert!(
+        AlertIncidentRepository::create_incident(
+            &store,
+            incident(rule_id, uuid::Uuid::now_v7(), AlertIncidentStatus::Pending),
+            None,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
 
     let open_id = uuid::Uuid::now_v7();
     let opened_at = Utc::now().with_nanosecond(123_456_789).unwrap();
@@ -156,6 +166,32 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn sqlite_direct_resolution_sets_recovery_started_at() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    rule(&store, rule_id).await;
+    let id = uuid::Uuid::now_v7();
+    let opened = AlertIncidentRepository::create_incident(
+        &store,
+        incident(rule_id, id, AlertIncidentStatus::Open),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let resolved_at = Utc::now() + Duration::seconds(1);
+
+    let resolved =
+        AlertIncidentRepository::resolve_incident(&store, id, opened.state_version, resolved_at)
+            .await
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(resolved.status, AlertIncidentStatus::Resolved);
+    assert_eq!(resolved.recovery_started_at, Some(resolved_at));
 }
 
 #[tokio::test]
@@ -298,6 +334,16 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     .await
     .unwrap()
     .unwrap();
+    assert!(
+        AlertIncidentRepository::create_incident(
+            &store,
+            incident(rule_id, uuid::Uuid::now_v7(), AlertIncidentStatus::Pending),
+            None,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
     let opened = AlertIncidentRepository::open_incident(
         &store,
         incident_id,
@@ -335,4 +381,23 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
         .await
         .unwrap();
     assert_eq!(first, second);
+
+    let direct_id = uuid::Uuid::now_v7();
+    let mut direct = incident(rule_id, direct_id, AlertIncidentStatus::Open);
+    direct.device_id = "direct-resolve-device".to_owned();
+    let opened = AlertIncidentRepository::create_incident(&store, direct, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved_at = Utc::now() + Duration::seconds(1);
+    let resolved = AlertIncidentRepository::resolve_incident(
+        &store,
+        direct_id,
+        opened.state_version,
+        resolved_at,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resolved.recovery_started_at, Some(resolved_at));
 }
