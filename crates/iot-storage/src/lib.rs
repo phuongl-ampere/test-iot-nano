@@ -853,6 +853,11 @@ pub trait AlertEvaluationRepository: Send + Sync {
         events: &'a [AlertEvaluationEvent],
         evaluated_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<AlertEvaluationResult, PlatformStoreError>> + Send + 'a>>;
+
+    fn evaluate_alert_windows<'a>(
+        &'a self,
+        evaluated_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<AlertEvaluationResult, PlatformStoreError>> + Send + 'a>>;
 }
 
 pub trait AlertRepository: Send + Sync {
@@ -1224,6 +1229,17 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => evaluate_sqlite_alert_events(store, events).await,
             Self::Timescale(pool) => evaluate_timescale_alert_events(pool, events).await,
+        }
+    }
+
+    pub async fn evaluate_alert_windows(
+        &self,
+        evaluated_at: DateTime<Utc>,
+    ) -> Result<AlertEvaluationResult, PlatformStoreError> {
+        let evaluated_at = canonical_postgres_timestamp(evaluated_at);
+        match self {
+            Self::Sqlite(store) => evaluate_sqlite_alert_windows(store, evaluated_at).await,
+            Self::Timescale(pool) => evaluate_timescale_alert_windows(pool, evaluated_at).await,
         }
     }
 
@@ -4149,6 +4165,245 @@ async fn evaluate_timescale_alert_events(
     Ok(result)
 }
 
+async fn sqlite_window_aggregates(
+    transaction: &mut Transaction<'_, Sqlite>,
+    rule: &AlertRule,
+    evaluated_at: DateTime<Utc>,
+) -> Result<Vec<(String, f64)>, PlatformStoreError> {
+    let Some(window) = rule.window else {
+        return Ok(Vec::new());
+    };
+    let from = evaluated_at - window;
+    let path = format!("$.{}", rule.metric_key);
+    let rows = sqlx::query(
+        "WITH canonical_telemetry AS (
+            SELECT device_id, measurements,
+                   CAST(unixepoch(event_at) AS INTEGER) * 1000000
+                   + CASE
+                       WHEN instr(event_at, '.') = 0 THEN 0
+                       ELSE CAST(
+                           substr(
+                               substr(
+                                   event_at,
+                                   instr(event_at, '.') + 1,
+                                   CASE
+                                       WHEN instr(
+                                           substr(event_at, instr(event_at, '.') + 1),
+                                           'Z'
+                                       ) > 0
+                                       THEN instr(
+                                           substr(event_at, instr(event_at, '.') + 1),
+                                           'Z'
+                                       ) - 1
+                                       WHEN instr(
+                                           substr(event_at, instr(event_at, '.') + 1),
+                                           '+'
+                                       ) > 0
+                                       THEN instr(
+                                           substr(event_at, instr(event_at, '.') + 1),
+                                           '+'
+                                       ) - 1
+                                       ELSE instr(
+                                           substr(event_at, instr(event_at, '.') + 1),
+                                           '-'
+                                       ) - 1
+                                   END
+                               ) || '000000',
+                               1,
+                               6
+                           ) AS INTEGER
+                       )
+                   END AS event_at_micros
+            FROM telemetry
+         )
+         SELECT device_id, AVG(json_extract(measurements, ?)) AS average
+         FROM canonical_telemetry
+         WHERE event_at_micros >= ?
+           AND event_at_micros <= ?
+           AND (? IS NULL OR device_id = ?)
+           AND json_type(measurements, ?) IN ('integer', 'real')
+           AND json_extract(measurements, ?) > -1.0e999
+           AND json_extract(measurements, ?) < 1.0e999
+         GROUP BY device_id
+         ORDER BY device_id",
+    )
+    .bind(&path)
+    .bind(from.timestamp_micros())
+    .bind(evaluated_at.timestamp_micros())
+    .bind(rule.device_id.as_deref())
+    .bind(rule.device_id.as_deref())
+    .bind(&path)
+    .bind(&path)
+    .bind(&path)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut aggregates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let average: f64 = row.try_get("average")?;
+        if average.is_finite() {
+            aggregates.push((row.try_get("device_id")?, average));
+        }
+    }
+    Ok(aggregates)
+}
+
+async fn timescale_window_aggregates(
+    transaction: &mut Transaction<'_, Postgres>,
+    rule: &AlertRule,
+    evaluated_at: DateTime<Utc>,
+) -> Result<Vec<(String, f64)>, PlatformStoreError> {
+    let Some(window) = rule.window else {
+        return Ok(Vec::new());
+    };
+    let from = evaluated_at - window;
+    let rows = sqlx::query(
+        "WITH finite_telemetry AS (
+             SELECT device_id,
+                    CASE
+                        WHEN jsonb_typeof(measurements -> $1) = 'number'
+                        THEN CASE
+                            WHEN (measurements ->> $1)::numeric BETWEEN
+                                     '-1.7976931348623157e308'::numeric
+                                 AND '1.7976931348623157e308'::numeric
+                            THEN (measurements ->> $1)::numeric
+                        END
+                    END AS finite_value
+             FROM telemetry
+             WHERE event_at >= $2
+               AND event_at <= $3
+               AND ($4::text IS NULL OR device_id = $4)
+         )
+         SELECT device_id, (AVG(finite_value))::double precision AS average
+         FROM finite_telemetry
+         GROUP BY device_id
+         HAVING COUNT(finite_value) > 0
+         ORDER BY device_id",
+    )
+    .bind(&rule.metric_key)
+    .bind(from)
+    .bind(evaluated_at)
+    .bind(rule.device_id.as_deref())
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut aggregates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let average: f64 = row.try_get("average")?;
+        if average.is_finite() {
+            aggregates.push((row.try_get("device_id")?, average));
+        }
+    }
+    Ok(aggregates)
+}
+
+async fn evaluate_sqlite_alert_windows(
+    store: &SqliteStore,
+    evaluated_at: DateTime<Utc>,
+) -> Result<AlertEvaluationResult, PlatformStoreError> {
+    let mut transaction = store.pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+                window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
+                hysteresis, severity, reminder_interval_seconds
+         FROM alert_rules WHERE enabled = 1 AND archived_at IS NULL
+           AND rule_type = 'window_average' ORDER BY created_at, id",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let rules: Vec<_> = rows
+        .into_iter()
+        .map(sqlite_alert_rule_record)
+        .collect::<Result<_, _>>()?;
+    let mut evaluations = Vec::new();
+    for rule in &rules {
+        evaluations.extend(
+            sqlite_window_aggregates(&mut transaction, rule, evaluated_at)
+                .await?
+                .into_iter()
+                .map(|(device_id, value)| (rule.clone(), device_id, value)),
+        );
+    }
+
+    let mut result = AlertEvaluationResult::default();
+    for (rule, device_id, value) in evaluations {
+        result.evaluated += 1;
+        let transition = evaluate_sqlite_event_transition(
+            &mut transaction,
+            &rule,
+            &device_id,
+            value,
+            evaluated_at,
+        )
+        .await?;
+        result.opened += usize::from(transition.opened);
+        result.resolved += usize::from(transition.resolved);
+        result.reminders += usize::from(transition.reminder);
+    }
+    transaction.commit().await?;
+    Ok(result)
+}
+
+async fn evaluate_timescale_alert_windows(
+    pool: &PgPool,
+    evaluated_at: DateTime<Utc>,
+) -> Result<AlertEvaluationResult, PlatformStoreError> {
+    let mut transaction = pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+                window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
+                hysteresis, severity, reminder_interval_seconds
+         FROM alert_rules WHERE enabled AND archived_at IS NULL
+           AND rule_type = 'window_average' ORDER BY created_at, id FOR SHARE",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let rules: Vec<_> = rows
+        .into_iter()
+        .map(postgres_alert_rule_record)
+        .collect::<Result<_, _>>()?;
+    let mut evaluations = Vec::new();
+    for rule in &rules {
+        evaluations.extend(
+            timescale_window_aggregates(&mut transaction, rule, evaluated_at)
+                .await?
+                .into_iter()
+                .map(|(device_id, value)| (rule.clone(), device_id, value)),
+        );
+    }
+
+    // Lock every affected incident key in a stable order before any transition.
+    // This prevents opposite window-batch orders from forming an advisory-lock cycle.
+    let mut lock_keys: Vec<_> = evaluations
+        .iter()
+        .map(|(rule, device_id, _)| (rule.id, device_id.clone()))
+        .collect();
+    lock_keys.sort_unstable();
+    lock_keys.dedup();
+    for (rule_id, device_id) in lock_keys {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("iot_nano:alert-window:{rule_id}:{device_id}"))
+            .execute(&mut *transaction)
+            .await?;
+    }
+
+    let mut result = AlertEvaluationResult::default();
+    for (rule, device_id, value) in evaluations {
+        result.evaluated += 1;
+        let transition = evaluate_timescale_event_transition(
+            &mut transaction,
+            &rule,
+            &device_id,
+            value,
+            evaluated_at,
+        )
+        .await?;
+        result.opened += usize::from(transition.opened);
+        result.resolved += usize::from(transition.resolved);
+        result.reminders += usize::from(transition.reminder);
+    }
+    transaction.commit().await?;
+    Ok(result)
+}
+
 fn validate_telemetry_metric_key(metric_key: &str) -> Result<(), PlatformStoreError> {
     let mut characters = metric_key.chars();
     let valid = matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
@@ -4222,6 +4477,14 @@ impl AlertEvaluationRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<AlertEvaluationResult, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move { self.evaluate_alert_events(events, evaluated_at).await })
+    }
+
+    fn evaluate_alert_windows<'a>(
+        &'a self,
+        evaluated_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<AlertEvaluationResult, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { self.evaluate_alert_windows(evaluated_at).await })
     }
 }
 

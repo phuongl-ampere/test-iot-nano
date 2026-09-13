@@ -9,6 +9,8 @@ use serde_json::{Map, Value};
 use sqlx::{Connection, PgConnection};
 use tokio::{sync::Barrier, time::Duration as TokioDuration};
 
+const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
+
 async fn store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -25,6 +27,10 @@ async fn store() -> (tempfile::TempDir, PlatformStore) {
 async fn timescale_store() -> (PgConnection, PlatformStore) {
     let url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    assert_eq!(
+        url, TIMESCALE_TEST_URL,
+        "Timescale contracts may run only against the disposable test database"
+    );
     let mut connection = PgConnection::connect(&url).await.unwrap();
     let database: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(&mut connection)
@@ -74,6 +80,398 @@ fn event_for_device(
         sequence,
         measurements: Map::from_iter([("temperature_c".to_owned(), Value::from(value))]),
     }
+}
+
+async fn insert_sqlite_window_telemetry(
+    store: &PlatformStore,
+    event_at: &str,
+    device_id: &str,
+    sequence: i64,
+    measurements: &str,
+) {
+    sqlx::query("INSERT OR IGNORE INTO devices (device_id) VALUES (?)")
+        .bind(device_id)
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, 'window-boot', ?, ?, 'test')",
+    )
+    .bind(event_at)
+    .bind(event_at)
+    .bind(device_id)
+    .bind(sequence)
+    .bind(measurements)
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+}
+
+async fn evaluate_sqlite_window_sample(
+    store: &PlatformStore,
+    at: chrono::DateTime<Utc>,
+    sequence: i64,
+    value: f64,
+) -> AlertEvaluationResult {
+    let event_at = at.to_rfc3339();
+    let measurements = format!(r#"{{"temperature_c":{value}}}"#);
+    insert_sqlite_window_telemetry(store, &event_at, "device-1", sequence, &measurements).await;
+    store.evaluate_alert_windows(at).await.unwrap()
+}
+
+async fn insert_timescale_window_telemetry(
+    store: &PlatformStore,
+    event_at: chrono::DateTime<Utc>,
+    device_id: &str,
+    sequence: i64,
+    measurements: &str,
+) {
+    sqlx::query("INSERT INTO devices (device_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(device_id)
+        .execute(store.timescale_pool().unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, 'test')",
+    )
+    .bind(event_at)
+    .bind(device_id)
+    .bind(uuid::Uuid::nil())
+    .bind(sequence)
+    .bind(measurements)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+}
+
+async fn evaluate_timescale_window_sample(
+    store: &PlatformStore,
+    at: chrono::DateTime<Utc>,
+    sequence: i64,
+    value: f64,
+) -> AlertEvaluationResult {
+    let measurements = format!(r#"{{"temperature_c":{value}}}"#);
+    insert_timescale_window_telemetry(store, at, "device-1", sequence, &measurements).await;
+    store.evaluate_alert_windows(at).await.unwrap()
+}
+
+#[tokio::test]
+async fn sqlite_window_evaluation_uses_semantic_inclusive_ranges_and_finite_json_numbers() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            window_seconds, for_seconds
+         ) VALUES (?, 'temperature average high', 'device-1', 'temperature_c',
+                   'window_average', 'gt', 30, 60, 0)",
+    )
+    .bind(rule_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    let evaluated_at = Utc.timestamp_opt(1_700_000_000, 123_456_000).unwrap();
+    insert_sqlite_window_telemetry(
+        &store,
+        "2023-11-15T05:12:20.123456+07:00",
+        "device-1",
+        1,
+        r#"{"temperature_c":31}"#,
+    )
+    .await;
+    insert_sqlite_window_telemetry(
+        &store,
+        "2023-11-14T22:13:20.123456Z",
+        "device-1",
+        2,
+        r#"{"temperature_c":33}"#,
+    )
+    .await;
+    insert_sqlite_window_telemetry(
+        &store,
+        "2023-11-15T05:12:19.123456+07:00",
+        "device-1",
+        3,
+        r#"{"temperature_c":200}"#,
+    )
+    .await;
+    for (sequence, measurements) in [
+        (4, r#"{"temperature_c":"99"}"#),
+        (5, r#"{"temperature_c":null}"#),
+        (6, r#"{"other":99}"#),
+        (7, r#"{"temperature_c":9e999}"#),
+        (8, r#"{"temperature_c":-9e999}"#),
+    ] {
+        insert_sqlite_window_telemetry(
+            &store,
+            "2023-11-15T05:12:30.123456+07:00",
+            "device-1",
+            sequence,
+            measurements,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        store.evaluate_alert_windows(evaluated_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, f64>("SELECT last_value FROM alert_incidents WHERE rule_id = ?")
+            .bind(rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        32.0
+    );
+}
+
+#[tokio::test]
+async fn sqlite_window_evaluation_selects_wildcard_and_scoped_devices_and_excludes_rules() {
+    let (_directory, store) = store().await;
+    let wildcard_rule_id = uuid::Uuid::now_v7();
+    let scoped_rule_id = uuid::Uuid::now_v7();
+    let disabled_rule_id = uuid::Uuid::now_v7();
+    let archived_rule_id = uuid::Uuid::now_v7();
+    for (rule_id, device_id, enabled, archived_at) in [
+        (wildcard_rule_id, None, 1_i64, None),
+        (scoped_rule_id, Some("device-a"), 1, None),
+        (disabled_rule_id, None, 0, None),
+        (
+            archived_rule_id,
+            None,
+            1,
+            Some("2023-11-14T22:13:20.123456Z"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO alert_rules (
+                id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+                window_seconds, for_seconds, archived_at
+             ) VALUES (?, 'temperature average high', ?, ?, 'temperature_c',
+                       'window_average', 'gt', 30, 60, 0, ?)",
+        )
+        .bind(rule_id.to_string())
+        .bind(enabled)
+        .bind(device_id)
+        .bind(archived_at)
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    }
+    let evaluated_at = Utc.timestamp_opt(1_700_000_000, 123_456_000).unwrap();
+    insert_sqlite_window_telemetry(
+        &store,
+        "2023-11-14T22:13:20.123456Z",
+        "device-a",
+        1,
+        r#"{"temperature_c":31}"#,
+    )
+    .await;
+    insert_sqlite_window_telemetry(
+        &store,
+        "2023-11-14T22:13:20.123456Z",
+        "device-b",
+        1,
+        r#"{"temperature_c":32}"#,
+    )
+    .await;
+
+    assert_eq!(
+        store.evaluate_alert_windows(evaluated_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 3,
+            opened: 3,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents
+             WHERE rule_id IN (?, ?) AND status = 'open'",
+        )
+        .bind(wildcard_rule_id.to_string())
+        .bind(scoped_rule_id.to_string())
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT device_id FROM alert_incidents WHERE rule_id = ?",)
+            .bind(scoped_rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        "device-a"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents WHERE rule_id IN (?, ?)",
+        )
+        .bind(disabled_rule_id.to_string())
+        .bind(archived_rule_id.to_string())
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn sqlite_window_evaluation_without_valid_samples_is_a_noop() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds
+         ) VALUES (?, 'humidity average high', 'humidity_pct', 'window_average', 'gt', 90, 60, 0)",
+    )
+    .bind(rule_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let evaluated_at = Utc.timestamp_opt(1_700_000_000, 123_456_000).unwrap();
+    insert_sqlite_window_telemetry(
+        &store,
+        "2023-11-14T22:13:20.123456Z",
+        "device-1",
+        1,
+        r#"{"humidity_pct":"not-a-number"}"#,
+    )
+    .await;
+
+    assert_eq!(
+        AlertEvaluationRepository::evaluate_alert_windows(&store, evaluated_at)
+            .await
+            .unwrap(),
+        AlertEvaluationResult::default()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM alert_incidents WHERE rule_id = ?")
+            .bind(rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn sqlite_window_samples_preserve_pending_recovery_notification_and_reopen_transitions() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds,
+            resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
+         ) VALUES (?, 'temperature average high', 'temperature_c', 'window_average', 'gt', 30,
+                   60, 120, 120, 600, 120)",
+    )
+    .bind(rule_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let started_at = Utc.timestamp_opt(1_700_000_100, 0).unwrap();
+    assert_eq!(
+        evaluate_sqlite_window_sample(&store, started_at, 1, 31.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let opened_at = started_at + Duration::seconds(120);
+    assert_eq!(
+        evaluate_sqlite_window_sample(&store, opened_at, 2, 32.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let reminder_at = opened_at + Duration::seconds(120);
+    assert_eq!(
+        evaluate_sqlite_window_sample(&store, reminder_at, 3, 33.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            reminders: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let recovery_started_at = reminder_at + Duration::seconds(61);
+    assert_eq!(
+        evaluate_sqlite_window_sample(&store, recovery_started_at, 4, 29.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let resolved_at = recovery_started_at + Duration::seconds(120);
+    assert_eq!(
+        evaluate_sqlite_window_sample(&store, resolved_at, 5, 29.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            resolved: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let reopened_pending_at = resolved_at + Duration::seconds(61);
+    assert_eq!(
+        evaluate_sqlite_window_sample(&store, reopened_pending_at, 6, 32.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let reopened_at = reopened_pending_at + Duration::seconds(120);
+    assert_eq!(
+        evaluate_sqlite_window_sample(&store, reopened_at, 7, 33.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE rule_id = ?")
+            .bind(rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        "open"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT state_version FROM alert_incidents WHERE rule_id = ?")
+            .bind(rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        4
+    );
 }
 
 #[tokio::test]
@@ -1403,5 +1801,176 @@ async fn timescale_event_evaluation_matches_sqlite_state_sequence_and_duplicate_
             .await
             .unwrap(),
         4
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the guarded disposable Timescale URL"]
+async fn timescale_window_evaluation_matches_sqlite_state_sequence_and_finite_samples() {
+    let (_lock, store) = timescale_store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold, window_seconds,
+            for_seconds, resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
+         ) VALUES ($1, 'temperature average high', 'device-1', 'temperature_c',
+                   'window_average', 'gt', 30, 60, 0, 120, 600, 120)",
+    )
+    .bind(rule_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let opened_at = Utc.timestamp_opt(1_700_003_000, 123_456_000).unwrap();
+    for (sequence, measurements) in [
+        (1, r#"{"temperature_c":31}"#),
+        (2, r#"{"temperature_c":"99"}"#),
+        (3, r#"{"temperature_c":null}"#),
+        (4, r#"{"other":99}"#),
+        (5, r#"{"temperature_c":9e999}"#),
+        (6, r#"{"temperature_c":-9e999}"#),
+    ] {
+        insert_timescale_window_telemetry(&store, opened_at, "device-1", sequence, measurements)
+            .await;
+    }
+    assert_eq!(
+        store.evaluate_alert_windows(opened_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, f64>("SELECT last_value FROM alert_incidents WHERE rule_id = $1")
+            .bind(rule_id)
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap(),
+        31.0
+    );
+
+    let reminder_at = opened_at + Duration::seconds(120);
+    assert_eq!(
+        evaluate_timescale_window_sample(&store, reminder_at, 7, 32.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            reminders: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let recovery_started_at = reminder_at + Duration::seconds(61);
+    assert_eq!(
+        evaluate_timescale_window_sample(&store, recovery_started_at, 8, 29.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let resolved_at = recovery_started_at + Duration::seconds(120);
+    assert_eq!(
+        evaluate_timescale_window_sample(&store, resolved_at, 9, 29.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            resolved: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let reopened_at = resolved_at + Duration::seconds(61);
+    assert_eq!(
+        evaluate_timescale_window_sample(&store, reopened_at, 10, 32.0).await,
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>(
+            "SELECT state_version FROM alert_incidents WHERE rule_id = $1"
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        4
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_outbox")
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap(),
+        4
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the guarded disposable Timescale URL"]
+async fn timescale_concurrent_multi_device_window_evaluations_do_not_deadlock() {
+    let (_lock, store) = timescale_store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds,
+            resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
+         ) VALUES ($1, 'temperature average high', 'temperature_c', 'window_average', 'gt', 30,
+                   60, 0, 120, 600, 60)",
+    )
+    .bind(rule_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let at = Utc.timestamp_opt(1_700_003_500, 123_456_000).unwrap();
+    insert_timescale_window_telemetry(&store, at, "device-b", 1, r#"{"temperature_c":32}"#).await;
+    insert_timescale_window_telemetry(&store, at, "device-a", 1, r#"{"temperature_c":31}"#).await;
+
+    let barrier = Arc::new(Barrier::new(3));
+    let first_store = store.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_store.evaluate_alert_windows(at).await
+    });
+    let second_store = store.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        second_store.evaluate_alert_windows(at).await
+    });
+    barrier.wait().await;
+
+    let (first, second) = tokio::time::timeout(TokioDuration::from_secs(5), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("multi-device window evaluations must not deadlock");
+    let first = first.unwrap().unwrap();
+    let second = second.unwrap().unwrap();
+    assert_eq!(first.evaluated, 2);
+    assert_eq!(second.evaluated, 2);
+    assert_eq!(first.opened + second.opened, 2);
+    assert_eq!(first.reminders + second.reminders, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents
+             WHERE rule_id = $1 AND status IN ('pending', 'open')",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_outbox
+             WHERE kind = 'opened' AND incident_id IN (
+                 SELECT id FROM alert_incidents WHERE rule_id = $1
+             )",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        2
     );
 }
