@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     io::BufReader,
-    net::SocketAddr,
+    net::{SocketAddr, TcpListener as StdTcpListener},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -74,6 +74,11 @@ pub struct BrokerLifecycleHandle {
     inner: Option<CoreBrokerHandle>,
     public_accept_stop: watch::Sender<bool>,
     public_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+pub struct PreboundBackendListeners {
+    pub v311: StdTcpListener,
+    pub v5: StdTcpListener,
 }
 
 impl BrokerLifecycleHandle {
@@ -1329,6 +1334,21 @@ pub async fn start_broker_with_storage(
     start_broker_with_storage_and_policy(configuration, storage, RetentionPolicy::default()).await
 }
 
+pub async fn start_broker_with_prebound_listeners(
+    configuration: ListenerConfiguration,
+    listeners: PreboundBackendListeners,
+    storage: std::sync::Arc<dyn BrokerStorage>,
+) -> Result<BrokerLifecycleHandle, MqttdError> {
+    start_broker_with_timeout_storage_and_prebound_listeners(
+        configuration,
+        DEFAULT_BROKER_STARTUP_TIMEOUT,
+        Some(storage),
+        RetentionPolicy::default(),
+        Some(listeners),
+    )
+    .await
+}
+
 pub async fn start_broker_with_storage_and_policy(
     configuration: ListenerConfiguration,
     storage: std::sync::Arc<dyn BrokerStorage>,
@@ -1349,6 +1369,23 @@ async fn start_broker_with_timeout_and_storage(
     storage: Option<std::sync::Arc<dyn BrokerStorage>>,
     policy: RetentionPolicy,
 ) -> Result<BrokerLifecycleHandle, MqttdError> {
+    start_broker_with_timeout_storage_and_prebound_listeners(
+        configuration,
+        startup_timeout,
+        storage,
+        policy,
+        None,
+    )
+    .await
+}
+
+async fn start_broker_with_timeout_storage_and_prebound_listeners(
+    configuration: ListenerConfiguration,
+    startup_timeout: Duration,
+    storage: Option<std::sync::Arc<dyn BrokerStorage>>,
+    policy: RetentionPolicy,
+    listeners: Option<PreboundBackendListeners>,
+) -> Result<BrokerLifecycleHandle, MqttdError> {
     let mut config = broker_config(&configuration)?;
     config.storage_policy = policy;
     if let Some(storage) = &storage {
@@ -1361,24 +1398,33 @@ async fn start_broker_with_timeout_and_storage(
             .map_err(|error| MqttdError::Broker(Box::new(error)))?;
         config.storage = Some(storage.clone());
     }
-    for address in [
-        configuration.v311_backend_address,
-        configuration.v5_backend_address,
-    ] {
-        std::net::TcpListener::bind(address).map_err(|error| {
-            MqttdError::Broker(Box::new(std::io::Error::new(
-                error.kind(),
-                format!("MQTT backend {address} is unavailable: {error}"),
-            )))
-        })?;
+    if listeners.is_none() {
+        for address in [
+            configuration.v311_backend_address,
+            configuration.v5_backend_address,
+        ] {
+            std::net::TcpListener::bind(address).map_err(|error| {
+                MqttdError::Broker(Box::new(std::io::Error::new(
+                    error.kind(),
+                    format!("MQTT backend {address} is unavailable: {error}"),
+                )))
+            })?;
+        }
     }
     let (public_accept_stop, _public_accept_shutdown) = watch::channel(false);
+    let broker = Broker::new(config).map_err(|error| MqttdError::Broker(Box::new(error)))?;
+    let inner = match listeners {
+        Some(listeners) => {
+            let mut v4_listeners = HashMap::new();
+            v4_listeners.insert("v311".to_owned(), listeners.v311);
+            let mut v5_listeners = HashMap::new();
+            v5_listeners.insert("v5".to_owned(), listeners.v5);
+            broker.spawn_with_prebound_listeners(v4_listeners, v5_listeners)
+        }
+        None => broker.spawn(),
+    };
     let handle = BrokerLifecycleHandle {
-        inner: Some(
-            Broker::new(config)
-                .map_err(|error| MqttdError::Broker(Box::new(error)))?
-                .spawn(),
-        ),
+        inner: Some(inner),
         public_accept_stop,
         public_workers: Mutex::new(Vec::new()),
     };

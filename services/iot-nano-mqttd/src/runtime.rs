@@ -27,8 +27,8 @@ use crate::{
     AuthenticatedDevice, AuthorizationError, BrokerLifecycleHandle, BrokerStorage, CacheEntry,
     CachePort, CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization,
     GatewayAuthorizationRequest, ListenerConfiguration, MqttdDeviceTransport, MqttdError,
-    MuxSettings, ProtocolBackends, RpcSessionRouter, TransportAuthRequest, load_tls_acceptor,
-    start_broker_with_storage,
+    MuxSettings, PreboundBackendListeners, ProtocolBackends, RpcSessionRouter,
+    TransportAuthRequest, load_tls_acceptor, start_broker_with_prebound_listeners,
 };
 
 const AUTHORIZATION_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -81,10 +81,16 @@ impl MqttRuntime {
         )
         .map_err(MqttRuntimeStartError::Tls)?;
 
-        let v311_backend_address =
-            reserve_private_address().map_err(MqttRuntimeStartError::PrivateBackendReservation)?;
-        let v5_backend_address =
-            reserve_private_address().map_err(MqttRuntimeStartError::PrivateBackendReservation)?;
+        let v311_backend_listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(MqttRuntimeStartError::PrivateBackendBind)?;
+        let v311_backend_address = v311_backend_listener
+            .local_addr()
+            .map_err(MqttRuntimeStartError::PrivateBackendBind)?;
+        let v5_backend_listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(MqttRuntimeStartError::PrivateBackendBind)?;
+        let v5_backend_address = v5_backend_listener
+            .local_addr()
+            .map_err(MqttRuntimeStartError::PrivateBackendBind)?;
         let device_v311_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(MqttRuntimeStartError::DeviceBackendBind)?;
@@ -98,7 +104,7 @@ impl MqttRuntime {
             .local_addr()
             .map_err(MqttRuntimeStartError::DeviceBackendBind)?;
 
-        let broker = start_broker_with_storage(
+        let broker = start_broker_with_prebound_listeners(
             ListenerConfiguration {
                 plaintext_address: config.listeners.plaintext_address,
                 tls_address: config.listeners.tls_address,
@@ -115,6 +121,10 @@ impl MqttRuntime {
                 token_authenticator: None,
                 auth_handler: None,
                 authorization_handler: None,
+            },
+            PreboundBackendListeners {
+                v311: v311_backend_listener,
+                v5: v5_backend_listener,
             },
             Arc::clone(&config.storage),
         )
@@ -403,8 +413,8 @@ pub enum MqttRuntimeStartError {
     InvalidLimit(&'static str),
     #[error("MQTT TLS setup failed")]
     Tls(#[source] MqttdError),
-    #[error("MQTT private backend reservation failed")]
-    PrivateBackendReservation(#[source] io::Error),
+    #[error("MQTT private backend bind failed")]
+    PrivateBackendBind(#[source] io::Error),
     #[error("MQTT private device backend bind failed")]
     DeviceBackendBind(#[source] io::Error),
     #[error("MQTT broker startup failed")]
@@ -441,13 +451,6 @@ fn validate_listeners(listeners: &MqttListenerConfig) -> Result<(), MqttRuntimeS
         }
     }
     Ok(())
-}
-
-fn reserve_private_address() -> io::Result<SocketAddr> {
-    let listener = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let address = listener.local_addr()?;
-    drop(listener);
-    Ok(address)
 }
 
 #[derive(Clone)]

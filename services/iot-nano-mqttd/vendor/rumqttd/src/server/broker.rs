@@ -15,7 +15,7 @@ use crate::server::tls::{self, TLSAcceptor};
 use crate::{meters, ConnectionSettings, Meter};
 use flume::{RecvError, SendError, Sender};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 use tracing::{error, field, info, warn, Instrument};
 
@@ -108,12 +108,20 @@ impl Broker {
         })
     }
 
-    pub fn spawn(mut self) -> BrokerHandle {
+    pub fn spawn(self) -> BrokerHandle {
+        self.spawn_with_prebound_listeners(HashMap::new(), HashMap::new())
+    }
+
+    pub fn spawn_with_prebound_listeners(
+        mut self,
+        v4_listeners: HashMap<String, StdTcpListener>,
+        v5_listeners: HashMap<String, StdTcpListener>,
+    ) -> BrokerHandle {
         let (shutdown, receiver) = watch::channel(false);
         let router_tx = self.router_tx.clone();
         let join = thread::Builder::new()
             .name("iot-mqtt-core-broker".to_owned())
-            .spawn(move || self.start_with_shutdown(receiver))
+            .spawn(move || self.start_with_shutdown(receiver, v4_listeners, v5_listeners))
             .expect("broker thread must start");
         BrokerHandle {
             shutdown,
@@ -184,11 +192,16 @@ impl Broker {
     #[tracing::instrument(skip(self))]
     pub fn start(&mut self) -> Result<(), Error> {
         let (_shutdown, receiver) = watch::channel(false);
-        self.start_with_shutdown(receiver)
+        self.start_with_shutdown(receiver, HashMap::new(), HashMap::new())
     }
 
     #[tracing::instrument(skip(self))]
-    fn start_with_shutdown(&mut self, shutdown: watch::Receiver<bool>) -> Result<(), Error> {
+    fn start_with_shutdown(
+        &mut self,
+        shutdown: watch::Receiver<bool>,
+        mut v4_listeners: HashMap<String, StdTcpListener>,
+        mut v5_listeners: HashMap<String, StdTcpListener>,
+    ) -> Result<(), Error> {
         if self.config.v4.is_none()
             && self.config.v5.is_none()
             && (cfg!(not(feature = "websocket")) || self.config.ws.is_none())
@@ -250,16 +263,29 @@ impl Broker {
 
         // Spawn servers in a separate thread.
         if let Some(v4_config) = &self.config.v4 {
-            for (_, config) in v4_config.clone() {
+            for (name, config) in v4_config.clone() {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
                 let shutdown = shutdown.clone();
+                let listener = v4_listeners.remove(&name);
                 let handle = server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
                     runtime.block_on(async {
-                        if let Err(e) = server.start(LinkType::Remote, shutdown).await {
+                        let result = match listener {
+                            Some(listener) => {
+                                server
+                                    .start_with_prebound_listener(
+                                        listener,
+                                        LinkType::Remote,
+                                        shutdown,
+                                    )
+                                    .await
+                            }
+                            None => server.start(LinkType::Remote, shutdown).await,
+                        };
+                        if let Err(e) = result {
                             error!(error=?e, "Server error - V4");
                         }
                     });
@@ -269,16 +295,29 @@ impl Broker {
         }
 
         if let Some(v5_config) = &self.config.v5 {
-            for (_, config) in v5_config.clone() {
+            for (name, config) in v5_config.clone() {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V5);
                 let shutdown = shutdown.clone();
+                let listener = v5_listeners.remove(&name);
                 let handle = server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
                     runtime.block_on(async {
-                        if let Err(e) = server.start(LinkType::Remote, shutdown).await {
+                        let result = match listener {
+                            Some(listener) => {
+                                server
+                                    .start_with_prebound_listener(
+                                        listener,
+                                        LinkType::Remote,
+                                        shutdown,
+                                    )
+                                    .await
+                            }
+                            None => server.start(LinkType::Remote, shutdown).await,
+                        };
+                        if let Err(e) = result {
                             error!(error=?e, "Server error - V5");
                         }
                     });
@@ -477,9 +516,29 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
     pub async fn start(
         &mut self,
         link_type: LinkType,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) -> Result<(), Error> {
         let listener = TcpListener::bind(&self.config.listen).await?;
+        self.accept(listener, link_type, shutdown).await
+    }
+
+    pub async fn start_with_prebound_listener(
+        &mut self,
+        listener: StdTcpListener,
+        link_type: LinkType,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<(), Error> {
+        listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(listener)?;
+        self.accept(listener, link_type, shutdown).await
+    }
+
+    async fn accept(
+        &self,
+        listener: TcpListener,
+        link_type: LinkType,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), Error> {
         let delay = Duration::from_millis(self.config.next_connection_delay_ms);
         let mut count: usize = 0;
         let mut remote_tasks = Vec::new();
