@@ -5,9 +5,7 @@ use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use chrono::{
-    DateTime, Duration as ChronoDuration, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
-};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Timelike, Utc};
 use iot_core::{
     DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent, device_token_prefix,
     verify_device_token,
@@ -2384,18 +2382,58 @@ impl PlatformStore {
             Self::Sqlite(store) => {
                 let path = format!("$.{metric_key}");
                 let row = sqlx::query(
-                    "SELECT AVG(json_extract(measurements, ?)) AS average,
+                    "WITH canonical_telemetry AS (
+                        SELECT measurements,
+                               CAST(unixepoch(event_at) AS INTEGER) * 1000000
+                               + CASE
+                                   WHEN instr(event_at, '.') = 0 THEN 0
+                                   ELSE CAST(
+                                       substr(
+                                           substr(
+                                               event_at,
+                                               instr(event_at, '.') + 1,
+                                               CASE
+                                                   WHEN instr(
+                                                       substr(event_at, instr(event_at, '.') + 1),
+                                                       'Z'
+                                                   ) > 0
+                                                   THEN instr(
+                                                       substr(event_at, instr(event_at, '.') + 1),
+                                                       'Z'
+                                                   ) - 1
+                                                   WHEN instr(
+                                                       substr(event_at, instr(event_at, '.') + 1),
+                                                       '+'
+                                                   ) > 0
+                                                   THEN instr(
+                                                       substr(event_at, instr(event_at, '.') + 1),
+                                                       '+'
+                                                   ) - 1
+                                                   ELSE instr(
+                                                       substr(event_at, instr(event_at, '.') + 1),
+                                                       '-'
+                                                   ) - 1
+                                               END
+                                           ) || '000000',
+                                           1,
+                                           6
+                                       ) AS INTEGER
+                                   )
+                               END AS event_at_micros
+                        FROM telemetry
+                        WHERE device_id = ?
+                     )
+                     SELECT AVG(json_extract(measurements, ?)) AS average,
                             COUNT(*) AS sample_count
-                     FROM telemetry
-                     WHERE device_id = ?
-                       AND event_at >= ?
-                       AND event_at <= ?
+                     FROM canonical_telemetry
+                     WHERE event_at_micros >= ?
+                       AND event_at_micros <= ?
                        AND json_type(measurements, ?) IN ('integer', 'real')",
                 )
-                .bind(&path)
                 .bind(device_id)
-                .bind(sqlite_timestamp(from))
-                .bind(sqlite_timestamp(to))
+                .bind(&path)
+                .bind(from.timestamp_micros())
+                .bind(to.timestamp_micros())
                 .bind(&path)
                 .fetch_one(store.pool())
                 .await?;
@@ -3032,10 +3070,6 @@ fn canonical_postgres_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
     timestamp
         .with_nanosecond(timestamp.nanosecond() / 1_000 * 1_000)
         .expect("a valid UTC timestamp can be represented at microsecond precision")
-}
-
-fn sqlite_timestamp(timestamp: DateTime<Utc>) -> String {
-    timestamp.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
 fn validate_telemetry_metric_key(metric_key: &str) -> Result<(), PlatformStoreError> {

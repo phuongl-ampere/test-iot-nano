@@ -1,4 +1,4 @@
-use chrono::{TimeZone, Utc};
+use chrono::{TimeZone, Timelike, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{PlatformStore, PlatformStoreError, TelemetryAggregateRepository};
 use sqlx::{Connection, PgConnection};
@@ -63,6 +63,56 @@ async fn sqlite_telemetry_aggregate_contract_uses_canonical_ranges_and_filters_s
     let (_directory, store) = sqlite_store().await;
     seed_sqlite_aggregate_contract(&store).await;
     exercise_aggregate_contract(&store).await;
+}
+
+#[tokio::test]
+async fn sqlite_telemetry_aggregate_parses_rfc3339_range_values_without_lexical_ordering() {
+    let (_directory, store) = sqlite_store().await;
+    for (event_at, sequence, measurements) in [
+        ("2026-01-01T00:00:00+00:00", 1, r#"{"temperature_c":10}"#),
+        (
+            "2026-01-01T00:00:00.000000900+00:00",
+            2,
+            r#"{"temperature_c":20}"#,
+        ),
+        ("2026-01-01T00:00:00.000001Z", 3, r#"{"temperature_c":30}"#),
+        (
+            "2026-01-01T00:00:00.000000500Z",
+            4,
+            r#"{"temperature_c":"not-a-number"}"#,
+        ),
+        (
+            "2026-01-01T00:00:00.000002100+00:00",
+            5,
+            r#"{"temperature_c":40}"#,
+        ),
+    ] {
+        insert_sqlite_telemetry(&store, event_at, sequence, measurements).await;
+    }
+
+    let from = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .with_nanosecond(900)
+        .unwrap();
+    let to = Utc
+        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+        .unwrap()
+        .with_nanosecond(1_900)
+        .unwrap();
+    let aggregate = TelemetryAggregateRepository::average_metric(
+        &store,
+        "aggregate-device",
+        "temperature_c",
+        from,
+        to,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(aggregate.average, 20.0);
+    assert_eq!(aggregate.sample_count, 3);
 }
 
 async fn seed_sqlite_aggregate_contract(store: &PlatformStore) {
