@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration,
-};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
 use crate::{CommandOutboxRecord, CoreSqliteStore, CoreSqliteStoreError};
 use chrono::{DateTime, Duration, Utc};
@@ -262,7 +260,6 @@ pub struct PlatformCommandDispatcher<C> {
     store: Arc<PlatformStore>,
     transport: C,
     batch_size: u32,
-    issue_times: Arc<tokio::sync::Mutex<HashMap<String, DateTime<Utc>>>>,
 }
 
 impl<C> PlatformCommandDispatcher<C>
@@ -274,7 +271,6 @@ where
             store,
             transport,
             batch_size: batch_size.max(1),
-            issue_times: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -298,19 +294,8 @@ where
         result.claimed = commands.len();
 
         for record in commands {
-            let issued_at = {
-                let mut issue_times = self.issue_times.lock().await;
-                *issue_times
-                    .entry(record.id.clone())
-                    .or_insert(record.next_attempt_at)
-            };
-            let command = PlatformClaimedCommand::from_record(record, issued_at);
-            let retrying =
-                dispatch_platform_command(&self.store, &self.transport, &command, &mut result)
-                    .await?;
-            if !retrying {
-                self.issue_times.lock().await.remove(&command.id);
-            }
+            let command = PlatformClaimedCommand::from_record(record);
+            dispatch_platform_command(&self.store, &self.transport, &command, &mut result).await?;
         }
         Ok(result)
     }
@@ -353,14 +338,14 @@ struct PlatformClaimedCommand {
 }
 
 impl PlatformClaimedCommand {
-    fn from_record(command: PlatformCommandOutboxRecord, issued_at: DateTime<Utc>) -> Self {
+    fn from_record(command: PlatformCommandOutboxRecord) -> Self {
         Self {
             id: command.id,
             device_id: command.device_id,
             method: command.method,
             params: command.params,
             mode: command.mode,
-            issued_at,
+            issued_at: command.created_at,
             expires_at: command.expires_at,
         }
     }

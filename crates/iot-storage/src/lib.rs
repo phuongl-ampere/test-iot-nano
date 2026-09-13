@@ -1950,7 +1950,7 @@ impl PlatformStore {
                            )
                        AND expires_at <= $1
                      RETURNING
-                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                        id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                         lease_until, attempt_count, last_error, published_at, response, responded_at",
                 )
                 .bind(now)
@@ -2016,7 +2016,7 @@ impl PlatformStore {
                               AND revoked_at IS NULL
                        )
                      RETURNING
-                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                        id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                         lease_until, attempt_count, last_error, published_at, response, responded_at",
                 )
                 .bind(Json(response_value))
@@ -2532,7 +2532,7 @@ async fn enqueue_sqlite_platform_command(
          ) VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO NOTHING
          RETURNING
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
     )
     .bind(&command.id)
@@ -2550,7 +2550,7 @@ async fn enqueue_sqlite_platform_command(
 
     let existing = sqlx::query(
         "SELECT
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at
          FROM command_outbox
          WHERE id = ?",
@@ -2583,7 +2583,7 @@ async fn enqueue_timescale_platform_command(
          ) VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (id) DO NOTHING
          RETURNING
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
     )
     .bind(id)
@@ -2603,7 +2603,7 @@ async fn enqueue_timescale_platform_command(
 
     let existing = sqlx::query(
         "SELECT
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at
          FROM command_outbox
          WHERE id = $1",
@@ -2667,7 +2667,7 @@ async fn claim_timescale_commands(
          WHERE command.id = due.id
          RETURNING
             command.id, command.device_id, command.method, command.params, command.mode,
-            command.state, command.expires_at, command.next_attempt_at, command.lease_until,
+            command.state, command.created_at, command.expires_at, command.next_attempt_at, command.lease_until,
             command.attempt_count, command.last_error, command.published_at, command.response,
             command.responded_at",
     )
@@ -3007,7 +3007,7 @@ async fn mark_timescale_command_published(
          SET state = 'published_to_broker', published_at = $1, lease_until = NULL
          WHERE id = $2 AND state = 'leased' AND expires_at > $1
          RETURNING
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
     )
     .bind(published_at)
@@ -3027,7 +3027,7 @@ async fn mark_timescale_command_failed(
          SET state = 'failed', last_error = $1, lease_until = NULL
          WHERE id = $2 AND state = 'leased'
          RETURNING
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
     )
     .bind(error)
@@ -3048,7 +3048,7 @@ async fn release_timescale_command_for_retry(
          SET state = 'queued', next_attempt_at = $1, last_error = $2, lease_until = NULL
          WHERE id = $3 AND state = 'leased' AND expires_at > $1
          RETURNING
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, response, responded_at",
     )
     .bind(next_attempt_at)
@@ -3884,6 +3884,7 @@ fn postgres_command_outbox_record(row: PgRow) -> Result<CommandOutboxRecord, Pla
             .to_string(),
         mode: command_mode_from_database(&row.try_get::<String, _>("mode")?)?,
         state: CommandOutboxState::from_database(&row.try_get::<String, _>("state")?)?,
+        created_at: row.try_get("created_at")?,
         expires_at: row.try_get("expires_at")?,
         next_attempt_at: row.try_get("next_attempt_at")?,
         lease_until: row.try_get("lease_until")?,
@@ -3959,6 +3960,7 @@ pub struct CommandOutboxRecord {
     pub params: String,
     pub mode: RpcMode,
     pub state: CommandOutboxState,
+    pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub next_attempt_at: DateTime<Utc>,
     pub lease_until: Option<DateTime<Utc>>,
@@ -4118,7 +4120,7 @@ impl SqliteStore {
                 id, device_id, method, params, mode, expires_at, next_attempt_at
              ) VALUES (?, ?, ?, ?, ?, ?, ?)
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(command.id)
@@ -4162,7 +4164,7 @@ impl SqliteStore {
                  attempt_count = attempt_count + 1
              WHERE id IN (SELECT id FROM due)
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(&now)
@@ -4190,7 +4192,7 @@ impl SqliteStore {
                AND state = 'leased'
                AND expires_at > ?
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(&published_at)
@@ -4214,7 +4216,7 @@ impl SqliteStore {
              WHERE id = ?
                AND state = 'leased'
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(error)
@@ -4241,7 +4243,7 @@ impl SqliteStore {
                AND state = 'leased'
                AND expires_at > ?
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(&next_attempt_at)
@@ -4600,7 +4602,7 @@ impl SqliteStore {
                    )
                AND expires_at <= ?
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(now.to_rfc3339())
@@ -4645,7 +4647,7 @@ impl SqliteStore {
                       AND revoked_at IS NULL
                )
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(response)
@@ -5017,6 +5019,7 @@ fn command_outbox_record(row: SqliteRow) -> Result<CommandOutboxRecord, SqliteSt
         params: row.try_get("params")?,
         mode: command_mode_from_database(&row.try_get::<String, _>("mode")?)?,
         state: CommandOutboxState::from_database(&row.try_get::<String, _>("state")?)?,
+        created_at: command_timestamp(&row, "created_at")?,
         expires_at: command_timestamp(&row, "expires_at")?,
         next_attempt_at: command_timestamp(&row, "next_attempt_at")?,
         lease_until: command_optional_timestamp(&row, "lease_until")?,
@@ -5176,13 +5179,11 @@ fn command_timestamp(
     column: &'static str,
 ) -> Result<DateTime<Utc>, SqliteStoreError> {
     let value: String = row.try_get(column)?;
-    DateTime::parse_from_rfc3339(&value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|source| SqliteStoreError::InvalidCommandTimestamp {
-            column,
-            value,
-            source,
-        })
+    parse_command_timestamp(&value).map_err(|source| SqliteStoreError::InvalidCommandTimestamp {
+        column,
+        value,
+        source,
+    })
 }
 
 fn command_optional_timestamp(
@@ -5191,15 +5192,21 @@ fn command_optional_timestamp(
 ) -> Result<Option<DateTime<Utc>>, SqliteStoreError> {
     row.try_get::<Option<String>, _>(column)?
         .map(|value| {
-            DateTime::parse_from_rfc3339(&value)
-                .map(|timestamp| timestamp.with_timezone(&Utc))
-                .map_err(|source| SqliteStoreError::InvalidCommandTimestamp {
+            parse_command_timestamp(&value).map_err(|source| {
+                SqliteStoreError::InvalidCommandTimestamp {
                     column,
                     value,
                     source,
-                })
+                }
+            })
         })
         .transpose()
+}
+
+fn parse_command_timestamp(value: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(value)
+        .or_else(|_| DateTime::parse_from_str(&format!("{value} +00:00"), "%Y-%m-%d %H:%M:%S %z"))
+        .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
 async fn delete_before(

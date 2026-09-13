@@ -76,6 +76,66 @@ async fn sqlite_command_outbox_claim_leases_a_command_only_once() {
 }
 
 #[tokio::test]
+async fn sqlite_command_outbox_preserves_created_at_across_lifecycle_transitions() {
+    let (_directory, store) = store().await;
+    let issued_at = at(1_800_000_000);
+    let command_id = "command-created-at";
+    let mut entry = command(command_id, issued_at, issued_at + Duration::minutes(5));
+    entry.mode = RpcMode::TwoWay;
+
+    let enqueued = store.enqueue_command(entry).await.unwrap();
+    let created_at = enqueued.created_at;
+    let claimed = store
+        .claim_commands(issued_at, issued_at + Duration::seconds(30), 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let released = store
+        .release_command_for_retry(
+            command_id,
+            "broker unavailable",
+            issued_at + Duration::seconds(2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let reclaimed = store
+        .claim_commands(
+            issued_at + Duration::seconds(2),
+            issued_at + Duration::seconds(32),
+            1,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let published = store
+        .mark_command_published(command_id, issued_at + Duration::seconds(3))
+        .await
+        .unwrap()
+        .unwrap();
+    let responded = store
+        .mark_command_responded(
+            command_id,
+            "device-1",
+            "active-token",
+            r#"{"ok":true}"#,
+            issued_at + Duration::seconds(4),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(enqueued.created_at, created_at);
+    assert_eq!(claimed.created_at, created_at);
+    assert_eq!(released.created_at, created_at);
+    assert_eq!(reclaimed.created_at, created_at);
+    assert_eq!(published.created_at, created_at);
+    assert_eq!(responded.created_at, created_at);
+}
+
+#[tokio::test]
 async fn sqlite_platform_store_command_lifecycle_port_claims_a_command() {
     let (_directory, sqlite) = store().await;
     let platform = PlatformStore::Sqlite(sqlite);

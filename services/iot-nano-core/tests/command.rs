@@ -398,7 +398,7 @@ async fn platform_dispatcher_claims_and_publishes_through_the_platform_store() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();
     let command_id = Uuid::now_v7();
-    store
+    let enqueued = store
         .enqueue_command(PlatformCommand {
             id: command_id.to_string(),
             device_id: "device-a".to_owned(),
@@ -426,7 +426,7 @@ async fn platform_dispatcher_claims_and_publishes_through_the_platform_store() {
     assert_eq!(requests[0].method, "sample_now");
     assert_eq!(requests[0].params, json!({ "source": "dashboard" }));
     assert_eq!(requests[0].mode, RpcMode::TwoWay);
-    assert_eq!(requests[0].issued_at, now);
+    assert_eq!(requests[0].issued_at, enqueued.created_at);
     assert_eq!(requests[0].expires_at, now + Duration::seconds(30));
 }
 
@@ -515,7 +515,7 @@ async fn platform_dispatcher_preserves_original_issue_time_after_retry() {
     let (_directory, store) = platform_store().await;
     let issued_at = Utc::now();
     let command_id = Uuid::now_v7();
-    store
+    let enqueued = store
         .enqueue_command(PlatformCommand {
             id: command_id.to_string(),
             device_id: "device-a".to_owned(),
@@ -528,10 +528,13 @@ async fn platform_dispatcher_preserves_original_issue_time_after_retry() {
         .await
         .unwrap();
     let transport = RetryThenSuccessTransport::new();
-    let dispatcher = PlatformCommandDispatcher::new(Arc::new(store), transport.clone(), 10);
+    let first_dispatcher =
+        PlatformCommandDispatcher::new(Arc::new(store.clone()), transport.clone(), 10);
 
-    let first = dispatcher.dispatch_once(issued_at).await.unwrap();
-    let second = dispatcher
+    let first = first_dispatcher.dispatch_once(issued_at).await.unwrap();
+    drop(first_dispatcher);
+    let second_dispatcher = PlatformCommandDispatcher::new(Arc::new(store), transport.clone(), 10);
+    let second = second_dispatcher
         .dispatch_once(issued_at + Duration::seconds(2))
         .await
         .unwrap();
@@ -541,8 +544,8 @@ async fn platform_dispatcher_preserves_original_issue_time_after_retry() {
     assert_eq!(second.published, 1);
     let requests = transport.requests.lock().await;
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].issued_at, issued_at);
-    assert_eq!(requests[1].issued_at, issued_at);
+    assert_eq!(requests[0].issued_at, enqueued.created_at);
+    assert_eq!(requests[1].issued_at, enqueued.created_at);
 }
 
 #[tokio::test]
