@@ -197,6 +197,9 @@ async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
             r#"{"temperature_c":"not-a-number"}"#,
         ),
     ] {
+        let event_at = chrono::DateTime::parse_from_rfc3339(event_at)
+            .unwrap()
+            .with_timezone(&Utc);
         sqlx::query(
             "INSERT INTO telemetry (
                 event_at, received_at, device_id, boot_id, sequence, measurements, topic

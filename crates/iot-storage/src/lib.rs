@@ -2415,19 +2415,13 @@ impl PlatformStore {
                     "SELECT AVG(
                                 CASE
                                     WHEN jsonb_typeof(measurements -> $1) = 'number'
-                                    THEN CASE
-                                        WHEN isfinite((measurements ->> $1)::double precision)
-                                        THEN (measurements ->> $1)::double precision
-                                    END
+                                    THEN (measurements ->> $1)::double precision
                                 END
                             ) AS average,
                             COUNT(
                                 CASE
                                     WHEN jsonb_typeof(measurements -> $1) = 'number'
-                                    THEN CASE
-                                        WHEN isfinite((measurements ->> $1)::double precision)
-                                        THEN 1
-                                    END
+                                    THEN 1
                                 END
                             ) AS sample_count
                      FROM telemetry
