@@ -829,6 +829,32 @@ pub enum AlertSeverity {
     Critical,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertEvaluationEvent {
+    pub event_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub device_id: String,
+    pub boot_id: uuid::Uuid,
+    pub sequence: u64,
+    pub measurements: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlertEvaluationResult {
+    pub evaluated: usize,
+    pub opened: usize,
+    pub resolved: usize,
+    pub reminders: usize,
+}
+
+pub trait AlertEvaluationRepository: Send + Sync {
+    fn evaluate_alert_events<'a>(
+        &'a self,
+        events: &'a [AlertEvaluationEvent],
+        evaluated_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<AlertEvaluationResult, PlatformStoreError>> + Send + 'a>>;
+}
+
 pub trait AlertRepository: Send + Sync {
     fn load_active_rules<'a>(
         &'a self,
@@ -1187,6 +1213,17 @@ impl PlatformStore {
                 .await?;
                 Ok(result.rows_affected() == 1)
             }
+        }
+    }
+
+    pub async fn evaluate_alert_events(
+        &self,
+        events: &[AlertEvaluationEvent],
+        _evaluated_at: DateTime<Utc>,
+    ) -> Result<AlertEvaluationResult, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => evaluate_sqlite_alert_events(store, events).await,
+            Self::Timescale(pool) => evaluate_timescale_alert_events(pool, events).await,
         }
     }
 
@@ -3104,6 +3141,982 @@ fn canonical_postgres_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
         .expect("a valid UTC timestamp can be represented at microsecond precision")
 }
 
+fn event_condition(rule: &AlertRule, value: f64) -> Option<bool> {
+    let hysteresis = rule.hysteresis.unwrap_or(0.0);
+    Some(match rule.comparison {
+        AlertComparison::GreaterThan if value > rule.threshold => true,
+        AlertComparison::GreaterThan if value <= rule.threshold - hysteresis => false,
+        AlertComparison::GreaterThanOrEqual if value >= rule.threshold => true,
+        AlertComparison::GreaterThanOrEqual if value < rule.threshold - hysteresis => false,
+        AlertComparison::LessThan if value < rule.threshold => true,
+        AlertComparison::LessThan if value >= rule.threshold + hysteresis => false,
+        AlertComparison::LessThanOrEqual if value <= rule.threshold => true,
+        AlertComparison::LessThanOrEqual if value > rule.threshold + hysteresis => false,
+        _ => return None,
+    })
+}
+
+fn alert_severity_name(severity: AlertSeverity) -> &'static str {
+    match severity {
+        AlertSeverity::Info => "INFO",
+        AlertSeverity::Warning => "WARNING",
+        AlertSeverity::Critical => "CRITICAL",
+    }
+}
+
+#[derive(Default)]
+struct EventTransition {
+    opened: bool,
+    resolved: bool,
+    reminder: bool,
+}
+
+struct EventIncident {
+    id: uuid::Uuid,
+    status: AlertIncidentStatus,
+    condition_started_at: DateTime<Utc>,
+    recovery_started_at: Option<DateTime<Utc>>,
+    acknowledged_at: Option<DateTime<Utc>>,
+    last_reminder_at: Option<DateTime<Utc>>,
+    state_version: i64,
+}
+
+fn sqlite_event_incident(row: SqliteRow) -> Result<EventIncident, PlatformStoreError> {
+    let id: String = row.try_get("id")?;
+    Ok(EventIncident {
+        id: uuid::Uuid::parse_str(&id).map_err(|_| PlatformStoreError::InvalidIncidentId(id))?,
+        status: AlertIncidentStatus::from_database(&row.try_get::<String, _>("status")?)?,
+        condition_started_at: incident_timestamp(&row, "condition_started_at")?,
+        recovery_started_at: incident_optional_timestamp(&row, "recovery_started_at")?,
+        acknowledged_at: incident_optional_timestamp(&row, "acknowledged_at")?,
+        last_reminder_at: incident_optional_timestamp(&row, "last_reminder_at")?,
+        state_version: row.try_get("state_version")?,
+    })
+}
+
+fn postgres_event_incident(row: PgRow) -> Result<EventIncident, PlatformStoreError> {
+    Ok(EventIncident {
+        id: row.try_get("id")?,
+        status: AlertIncidentStatus::from_database(&row.try_get::<String, _>("status")?)?,
+        condition_started_at: row.try_get("condition_started_at")?,
+        recovery_started_at: row.try_get("recovery_started_at")?,
+        acknowledged_at: row.try_get("acknowledged_at")?,
+        last_reminder_at: row.try_get("last_reminder_at")?,
+        state_version: i64::from(row.try_get::<i32, _>("state_version")?),
+    })
+}
+
+fn event_notification(
+    rule: &AlertRule,
+    incident_id: uuid::Uuid,
+    device_id: &str,
+    value: f64,
+    kind: &str,
+    state_version: i64,
+    created_at: DateTime<Utc>,
+) -> (String, String, String) {
+    let dedupe_key = match kind {
+        "opened" | "resolved" => format!("incident:{incident_id}:{kind}:{state_version}"),
+        "reminder" => format!(
+            "incident:{incident_id}:reminder:{state_version}:{}",
+            created_at
+                .timestamp()
+                .div_euclid(rule.reminder_interval.num_seconds())
+        ),
+        _ => unreachable!("event notifications have a known kind"),
+    };
+    let severity = alert_severity_name(rule.severity);
+    (
+        dedupe_key,
+        format!("[{severity}] {} {kind}", rule.name),
+        format!(
+            "Rule: {}\nDevice: {device_id}\nMetric: {}\nValue: {value:.3}\nThreshold: {:.3}\nState: {kind}\n",
+            rule.name, rule.metric_key, rule.threshold
+        ),
+    )
+}
+
+async fn insert_sqlite_event_notification(
+    transaction: &mut Transaction<'_, Sqlite>,
+    rule: &AlertRule,
+    incident_id: uuid::Uuid,
+    device_id: &str,
+    value: f64,
+    kind: &str,
+    state_version: i64,
+    created_at: DateTime<Utc>,
+) -> Result<(), PlatformStoreError> {
+    let (dedupe_key, subject, body) = event_notification(
+        rule,
+        incident_id,
+        device_id,
+        value,
+        kind,
+        state_version,
+        created_at,
+    );
+    let created_at = created_at.to_rfc3339();
+    sqlx::query(
+        "INSERT INTO notification_outbox (
+            id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(incident_id.to_string())
+    .bind(kind)
+    .bind(dedupe_key)
+    .bind(subject)
+    .bind(body)
+    .bind(&created_at)
+    .bind(&created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_timescale_event_notification(
+    transaction: &mut Transaction<'_, Postgres>,
+    rule: &AlertRule,
+    incident_id: uuid::Uuid,
+    device_id: &str,
+    value: f64,
+    kind: &str,
+    state_version: i64,
+    created_at: DateTime<Utc>,
+) -> Result<(), PlatformStoreError> {
+    let (dedupe_key, subject, body) = event_notification(
+        rule,
+        incident_id,
+        device_id,
+        value,
+        kind,
+        state_version,
+        created_at,
+    );
+    sqlx::query(
+        "INSERT INTO notification_outbox (
+            id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(incident_id)
+    .bind(kind)
+    .bind(dedupe_key)
+    .bind(subject)
+    .bind(body)
+    .bind(created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn load_sqlite_active_event_incident(
+    transaction: &mut Transaction<'_, Sqlite>,
+    rule_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<Option<EventIncident>, PlatformStoreError> {
+    sqlx::query(
+        "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
+                last_reminder_at, state_version
+         FROM alert_incidents
+         WHERE rule_id = ? AND device_id = ? AND status IN ('pending', 'open')",
+    )
+    .bind(rule_id.to_string())
+    .bind(device_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(sqlite_event_incident)
+    .transpose()
+}
+
+async fn load_timescale_active_event_incident(
+    transaction: &mut Transaction<'_, Postgres>,
+    rule_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<Option<EventIncident>, PlatformStoreError> {
+    sqlx::query(
+        "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
+                last_reminder_at, state_version
+         FROM alert_incidents
+         WHERE rule_id = $1 AND device_id = $2 AND status IN ('pending', 'open')
+         FOR UPDATE",
+    )
+    .bind(rule_id)
+    .bind(device_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(postgres_event_incident)
+    .transpose()
+}
+
+async fn load_sqlite_recent_resolved_event_incident(
+    transaction: &mut Transaction<'_, Sqlite>,
+    rule_id: uuid::Uuid,
+    device_id: &str,
+    reopen_after: DateTime<Utc>,
+) -> Result<Option<EventIncident>, PlatformStoreError> {
+    sqlx::query(
+        "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
+                last_reminder_at, state_version
+         FROM alert_incidents
+         WHERE rule_id = ? AND device_id = ? AND status = 'resolved' AND resolved_at >= ?
+         ORDER BY resolved_at DESC
+         LIMIT 1",
+    )
+    .bind(rule_id.to_string())
+    .bind(device_id)
+    .bind(reopen_after.to_rfc3339())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(sqlite_event_incident)
+    .transpose()
+}
+
+async fn load_timescale_recent_resolved_event_incident(
+    transaction: &mut Transaction<'_, Postgres>,
+    rule_id: uuid::Uuid,
+    device_id: &str,
+    reopen_after: DateTime<Utc>,
+) -> Result<Option<EventIncident>, PlatformStoreError> {
+    sqlx::query(
+        "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
+                last_reminder_at, state_version
+         FROM alert_incidents
+         WHERE rule_id = $1 AND device_id = $2 AND status = 'resolved' AND resolved_at >= $3
+         ORDER BY resolved_at DESC
+         LIMIT 1
+         FOR UPDATE",
+    )
+    .bind(rule_id)
+    .bind(device_id)
+    .bind(reopen_after)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(postgres_event_incident)
+    .transpose()
+}
+
+async fn reopen_sqlite_event_incident(
+    transaction: &mut Transaction<'_, Sqlite>,
+    rule: &AlertRule,
+    incident: EventIncident,
+    device_id: &str,
+    value: f64,
+    evaluated_at: DateTime<Utc>,
+) -> Result<EventTransition, PlatformStoreError> {
+    let at = evaluated_at.to_rfc3339();
+    if rule.for_duration == ChronoDuration::zero() {
+        let state_version = incident.state_version + 1;
+        sqlx::query(
+            "UPDATE alert_incidents
+             SET status = 'open', condition_started_at = ?, recovery_started_at = NULL,
+                 opened_at = ?, resolved_at = NULL, acknowledged_at = NULL,
+                 acknowledged_by = NULL, last_value = ?, last_notified_at = ?,
+                 last_reminder_at = ?, state_version = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&at)
+        .bind(&at)
+        .bind(value)
+        .bind(&at)
+        .bind(&at)
+        .bind(state_version)
+        .bind(&at)
+        .bind(incident.id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+        insert_sqlite_event_notification(
+            transaction,
+            rule,
+            incident.id,
+            device_id,
+            value,
+            "opened",
+            state_version,
+            evaluated_at,
+        )
+        .await?;
+        return Ok(EventTransition {
+            opened: true,
+            ..EventTransition::default()
+        });
+    }
+    sqlx::query(
+        "UPDATE alert_incidents
+         SET status = 'pending', condition_started_at = ?, recovery_started_at = NULL,
+             opened_at = NULL, resolved_at = NULL, acknowledged_at = NULL,
+             acknowledged_by = NULL, last_value = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&at)
+    .bind(value)
+    .bind(&at)
+    .bind(incident.id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(EventTransition::default())
+}
+
+async fn reopen_timescale_event_incident(
+    transaction: &mut Transaction<'_, Postgres>,
+    rule: &AlertRule,
+    incident: EventIncident,
+    device_id: &str,
+    value: f64,
+    evaluated_at: DateTime<Utc>,
+) -> Result<EventTransition, PlatformStoreError> {
+    if rule.for_duration == ChronoDuration::zero() {
+        let state_version = incident.state_version + 1;
+        sqlx::query(
+            "UPDATE alert_incidents
+             SET status = 'open', condition_started_at = $2, recovery_started_at = NULL,
+                 opened_at = $2, resolved_at = NULL, acknowledged_at = NULL,
+                 acknowledged_by = NULL, last_value = $3, last_notified_at = $2,
+                 last_reminder_at = $2, state_version = $4, updated_at = $2
+             WHERE id = $1",
+        )
+        .bind(incident.id)
+        .bind(evaluated_at)
+        .bind(value)
+        .bind(state_version as i32)
+        .execute(&mut **transaction)
+        .await?;
+        insert_timescale_event_notification(
+            transaction,
+            rule,
+            incident.id,
+            device_id,
+            value,
+            "opened",
+            state_version,
+            evaluated_at,
+        )
+        .await?;
+        return Ok(EventTransition {
+            opened: true,
+            ..EventTransition::default()
+        });
+    }
+    sqlx::query(
+        "UPDATE alert_incidents
+         SET status = 'pending', condition_started_at = $2, recovery_started_at = NULL,
+             opened_at = NULL, resolved_at = NULL, acknowledged_at = NULL,
+             acknowledged_by = NULL, last_value = $3, updated_at = $2
+         WHERE id = $1",
+    )
+    .bind(incident.id)
+    .bind(evaluated_at)
+    .bind(value)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(EventTransition::default())
+}
+
+async fn evaluate_sqlite_event_transition(
+    transaction: &mut Transaction<'_, Sqlite>,
+    rule: &AlertRule,
+    device_id: &str,
+    value: f64,
+    evaluated_at: DateTime<Utc>,
+) -> Result<EventTransition, PlatformStoreError> {
+    let condition = event_condition(rule, value);
+    let at = evaluated_at.to_rfc3339();
+    if condition != Some(true) {
+        if condition == Some(false) {
+            if let Some(incident) =
+                load_sqlite_active_event_incident(transaction, rule.id, device_id).await?
+            {
+                match incident.status {
+                    AlertIncidentStatus::Pending => {
+                        sqlx::query("DELETE FROM alert_incidents WHERE id = ?")
+                            .bind(incident.id.to_string())
+                            .execute(&mut **transaction)
+                            .await?;
+                    }
+                    AlertIncidentStatus::Open => {
+                        let recovery_started_at =
+                            incident.recovery_started_at.unwrap_or(evaluated_at);
+                        if evaluated_at - recovery_started_at >= rule.resolve_after {
+                            let state_version = incident.state_version + 1;
+                            sqlx::query(
+                                "UPDATE alert_incidents
+                                 SET status = 'resolved', recovery_started_at = ?, resolved_at = ?,
+                                     last_value = ?, last_notified_at = ?, state_version = ?,
+                                     updated_at = ?
+                                 WHERE id = ?",
+                            )
+                            .bind(&at)
+                            .bind(&at)
+                            .bind(value)
+                            .bind(&at)
+                            .bind(state_version)
+                            .bind(&at)
+                            .bind(incident.id.to_string())
+                            .execute(&mut **transaction)
+                            .await?;
+                            insert_sqlite_event_notification(
+                                transaction,
+                                rule,
+                                incident.id,
+                                device_id,
+                                value,
+                                "resolved",
+                                state_version,
+                                evaluated_at,
+                            )
+                            .await?;
+                            return Ok(EventTransition {
+                                resolved: true,
+                                ..EventTransition::default()
+                            });
+                        }
+                        sqlx::query(
+                            "UPDATE alert_incidents
+                             SET recovery_started_at = ?, last_value = ?, updated_at = ?
+                             WHERE id = ?",
+                        )
+                        .bind(recovery_started_at.to_rfc3339())
+                        .bind(value)
+                        .bind(&at)
+                        .bind(incident.id.to_string())
+                        .execute(&mut **transaction)
+                        .await?;
+                    }
+                    AlertIncidentStatus::Resolved => {}
+                }
+            }
+        }
+        return Ok(EventTransition::default());
+    }
+    let Some(incident) = load_sqlite_active_event_incident(transaction, rule.id, device_id).await?
+    else {
+        if let Some(resolved) = load_sqlite_recent_resolved_event_incident(
+            transaction,
+            rule.id,
+            device_id,
+            evaluated_at - rule.reopen_grace,
+        )
+        .await?
+        {
+            return reopen_sqlite_event_incident(
+                transaction,
+                rule,
+                resolved,
+                device_id,
+                value,
+                evaluated_at,
+            )
+            .await;
+        }
+        let id = uuid::Uuid::new_v4();
+        if rule.for_duration == ChronoDuration::zero() {
+            sqlx::query(
+                "INSERT INTO alert_incidents (id, rule_id, device_id, status, condition_started_at,
+                    opened_at, last_value, last_notified_at, last_reminder_at, state_version,
+                    created_at, updated_at)
+                 VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, 1, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(rule.id.to_string())
+            .bind(device_id)
+            .bind(&at)
+            .bind(&at)
+            .bind(value)
+            .bind(&at)
+            .bind(&at)
+            .bind(&at)
+            .bind(&at)
+            .execute(&mut **transaction)
+            .await?;
+            insert_sqlite_event_notification(
+                transaction,
+                rule,
+                id,
+                device_id,
+                value,
+                "opened",
+                1,
+                evaluated_at,
+            )
+            .await?;
+            return Ok(EventTransition {
+                opened: true,
+                ..EventTransition::default()
+            });
+        }
+        sqlx::query(
+            "INSERT INTO alert_incidents (
+                id, rule_id, device_id, status, condition_started_at, last_value, created_at, updated_at
+             ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(rule.id.to_string())
+        .bind(device_id)
+        .bind(&at)
+        .bind(value)
+        .bind(&at)
+        .bind(&at)
+        .execute(&mut **transaction)
+        .await?;
+        return Ok(EventTransition::default());
+    };
+
+    match incident.status {
+        AlertIncidentStatus::Pending => {
+            if evaluated_at - incident.condition_started_at >= rule.for_duration {
+                let state_version = incident.state_version + 1;
+                sqlx::query(
+                    "UPDATE alert_incidents
+                     SET status = 'open', recovery_started_at = NULL, opened_at = ?,
+                         last_value = ?, last_notified_at = ?, last_reminder_at = ?,
+                         state_version = ?, updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(&at)
+                .bind(value)
+                .bind(&at)
+                .bind(&at)
+                .bind(state_version)
+                .bind(&at)
+                .bind(incident.id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+                insert_sqlite_event_notification(
+                    transaction,
+                    rule,
+                    incident.id,
+                    device_id,
+                    value,
+                    "opened",
+                    state_version,
+                    evaluated_at,
+                )
+                .await?;
+                return Ok(EventTransition {
+                    opened: true,
+                    ..EventTransition::default()
+                });
+            }
+            sqlx::query("UPDATE alert_incidents SET last_value = ?, updated_at = ? WHERE id = ?")
+                .bind(value)
+                .bind(&at)
+                .bind(incident.id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+        }
+        AlertIncidentStatus::Open => {
+            sqlx::query(
+                "UPDATE alert_incidents
+                 SET recovery_started_at = NULL, last_value = ?, updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(value)
+            .bind(&at)
+            .bind(incident.id.to_string())
+            .execute(&mut **transaction)
+            .await?;
+            let due = incident.acknowledged_at.is_none()
+                && incident.last_reminder_at.is_none_or(|last_reminder_at| {
+                    evaluated_at - last_reminder_at >= rule.reminder_interval
+                });
+            if due {
+                let state_version = incident.state_version + 1;
+                sqlx::query(
+                    "UPDATE alert_incidents
+                     SET last_reminder_at = ?, last_notified_at = ?, state_version = ?,
+                         updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(&at)
+                .bind(&at)
+                .bind(state_version)
+                .bind(&at)
+                .bind(incident.id.to_string())
+                .execute(&mut **transaction)
+                .await?;
+                insert_sqlite_event_notification(
+                    transaction,
+                    rule,
+                    incident.id,
+                    device_id,
+                    value,
+                    "reminder",
+                    state_version,
+                    evaluated_at,
+                )
+                .await?;
+                return Ok(EventTransition {
+                    reminder: true,
+                    ..EventTransition::default()
+                });
+            }
+        }
+        AlertIncidentStatus::Resolved => {}
+    }
+    Ok(EventTransition::default())
+}
+
+async fn evaluate_timescale_event_transition(
+    transaction: &mut Transaction<'_, Postgres>,
+    rule: &AlertRule,
+    device_id: &str,
+    value: f64,
+    evaluated_at: DateTime<Utc>,
+) -> Result<EventTransition, PlatformStoreError> {
+    let condition = event_condition(rule, value);
+    if condition != Some(true) {
+        if condition == Some(false) {
+            if let Some(incident) =
+                load_timescale_active_event_incident(transaction, rule.id, device_id).await?
+            {
+                match incident.status {
+                    AlertIncidentStatus::Pending => {
+                        sqlx::query("DELETE FROM alert_incidents WHERE id = $1")
+                            .bind(incident.id)
+                            .execute(&mut **transaction)
+                            .await?;
+                    }
+                    AlertIncidentStatus::Open => {
+                        let recovery_started_at =
+                            incident.recovery_started_at.unwrap_or(evaluated_at);
+                        if evaluated_at - recovery_started_at >= rule.resolve_after {
+                            let state_version = incident.state_version + 1;
+                            sqlx::query(
+                                "UPDATE alert_incidents
+                                 SET status = 'resolved', recovery_started_at = $2, resolved_at = $2,
+                                     last_value = $3, last_notified_at = $2, state_version = $4,
+                                     updated_at = $2
+                                 WHERE id = $1",
+                            )
+                            .bind(incident.id)
+                            .bind(evaluated_at)
+                            .bind(value)
+                            .bind(state_version as i32)
+                            .execute(&mut **transaction)
+                            .await?;
+                            insert_timescale_event_notification(
+                                transaction,
+                                rule,
+                                incident.id,
+                                device_id,
+                                value,
+                                "resolved",
+                                state_version,
+                                evaluated_at,
+                            )
+                            .await?;
+                            return Ok(EventTransition {
+                                resolved: true,
+                                ..EventTransition::default()
+                            });
+                        }
+                        sqlx::query(
+                            "UPDATE alert_incidents
+                             SET recovery_started_at = $2, last_value = $3, updated_at = $4
+                             WHERE id = $1",
+                        )
+                        .bind(incident.id)
+                        .bind(recovery_started_at)
+                        .bind(value)
+                        .bind(evaluated_at)
+                        .execute(&mut **transaction)
+                        .await?;
+                    }
+                    AlertIncidentStatus::Resolved => {}
+                }
+            }
+        }
+        return Ok(EventTransition::default());
+    }
+    let Some(incident) =
+        load_timescale_active_event_incident(transaction, rule.id, device_id).await?
+    else {
+        if let Some(resolved) = load_timescale_recent_resolved_event_incident(
+            transaction,
+            rule.id,
+            device_id,
+            evaluated_at - rule.reopen_grace,
+        )
+        .await?
+        {
+            return reopen_timescale_event_incident(
+                transaction,
+                rule,
+                resolved,
+                device_id,
+                value,
+                evaluated_at,
+            )
+            .await;
+        }
+        let id = uuid::Uuid::new_v4();
+        if rule.for_duration == ChronoDuration::zero() {
+            sqlx::query(
+                "INSERT INTO alert_incidents (id, rule_id, device_id, status, condition_started_at,
+                    opened_at, last_value, last_notified_at, last_reminder_at, state_version,
+                    created_at, updated_at)
+                 VALUES ($1, $2, $3, 'open', $4, $4, $5, $4, $4, 1, $4, $4)",
+            )
+            .bind(id)
+            .bind(rule.id)
+            .bind(device_id)
+            .bind(evaluated_at)
+            .bind(value)
+            .execute(&mut **transaction)
+            .await?;
+            insert_timescale_event_notification(
+                transaction,
+                rule,
+                id,
+                device_id,
+                value,
+                "opened",
+                1,
+                evaluated_at,
+            )
+            .await?;
+            return Ok(EventTransition {
+                opened: true,
+                ..EventTransition::default()
+            });
+        }
+        sqlx::query(
+            "INSERT INTO alert_incidents (
+                id, rule_id, device_id, status, condition_started_at, last_value, created_at, updated_at
+             ) VALUES ($1, $2, $3, 'pending', $4, $5, $4, $4)",
+        )
+        .bind(id)
+        .bind(rule.id)
+        .bind(device_id)
+        .bind(evaluated_at)
+        .bind(value)
+        .execute(&mut **transaction)
+        .await?;
+        return Ok(EventTransition::default());
+    };
+
+    match incident.status {
+        AlertIncidentStatus::Pending => {
+            if evaluated_at - incident.condition_started_at >= rule.for_duration {
+                let state_version = incident.state_version + 1;
+                sqlx::query(
+                    "UPDATE alert_incidents
+                     SET status = 'open', recovery_started_at = NULL, opened_at = $2,
+                         last_value = $3, last_notified_at = $2, last_reminder_at = $2,
+                         state_version = $4, updated_at = $2
+                     WHERE id = $1",
+                )
+                .bind(incident.id)
+                .bind(evaluated_at)
+                .bind(value)
+                .bind(state_version as i32)
+                .execute(&mut **transaction)
+                .await?;
+                insert_timescale_event_notification(
+                    transaction,
+                    rule,
+                    incident.id,
+                    device_id,
+                    value,
+                    "opened",
+                    state_version,
+                    evaluated_at,
+                )
+                .await?;
+                return Ok(EventTransition {
+                    opened: true,
+                    ..EventTransition::default()
+                });
+            }
+            sqlx::query(
+                "UPDATE alert_incidents SET last_value = $2, updated_at = $3 WHERE id = $1",
+            )
+            .bind(incident.id)
+            .bind(value)
+            .bind(evaluated_at)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        AlertIncidentStatus::Open => {
+            sqlx::query(
+                "UPDATE alert_incidents
+                 SET recovery_started_at = NULL, last_value = $2, updated_at = $3
+                 WHERE id = $1",
+            )
+            .bind(incident.id)
+            .bind(value)
+            .bind(evaluated_at)
+            .execute(&mut **transaction)
+            .await?;
+            let due = incident.acknowledged_at.is_none()
+                && incident.last_reminder_at.is_none_or(|last_reminder_at| {
+                    evaluated_at - last_reminder_at >= rule.reminder_interval
+                });
+            if due {
+                let state_version = incident.state_version + 1;
+                sqlx::query(
+                    "UPDATE alert_incidents
+                     SET last_reminder_at = $2, last_notified_at = $2, state_version = $3,
+                         updated_at = $2
+                     WHERE id = $1",
+                )
+                .bind(incident.id)
+                .bind(evaluated_at)
+                .bind(state_version as i32)
+                .execute(&mut **transaction)
+                .await?;
+                insert_timescale_event_notification(
+                    transaction,
+                    rule,
+                    incident.id,
+                    device_id,
+                    value,
+                    "reminder",
+                    state_version,
+                    evaluated_at,
+                )
+                .await?;
+                return Ok(EventTransition {
+                    reminder: true,
+                    ..EventTransition::default()
+                });
+            }
+        }
+        AlertIncidentStatus::Resolved => {}
+    }
+    Ok(EventTransition::default())
+}
+
+async fn evaluate_sqlite_alert_events(
+    store: &SqliteStore,
+    events: &[AlertEvaluationEvent],
+) -> Result<AlertEvaluationResult, PlatformStoreError> {
+    let mut transaction = store.pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+                window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
+                hysteresis, severity, reminder_interval_seconds
+         FROM alert_rules WHERE enabled = 1 AND archived_at IS NULL
+           AND rule_type = 'event_threshold' ORDER BY created_at, id",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let rules: Vec<_> = rows
+        .into_iter()
+        .map(sqlite_alert_rule_record)
+        .collect::<Result<_, _>>()?;
+    let mut result = AlertEvaluationResult::default();
+    for event in events {
+        for rule in &rules {
+            if rule
+                .device_id
+                .as_deref()
+                .is_some_and(|id| id != event.device_id)
+            {
+                continue;
+            }
+            let Some(value) = event
+                .measurements
+                .get(&rule.metric_key)
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite())
+            else {
+                continue;
+            };
+            let claim = sqlx::query(
+                "INSERT INTO alert_rule_event_evaluations
+                 (rule_id, event_at, device_id, boot_id, sequence) VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence) DO NOTHING",
+            )
+            .bind(rule.id.to_string())
+            .bind(canonical_postgres_timestamp(event.event_at).to_rfc3339())
+            .bind(&event.device_id)
+            .bind(event.boot_id.to_string())
+            .bind(event.sequence.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            if claim.rows_affected() == 0 {
+                continue;
+            }
+            result.evaluated += 1;
+            let transition = evaluate_sqlite_event_transition(
+                &mut transaction,
+                rule,
+                &event.device_id,
+                value,
+                canonical_postgres_timestamp(event.received_at),
+            )
+            .await?;
+            result.opened += usize::from(transition.opened);
+            result.resolved += usize::from(transition.resolved);
+            result.reminders += usize::from(transition.reminder);
+        }
+    }
+    transaction.commit().await?;
+    Ok(result)
+}
+
+async fn evaluate_timescale_alert_events(
+    pool: &PgPool,
+    events: &[AlertEvaluationEvent],
+) -> Result<AlertEvaluationResult, PlatformStoreError> {
+    let mut transaction = pool.begin().await?;
+    let rows = sqlx::query(
+        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+                window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
+                hysteresis, severity, reminder_interval_seconds
+         FROM alert_rules WHERE enabled AND archived_at IS NULL
+           AND rule_type = 'event_threshold' ORDER BY created_at, id FOR SHARE",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let rules: Vec<_> = rows
+        .into_iter()
+        .map(postgres_alert_rule_record)
+        .collect::<Result<_, _>>()?;
+    let mut result = AlertEvaluationResult::default();
+    for event in events {
+        for rule in &rules {
+            if rule
+                .device_id
+                .as_deref()
+                .is_some_and(|id| id != event.device_id)
+            {
+                continue;
+            }
+            let Some(value) = event
+                .measurements
+                .get(&rule.metric_key)
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite())
+            else {
+                continue;
+            };
+            let sequence = i64::try_from(event.sequence)
+                .map_err(|_| PlatformStoreError::AlertRuleSequenceOverflow)?;
+            let claim = sqlx::query("INSERT INTO alert_rule_event_evaluations (rule_id, event_at, device_id, boot_id, sequence) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence) DO NOTHING")
+                .bind(rule.id).bind(canonical_postgres_timestamp(event.event_at)).bind(&event.device_id).bind(event.boot_id).bind(sequence).execute(&mut *transaction).await?;
+            if claim.rows_affected() == 0 {
+                continue;
+            }
+            result.evaluated += 1;
+            let transition = evaluate_timescale_event_transition(
+                &mut transaction,
+                rule,
+                &event.device_id,
+                value,
+                canonical_postgres_timestamp(event.received_at),
+            )
+            .await?;
+            result.opened += usize::from(transition.opened);
+            result.resolved += usize::from(transition.resolved);
+            result.reminders += usize::from(transition.reminder);
+        }
+    }
+    transaction.commit().await?;
+    Ok(result)
+}
+
 fn validate_telemetry_metric_key(metric_key: &str) -> Result<(), PlatformStoreError> {
     let mut characters = metric_key.chars();
     let valid = matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
@@ -3166,6 +4179,17 @@ impl AlertRepository for PlatformStore {
             self.claim_alert_rule_event(rule_id, event_at, device_id, boot_id, sequence)
                 .await
         })
+    }
+}
+
+impl AlertEvaluationRepository for PlatformStore {
+    fn evaluate_alert_events<'a>(
+        &'a self,
+        events: &'a [AlertEvaluationEvent],
+        evaluated_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<AlertEvaluationResult, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { self.evaluate_alert_events(events, evaluated_at).await })
     }
 }
 
