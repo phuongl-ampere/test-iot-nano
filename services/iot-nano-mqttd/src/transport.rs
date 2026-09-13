@@ -895,6 +895,20 @@ impl MqttdDeviceTransport {
                 return Err(TransportError::Unauthorized);
             }
         };
+        if self
+            .authenticator
+            .authorize_session(device.clone())
+            .await
+            .is_err()
+        {
+            framed
+                .send(Packet::ConnAck(ConnAck::new(
+                    ConnectReturnCode::NotAuthorized,
+                    false,
+                )))
+                .await?;
+            return Err(TransportError::Unauthorized);
+        }
         framed
             .send(Packet::ConnAck(ConnAck::new(
                 ConnectReturnCode::Success,
@@ -955,6 +969,21 @@ impl MqttdDeviceTransport {
                 return Err(TransportError::Unauthorized);
             }
         };
+        if self
+            .authenticator
+            .authorize_session(device.clone())
+            .await
+            .is_err()
+        {
+            framed
+                .send(V5Packet::ConnAck(V5ConnAck {
+                    session_present: false,
+                    code: V5ConnectReturnCode::NotAuthorized,
+                    properties: None,
+                }))
+                .await?;
+            return Err(TransportError::Unauthorized);
+        }
         framed
             .send(V5Packet::ConnAck(V5ConnAck {
                 session_present: false,

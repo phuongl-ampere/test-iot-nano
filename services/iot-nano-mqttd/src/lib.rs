@@ -25,6 +25,7 @@ mod config;
 mod management;
 mod policy;
 mod ports;
+mod runtime;
 mod storage;
 mod transport;
 
@@ -49,6 +50,9 @@ pub use rumqttd::{
     BrokerStorage, BrokerStorageState, InboundQos2CommitResult, InboundQos2CompletionResult,
     InboundQos2JournalEntry, InboundQos2JournalState, InboundQos2PrepareResult, MemoryStorage,
     RetentionPolicy, StorageError, StoredInflight, StoredPublish, StoredSession,
+};
+pub use runtime::{
+    MqttListenerConfig, MqttRuntime, MqttRuntimeConfig, MqttRuntimeError, MqttRuntimeStartError,
 };
 pub use storage::SqliteStorage;
 pub use transport::{

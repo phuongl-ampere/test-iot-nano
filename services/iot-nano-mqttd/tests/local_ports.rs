@@ -313,6 +313,25 @@ async fn local_device_authorization_uses_the_typed_port_without_http() {
 }
 
 #[tokio::test]
+async fn local_mqtt_connect_revalidates_the_authenticated_session() {
+    let authorization = Arc::new(RecordingAuthorization::default());
+    let transport = MqttdDeviceTransport::with_local_ports(
+        authorization.clone(),
+        Arc::new(BlockingStream::new()),
+        Arc::new(RecordingResponses::default()),
+    );
+    let (server, client) = duplex(8 * 1024);
+    let server_task = tokio::spawn(async move { transport.serve_connection(server).await });
+    let mut client = Framed::new(client, v311_codec());
+
+    connect_v311(&mut client).await;
+    assert_eq!(authorization.sessions.lock().await.len(), 1);
+
+    drop(client);
+    assert!(server_task.await.unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn local_uplink_returns_only_after_durable_stream_append() {
     let authorization = Arc::new(RecordingAuthorization::default());
     let stream = BlockingStream::new();
