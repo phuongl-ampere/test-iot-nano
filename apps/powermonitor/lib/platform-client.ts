@@ -22,6 +22,9 @@ export async function platformRequest(path: string, session: PlatformSession): P
 
   const baseUrl = requireEnvironment("PLATFORM_BASE_URL");
   const url = new URL(`/api/v1${path}`, baseUrl);
+  if (url.pathname !== "/api/v1" && !url.pathname.startsWith("/api/v1/")) {
+    throw new TypeError("Platform paths must remain under /api/v1");
+  }
   const response = await (session.fetcher ?? fetch)(url, {
     headers: {
       accept: "application/json",

@@ -33,4 +33,17 @@ describe("platformRequest", () => {
       }),
     ).rejects.toEqual(new PlatformApiError(403, "Platform request denied"));
   });
+
+  it("rejects a traversal path before calling the platform", async () => {
+    const fetcher = vi.fn();
+
+    await expect(
+      platformRequest("/../internal", {
+        accessToken: "access-token",
+        fetcher,
+      }),
+    ).rejects.toThrow("Platform paths must remain under /api/v1");
+
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 });

@@ -46,6 +46,7 @@ describe("PowerMonitor OAuth BFF", () => {
       cookies,
       unsealState: vi.fn().mockReturnValue({ state: "state-123", verifier: "verifier-123" }),
       exchangeCode,
+      redirectUri: "https://powermonitor.example.test/api/auth/callback",
     });
 
     expect(exchangeCode).toHaveBeenCalledWith({
@@ -60,5 +61,28 @@ describe("PowerMonitor OAuth BFF", () => {
       expect.any(String),
       expect.objectContaining({ httpOnly: true, secure: true, sameSite: "lax" }),
     );
+  });
+
+  it("uses the configured callback URI behind a proxy", async () => {
+    const cookies = {
+      get: vi.fn().mockReturnValue({ value: "sealed-state" }),
+      set: vi.fn(),
+    };
+    const exchangeCode = vi.fn().mockResolvedValue({ accessToken: "opaque-access-token" });
+    const redirectUri = "https://powermonitor.example.test/api/auth/callback";
+    const response = await createCallbackHandler({
+      requestUrl: "https://proxy.example.test/api/auth/callback?code=code-123&state=state-123",
+      cookies,
+      unsealState: vi.fn().mockReturnValue({ state: "state-123", verifier: "verifier-123" }),
+      exchangeCode,
+      redirectUri,
+    });
+
+    expect(exchangeCode).toHaveBeenCalledWith({
+      code: "code-123",
+      codeVerifier: "verifier-123",
+      redirectUri,
+    });
+    expect(response.headers.get("location")).toBe("https://powermonitor.example.test/");
   });
 });

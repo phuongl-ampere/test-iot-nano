@@ -84,3 +84,40 @@ existing web application file was changed.
 ## Commit
 
 Commit: `feat: add powermonitor external bff foundation`
+
+## Review Fixes
+
+### Path Traversal Regression
+
+RED:
+
+- Added a `platformRequest("/../internal", ...)` regression with a mock
+  fetcher.
+- `npm --prefix apps/powermonitor test -- tests/platform-client.test.ts`
+  failed because the path reached the fetcher and then failed while reading
+  the undefined mock response.
+
+GREEN:
+
+- `platformRequest` now checks the normalized URL pathname remains
+  `/api/v1` or under `/api/v1/` before it invokes fetch.
+- The targeted test passed with 3 tests, including the assertion that fetch
+  was never called.
+
+### Proxied OAuth Callback Regression
+
+RED:
+
+- Added a callback request with `proxy.example.test` and a configured
+  `powermonitor.example.test` callback URI.
+- `npm --prefix apps/powermonitor test -- tests/oauth-callback.test.ts`
+  failed because the token exchange received the proxy origin.
+
+GREEN:
+
+- `createCallbackHandler` now accepts the configured redirect URI, uses it
+  for token exchange, and constructs the post-login redirect from it.
+- The Next.js callback route passes `config.redirectUri` from
+  `OAUTH_REDIRECT_URI`.
+- The targeted test passed with 3 tests, including the proxy-origin
+  regression.

@@ -12,5 +12,6 @@ export async function GET(request: Request) {
     requestUrl: request.url,
     cookies: await cookies(),
     exchangeCode: (input) => exchangeAuthorizationCode(config, input),
+    redirectUri: config.redirectUri,
   });
 }

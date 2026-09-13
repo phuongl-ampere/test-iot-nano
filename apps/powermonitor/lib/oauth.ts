@@ -56,10 +56,12 @@ export async function createCallbackHandler(input: {
     codeVerifier: string;
     redirectUri: string;
   }) => Promise<OAuthToken>;
+  redirectUri: string;
   unsealState?: (value: string) => OAuthState;
   sealSession?: (value: OAuthToken) => string;
 }): Promise<Response> {
   const request = new URL(input.requestUrl);
+  const redirectUri = new URL(input.redirectUri);
   const code = request.searchParams.get("code");
   const state = request.searchParams.get("state");
   const sealedState = input.cookies.get(oauthStateCookieName)?.value;
@@ -84,7 +86,7 @@ export async function createCallbackHandler(input: {
     token = await input.exchangeCode({
       code,
       codeVerifier: oauthState.verifier,
-      redirectUri: `${request.origin}${request.pathname}`,
+      redirectUri: redirectUri.href,
     });
   } catch {
     return new Response("OAuth token exchange denied", { status: 502 });
@@ -92,7 +94,7 @@ export async function createCallbackHandler(input: {
   const sealSession = input.sealSession ?? seal;
   input.cookies.set(sessionCookieName, sealSession(token), cookieOptions(60 * 60 * 8));
   input.cookies.set(oauthStateCookieName, "", { ...cookieOptions(0), maxAge: 0 });
-  return Response.redirect(new URL("/", request.origin), 307);
+  return Response.redirect(new URL("/", redirectUri), 307);
 }
 
 export async function exchangeAuthorizationCode(
