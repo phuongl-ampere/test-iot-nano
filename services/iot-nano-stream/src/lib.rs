@@ -43,6 +43,8 @@ struct StreamInner {
     config: StreamConfig,
     store: Arc<sqlite_store::SqliteStore>,
     accepting: AtomicBool,
+    #[cfg(test)]
+    claim_pause: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[derive(
@@ -178,6 +180,8 @@ impl LocalStream {
                 config,
                 store: Arc::new(store),
                 accepting: AtomicBool::new(true),
+                #[cfg(test)]
+                claim_pause: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -188,6 +192,15 @@ impl LocalStream {
 
     pub fn stop_claiming(&self) {
         self.inner.accepting.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn pause_claim_after_accepting_check(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self
+            .inner
+            .claim_pause
+            .lock()
+            .expect("claim pause mutex is not poisoned") = Some(barrier);
     }
 
     pub async fn append(
@@ -204,15 +217,21 @@ impl LocalStream {
         if !self.inner.accepting.load(Ordering::Acquire) {
             return Err(StreamError::Draining);
         }
+        #[cfg(test)]
+        let claim_pause = {
+            self.inner
+                .claim_pause
+                .lock()
+                .expect("claim pause mutex is not poisoned")
+                .clone()
+        };
+        #[cfg(test)]
+        if let Some(barrier) = claim_pause {
+            barrier.wait().await;
+        }
         let config = self.inner.config.clone();
-        let inner = self.inner.clone();
-        self.blocking(move |store| {
-            if !inner.accepting.load(Ordering::Acquire) {
-                return Err(StreamError::Draining);
-            }
-            store.claim(&config, request)
-        })
-        .await
+        self.blocking(move |store| store.claim(&config, request))
+            .await
     }
 
     pub async fn acknowledge(&self, request: AcknowledgeRequest) -> Result<(), StreamError> {
@@ -364,6 +383,45 @@ mod tests {
 
         assert!(matches!(
             claim_started_after_stop,
+            Err(StreamError::Draining)
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_started_before_stop_may_complete_after_the_stop_signal() {
+        let directory = tempdir().unwrap();
+        let stream =
+            LocalStream::open(StreamConfig::sqlite(directory.path().join("stream.sqlite")))
+                .await
+                .unwrap();
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        stream.pause_claim_after_accepting_check(Arc::clone(&gate));
+
+        let claiming_stream = stream.clone();
+        let claim = tokio::spawn(async move {
+            claiming_stream
+                .claim(ClaimRequest {
+                    group: "workers".to_owned(),
+                    member_id: "worker-1".to_owned(),
+                    start: GroupStart::Earliest,
+                    limit: 1,
+                })
+                .await
+        });
+
+        gate.wait().await;
+        stream.stop_claiming();
+
+        assert!(claim.await.unwrap().is_ok());
+        assert!(matches!(
+            stream
+                .claim(ClaimRequest {
+                    group: "workers".to_owned(),
+                    member_id: "worker-2".to_owned(),
+                    start: GroupStart::Earliest,
+                    limit: 1,
+                })
+                .await,
             Err(StreamError::Draining)
         ));
     }
