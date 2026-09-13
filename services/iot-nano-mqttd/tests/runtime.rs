@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
-const FIXTURE_CERTIFICATE_VALID_TIME: u64 = 1_789_000_000;
+const FIXTURE_CERTIFICATE_VALID_TIME: u64 = 1_790_000_000;
 
 #[derive(Debug)]
 struct FixtureCertificateVerifier {

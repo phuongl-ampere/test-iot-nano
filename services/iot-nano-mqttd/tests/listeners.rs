@@ -34,7 +34,7 @@ const CONNECT_V5_TOKEN: &[u8] = &[
     0x10, 0x1b, 0x00, 0x04, b'M', b'Q', b'T', b'T', 5, 0x82, 0x00, 0x3c, 0x00, 0x00, 0x02, b'i',
     b'd', 0x00, 0x0a, b'i', b'o', b't', b'd', b'_', b't', b'o', b'k', b'e', b'n',
 ];
-const FIXTURE_CERTIFICATE_VALID_TIME: u64 = 1_789_000_000;
+const FIXTURE_CERTIFICATE_VALID_TIME: u64 = 1_790_000_000;
 
 #[derive(Debug)]
 struct FixtureCertificateVerifier {
@@ -80,6 +80,32 @@ impl ServerCertVerifier for FixtureCertificateVerifier {
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
     }
+}
+
+#[test]
+fn fixture_certificate_is_valid_at_fixed_verifier_time() {
+    tokio_rustls::rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let certificate_path = fixture("server.crt");
+    let certificate = std::fs::File::open(certificate_path).unwrap();
+    let mut certificate = std::io::BufReader::new(certificate);
+    let certificate = certs(&mut certificate).next().unwrap().unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(certificate.clone()).unwrap();
+    let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .unwrap();
+
+    verifier
+        .verify_server_cert(
+            &certificate,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::since_unix_epoch(Duration::from_secs(FIXTURE_CERTIFICATE_VALID_TIME)),
+        )
+        .unwrap();
 }
 
 #[tokio::test]
