@@ -10,11 +10,16 @@ use iot_nano_core::{
     CoreControlState, CoreSqliteStore, connect_core_database, core_control_router, migrate,
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, pool::PoolConnection};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const CORE_SECRET: &str = "core-control-secret-must-have-at-least-32";
+const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
+
+struct TimescaleTestLock {
+    _connection: PoolConnection<Postgres>,
+}
 
 async fn store() -> (tempfile::TempDir, CoreSqliteStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -29,24 +34,37 @@ async fn store() -> (tempfile::TempDir, CoreSqliteStore) {
     (directory, store)
 }
 
-async fn timescale_pool() -> PgPool {
+async fn timescale_pool() -> (TimescaleTestLock, PgPool) {
     let database_url = env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must point to the local TimescaleDB test database");
-    let pool = connect_core_database(&database_url).await.unwrap();
-    let database_name: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(
-        database_name.starts_with("iot_nano_test_"),
-        "refusing to reset non-test database {database_name:?}"
+    assert_eq!(
+        database_url, TIMESCALE_TEST_URL,
+        "refusing to reset a TimescaleDB URL other than the disposable test database"
     );
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano_core CASCADE")
-        .execute(&pool)
+    let pool = connect_core_database(&database_url).await.unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:core-control-test-setup'))")
+        .execute(&mut *connection)
         .await
         .unwrap();
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('iot_nano:core-control-test'))")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano_core CASCADE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
     migrate(&pool).await.unwrap();
-    pool
+    (
+        TimescaleTestLock {
+            _connection: connection,
+        },
+        pool,
+    )
 }
 
 #[tokio::test]
@@ -212,9 +230,13 @@ async fn authenticated_telemetry_control_reads_raw_sqlite_telemetry() {
 }
 
 #[tokio::test]
-#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL pointing to a disposable TimescaleDB database"]
+// docker compose -f infra/compose.yaml up -d timescaledb
+// docker compose -f infra/compose.yaml exec -T timescaledb createdb -U iot iot_nano_test_platform # first run only
+// IOT_NANO_TIMESCALE_TEST_URL=postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform cargo test -p iot-nano-core --test control timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none -- --ignored --exact
+// docker compose -f infra/compose.yaml stop timescaledb
+#[ignore = "requires the exact disposable IOT_NANO_TIMESCALE_TEST_URL"]
 async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() {
-    let pool = timescale_pool().await;
+    let (_lock, pool) = timescale_pool().await;
     let at = Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 0).unwrap();
     sqlx::query(
         "INSERT INTO telemetry (
@@ -227,7 +249,23 @@ async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() 
     .bind(1_i64)
     .bind(sqlx::types::Json(json!({
         "temperature_c": "not-a-number",
-        "humidity_pct": "not-a-number"
+        "humidity_pct": 51.0
+    })))
+    .bind("iot/v1/devices/telemetry-device/telemetry")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $1, $2, $3, $4, $5, $6)",
+    )
+    .bind(at + chrono::Duration::seconds(1))
+    .bind("telemetry-device")
+    .bind(Uuid::now_v7())
+    .bind(2_i64)
+    .bind(sqlx::types::Json(json!({
+        "temperature_c": 26.4
     })))
     .bind("iot/v1/devices/telemetry-device/telemetry")
     .execute(&pool)
@@ -247,10 +285,13 @@ async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() 
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body.as_array().unwrap().len(), 2);
     assert_eq!(body[0]["temperature_c"], serde_json::Value::Null);
-    assert_eq!(body[0]["humidity_pct"], serde_json::Value::Null);
+    assert_eq!(body[0]["humidity_pct"], 51.0);
     assert_eq!(body[0]["event_count"], 1);
+    assert_eq!(body[1]["temperature_c"], 26.4);
+    assert_eq!(body[1]["humidity_pct"], serde_json::Value::Null);
+    assert_eq!(body[1]["event_count"], 1);
 }
 
 #[tokio::test]
