@@ -40,6 +40,38 @@ CREATE TABLE IF NOT EXISTS application_redirect_uris (
 );
 CREATE INDEX IF NOT EXISTS application_redirect_uris_lookup_index
     ON application_redirect_uris (app_id, redirect_uri);
+CREATE TABLE IF NOT EXISTS oauth_client_secrets (
+    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    secret_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (app_id, secret_hash)
+);
+CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
+    code_hash TEXT PRIMARY KEY,
+    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    redirect_uri TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    scopes_json JSONB NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    CHECK (expires_at > issued_at)
+);
+CREATE INDEX IF NOT EXISTS oauth_authorization_codes_active_index
+    ON oauth_authorization_codes (app_id, expires_at)
+    WHERE consumed_at IS NULL;
+CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+    token_hash TEXT PRIMARY KEY,
+    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    scopes_json JSONB NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    CHECK (expires_at > issued_at)
+);
+CREATE INDEX IF NOT EXISTS oauth_access_tokens_expiry_index
+    ON oauth_access_tokens (expires_at);
 CREATE TABLE IF NOT EXISTS asset_profiles (
     id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE,
     fields JSONB NOT NULL DEFAULT '{}'::jsonb,
