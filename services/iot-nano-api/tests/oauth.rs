@@ -173,6 +173,78 @@ async fn authorization_endpoint_issues_an_s256_bound_code_on_the_public_router()
 }
 
 #[tokio::test]
+async fn authorization_endpoint_requires_a_nonempty_state_before_issuing_a_code() {
+    let (_directory, store, state) = oauth_test_state(true).await;
+    let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
+
+    for state_parameter in ["", "&state="] {
+        let response = routers(state.clone())
+            .public
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread{state_parameter}&code_challenge={challenge}&code_challenge_method=S256"
+                    ))
+                    .header(COOKIE, format!("iot_nano_session={BROWSER_SESSION}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["error"], "invalid_request");
+    }
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM oauth_authorization_codes")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn authorization_endpoint_requires_a_nonempty_scope_before_issuing_a_code() {
+    let (_directory, store, state) = oauth_test_state(true).await;
+    let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
+
+    for scope_parameter in ["", "&scope="] {
+        let response = routers(state.clone())
+            .public
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback{scope_parameter}&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
+                    ))
+                    .header(COOKIE, format!("iot_nano_session={BROWSER_SESSION}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["error"], "invalid_request");
+    }
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM oauth_authorization_codes")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn token_endpoint_exchanges_a_code_with_its_original_s256_verifier() {
     let (_directory, store, state) = oauth_test_state(true).await;
     let verifier = "correct-pkce-verifier-with-at-least-forty-three-characters";
@@ -264,6 +336,55 @@ async fn token_endpoint_issues_client_credentials_for_the_exact_requested_scope(
             .unwrap();
     assert_ne!(token_hash, access_token);
     assert!(user_id.is_none());
+}
+
+#[tokio::test]
+async fn token_endpoint_requires_a_nonempty_client_credentials_scope() {
+    let (_directory, store, state) = oauth_test_state(true).await;
+    OAuthRepository::register_client_secret(
+        &store,
+        NewOAuthClientSecret {
+            app_id: "oauth-test-app".parse().unwrap(),
+            client_secret: "correct-confidential-client-secret".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    for body in [
+        format!(
+            "grant_type=client_credentials&client_id={CLIENT_ID}&client_secret=correct-confidential-client-secret"
+        ),
+        format!(
+            "grant_type=client_credentials&client_id={CLIENT_ID}&client_secret=correct-confidential-client-secret&scope="
+        ),
+    ] {
+        let response = routers(state.clone())
+            .public
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/token")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(payload["error"], "invalid_request");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM oauth_access_tokens")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -369,6 +490,7 @@ async fn browser_login_sets_the_cookie_used_by_oauth_authorization() {
     let session_id = payload["session_id"].as_str().unwrap();
     assert!(cookie.starts_with(format!("iot_nano_session={session_id};").as_str()));
     assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("Secure"));
     assert!(cookie.contains("SameSite=Lax"));
     assert!(cookie.contains("Path=/"));
 }
@@ -426,7 +548,7 @@ async fn sqlite_public_router_mounts_the_oauth_authorization_endpoint() {
         .oneshot(
             Request::builder()
                 .uri(format!(
-                    "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&code_challenge={challenge}&code_challenge_method=S256"
+                    "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
                 ))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
@@ -496,6 +618,8 @@ async fn token_endpoint_does_not_expand_client_credentials_scopes() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["pragma"], "no-cache");
     let payload: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(payload["error"], "invalid_scope");
@@ -596,7 +720,7 @@ async fn authorization_endpoint_rejects_an_unregistered_redirect_uri_without_iss
     let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
     let request = Request::builder()
         .uri(format!(
-            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Funregistered.example.test%2Fcallback&scope=devices%3Aread&code_challenge={challenge}&code_challenge_method=S256"
+            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Funregistered.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .header(COOKIE, format!("iot_nano_session={BROWSER_SESSION}"))
         .body(Body::empty())
@@ -641,7 +765,7 @@ async fn authorization_endpoint_rejects_a_fragment_redirect_uri_before_issuing_a
     let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
     let request = Request::builder()
         .uri(format!(
-            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback%23fragment&scope=devices%3Aread&code_challenge={challenge}&code_challenge_method=S256"
+            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback%23fragment&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .header(COOKIE, format!("iot_nano_session={BROWSER_SESSION}"))
         .body(Body::empty())
@@ -665,7 +789,7 @@ async fn authorization_endpoint_denies_a_disabled_application_without_issuing_a_
     let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
     let request = Request::builder()
         .uri(format!(
-            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&code_challenge={challenge}&code_challenge_method=S256"
+            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .header(COOKIE, format!("iot_nano_session={BROWSER_SESSION}"))
         .body(Body::empty())
@@ -692,7 +816,7 @@ async fn authorization_endpoint_does_not_issue_a_code_for_an_unallowed_scope() {
     let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
     let request = Request::builder()
         .uri(format!(
-            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=alerts%3Aread&code_challenge={challenge}&code_challenge_method=S256"
+            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=alerts%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .header(COOKIE, format!("iot_nano_session={BROWSER_SESSION}"))
         .body(Body::empty())
@@ -719,7 +843,7 @@ async fn authorization_endpoint_denies_an_unknown_client_without_issuing_a_code(
     let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
     let request = Request::builder()
         .uri(format!(
-            "/oauth/authorize?response_type=code&client_id=unknown-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&code_challenge={challenge}&code_challenge_method=S256"
+            "/oauth/authorize?response_type=code&client_id=unknown-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .header(COOKIE, format!("iot_nano_session={BROWSER_SESSION}"))
         .body(Body::empty())
@@ -873,7 +997,7 @@ async fn oauth_authorization_uses_a_browser_cookie_not_a_bearer_session() {
     let challenge = s256_challenge("correct-pkce-verifier-with-at-least-forty-three-characters");
     let request = Request::builder()
         .uri(format!(
-            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&code_challenge={challenge}&code_challenge_method=S256"
+            "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .header(AUTHORIZATION, format!("Bearer {BROWSER_SESSION}"))
         .body(Body::empty())

@@ -536,7 +536,7 @@ fn browser_session_id(headers: &HeaderMap) -> Option<&str> {
 fn session_cookie_headers(session_id: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let value = HeaderValue::try_from(format!(
-        "iot_nano_session={session_id}; HttpOnly; SameSite=Lax; Path=/"
+        "iot_nano_session={session_id}; HttpOnly; Secure; SameSite=Lax; Path=/"
     ))
     .expect("generated session IDs are valid cookie values");
     headers.insert(SET_COOKIE, value);

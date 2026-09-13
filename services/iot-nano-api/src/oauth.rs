@@ -138,14 +138,21 @@ impl OAuthError {
                 "The authorization server could not complete the request.",
             ),
         };
-        (
+        let mut response = (
             status,
             axum::Json(OAuthErrorBody {
                 error,
                 error_description,
             }),
         )
-            .into_response()
+            .into_response();
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+        response
     }
 }
 
@@ -236,6 +243,11 @@ async fn authorize_request(
         .redirect_uri
         .as_deref()
         .ok_or(OAuthError::InvalidRequest)?;
+    let state_parameter = request
+        .state
+        .as_deref()
+        .filter(|state| !state.is_empty())
+        .ok_or(OAuthError::InvalidRequest)?;
     if redirect_uri.contains('#') {
         return Err(OAuthError::InvalidRequest);
     }
@@ -251,7 +263,7 @@ async fn authorize_request(
         .authenticate_browser_session(headers)
         .ok_or(OAuthError::AccessDenied)?;
     let store = state.oauth_store().ok_or(OAuthError::ServerError)?;
-    let scopes = requested_scopes(request.scope.as_deref());
+    let scopes = requested_scopes(request.scope.as_deref())?;
     let application = ApplicationRegistry::new(store.clone())
         .validate_authorization_request(client_id, redirect_uri, &scopes)
         .await?;
@@ -274,15 +286,18 @@ async fn authorize_request(
     .await
     .map_err(issue_code_error)?;
 
-    authorization_redirect(redirect_uri, &code, request.state.as_deref())
+    authorization_redirect(redirect_uri, &code, Some(state_parameter))
 }
 
-fn requested_scopes(scope: Option<&str>) -> Vec<String> {
-    scope
+fn requested_scopes(scope: Option<&str>) -> Result<Vec<String>, OAuthError> {
+    let scopes = scope
         .unwrap_or_default()
         .split_ascii_whitespace()
         .map(str::to_owned)
-        .collect()
+        .collect::<Vec<_>>();
+    (!scopes.is_empty())
+        .then_some(scopes)
+        .ok_or(OAuthError::InvalidRequest)
 }
 
 fn is_s256_challenge(challenge: &str) -> bool {
@@ -384,7 +399,7 @@ async fn issue_client_credentials(
             client_id,
             client_secret,
             access_token: access_token.clone(),
-            scopes: requested_scopes(request.scope.as_deref()),
+            scopes: requested_scopes(request.scope.as_deref())?,
             issued_at,
             expires_at: issued_at + ACCESS_TOKEN_TTL,
         },
