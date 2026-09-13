@@ -166,6 +166,28 @@ impl BrokerLifecycleHandle {
         )
     }
 
+    pub fn spawn_public_plaintext_device_only_mux(
+        &self,
+        listener: std::net::TcpListener,
+        backends: ProtocolBackends,
+        settings: MuxSettings,
+    ) -> Result<(), MqttdError> {
+        self.spawn_public_worker(
+            "iot-mqttd-plaintext-mux",
+            listener,
+            move |listener, shutdown| async move {
+                serve_plaintext_mux_with_shutdown_and_mode(
+                    listener,
+                    backends,
+                    settings,
+                    shutdown,
+                    MuxRouteMode::DeviceOnly,
+                )
+                .await
+            },
+        )
+    }
+
     pub fn spawn_public_tls_mux(
         &self,
         listener: std::net::TcpListener,
@@ -178,6 +200,30 @@ impl BrokerLifecycleHandle {
             listener,
             move |listener, shutdown| async move {
                 serve_tls_mux_with_shutdown(listener, acceptor, backends, settings, shutdown).await
+            },
+        )
+    }
+
+    pub fn spawn_public_tls_device_only_mux(
+        &self,
+        listener: std::net::TcpListener,
+        acceptor: TlsAcceptor,
+        backends: ProtocolBackends,
+        settings: MuxSettings,
+    ) -> Result<(), MqttdError> {
+        self.spawn_public_worker(
+            "iot-mqttd-tls-mux",
+            listener,
+            move |listener, shutdown| async move {
+                serve_tls_mux_with_shutdown_and_mode(
+                    listener,
+                    acceptor,
+                    backends,
+                    settings,
+                    shutdown,
+                    MuxRouteMode::DeviceOnly,
+                )
+                .await
             },
         )
     }
@@ -462,6 +508,12 @@ pub struct MuxSettings {
     pub preamble_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuxRouteMode {
+    GenericBroker,
+    DeviceOnly,
+}
+
 impl Default for MuxSettings {
     fn default() -> Self {
         Self {
@@ -491,7 +543,24 @@ pub async fn serve_plaintext_mux_with_shutdown(
     listener: TcpListener,
     backends: ProtocolBackends,
     settings: MuxSettings,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    serve_plaintext_mux_with_shutdown_and_mode(
+        listener,
+        backends,
+        settings,
+        shutdown,
+        MuxRouteMode::GenericBroker,
+    )
+    .await
+}
+
+async fn serve_plaintext_mux_with_shutdown_and_mode(
+    listener: TcpListener,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
     mut shutdown: watch::Receiver<bool>,
+    route_mode: MuxRouteMode,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
     loop {
@@ -501,7 +570,7 @@ pub async fn serve_plaintext_mux_with_shutdown(
                 let mut connection_shutdown = shutdown.clone();
                 connections.spawn(async move {
                     tokio::select! {
-                        result = proxy_plaintext_connection(stream, backends, settings) => {
+                        result = proxy_plaintext_connection(stream, backends, settings, route_mode) => {
                             if let Err(error) = result {
                                 eprintln!("iot-mqttd protocol mux connection error: {error}");
                             }
@@ -522,8 +591,9 @@ async fn proxy_plaintext_connection(
     inbound: TcpStream,
     backends: ProtocolBackends,
     settings: MuxSettings,
+    route_mode: MuxRouteMode,
 ) -> std::io::Result<()> {
-    proxy_stream(inbound, backends, settings).await
+    proxy_stream(inbound, backends, settings, route_mode).await
 }
 
 pub async fn serve_tls_mux(
@@ -549,7 +619,26 @@ pub async fn serve_tls_mux_with_shutdown(
     acceptor: TlsAcceptor,
     backends: ProtocolBackends,
     settings: MuxSettings,
+    shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    serve_tls_mux_with_shutdown_and_mode(
+        listener,
+        acceptor,
+        backends,
+        settings,
+        shutdown,
+        MuxRouteMode::GenericBroker,
+    )
+    .await
+}
+
+async fn serve_tls_mux_with_shutdown_and_mode(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
     mut shutdown: watch::Receiver<bool>,
+    route_mode: MuxRouteMode,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
     loop {
@@ -564,7 +653,7 @@ pub async fn serve_tls_mux_with_shutdown(
                         _ = async {
                             match tokio::time::timeout(settings.preamble_timeout, acceptor.accept(stream)).await {
                                 Ok(Ok(stream)) => {
-                                    if let Err(error) = proxy_stream(stream, backends, settings).await {
+                                    if let Err(error) = proxy_stream(stream, backends, settings, route_mode).await {
                                         eprintln!("iot-mqttd TLS protocol mux connection error: {error}");
                                     }
                                 }
@@ -611,6 +700,7 @@ async fn proxy_stream<S>(
     mut inbound: S,
     backends: ProtocolBackends,
     settings: MuxSettings,
+    route_mode: MuxRouteMode,
 ) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -645,6 +735,12 @@ where
     let Some(route) = route else {
         return Ok(());
     };
+    if route_mode == MuxRouteMode::DeviceOnly && matches!(route, ConnectRoute::Broker(_)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "MQTT device credentials are required",
+        ));
+    }
     let backend_address = match route {
         ConnectRoute::Broker(MqttProtocol::V311) => backends.v311,
         ConnectRoute::Broker(MqttProtocol::V5) => backends.v5,

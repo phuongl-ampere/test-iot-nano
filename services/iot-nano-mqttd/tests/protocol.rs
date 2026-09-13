@@ -146,6 +146,26 @@ fn connect_route_sends_token_devices_to_the_native_transport_backend() {
 }
 
 #[test]
+fn standalone_connect_routing_keeps_generic_clients_on_broker_backends() {
+    assert_eq!(
+        detect_connect_route(&connect_packet(4)).unwrap(),
+        ConnectRoute::Broker(MqttProtocol::V311)
+    );
+    assert_eq!(
+        detect_connect_route(&v311_connect_with_username("ordinary")).unwrap(),
+        ConnectRoute::Broker(MqttProtocol::V311)
+    );
+    assert_eq!(
+        detect_connect_route(&connect_packet(5)).unwrap(),
+        ConnectRoute::Broker(MqttProtocol::V5)
+    );
+    assert_eq!(
+        detect_connect_route(&v5_connect_with_username("ordinary")).unwrap(),
+        ConnectRoute::Broker(MqttProtocol::V5)
+    );
+}
+
+#[test]
 fn mqtt5_device_tokens_route_to_the_native_transport_backend() {
     assert_eq!(
         detect_connect_route(&v5_connect_with_username("iotd_token")).unwrap(),

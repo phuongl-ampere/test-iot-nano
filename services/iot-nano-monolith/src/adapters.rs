@@ -19,11 +19,15 @@ const COMMAND_REQUEST_EXPIRED: &str = "command request has expired";
 
 pub struct PlatformCommandTransport {
     router: RpcSessionRouter,
+    authorization: Arc<dyn DeviceAuthorizationPort>,
 }
 
 impl PlatformCommandTransport {
-    pub fn new(router: RpcSessionRouter) -> Self {
-        Self { router }
+    pub fn new(router: RpcSessionRouter, authorization: Arc<dyn DeviceAuthorizationPort>) -> Self {
+        Self {
+            router,
+            authorization,
+        }
     }
 
     async fn publish_request(
@@ -45,8 +49,17 @@ impl PlatformCommandTransport {
             request.mode,
         )
         .map_err(|_| CommandTransportError::Configuration("request is not valid".to_owned()))?;
+        let snapshot = self
+            .router
+            .active_snapshot(&device_id)
+            .await
+            .ok_or(CommandTransportError::NoActiveSession)?;
+        self.authorization
+            .authorize_session(snapshot.authenticated_device())
+            .await
+            .map_err(map_authorization_error)?;
         self.router
-            .publish_to_device(&device_id, rpc)
+            .publish_to_snapshot(&snapshot, rpc)
             .await
             .map_err(map_session_error)
     }
@@ -68,6 +81,15 @@ fn map_session_error(error: SessionError) -> CommandTransportError {
         | SessionError::PublicationTimeout
         | SessionError::PublicationWaiterUnavailable
         | SessionError::AcknowledgementAlreadyConsumed => {
+            CommandTransportError::Unavailable(COMMAND_PUBLICATION_UNAVAILABLE.to_owned())
+        }
+    }
+}
+
+fn map_authorization_error(error: AuthorizationError) -> CommandTransportError {
+    match error {
+        AuthorizationError::Denied => CommandTransportError::NoActiveSession,
+        AuthorizationError::Unavailable(_) => {
             CommandTransportError::Unavailable(COMMAND_PUBLICATION_UNAVAILABLE.to_owned())
         }
     }

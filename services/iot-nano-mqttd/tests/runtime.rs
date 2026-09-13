@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    io::BufReader,
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
@@ -17,15 +18,74 @@ use iot_nano_stream::{
     AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment, PartitionId,
     StreamError, StreamMessage, StreamPort,
 };
+use rustls_pemfile::certs;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
+};
+use tokio_rustls::{
+    TlsConnector,
+    rustls::{
+        ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+        client::{
+            WebPkiServerVerifier,
+            danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        },
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    },
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
+const FIXTURE_CERTIFICATE_VALID_TIME: u64 = 1_789_000_000;
+
+#[derive(Debug)]
+struct FixtureCertificateVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+}
+
+impl ServerCertVerifier for FixtureCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            UnixTime::since_unix_epoch(Duration::from_secs(FIXTURE_CERTIFICATE_VALID_TIME)),
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
 
 #[derive(Clone)]
 struct TestAuthorization {
@@ -223,6 +283,74 @@ async fn runtime_denies_device_token_before_accepting_a_session() {
 }
 
 #[tokio::test]
+async fn runtime_rejects_missing_and_non_device_mqtt311_and_mqtt5_before_broker_dispatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let plaintext_address = reserve_address().await;
+    let tls_address = reserve_address().await;
+    let storage: Arc<dyn BrokerStorage> = Arc::new(MemoryStorage::new());
+    let mut runtime = start_runtime(
+        directory.path(),
+        plaintext_address,
+        tls_address,
+        storage,
+        Arc::new(TestAuthorization::allowing()),
+    )
+    .await
+    .unwrap();
+
+    for (connect, publish) in [
+        (
+            v311_connect_without_credentials("missing-v311"),
+            v311_qos_one_publish("test/missing-v311", b"blocked", 1),
+        ),
+        (
+            v311_connect("non-device-v311", "ordinary", "password"),
+            v311_qos_one_publish("test/non-device-v311", b"blocked", 2),
+        ),
+        (
+            v5_connect_without_credentials("missing-v5"),
+            v5_qos_one_publish("test/missing-v5", b"blocked", 3),
+        ),
+        (
+            v5_connect("non-device-v5", "ordinary", "password"),
+            v5_qos_one_publish("test/non-device-v5", b"blocked", 4),
+        ),
+    ] {
+        let stream = TcpStream::connect(plaintext_address).await.unwrap();
+        assert_rejected_before_broker_dispatch(stream, &connect, &publish).await;
+    }
+
+    shutdown(&mut runtime).await;
+}
+
+#[tokio::test]
+async fn runtime_rejects_non_device_tls_mqtt_connection_before_broker_dispatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let plaintext_address = reserve_address().await;
+    let tls_address = reserve_address().await;
+    let storage: Arc<dyn BrokerStorage> = Arc::new(MemoryStorage::new());
+    let mut runtime = start_runtime(
+        directory.path(),
+        plaintext_address,
+        tls_address,
+        storage,
+        Arc::new(TestAuthorization::allowing()),
+    )
+    .await
+    .unwrap();
+
+    let stream = tls_connect(tls_address, &fixture_certificate()).await;
+    assert_rejected_before_broker_dispatch(
+        stream,
+        &v311_connect("non-device-tls", "ordinary", "password"),
+        &v311_qos_one_publish("test/non-device-tls", b"blocked", 5),
+    )
+    .await;
+
+    shutdown(&mut runtime).await;
+}
+
+#[tokio::test]
 async fn tls_failure_leaves_configured_public_addresses_unbound() {
     let directory = tempfile::tempdir().unwrap();
     let plaintext_address = reserve_address().await;
@@ -386,4 +514,162 @@ fn v311_connect(client_id: &str, username: &str, password: &str) -> Vec<u8> {
     packet.extend_from_slice(&(password.len() as u16).to_be_bytes());
     packet.extend_from_slice(password.as_bytes());
     packet
+}
+
+fn v311_connect_without_credentials(client_id: &str) -> Vec<u8> {
+    let remaining = 10 + 2 + client_id.len();
+    let mut packet = vec![
+        0x10,
+        remaining as u8,
+        0x00,
+        0x04,
+        b'M',
+        b'Q',
+        b'T',
+        b'T',
+        4,
+        0x02,
+        0x00,
+        0x3c,
+        (client_id.len() >> 8) as u8,
+        client_id.len() as u8,
+    ];
+    packet.extend_from_slice(client_id.as_bytes());
+    packet
+}
+
+fn v5_connect_without_credentials(client_id: &str) -> Vec<u8> {
+    let remaining = 11 + 2 + client_id.len();
+    let mut packet = vec![
+        0x10,
+        remaining as u8,
+        0x00,
+        0x04,
+        b'M',
+        b'Q',
+        b'T',
+        b'T',
+        5,
+        0x02,
+        0x00,
+        0x3c,
+        0x00,
+        (client_id.len() >> 8) as u8,
+        client_id.len() as u8,
+    ];
+    packet.extend_from_slice(client_id.as_bytes());
+    packet
+}
+
+fn v5_connect(client_id: &str, username: &str, password: &str) -> Vec<u8> {
+    let remaining = 11 + 2 + client_id.len() + 2 + username.len() + 2 + password.len();
+    let mut packet = vec![
+        0x10,
+        remaining as u8,
+        0x00,
+        0x04,
+        b'M',
+        b'Q',
+        b'T',
+        b'T',
+        5,
+        0xc2,
+        0x00,
+        0x3c,
+        0x00,
+        (client_id.len() >> 8) as u8,
+        client_id.len() as u8,
+    ];
+    packet.extend_from_slice(client_id.as_bytes());
+    packet.extend_from_slice(&(username.len() as u16).to_be_bytes());
+    packet.extend_from_slice(username.as_bytes());
+    packet.extend_from_slice(&(password.len() as u16).to_be_bytes());
+    packet.extend_from_slice(password.as_bytes());
+    packet
+}
+
+fn v311_qos_one_publish(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
+    let remaining = 2 + topic.len() + 2 + payload.len();
+    let mut packet = vec![0x32];
+    encode_remaining_length(remaining, &mut packet);
+    packet.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    packet.extend_from_slice(topic.as_bytes());
+    packet.extend_from_slice(&packet_id.to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+fn v5_qos_one_publish(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> {
+    let remaining = 2 + topic.len() + 2 + 1 + payload.len();
+    let mut packet = vec![0x32];
+    encode_remaining_length(remaining, &mut packet);
+    packet.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    packet.extend_from_slice(topic.as_bytes());
+    packet.extend_from_slice(&packet_id.to_be_bytes());
+    packet.push(0x00);
+    packet.extend_from_slice(payload);
+    packet
+}
+
+fn encode_remaining_length(mut value: usize, packet: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value % 128) as u8;
+        value /= 128;
+        if value > 0 {
+            byte |= 0x80;
+        }
+        packet.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
+async fn assert_rejected_before_broker_dispatch<S>(mut stream: S, connect: &[u8], publish: &[u8])
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(connect).await.unwrap();
+    let _ = stream.write_all(publish).await;
+    let mut response = Vec::new();
+    match timeout(Duration::from_secs(1), stream.read_to_end(&mut response)).await {
+        Ok(Ok(_)) | Ok(Err(_)) => {
+            assert!(
+                response.is_empty(),
+                "unexpected MQTT broker response: {response:?}"
+            );
+        }
+        Err(_) => panic!("non-device MQTT connection remained open"),
+    }
+}
+
+async fn tls_connect(
+    address: SocketAddr,
+    certificate_path: &PathBuf,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let certificate = std::fs::File::open(certificate_path).unwrap();
+    let mut certificate = BufReader::new(certificate);
+    let mut roots = RootCertStore::empty();
+    for certificate in certs(&mut certificate) {
+        roots.add(certificate.unwrap()).unwrap();
+    }
+    let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .unwrap();
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(FixtureCertificateVerifier { inner: verifier }))
+        .with_no_client_auth();
+    let stream = TcpStream::connect(address).await.unwrap();
+    TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap()
+}
+
+fn fixture_certificate() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("server.crt")
 }

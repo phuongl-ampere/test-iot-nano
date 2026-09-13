@@ -136,7 +136,7 @@ pub struct SessionSnapshot {
 }
 
 impl SessionSnapshot {
-    fn authenticated_device(&self) -> AuthenticatedDevice {
+    pub fn authenticated_device(&self) -> AuthenticatedDevice {
         AuthenticatedDevice {
             token_id: self.registration.token_id,
             device_id: self.registration.device_id.clone(),

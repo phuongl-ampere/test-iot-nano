@@ -161,13 +161,15 @@ impl MqttRuntime {
             device_v311: Some(device_v311_address),
             device_v5: Some(device_v5_address),
         };
-        if let Err(error) =
-            broker.spawn_public_plaintext_mux(plaintext_listener, backends, MuxSettings::default())
-        {
+        if let Err(error) = broker.spawn_public_plaintext_device_only_mux(
+            plaintext_listener,
+            backends,
+            MuxSettings::default(),
+        ) {
             cancel_startup(&broker, &cancellation, device_workers).await;
             return Err(MqttRuntimeStartError::PublicWorker(error));
         }
-        if let Err(error) = broker.spawn_public_tls_mux(
+        if let Err(error) = broker.spawn_public_tls_device_only_mux(
             tls_listener,
             tls_acceptor,
             backends,

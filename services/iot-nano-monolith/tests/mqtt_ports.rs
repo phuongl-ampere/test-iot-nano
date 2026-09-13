@@ -293,7 +293,8 @@ async fn shared_router_waits_for_puback_records_response_and_honors_revocation()
     );
 
     let router = fixture.runtime.session_router();
-    let command_transport = PlatformCommandTransport::new(router.clone());
+    let command_transport =
+        PlatformCommandTransport::new(router.clone(), fixture.authorization.clone());
     let issued_at = Utc::now();
     let command_id = Uuid::now_v7();
     let publish = tokio::spawn(async move {
@@ -350,7 +351,7 @@ async fn shared_router_waits_for_puback_records_response_and_honors_revocation()
             .await
     );
     let now = Utc::now();
-    let revoked_transport = PlatformCommandTransport::new(router);
+    let revoked_transport = PlatformCommandTransport::new(router, fixture.authorization.clone());
     let revoked = revoked_transport.publish(TransportRpcPublishRequest {
         device_id: "meter-a".to_owned(),
         id: Uuid::now_v7(),
