@@ -146,6 +146,8 @@ async fn authorization_endpoint_issues_an_s256_bound_code_on_the_public_router()
     let response = routers(state).public.oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["pragma"], "no-cache");
     let location = response.headers().get(LOCATION).unwrap().to_str().unwrap();
     assert!(location.starts_with("https://client.example.test/callback?"));
     assert!(location.ends_with("&state=carry-me"));
@@ -579,6 +581,48 @@ async fn token_endpoint_hides_a_confidential_client_secret_mismatch() {
             "incorrect-confidential-client-secret",
             "devices%3Aread",
         ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["error"], "invalid_client");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM oauth_access_tokens")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn token_endpoint_hides_a_confidential_secret_mismatch_for_authorization_code() {
+    let (_directory, store, state) = oauth_test_state(true).await;
+    OAuthRepository::register_client_secret(
+        &store,
+        NewOAuthClientSecret {
+            app_id: "oauth-test-app".parse().unwrap(),
+            client_secret: "correct-confidential-client-secret".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let verifier = "correct-pkce-verifier-with-at-least-forty-three-characters";
+    let code = authorize_code(state.clone(), verifier).await;
+    let response = routers(state)
+        .public
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id={CLIENT_ID}&client_secret=incorrect-confidential-client-secret&code_verifier={verifier}"
+                )))
+                .unwrap(),
+        )
         .await
         .unwrap();
 

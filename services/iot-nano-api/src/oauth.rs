@@ -378,6 +378,7 @@ async fn exchange_authorization_code(
 fn exchange_code_error(error: PlatformStoreError) -> OAuthError {
     match error {
         PlatformStoreError::OAuthAuthorizationCodeDenied => OAuthError::InvalidGrant,
+        PlatformStoreError::OAuthClientAuthenticationDenied => OAuthError::InvalidClient,
         _ => OAuthError::ServerError,
     }
 }
@@ -499,6 +500,12 @@ fn authorization_redirect(
     let location = HeaderValue::from_str(&location).map_err(|_| OAuthError::InvalidRequest)?;
     let mut response = StatusCode::FOUND.into_response();
     response.headers_mut().insert(LOCATION, location);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
     Ok(response)
 }
 
