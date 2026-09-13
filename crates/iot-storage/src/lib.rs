@@ -2454,22 +2454,24 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let row = sqlx::query(
-                    "SELECT AVG(
-                                CASE
+                    "WITH finite_telemetry AS (
+                         SELECT CASE
                                     WHEN jsonb_typeof(measurements -> $1) = 'number'
-                                    THEN (measurements ->> $1)::double precision
-                                END
-                            ) AS average,
-                            COUNT(
-                                CASE
-                                    WHEN jsonb_typeof(measurements -> $1) = 'number'
-                                    THEN 1
-                                END
-                            ) AS sample_count
-                     FROM telemetry
-                     WHERE device_id = $2
-                       AND event_at >= $3
-                       AND event_at <= $4",
+                                    THEN CASE
+                                        WHEN (measurements ->> $1)::numeric BETWEEN
+                                                 '-1.7976931348623157e308'::numeric
+                                             AND '1.7976931348623157e308'::numeric
+                                        THEN (measurements ->> $1)::numeric
+                                    END
+                                END AS finite_value
+                         FROM telemetry
+                         WHERE device_id = $2
+                           AND event_at >= $3
+                           AND event_at <= $4
+                     )
+                     SELECT (AVG(finite_value))::double precision AS average,
+                            COUNT(finite_value) AS sample_count
+                     FROM finite_telemetry",
                 )
                 .bind(metric_key)
                 .bind(device_id)

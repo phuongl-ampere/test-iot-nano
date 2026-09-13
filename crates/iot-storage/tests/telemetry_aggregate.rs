@@ -257,24 +257,17 @@ async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
         .await
         .unwrap();
     for (event_at, sequence, measurements) in [
+        ("2026-01-01T00:00:00Z", 1_i64, r#"{"temperature_c":1.25}"#),
+        ("2026-01-01T00:00:10Z", 2, r#"{"temperature_c":9e999}"#),
+        ("2026-01-01T00:00:20Z", 3, r#"{"temperature_c":-9e999}"#),
         (
-            "2026-01-01T00:00:00.000000900Z",
-            1_i64,
-            r#"{"temperature_c":10}"#,
-        ),
-        (
-            "2026-01-01T00:00:30.000000100Z",
-            2,
-            r#"{"temperature_c":20}"#,
-        ),
-        ("2026-01-01T00:01:00Z", 3, r#"{"temperature_c":30}"#),
-        (
-            "2026-01-01T00:00:45Z",
+            "2026-01-01T00:00:30Z",
             4,
             r#"{"temperature_c":"not-a-number"}"#,
         ),
-        ("2026-01-01T00:00:50Z", 5, r#"{"other":99}"#),
-        ("2026-01-01T00:00:55Z", 6, r#"{"temperature_c":null}"#),
+        ("2026-01-01T00:00:40Z", 5, r#"{"temperature_c":null}"#),
+        ("2026-01-01T00:00:50Z", 6, r#"{"other":99}"#),
+        ("2026-01-01T00:01:00Z", 7, r#"{"temperature_c":-2.5}"#),
     ] {
         let event_at = chrono::DateTime::parse_from_rfc3339(event_at)
             .unwrap()
@@ -303,6 +296,6 @@ async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
     .unwrap()
     .unwrap();
 
-    assert_eq!(aggregate.average, 20.0);
-    assert_eq!(aggregate.sample_count, 3);
+    assert_eq!(aggregate.average, -0.625);
+    assert_eq!(aggregate.sample_count, 2);
 }
