@@ -229,7 +229,6 @@ impl MqttRuntime {
     }
 
     pub async fn drain(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
-        self.stop_parent_cancellation_watcher().await;
         self.stop_accepting().await?;
         let public_workers = self
             .broker
@@ -251,7 +250,7 @@ impl MqttRuntime {
             }
         }
 
-        if let Err(error) = drain_result {
+        let result = if let Err(error) = drain_result {
             self.force_cancellation.cancel();
             self.shutdown_broker();
             self.abort_and_join_device_workers().await;
@@ -259,12 +258,14 @@ impl MqttRuntime {
                 let _ = join.await;
             }
             self.join_broker_after_shutdown().await;
-            return Err(error);
-        }
-
-        drop(public_join);
-        self.force_cancellation.cancel();
-        self.join_broker_until(deadline).await
+            Err(error)
+        } else {
+            drop(public_join);
+            self.force_cancellation.cancel();
+            self.join_broker_until(deadline).await
+        };
+        self.stop_parent_cancellation_watcher().await;
+        result
     }
 
     async fn drain_device_workers(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {

@@ -405,6 +405,46 @@ async fn parent_cancellation_releases_configured_public_listener_addresses() {
 }
 
 #[tokio::test]
+async fn parent_cancellation_forces_held_public_preambles_during_drain() {
+    let directory = tempfile::tempdir().unwrap();
+    let plaintext_address = reserve_address().await;
+    let tls_address = reserve_address().await;
+    let cancellation = CancellationToken::new();
+    let mut config = runtime_config(
+        directory.path(),
+        plaintext_address,
+        tls_address,
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestAuthorization::allowing()),
+        fixture_certificate(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server.key"),
+    );
+    config.cancellation = cancellation.clone();
+    let runtime = MqttRuntime::start(config).await.unwrap();
+    let plaintext = TcpStream::connect(plaintext_address).await.unwrap();
+    let tls = TcpStream::connect(tls_address).await.unwrap();
+    let mut drain = tokio::spawn(async move {
+        let mut runtime = runtime;
+        runtime.drain(Instant::now() + Duration::from_secs(5)).await
+    });
+
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    cancellation.cancel();
+
+    let result = timeout(Duration::from_secs(1), &mut drain).await;
+    if result.is_err() {
+        drain.abort();
+        let _ = drain.await;
+    }
+    drop((plaintext, tls));
+    assert!(matches!(result, Ok(Ok(Ok(())))));
+    assert_bindable(plaintext_address).await;
+    assert_bindable(tls_address).await;
+}
+
+#[tokio::test]
 async fn runtime_rejects_missing_and_non_device_mqtt311_and_mqtt5_before_broker_dispatch() {
     let directory = tempfile::tempdir().unwrap();
     let plaintext_address = reserve_address().await;
@@ -612,7 +652,10 @@ async fn assert_bindable(address: SocketAddr) {
     drop(listener);
 }
 
-async fn assert_public_addresses_rebindable(plaintext_address: SocketAddr, tls_address: SocketAddr) {
+async fn assert_public_addresses_rebindable(
+    plaintext_address: SocketAddr,
+    tls_address: SocketAddr,
+) {
     timeout(Duration::from_secs(2), async {
         loop {
             if let Ok(plaintext_listener) = TcpListener::bind(plaintext_address).await {
