@@ -111,6 +111,49 @@ async fn legacy_router_keeps_management_and_internal_routes() {
 }
 
 #[tokio::test]
+async fn sqlite_public_router_mounts_oauth_and_public_device_routes() {
+    let (_directory, state) = sqlite_test_state().await;
+    let app = sqlite_routers(state).public;
+
+    for (method, uri, body, expected_status) in [
+        (
+            "GET",
+            "/oauth/authorize",
+            Body::empty(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "POST",
+            "/oauth/token",
+            Body::from("grant_type=client_credentials"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            "GET",
+            "/api/v1/devices",
+            Body::empty(),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let mut request = Request::builder().method(method).uri(uri);
+        if method == "POST" {
+            request = request.header("content-type", "application/x-www-form-urlencoded");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            expected_status,
+            "{method} {uri} must be mounted on the SQLite public router"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sqlite_public_router_excludes_session_management_docs_and_internal_routes() {
     let (_directory, state) = sqlite_test_state().await;
     let app = sqlite_routers(state).public;
@@ -147,30 +190,71 @@ async fn sqlite_public_router_excludes_session_management_docs_and_internal_rout
 }
 
 #[tokio::test]
-async fn sqlite_management_router_keeps_protected_management_without_public_or_internal_routes() {
+async fn sqlite_management_router_mounts_session_management_and_docs_routes() {
     let (_directory, state) = sqlite_test_state().await;
     let routers = sqlite_routers(state);
 
-    let protected = routers
-        .management
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/auth/me")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+    for (method, uri, body, expected_status) in [
+        (
+            "POST",
+            "/api/auth/login",
+            Body::from(r#"{"username":"missing","password":"missing"}"#),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "GET",
+            "/api/auth/me",
+            Body::empty(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "GET",
+            "/api/management/devices",
+            Body::empty(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        ("GET", "/docs/", Body::empty(), StatusCode::OK),
+        (
+            "GET",
+            "/api-docs/openapi.json",
+            Body::empty(),
+            StatusCode::OK,
+        ),
+    ] {
+        let mut request = Request::builder().method(method).uri(uri);
+        if method == "POST" {
+            request = request.header("content-type", "application/json");
+        }
+        let response = routers
+            .management
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            expected_status,
+            "{method} {uri} must be mounted on the SQLite management router"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_management_router_excludes_public_and_internal_routes() {
+    let (_directory, state) = sqlite_test_state().await;
+    let app = sqlite_routers(state).management;
 
     for (method, uri) in [
         ("GET", "/oauth/authorize"),
+        ("POST", "/oauth/token"),
         ("GET", "/api/v1/devices"),
         ("POST", "/internal/mqttd/session-resolution"),
+        ("POST", "/internal/mqttd/session-authorization"),
+        ("POST", "/internal/mqttd/gateway-authorization"),
+        ("POST", "/internal/mqttd/rpc-response"),
     ] {
-        let response = routers
-            .management
+        let response = app
             .clone()
             .oneshot(
                 Request::builder()
