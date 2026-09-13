@@ -137,6 +137,8 @@ pub enum StreamError {
 }
 
 pub trait StreamPort: Send + Sync {
+    fn stop_claiming(&self) {}
+
     fn append(
         &self,
         message: StreamMessage,
@@ -182,6 +184,10 @@ impl LocalStream {
 
     pub fn partition_for(&self, partition_key: &str) -> PartitionId {
         segment::partition_for(partition_key, &self.inner.config)
+    }
+
+    pub fn stop_claiming(&self) {
+        self.inner.accepting.store(false, Ordering::Release);
     }
 
     pub async fn append(
@@ -239,7 +245,7 @@ impl LocalStream {
     }
 
     pub async fn drain_until(&self, deadline: Instant) -> Result<(), StreamError> {
-        self.inner.accepting.store(false, Ordering::Release);
+        self.stop_claiming();
         let mut remaining = 0;
         loop {
             let now = Instant::now();
@@ -279,6 +285,10 @@ impl LocalStream {
 }
 
 impl StreamPort for LocalStream {
+    fn stop_claiming(&self) {
+        LocalStream::stop_claiming(self);
+    }
+
     fn append(
         &self,
         message: StreamMessage,
@@ -322,6 +332,41 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn stop_claiming_rejects_claims_started_after_the_stop_signal() {
+        let directory = tempdir().unwrap();
+        let stream =
+            LocalStream::open(StreamConfig::sqlite(directory.path().join("stream.sqlite")))
+                .await
+                .unwrap();
+
+        let claim_started_before_stop = stream
+            .claim(ClaimRequest {
+                group: "workers".to_owned(),
+                member_id: "worker-1".to_owned(),
+                start: GroupStart::Earliest,
+                limit: 1,
+            })
+            .await;
+        assert!(claim_started_before_stop.is_ok());
+
+        stream.stop_claiming();
+
+        let claim_started_after_stop = stream
+            .claim(ClaimRequest {
+                group: "workers".to_owned(),
+                member_id: "worker-1".to_owned(),
+                start: GroupStart::Earliest,
+                limit: 1,
+            })
+            .await;
+
+        assert!(matches!(
+            claim_started_after_stop,
+            Err(StreamError::Draining)
+        ));
+    }
 
     #[tokio::test]
     async fn drain_until_honors_deadline_while_sqlite_work_is_contended() {

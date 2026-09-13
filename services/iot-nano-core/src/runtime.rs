@@ -13,12 +13,15 @@ use iot_storage::PlatformStore;
 use iot_stream::{StreamError, StreamPort};
 use thiserror::Error;
 use tokio::{
+    sync::Mutex as AsyncMutex,
     task::JoinHandle,
     time::{self, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{CoreStreamConsumer, IngestMetrics, PlatformAlertEvaluator, PlatformTelemetryWriter};
+use crate::{
+    CoreStreamConsumer, IngestMetrics, PlatformAlertEvaluator, PlatformTelemetryWriter, WriterError,
+};
 
 #[derive(Clone)]
 pub struct CoreRuntimeConfig {
@@ -79,6 +82,7 @@ pub struct CoreRuntime {
     cancellation: CancellationToken,
     stream: Arc<dyn StreamPort>,
     workers: Mutex<Option<Vec<WorkerHandle>>>,
+    drain_lock: AsyncMutex<()>,
     drain_started: AtomicBool,
 }
 
@@ -92,7 +96,7 @@ impl CoreRuntime {
             config.writer_group,
             config.writer_member_id,
         );
-        let alert_consumer = CoreStreamConsumer::new(
+        let event_consumer = CoreStreamConsumer::new(
             Arc::clone(&config.stream),
             config.alert_group,
             config.alert_member_id,
@@ -131,12 +135,11 @@ impl CoreRuntime {
                         .flush_once(&consumer, Utc::now())
                         .await
                         .map(|_| ())
-                        .map_err(|error| WorkError::Storage(error.to_string()))
+                        .map_err(writer_work_error)
                 })
             }),
         ));
         let alert_stop = Arc::clone(&stop_claiming);
-        let event_consumer = alert_consumer.clone();
         let event_handle = tokio::spawn(run_worker(
             "event alerts",
             event_consumer.clone(),
@@ -166,11 +169,9 @@ impl CoreRuntime {
                 })
             }),
         ));
-        let window_handle = tokio::spawn(run_worker(
+        let window_handle = tokio::spawn(run_window_worker(
             "window alerts",
-            alert_consumer,
             config.window_alert_interval,
-            config.alert_heartbeat_interval,
             cancellation.clone(),
             Arc::clone(&config.metrics),
             ready_tx,
@@ -190,6 +191,7 @@ impl CoreRuntime {
             cancellation,
             stream: config.stream,
             workers: Mutex::new(Some(vec![writer_handle, event_handle, window_handle])),
+            drain_lock: AsyncMutex::new(()),
             drain_started: AtomicBool::new(false),
         };
         for _ in 0..3 {
@@ -227,22 +229,27 @@ impl CoreRuntime {
 
     pub fn stop_claiming(&self) {
         self.stop_claiming.store(true, Ordering::Release);
+        self.stream.stop_claiming();
     }
 
     pub async fn drain(&self, deadline: Instant) -> Result<(), CoreRuntimeError> {
         self.stop_claiming();
+        let _drain_lock = self.drain_lock.lock().await;
         if !self.drain_started.swap(true, Ordering::AcqRel) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let drain_result = time::timeout(remaining, self.stream.drain(deadline)).await;
-            if drain_result.is_err() {
-                self.cancellation.cancel();
-                let _ = self.join_all(deadline).await;
-                return Err(CoreRuntimeError::Deadline);
-            }
-            if let Err(error) = drain_result.expect("drain result was checked above") {
-                self.cancellation.cancel();
-                let _ = self.join_all(deadline).await;
-                return Err(CoreRuntimeError::Drain(error));
+            match drain_result {
+                Err(_) | Ok(Err(StreamError::DrainTimeout { .. })) => {
+                    self.cancellation.cancel();
+                    let _ = self.join_all(deadline).await;
+                    return Err(CoreRuntimeError::Deadline);
+                }
+                Ok(Err(error)) => {
+                    self.cancellation.cancel();
+                    let _ = self.join_all(deadline).await;
+                    return Err(CoreRuntimeError::Drain(error));
+                }
+                Ok(Ok(())) => {}
             }
         }
         self.cancellation.cancel();
@@ -255,7 +262,7 @@ impl CoreRuntime {
     }
 
     async fn join_all(&self, deadline: Instant) -> Result<(), CoreRuntimeError> {
-        let handles = self
+        let worker_handles = self
             .workers
             .lock()
             .expect("runtime worker mutex poisoned")
@@ -264,17 +271,22 @@ impl CoreRuntime {
         let mut first_error = None;
         let mut handles = ["writer", "event alerts", "window alerts"]
             .into_iter()
-            .zip(handles)
-            .peekable();
-        while let Some((worker, handle)) = handles.next() {
+            .zip(worker_handles)
+            .collect::<Vec<_>>();
+        for index in 0..handles.len() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let result = time::timeout(remaining, handle).await;
+            let worker = handles[index].0;
+            let result = {
+                let (_, handle) = &mut handles[index];
+                time::timeout(remaining, handle).await
+            };
             match result {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => {
                     if first_error.is_none() {
                         first_error = Some(CoreRuntimeError::Worker(error));
                     }
+                    self.cancellation.cancel();
                 }
                 Ok(Err(error)) => {
                     if first_error.is_none() {
@@ -284,12 +296,16 @@ impl CoreRuntime {
                                 error: error.to_string(),
                             }));
                     }
+                    self.cancellation.cancel();
                 }
                 Err(_error) => {
-                    for (_, handle) in handles {
+                    for (_, handle) in handles.iter_mut().skip(index) {
                         handle.abort();
                     }
-                    return Err(first_error.unwrap_or(CoreRuntimeError::Deadline));
+                    for (_, handle) in handles.iter_mut().skip(index) {
+                        let _ = handle.await;
+                    }
+                    return Err(CoreRuntimeError::Deadline);
                 }
             }
         }
@@ -385,9 +401,48 @@ async fn run_worker(
     }
 }
 
+async fn run_window_worker(
+    name: &'static str,
+    work_interval: Duration,
+    cancellation: CancellationToken,
+    metrics: Arc<IngestMetrics>,
+    ready: tokio::sync::mpsc::Sender<Result<(), CoreRuntimeError>>,
+    mut work: Work,
+) -> Result<(), CoreRuntimeWorkerError> {
+    let _ = ready.send(Ok(())).await;
+    let mut work_tick = time::interval(work_interval);
+    work_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    work_tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = work_tick.tick() => {
+                if let Err(error) = work().await {
+                    match &error {
+                        WorkError::Stream(_) => metrics.record_stream_failure(),
+                        WorkError::Storage(_) => metrics.record_database_failure(),
+                        WorkError::Alert(_) => metrics.record_alert_failure(),
+                    }
+                    cancellation.cancel();
+                    return Err(worker_error(name, error));
+                }
+            }
+        }
+    }
+}
+
 fn worker_error(name: &'static str, error: impl std::fmt::Display) -> CoreRuntimeWorkerError {
     CoreRuntimeWorkerError::Failed {
         worker: name,
         error: error.to_string(),
+    }
+}
+
+fn writer_work_error(error: WriterError) -> WorkError {
+    match error {
+        WriterError::Stream(error) => WorkError::Stream(error.to_string()),
+        WriterError::Database(error) => WorkError::Storage(error.to_string()),
+        WriterError::Sqlite(error) => WorkError::Storage(error.to_string()),
+        WriterError::Platform(error) => WorkError::Storage(error.to_string()),
     }
 }
