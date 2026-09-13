@@ -25,8 +25,9 @@ pub use power_switcher::{
     bootstrap_power_switcher_profile_sqlite,
 };
 pub use routes::{
-    ApiState, MqttdDeviceTransportSessionRevocation, MqttdDeviceTransportSessionRevoker,
-    MqttdDeviceTransportSessionRevokerError, SqliteApiState, router, sqlite_router,
+    ApiRouters, ApiState, MqttdDeviceTransportSessionRevocation,
+    MqttdDeviceTransportSessionRevoker, MqttdDeviceTransportSessionRevokerError, SqliteApiState,
+    router, routers, sqlite_router,
 };
 pub use storage::{ApiSqliteStore, connect_api_database, migrate_api};
 pub use system_config::{

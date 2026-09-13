@@ -673,9 +673,30 @@ impl Modify for SessionSecurity {
     }
 }
 
+#[derive(Clone)]
+pub struct ApiRouters {
+    pub public: Router,
+    pub management: Router,
+}
+
+pub fn routers(state: ApiState) -> ApiRouters {
+    ApiRouters {
+        public: public_router(),
+        management: management_router(state),
+    }
+}
+
 pub fn router(state: ApiState) -> Router {
-    let public = Router::new()
-        .route("/healthz", get(healthz))
+    let ApiRouters { public, management } = routers(state);
+    public.merge(management)
+}
+
+fn public_router() -> Router {
+    Router::new().route("/healthz", get(healthz))
+}
+
+fn management_router(state: ApiState) -> Router {
+    let management = Router::new()
         .route("/api/auth/login", post(login))
         .route(
             "/internal/mqttd/session-resolution",
@@ -802,7 +823,7 @@ pub fn router(state: ApiState) -> Router {
             state.clone(),
             authenticate_request,
         ));
-    public
+    management
         .merge(protected)
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state)
