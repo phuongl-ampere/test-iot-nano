@@ -223,10 +223,12 @@ impl MqttRuntime {
         self.accepting.load(Ordering::Acquire)
     }
 
+    /// Returns the number of public mux connections accepted and still in flight.
     pub fn public_connection_count(&self) -> usize {
         self.public_connections.load(Ordering::Relaxed)
     }
 
+    /// Subscribes to the transition after public acceptance has stopped for a drain.
     pub fn drain_started_receiver(&self) -> watch::Receiver<bool> {
         self.drain_started.subscribe()
     }
