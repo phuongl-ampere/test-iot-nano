@@ -17,9 +17,10 @@ use iot_nano_core::{
 use iot_storage::PlatformStore;
 use iot_stream::{
     AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment,
-    HeartbeatRequest, PartitionId, StreamError, StreamMessage, StreamPort, TelemetryMessage,
+    HeartbeatRequest, LocalStream, PartitionId, StreamConfig, StreamError, StreamMessage,
+    StreamPort, TelemetryMessage,
 };
-use serde_json::Map;
+use serde_json::{Map, json};
 use tempfile::TempDir;
 use tokio::{
     sync::Notify,
@@ -42,6 +43,69 @@ impl ActiveClaim {
 impl Drop for ActiveClaim {
     fn drop(&mut self) {
         self.active_claims.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+struct AckCountingStream {
+    inner: LocalStream,
+    acknowledgements: Arc<AtomicUsize>,
+}
+
+impl AckCountingStream {
+    fn new(inner: LocalStream) -> Self {
+        Self {
+            inner,
+            acknowledgements: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn acknowledgements(&self) -> usize {
+        self.acknowledgements.load(Ordering::SeqCst)
+    }
+}
+
+impl StreamPort for AckCountingStream {
+    fn append(
+        &self,
+        message: StreamMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<AppendReceipt, StreamError>> + Send + '_>> {
+        Box::pin(self.inner.append(message))
+    }
+
+    fn claim(
+        &self,
+        request: ClaimRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ClaimedRecord>, StreamError>> + Send + '_>> {
+        Box::pin(self.inner.claim(request))
+    }
+
+    fn acknowledge(
+        &self,
+        request: AcknowledgeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+        let acknowledgements = Arc::clone(&self.acknowledgements);
+        Box::pin(async move {
+            let result = self.inner.acknowledge(request).await;
+            if result.is_ok() {
+                acknowledgements.fetch_add(1, Ordering::SeqCst);
+            }
+            result
+        })
+    }
+
+    fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GroupAssignment, StreamError>> + Send + '_>> {
+        Box::pin(self.inner.heartbeat(request))
+    }
+
+    fn drain(
+        &self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+        Box::pin(self.inner.drain_until(deadline))
     }
 }
 
@@ -124,10 +188,6 @@ impl RecordingStream {
             .expect("writer records mutex poisoned") = records;
     }
 
-    fn acknowledgements(&self) -> usize {
-        self.acknowledgements.load(Ordering::SeqCst)
-    }
-
     fn require_claim_on_heartbeat(&self) {
         self.heartbeat_requires_claim.store(true, Ordering::SeqCst);
     }
@@ -186,6 +246,9 @@ impl StreamPort for RecordingStream {
             .lock()
             .expect("claim members mutex poisoned")
             .push(request.member_id.clone());
+        if self.stop_claiming_calls.load(Ordering::SeqCst) > 0 {
+            return Box::pin(async { Err(StreamError::Draining) });
+        }
         if request.group == "writer" && self.panic_writer_claim.load(Ordering::SeqCst) {
             return Box::pin(async move { panic!("writer claim panic") });
         }
@@ -319,7 +382,7 @@ fn telemetry_record(device_id: &str) -> ClaimedRecord {
         partition: PartitionId::new(0),
         offset: 0,
         message: StreamMessage::Telemetry(TelemetryMessage {
-            topic: "telemetry/runtime-test".to_owned(),
+            topic: format!("iot/v1/devices/{device_id}/telemetry"),
             payload: b"{}".to_vec(),
             event: TelemetryEvent {
                 schema_version: 1,
@@ -327,7 +390,7 @@ fn telemetry_record(device_id: &str) -> ClaimedRecord {
                 boot_id: Uuid::nil(),
                 sequence: 1,
                 event_at: now,
-                measurements: Map::new(),
+                measurements: Map::from_iter([("temperature_c".to_owned(), json!(26.4))]),
                 gateway_device_id: None,
             },
             received_at: now,
@@ -415,6 +478,10 @@ async fn stop_prevents_later_claims_and_drain_is_called_once() {
     sleep(Duration::from_millis(25)).await;
     runtime.stop_claiming();
     let claims = stream.claims();
+    let claim_after_stop = stream
+        .claim(ClaimRequest::new("writer", "runtime-test"))
+        .await;
+    let claims_after_stop = stream.claims();
 
     runtime
         .drain(Instant::now() + Duration::from_secs(1))
@@ -425,7 +492,9 @@ async fn stop_prevents_later_claims_and_drain_is_called_once() {
         .await
         .unwrap();
 
-    assert_eq!(stream.claims(), claims);
+    assert_eq!(claims_after_stop, claims + 1);
+    assert_eq!(stream.claims(), claims_after_stop);
+    assert!(matches!(claim_after_stop, Err(StreamError::Draining)));
     assert_eq!(stream.drains(), 1);
 }
 
@@ -533,25 +602,48 @@ async fn writer_error_metrics_preserve_stream_and_platform_taxonomy() {
 }
 
 #[tokio::test]
-async fn failed_persistence_leaves_the_claim_reclaimable_until_a_successful_retry_acknowledges_once()
- {
-    let stream = RecordingStream::default();
-    stream.set_writer_records(vec![telemetry_record("retry-device")]);
-    let (_directory, config) = runtime_config(Arc::new(stream.clone())).await;
-    let consumer = CoreStreamConsumer::new(Arc::new(stream.clone()), "writer", "runtime-test");
+async fn failed_persistence_is_reclaimed_after_lease_expiry_and_acknowledged_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let stream = LocalStream::open(
+        StreamConfig::sqlite(directory.path().join("stream.sqlite"))
+            .with_partitions(1)
+            .with_lease_duration(Duration::from_millis(30)),
+    )
+    .await
+    .unwrap();
+    stream
+        .append(telemetry_record("retry-device").message)
+        .await
+        .unwrap();
+
+    let (_platform_directory, config) = runtime_config(Arc::new(stream.clone())).await;
+    let first_consumer =
+        CoreStreamConsumer::new(Arc::new(stream.clone()), "writer", "first-member");
     let writer = PlatformTelemetryWriter::new((*config.store).clone(), 1);
 
-    let first_attempt = writer.flush_once(&consumer, Utc::now()).await;
+    let first_attempt = writer.flush_once(&first_consumer, Utc::now()).await;
 
     assert!(matches!(first_attempt, Err(WriterError::Platform(_))));
-    assert_eq!(stream.acknowledgements(), 0);
+    let counted_stream = AckCountingStream::new(stream.clone());
+    assert_eq!(counted_stream.acknowledgements(), 0);
 
+    sleep(Duration::from_millis(60)).await;
     config.store.register_device("retry-device").await.unwrap();
 
-    let retry = writer.flush_once(&consumer, Utc::now()).await.unwrap();
+    let second_consumer =
+        CoreStreamConsumer::new(Arc::new(counted_stream.clone()), "writer", "second-member");
+    let retry = writer
+        .flush_once(&second_consumer, Utc::now())
+        .await
+        .unwrap();
+    let after_ack = counted_stream
+        .claim(ClaimRequest::new("writer", "second-member"))
+        .await
+        .unwrap();
 
     assert_eq!(retry.read, 1);
-    assert_eq!(stream.acknowledgements(), 1);
+    assert_eq!(after_ack.len(), 0);
+    assert_eq!(counted_stream.acknowledgements(), 1);
 }
 
 #[tokio::test]
