@@ -3100,7 +3100,7 @@ async fn timescale_active_gateway_is_locked(
         "SELECT device_id
          FROM devices
          WHERE device_id = $1 AND deleted_at IS NULL AND is_gateway = TRUE
-         FOR KEY SHARE",
+         FOR UPDATE",
     )
     .bind(gateway_device_id)
     .fetch_optional(&mut **transaction)
@@ -3120,7 +3120,7 @@ async fn timescale_active_owned_child_is_locked(
            AND deleted_at IS NULL
            AND is_gateway = FALSE
            AND gateway_device_id = $2
-         FOR KEY SHARE",
+         FOR UPDATE",
     )
     .bind(child_device_id)
     .bind(gateway_device_id)
@@ -3137,7 +3137,7 @@ async fn timescale_device_is_locked(
         "SELECT device_id
          FROM devices
          WHERE device_id = $1
-         FOR KEY SHARE",
+         FOR UPDATE",
     )
     .bind(device_id)
     .fetch_optional(&mut **transaction)

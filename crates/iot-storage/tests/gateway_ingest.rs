@@ -5,7 +5,7 @@ use iot_storage::{
     GatewayIngestValidationError, PlatformStore, PlatformStoreError,
 };
 use sqlx::{Connection, PgConnection, Row};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
 
 const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
 
@@ -912,19 +912,37 @@ async fn exercise_sequence_overflow_retry_contract(store: &PlatformStore, backen
 
 #[tokio::test]
 #[ignore = "requires the declared disposable Timescale test URL"]
-async fn timescale_gateway_ingest_serializes_with_topology_deletion() {
+async fn timescale_gateway_ingest_soft_delete_waits_for_inflight_validation() {
     let (_lock, store) = timescale_test_store().await;
     seed_gateway(&store, Backend::Timescale, "delete-race-gateway").await;
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
-    let mut deleter = PgConnection::connect(&database_url).await.unwrap();
+    let mut pause = PgConnection::connect(&database_url).await.unwrap();
     sqlx::query("SET search_path TO iot_nano")
-        .execute(&mut deleter)
+        .execute(&mut pause)
         .await
         .unwrap();
-    sqlx::query("BEGIN").execute(&mut deleter).await.unwrap();
-    sqlx::query("DELETE FROM devices WHERE device_id = $1")
-        .bind("delete-race-gateway")
-        .execute(&mut deleter)
+    sqlx::query(
+        "CREATE FUNCTION pause_gateway_ingest_runtime_state() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(4242, 4242);
+             RETURN NEW;
+         END;
+         $$",
+    )
+    .execute(&mut pause)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER pause_gateway_ingest_runtime_state_trigger
+         BEFORE INSERT OR UPDATE ON device_runtime_state
+         FOR EACH ROW EXECUTE FUNCTION pause_gateway_ingest_runtime_state()",
+    )
+    .execute(&mut pause)
+    .await
+    .unwrap();
+    sqlx::query("SELECT pg_advisory_lock(4242, 4242)")
+        .execute(&mut pause)
         .await
         .unwrap();
 
@@ -936,22 +954,67 @@ async fn timescale_gateway_ingest_serializes_with_topology_deletion() {
         "delete-race:connect",
         None,
     );
-    let blocked = timeout(
-        Duration::from_millis(100),
-        store.ingest_gateway(request.clone()),
-    )
-    .await;
+    let ingest_store = store.clone();
+    let ingest = tokio::spawn(async move { ingest_store.ingest_gateway(request).await });
+
+    let mut observer = PgConnection::connect(&database_url).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_locks
+                    WHERE locktype = 'advisory'
+                      AND classid = 4242
+                      AND objid = 4242
+                      AND granted = FALSE
+                 )",
+            )
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ingest must reach the post-validation pause");
+
+    let mut deleter = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut deleter)
+        .await
+        .unwrap();
+    let mut soft_delete = tokio::spawn(async move {
+        sqlx::query("UPDATE devices SET deleted_at = now() WHERE device_id = $1")
+            .bind("delete-race-gateway")
+            .execute(&mut deleter)
+            .await
+    });
+    let blocked = timeout(Duration::from_millis(100), &mut soft_delete).await;
     assert!(
         blocked.is_err(),
-        "ingest must wait for the concurrent topology delete"
+        "soft deletion must wait for the validated in-flight ingest"
     );
 
-    sqlx::query("COMMIT").execute(&mut deleter).await.unwrap();
-    assert!(matches!(
-        store.ingest_gateway(request).await,
-        Err(PlatformStoreError::UnknownDevice(device_id))
-            if device_id == "delete-race-gateway"
-    ));
+    sqlx::query("SELECT pg_advisory_unlock(4242, 4242)")
+        .execute(&mut pause)
+        .await
+        .unwrap();
+    let ingest = timeout(Duration::from_secs(2), ingest)
+        .await
+        .expect("ingest must finish after pause release")
+        .unwrap()
+        .unwrap();
+    assert!(ingest.receipt_inserted);
+    assert!(!ingest.telemetry_inserted);
+    let deleted = timeout(Duration::from_secs(2), &mut soft_delete)
+        .await
+        .expect("soft deletion must finish after ingest commit")
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.rows_affected(), 1);
     assert_eq!(
         receipt_count(
             &store,
@@ -960,7 +1023,7 @@ async fn timescale_gateway_ingest_serializes_with_topology_deletion() {
             "delete-race:connect",
         )
         .await,
-        0
+        1
     );
 }
 
