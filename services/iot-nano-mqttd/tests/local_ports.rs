@@ -508,6 +508,7 @@ async fn injected_router_routes_a_request_to_only_the_connected_transport_sessio
 
     assert_eq!(command.request.method, "sample_now");
     assert!(other_device.try_recv().is_err());
+    assert!(!publish.is_finished());
     command.acknowledge_published().unwrap();
     assert!(publish.await.unwrap().is_ok());
 }
@@ -547,6 +548,7 @@ async fn legacy_local_ports_wrapper_owns_a_usable_default_router() {
     let command = device.recv().await.unwrap();
 
     assert_eq!(command.request.method, "reboot");
+    assert!(!publish.is_finished());
     command.acknowledge_published().unwrap();
     assert!(publish.await.unwrap().is_ok());
 }
