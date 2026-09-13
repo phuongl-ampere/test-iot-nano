@@ -167,6 +167,18 @@ async fn assert_approved_authorization_contract(
     let system = user_subject(AccountClass::System);
 
     assert_eq!(
+        store.authorization_subject(USER_ID).await.unwrap(),
+        Some(user)
+    );
+    assert_eq!(
+        store.authorization_subject(OTHER_USER_ID).await.unwrap(),
+        Some(AuthorizationSubject {
+            user_id: OTHER_USER_ID,
+            account_class: AccountClass::User,
+        })
+    );
+
+    assert_eq!(
         store
             .device_permission(&admin, DEVICE_DIRECT_ID)
             .await

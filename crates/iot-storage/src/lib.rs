@@ -485,6 +485,8 @@ pub enum PlatformStoreError {
         #[source]
         source: chrono::ParseError,
     },
+    #[error("invalid authorization account class: {0:?}")]
+    InvalidAuthorizationAccountClass(String),
     #[error("application redirect URI is duplicated: {0:?}")]
     DuplicateApplicationRedirectUri(String),
     #[error("application scope must not be empty")]
@@ -1239,6 +1241,17 @@ impl AccountClass {
     }
 }
 
+fn authorization_account_class(value: &str) -> Result<AccountClass, PlatformStoreError> {
+    match value {
+        "system" => Ok(AccountClass::System),
+        "admin" => Ok(AccountClass::Admin),
+        "user" => Ok(AccountClass::User),
+        _ => Err(PlatformStoreError::InvalidAuthorizationAccountClass(
+            value.to_owned(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ResourcePermission {
     Viewer,
@@ -1300,6 +1313,16 @@ pub struct AuthorizedDeviceSummary {
 }
 
 pub trait AuthorizationRepository: Send + Sync {
+    fn authorization_subject<'a>(
+        &'a self,
+        user_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AuthorizationSubject>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
     fn list_authorized_devices<'a>(
         &'a self,
         subject: &'a AuthorizationSubject,
@@ -2424,6 +2447,35 @@ impl PlatformStore {
         } else {
             Err(PlatformStoreError::DeviceTokenDenied)
         }
+    }
+
+    pub async fn authorization_subject(
+        &self,
+        user_id: uuid::Uuid,
+    ) -> Result<Option<AuthorizationSubject>, PlatformStoreError> {
+        let account_class = match self {
+            Self::Sqlite(store) => {
+                sqlx::query_scalar::<_, String>("SELECT account_class FROM users WHERE id = ?")
+                    .bind(user_id.to_string())
+                    .fetch_optional(store.pool())
+                    .await?
+            }
+            Self::Timescale(pool) => {
+                sqlx::query_scalar::<_, String>("SELECT account_class FROM users WHERE id = $1")
+                    .bind(user_id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+        };
+        account_class
+            .map(|account_class| authorization_account_class(&account_class))
+            .transpose()
+            .map(|account_class| {
+                account_class.map(|account_class| AuthorizationSubject {
+                    user_id,
+                    account_class,
+                })
+            })
     }
 
     pub async fn list_authorized_devices(
@@ -5921,6 +5973,19 @@ impl TelemetryAggregateRepository for PlatformStore {
 }
 
 impl AuthorizationRepository for PlatformStore {
+    fn authorization_subject<'a>(
+        &'a self,
+        user_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AuthorizationSubject>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { PlatformStore::authorization_subject(self, user_id).await })
+    }
+
     fn list_authorized_devices<'a>(
         &'a self,
         subject: &'a AuthorizationSubject,
