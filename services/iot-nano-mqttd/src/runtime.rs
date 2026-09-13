@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
+    sync::watch,
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
@@ -63,6 +64,7 @@ pub struct MqttRuntime {
     force_cancellation: CancellationToken,
     parent_cancellation_watcher: Option<JoinHandle<()>>,
     accepting: Arc<AtomicBool>,
+    drain_started: watch::Sender<bool>,
     public_connections: Arc<AtomicUsize>,
     _cache: Arc<dyn CachePort>,
 }
@@ -190,6 +192,7 @@ impl MqttRuntime {
 
         let broker = Arc::new(Mutex::new(Some(broker)));
         let accepting = Arc::new(AtomicBool::new(true));
+        let (drain_started, _) = watch::channel(false);
         let parent_cancellation_watcher = spawn_parent_cancellation_watcher(
             config.cancellation,
             accept_cancellation.clone(),
@@ -206,6 +209,7 @@ impl MqttRuntime {
             force_cancellation,
             parent_cancellation_watcher: Some(parent_cancellation_watcher),
             accepting,
+            drain_started,
             public_connections,
             _cache: config.cache,
         })
@@ -221,6 +225,10 @@ impl MqttRuntime {
 
     pub fn public_connection_count(&self) -> usize {
         self.public_connections.load(Ordering::Relaxed)
+    }
+
+    pub fn drain_started_receiver(&self) -> watch::Receiver<bool> {
+        self.drain_started.subscribe()
     }
 
     pub async fn stop_accepting(&mut self) -> Result<(), MqttRuntimeError> {
@@ -239,6 +247,7 @@ impl MqttRuntime {
 
     pub async fn drain(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
         self.stop_accepting().await?;
+        self.drain_started.send_replace(true);
         let public_workers = self
             .broker
             .lock()

@@ -430,10 +430,22 @@ async fn parent_cancellation_forces_held_public_preambles_during_drain() {
     })
     .await
     .expect("public muxes did not accept both held preambles");
+    let mut drain_started = runtime.drain_started_receiver();
     let mut drain = tokio::spawn(async move {
         let mut runtime = runtime;
         runtime.drain(Instant::now() + Duration::from_secs(5)).await
     });
+
+    timeout(Duration::from_secs(1), async {
+        if !*drain_started.borrow() {
+            drain_started
+                .changed()
+                .await
+                .expect("runtime dropped before drain started");
+        }
+    })
+    .await
+    .expect("runtime did not begin drain");
 
     cancellation.cancel();
 
