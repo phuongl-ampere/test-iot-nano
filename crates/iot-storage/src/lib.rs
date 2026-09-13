@@ -362,6 +362,22 @@ pub enum PlatformStore {
     Timescale(PgPool),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum GatewayIngestValidationError {
+    #[error("child telemetry requires a child device ID")]
+    ChildTelemetryMissingChild,
+    #[error("child telemetry requires a telemetry event")]
+    ChildTelemetryMissingTelemetry,
+    #[error("telemetry is only valid for child telemetry events")]
+    TelemetryOnNonChildEvent,
+    #[error("telemetry requires a child device ID")]
+    TelemetryMissingChild,
+    #[error("telemetry device ID does not match the child device ID")]
+    TelemetryChildMismatch,
+    #[error("telemetry gateway ID does not match the gateway device ID")]
+    TelemetryGatewayMismatch,
+}
+
 #[derive(Debug, Error)]
 pub enum PlatformStoreError {
     #[error("platform storage configuration is incomplete")]
@@ -402,6 +418,8 @@ pub enum PlatformStoreError {
     },
     #[error("device is not registered: {0:?}")]
     UnknownDevice(String),
+    #[error("invalid gateway ingest: {0}")]
+    InvalidGatewayIngest(#[from] GatewayIngestValidationError),
     #[error("device token authentication denied")]
     DeviceTokenDenied,
     #[error("telemetry sequence does not fit PostgreSQL BIGINT")]
@@ -604,6 +622,39 @@ pub trait TopologyRepository: Send + Sync {
         &'a self,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayIngestEventKind {
+    Connect,
+    Disconnect,
+    Heartbeat,
+    ChildTelemetry,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayIngestRequest {
+    pub gateway_device_id: String,
+    pub child_device_id: Option<String>,
+    pub event_kind: GatewayIngestEventKind,
+    pub event_at: DateTime<Utc>,
+    pub idempotency_key: String,
+    pub telemetry_event: Option<TelemetryEvent>,
+    pub topic: String,
+    pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayIngestResult {
+    pub receipt_inserted: bool,
+    pub telemetry_inserted: bool,
+}
+
+pub trait GatewayIngestRepository: Send + Sync {
+    fn ingest_gateway<'a>(
+        &'a self,
+        request: GatewayIngestRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GatewayIngestResult, PlatformStoreError>> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2447,6 +2498,16 @@ impl PlatformStore {
         }
     }
 
+    pub async fn ingest_gateway(
+        &self,
+        request: GatewayIngestRequest,
+    ) -> Result<GatewayIngestResult, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => ingest_sqlite_gateway(store, request).await,
+            Self::Timescale(pool) => ingest_timescale_gateway(pool, request).await,
+        }
+    }
+
     pub async fn average_metric(
         &self,
         device_id: &str,
@@ -2698,6 +2759,374 @@ async fn enqueue_timescale_platform_command(
     };
     transaction.commit().await?;
     result
+}
+
+async fn ingest_sqlite_gateway(
+    store: &SqliteStore,
+    request: GatewayIngestRequest,
+) -> Result<GatewayIngestResult, PlatformStoreError> {
+    let mut transaction = store.pool().begin().await?;
+    let receipt = sqlx::query(
+        "INSERT OR IGNORE INTO gateway_event_receipts (
+            gateway_device_id, idempotency_key, event_at, received_at
+         ) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&request.gateway_device_id)
+    .bind(&request.idempotency_key)
+    .bind(request.event_at.to_rfc3339())
+    .bind(request.received_at.to_rfc3339())
+    .execute(transaction.as_mut())
+    .await?;
+    if receipt.rows_affected() == 0 {
+        transaction.commit().await?;
+        return Ok(GatewayIngestResult {
+            receipt_inserted: false,
+            telemetry_inserted: false,
+        });
+    }
+    if let Err(error) = validate_gateway_ingest_request(&request) {
+        transaction.rollback().await?;
+        return Err(error);
+    }
+    if !sqlite_active_gateway_exists(&mut transaction, &request.gateway_device_id).await? {
+        transaction.rollback().await?;
+        return Err(PlatformStoreError::UnknownDevice(request.gateway_device_id));
+    }
+    if let Some(child_device_id) = request.child_device_id.as_deref()
+        && !sqlite_active_owned_child_exists(
+            &mut transaction,
+            child_device_id,
+            &request.gateway_device_id,
+        )
+        .await?
+    {
+        transaction.rollback().await?;
+        return Err(PlatformStoreError::UnknownDevice(
+            child_device_id.to_owned(),
+        ));
+    }
+
+    let event_at = request.event_at.to_rfc3339();
+    sqlx::query(
+        "UPDATE devices
+         SET last_seen_at = CASE
+             WHEN last_seen_at IS NULL OR last_seen_at < ? THEN ?
+             ELSE last_seen_at
+         END
+         WHERE device_id = ?",
+    )
+    .bind(&event_at)
+    .bind(&event_at)
+    .bind(&request.gateway_device_id)
+    .execute(transaction.as_mut())
+    .await?;
+    let telemetry_inserted = if let Some(telemetry_event) = request.telemetry_event.as_ref() {
+        store
+            .write_telemetry_in_transaction(
+                &mut transaction,
+                telemetry_event,
+                request.received_at,
+                &request.topic,
+            )
+            .await?
+    } else {
+        false
+    };
+    match request.event_kind {
+        GatewayIngestEventKind::Disconnect => {
+            if let Some(child_device_id) = request.child_device_id.as_deref() {
+                sqlx::query(
+                    "UPDATE devices
+                     SET gateway_read_quality = 'unavailable'
+                     WHERE device_id = ?",
+                )
+                .bind(child_device_id)
+                .execute(transaction.as_mut())
+                .await?;
+            }
+        }
+        GatewayIngestEventKind::ChildTelemetry => {
+            if let Some(child_device_id) = request.child_device_id.as_deref() {
+                sqlx::query(
+                    "UPDATE devices
+                     SET gateway_last_read_at = CASE
+                             WHEN gateway_last_read_at IS NULL OR gateway_last_read_at < ? THEN ?
+                             ELSE gateway_last_read_at
+                         END,
+                         gateway_read_quality = 'good'
+                     WHERE device_id = ?",
+                )
+                .bind(&event_at)
+                .bind(&event_at)
+                .bind(child_device_id)
+                .execute(transaction.as_mut())
+                .await?;
+            }
+        }
+        GatewayIngestEventKind::Connect | GatewayIngestEventKind::Heartbeat => {}
+    }
+
+    transaction.commit().await?;
+    Ok(GatewayIngestResult {
+        receipt_inserted: true,
+        telemetry_inserted,
+    })
+}
+
+async fn ingest_timescale_gateway(
+    pool: &PgPool,
+    request: GatewayIngestRequest,
+) -> Result<GatewayIngestResult, PlatformStoreError> {
+    let mut transaction = pool.begin().await?;
+    let receipt = sqlx::query(
+        "INSERT INTO gateway_event_receipts (
+            gateway_device_id, idempotency_key, event_at, received_at
+         ) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (gateway_device_id, idempotency_key) DO NOTHING",
+    )
+    .bind(&request.gateway_device_id)
+    .bind(&request.idempotency_key)
+    .bind(request.event_at)
+    .bind(request.received_at)
+    .execute(&mut *transaction)
+    .await?;
+    if receipt.rows_affected() == 0 {
+        transaction.commit().await?;
+        return Ok(GatewayIngestResult {
+            receipt_inserted: false,
+            telemetry_inserted: false,
+        });
+    }
+    if let Err(error) = validate_gateway_ingest_request(&request) {
+        transaction.rollback().await?;
+        return Err(error);
+    }
+    if !timescale_active_gateway_is_locked(&mut transaction, &request.gateway_device_id).await? {
+        transaction.rollback().await?;
+        return Err(PlatformStoreError::UnknownDevice(request.gateway_device_id));
+    }
+    if let Some(child_device_id) = request.child_device_id.as_deref()
+        && !timescale_active_owned_child_is_locked(
+            &mut transaction,
+            child_device_id,
+            &request.gateway_device_id,
+        )
+        .await?
+    {
+        transaction.rollback().await?;
+        return Err(PlatformStoreError::UnknownDevice(
+            child_device_id.to_owned(),
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO device_runtime_state (device_id, last_seen_at)
+         VALUES ($1, $2)
+         ON CONFLICT (device_id)
+         DO UPDATE SET last_seen_at = GREATEST(
+             COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
+             EXCLUDED.last_seen_at
+         )",
+    )
+    .bind(&request.gateway_device_id)
+    .bind(request.event_at)
+    .execute(&mut *transaction)
+    .await?;
+    let telemetry_inserted = if let Some(telemetry_event) = request.telemetry_event.as_ref() {
+        let sequence = i64::try_from(telemetry_event.sequence)
+            .map_err(|_| PlatformStoreError::TelemetrySequenceOverflow)?;
+        sqlx::query(
+            "INSERT INTO device_runtime_state (device_id, last_seen_at)
+             VALUES ($1, $2)
+             ON CONFLICT (device_id)
+             DO UPDATE SET last_seen_at = GREATEST(
+                 COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
+                 EXCLUDED.last_seen_at
+             )",
+        )
+        .bind(&telemetry_event.device_id)
+        .bind(request.received_at)
+        .execute(&mut *transaction)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO telemetry (
+                event_at, received_at, device_id, boot_id, sequence, measurements, topic,
+                gateway_device_id
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (event_at, device_id, boot_id, sequence) DO NOTHING",
+        )
+        .bind(telemetry_event.event_at)
+        .bind(request.received_at)
+        .bind(&telemetry_event.device_id)
+        .bind(telemetry_event.boot_id)
+        .bind(sequence)
+        .bind(Json(serde_json::Value::Object(
+            telemetry_event.measurements.clone(),
+        )))
+        .bind(&request.topic)
+        .bind(&telemetry_event.gateway_device_id)
+        .execute(&mut *transaction)
+        .await?;
+        inserted.rows_affected() == 1
+    } else {
+        false
+    };
+    match request.event_kind {
+        GatewayIngestEventKind::Disconnect => {
+            if let Some(child_device_id) = request.child_device_id.as_deref() {
+                sqlx::query(
+                    "INSERT INTO device_runtime_state (device_id, gateway_read_quality)
+                     VALUES ($1, 'unavailable')
+                     ON CONFLICT (device_id)
+                     DO UPDATE SET gateway_read_quality = EXCLUDED.gateway_read_quality",
+                )
+                .bind(child_device_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        GatewayIngestEventKind::ChildTelemetry => {
+            if let Some(child_device_id) = request.child_device_id.as_deref() {
+                sqlx::query(
+                    "INSERT INTO device_runtime_state (
+                         device_id, gateway_last_read_at, gateway_read_quality
+                     ) VALUES ($1, $2, 'good')
+                     ON CONFLICT (device_id)
+                     DO UPDATE SET
+                         gateway_last_read_at = GREATEST(
+                             COALESCE(
+                                 device_runtime_state.gateway_last_read_at,
+                                 '-infinity'::timestamptz
+                             ),
+                             EXCLUDED.gateway_last_read_at
+                         ),
+                         gateway_read_quality = EXCLUDED.gateway_read_quality",
+                )
+                .bind(child_device_id)
+                .bind(request.event_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        GatewayIngestEventKind::Connect | GatewayIngestEventKind::Heartbeat => {}
+    }
+
+    transaction.commit().await?;
+    Ok(GatewayIngestResult {
+        receipt_inserted: true,
+        telemetry_inserted,
+    })
+}
+
+fn validate_gateway_ingest_request(
+    request: &GatewayIngestRequest,
+) -> Result<(), PlatformStoreError> {
+    match request.event_kind {
+        GatewayIngestEventKind::ChildTelemetry => {
+            if request.child_device_id.is_none() {
+                return Err(GatewayIngestValidationError::ChildTelemetryMissingChild.into());
+            }
+            if request.telemetry_event.is_none() {
+                return Err(GatewayIngestValidationError::ChildTelemetryMissingTelemetry.into());
+            }
+        }
+        GatewayIngestEventKind::Connect
+        | GatewayIngestEventKind::Disconnect
+        | GatewayIngestEventKind::Heartbeat => {
+            if request.telemetry_event.is_some() {
+                return Err(GatewayIngestValidationError::TelemetryOnNonChildEvent.into());
+            }
+        }
+    }
+
+    if let Some(telemetry_event) = request.telemetry_event.as_ref() {
+        let Some(child_device_id) = request.child_device_id.as_deref() else {
+            return Err(GatewayIngestValidationError::TelemetryMissingChild.into());
+        };
+        if telemetry_event.device_id != child_device_id {
+            return Err(GatewayIngestValidationError::TelemetryChildMismatch.into());
+        }
+        if telemetry_event.gateway_device_id.as_deref() != Some(request.gateway_device_id.as_str())
+        {
+            return Err(GatewayIngestValidationError::TelemetryGatewayMismatch.into());
+        }
+        i64::try_from(telemetry_event.sequence)
+            .map_err(|_| PlatformStoreError::TelemetrySequenceOverflow)?;
+    }
+
+    Ok(())
+}
+
+async fn sqlite_active_gateway_exists(
+    transaction: &mut Transaction<'_, Sqlite>,
+    gateway_device_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT device_id
+         FROM devices
+         WHERE device_id = ? AND deleted_at IS NULL AND is_gateway = 1",
+    )
+    .bind(gateway_device_id)
+    .fetch_optional(transaction.as_mut())
+    .await
+    .map(|device| device.is_some())
+}
+
+async fn sqlite_active_owned_child_exists(
+    transaction: &mut Transaction<'_, Sqlite>,
+    child_device_id: &str,
+    gateway_device_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT device_id
+         FROM devices
+         WHERE device_id = ?
+           AND deleted_at IS NULL
+           AND is_gateway = 0
+           AND gateway_device_id = ?",
+    )
+    .bind(child_device_id)
+    .bind(gateway_device_id)
+    .fetch_optional(transaction.as_mut())
+    .await
+    .map(|device| device.is_some())
+}
+
+async fn timescale_active_gateway_is_locked(
+    transaction: &mut Transaction<'_, Postgres>,
+    gateway_device_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT device_id
+         FROM devices
+         WHERE device_id = $1 AND deleted_at IS NULL AND is_gateway = TRUE
+         FOR KEY SHARE",
+    )
+    .bind(gateway_device_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map(|device| device.is_some())
+}
+
+async fn timescale_active_owned_child_is_locked(
+    transaction: &mut Transaction<'_, Postgres>,
+    child_device_id: &str,
+    gateway_device_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT device_id
+         FROM devices
+         WHERE device_id = $1
+           AND deleted_at IS NULL
+           AND is_gateway = FALSE
+           AND gateway_device_id = $2
+         FOR KEY SHARE",
+    )
+    .bind(child_device_id)
+    .bind(gateway_device_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map(|device| device.is_some())
 }
 
 async fn timescale_device_is_locked(
@@ -4685,6 +5114,16 @@ impl TelemetryRepository for PlatformStore {
         Box::pin(
             async move { PlatformStore::write_telemetry(self, event, received_at, topic).await },
         )
+    }
+}
+
+impl GatewayIngestRepository for PlatformStore {
+    fn ingest_gateway<'a>(
+        &'a self,
+        request: GatewayIngestRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GatewayIngestResult, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { PlatformStore::ingest_gateway(self, request).await })
     }
 }
 
