@@ -1244,6 +1244,19 @@ async fn timescale_opposite_ordered_event_batches_do_not_deadlock() {
         .unwrap(),
         4
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_outbox
+             WHERE kind = 'opened' AND incident_id IN (
+                 SELECT id FROM alert_incidents WHERE rule_id = $1
+             )",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        2
+    );
 }
 
 #[tokio::test]
