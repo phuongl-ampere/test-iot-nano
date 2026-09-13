@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{
@@ -119,9 +119,12 @@ impl SessionLifecycle {
         self.active.load(Ordering::Acquire)
     }
 
-    async fn invalidate(&self) {
-        let _guard = Arc::clone(&self.delivery_gate).lock_owned().await;
+    fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
+    }
+
+    async fn wait_for_active_delivery(&self) {
+        let _guard = Arc::clone(&self.delivery_gate).lock_owned().await;
     }
 
     async fn acquire_delivery_lease(self: Arc<Self>) -> Option<SessionDeliveryLease> {
@@ -147,8 +150,7 @@ pub enum SessionError {
 
 #[derive(Debug, Clone, Default)]
 pub struct RpcSessionRouter {
-    sessions: Arc<Mutex<HashMap<String, RegisteredSession>>>,
-    pending_responses: Arc<Mutex<HashMap<Uuid, PendingRpcResponse>>>,
+    state: Arc<Mutex<RouterState>>,
 }
 
 #[derive(Debug)]
@@ -156,6 +158,13 @@ struct RegisteredSession {
     registration: SessionRegistration,
     sender: mpsc::Sender<ActiveDeviceSession>,
     lifecycle: Arc<SessionLifecycle>,
+}
+
+#[derive(Debug, Default)]
+struct RouterState {
+    sessions: HashMap<String, RegisteredSession>,
+    pending_responses: HashMap<Uuid, PendingRpcResponse>,
+    revoked_tokens: HashSet<(String, Uuid)>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,94 +216,89 @@ impl RpcSessionRouter {
         &self,
         registration: SessionRegistration,
     ) -> mpsc::Receiver<ActiveDeviceSession> {
-        let previous = self
-            .sessions
-            .lock()
-            .await
-            .get(&registration.device_id)
-            .map(|session| Arc::clone(&session.lifecycle));
-        if let Some(previous) = previous {
-            previous.invalidate().await;
-        }
         let (sender, receiver) = mpsc::channel(SESSION_COMMAND_CAPACITY);
         let lifecycle = Arc::new(SessionLifecycle::new());
-        self.sessions.lock().await.insert(
-            registration.device_id.clone(),
-            RegisteredSession {
-                registration: registration.clone(),
-                sender,
-                lifecycle,
-            },
-        );
-        self.pending_responses.lock().await.retain(|_, pending| {
-            pending.expires_at > Utc::now() && pending.device_id != registration.device_id
-        });
+        let previous = {
+            let mut state = self.state.lock().await;
+            if state
+                .revoked_tokens
+                .contains(&(registration.device_id.clone(), registration.token_id))
+            {
+                return receiver;
+            }
+            let previous = state
+                .sessions
+                .get(&registration.device_id)
+                .map(|session| Arc::clone(&session.lifecycle));
+            if let Some(previous) = &previous {
+                previous.deactivate();
+            }
+            state.sessions.insert(
+                registration.device_id.clone(),
+                RegisteredSession {
+                    registration: registration.clone(),
+                    sender,
+                    lifecycle,
+                },
+            );
+            state.pending_responses.retain(|_, pending| {
+                pending.expires_at > Utc::now() && pending.device_id != registration.device_id
+            });
+            previous
+        };
+        if let Some(previous) = previous {
+            previous.wait_for_active_delivery().await;
+        }
         receiver
     }
 
     pub async fn unregister(&self, device_id: &str, connection_id: &str) {
-        let lifecycle = self
-            .sessions
-            .lock()
-            .await
-            .get(device_id)
-            .filter(|session| session.registration.connection_id == connection_id)
-            .map(|session| Arc::clone(&session.lifecycle));
-        let Some(lifecycle) = lifecycle else {
-            return;
-        };
-        lifecycle.invalidate().await;
-        let removed = {
-            let mut sessions = self.sessions.lock().await;
-            sessions
+        let lifecycle = {
+            let mut state = self.state.lock().await;
+            let lifecycle = state
+                .sessions
                 .get(device_id)
-                .is_some_and(|session| {
-                    session.registration.connection_id == connection_id
-                        && Arc::ptr_eq(&session.lifecycle, &lifecycle)
-                })
-                .then(|| sessions.remove(device_id))
-                .flatten()
-                .is_some()
+                .filter(|session| session.registration.connection_id == connection_id)
+                .map(|session| Arc::clone(&session.lifecycle));
+            if let Some(lifecycle) = &lifecycle {
+                lifecycle.deactivate();
+                state.sessions.remove(device_id);
+                state.pending_responses.retain(|_, pending| {
+                    pending.device_id != device_id || pending.connection_id != connection_id
+                });
+            }
+            lifecycle
         };
-        if removed {
-            self.pending_responses.lock().await.retain(|_, pending| {
-                pending.device_id != device_id || pending.connection_id != connection_id
-            });
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.wait_for_active_delivery().await;
         }
     }
 
     pub async fn revoke_session(&self, device_id: &str, token_id: Uuid) -> bool {
-        let mut revoked = false;
-        loop {
-            let lifecycle = self
+        let lifecycle = {
+            let mut state = self.state.lock().await;
+            state
+                .revoked_tokens
+                .insert((device_id.to_owned(), token_id));
+            let lifecycle = state
                 .sessions
-                .lock()
-                .await
                 .get(device_id)
                 .filter(|session| session.registration.token_id == token_id)
                 .map(|session| Arc::clone(&session.lifecycle));
-            let Some(lifecycle) = lifecycle else {
-                return revoked;
-            };
-            lifecycle.invalidate().await;
-            let removed = {
-                let mut sessions = self.sessions.lock().await;
-                sessions
-                    .get(device_id)
-                    .is_some_and(|session| {
-                        session.registration.token_id == token_id
-                            && Arc::ptr_eq(&session.lifecycle, &lifecycle)
-                    })
-                    .then(|| sessions.remove(device_id))
-                    .flatten()
-                    .is_some()
-            };
-            if removed {
-                self.pending_responses.lock().await.retain(|_, pending| {
+            if let Some(lifecycle) = &lifecycle {
+                lifecycle.deactivate();
+                state.sessions.remove(device_id);
+                state.pending_responses.retain(|_, pending| {
                     pending.device_id != device_id || pending.token_id != token_id
                 });
-                revoked = true;
             }
+            lifecycle
+        };
+        if let Some(lifecycle) = lifecycle {
+            lifecycle.wait_for_active_delivery().await;
+            true
+        } else {
+            false
         }
     }
 
@@ -305,9 +309,10 @@ impl RpcSessionRouter {
     }
 
     pub async fn active_snapshot(&self, device_id: &str) -> Option<SessionSnapshot> {
-        self.sessions
+        self.state
             .lock()
             .await
+            .sessions
             .get(device_id)
             .filter(|session| session.lifecycle.is_active())
             .map(|session| SessionSnapshot {
@@ -334,33 +339,32 @@ impl RpcSessionRouter {
         snapshot: &SessionSnapshot,
         request: RpcRequest,
     ) -> Result<(), SessionError> {
-        let (sender, lifecycle) = self
-            .sessions
-            .lock()
-            .await
-            .get(&snapshot.registration.device_id)
-            .filter(|session| snapshot.matches(session))
-            .map(|session| (session.sender.clone(), Arc::clone(&session.lifecycle)))
-            .ok_or(SessionError::SessionUnavailable)?;
-        if !lifecycle.is_active() {
-            return Err(SessionError::SessionUnavailable);
-        }
-        let pending = if request.mode == RpcMode::TwoWay {
-            let pending = PendingRpcResponse {
-                command_id: request.id,
-                device_id: snapshot.registration.device_id.clone(),
-                token_id: snapshot.registration.token_id,
-                connection_id: snapshot.registration.connection_id.clone(),
-                is_gateway: snapshot.registration.is_gateway,
-                expires_at: request.expires_at,
+        let (sender, lifecycle, pending) = {
+            let mut state = self.state.lock().await;
+            let (sender, lifecycle) = state
+                .sessions
+                .get(&snapshot.registration.device_id)
+                .filter(|session| snapshot.matches(session))
+                .map(|session| (session.sender.clone(), Arc::clone(&session.lifecycle)))
+                .ok_or(SessionError::SessionUnavailable)?;
+            if !lifecycle.is_active() {
+                return Err(SessionError::SessionUnavailable);
+            }
+            let pending = if request.mode == RpcMode::TwoWay {
+                let pending = PendingRpcResponse {
+                    command_id: request.id,
+                    device_id: snapshot.registration.device_id.clone(),
+                    token_id: snapshot.registration.token_id,
+                    connection_id: snapshot.registration.connection_id.clone(),
+                    is_gateway: snapshot.registration.is_gateway,
+                    expires_at: request.expires_at,
+                };
+                state.pending_responses.insert(request.id, pending.clone());
+                Some(pending)
+            } else {
+                None
             };
-            self.pending_responses
-                .lock()
-                .await
-                .insert(request.id, pending.clone());
-            Some(pending)
-        } else {
-            None
+            (sender, lifecycle, pending)
         };
         let (published, published_confirmation) = oneshot::channel();
         if sender
@@ -396,28 +400,35 @@ impl RpcSessionRouter {
         command_id: Uuid,
     ) -> Option<PendingRpcResponse> {
         let now = Utc::now();
-        let mut pending = self.pending_responses.lock().await;
-        pending.retain(|_, candidate| candidate.expires_at > now);
-        pending
+        let mut state = self.state.lock().await;
+        state
+            .pending_responses
+            .retain(|_, candidate| candidate.expires_at > now);
+        state
+            .pending_responses
             .get(&command_id)
             .filter(|candidate| candidate.matches(device, connection_id, command_id))
             .cloned()
     }
 
     async fn remove_pending_response(&self, pending: &PendingRpcResponse) {
-        let mut responses = self.pending_responses.lock().await;
-        if responses.get(&pending.command_id).is_some_and(|candidate| {
-            candidate.matches(
-                &AuthenticatedDevice {
-                    token_id: pending.token_id,
-                    device_id: pending.device_id.clone(),
-                    is_gateway: pending.is_gateway,
-                },
-                &pending.connection_id,
-                pending.command_id,
-            )
-        }) {
-            responses.remove(&pending.command_id);
+        let mut state = self.state.lock().await;
+        if state
+            .pending_responses
+            .get(&pending.command_id)
+            .is_some_and(|candidate| {
+                candidate.matches(
+                    &AuthenticatedDevice {
+                        token_id: pending.token_id,
+                        device_id: pending.device_id.clone(),
+                        is_gateway: pending.is_gateway,
+                    },
+                    &pending.connection_id,
+                    pending.command_id,
+                )
+            })
+        {
+            state.pending_responses.remove(&pending.command_id);
         }
     }
 }

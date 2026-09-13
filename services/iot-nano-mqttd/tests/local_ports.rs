@@ -612,6 +612,26 @@ async fn revocation_invalidates_a_command_queued_before_device_delivery() {
 }
 
 #[tokio::test]
+async fn revoked_token_cannot_register_a_session_after_revocation() {
+    let router = RpcSessionRouter::default();
+    let token_id = device().token_id;
+
+    assert!(!router.revoke_session("device-a", token_id).await);
+    let _receiver = router
+        .register(SessionRegistration {
+            token_id,
+            device_id: "device-a".to_owned(),
+            client_id: "local-client".to_owned(),
+            connection_id: "connection-a".to_owned(),
+            is_gateway: false,
+            connected_at: Utc::now(),
+        })
+        .await;
+
+    assert!(router.active_snapshot("device-a").await.is_none());
+}
+
+#[tokio::test]
 async fn local_mqtt311_qos1_puback_waits_for_stream_append_release() {
     let stream = BlockingStream::new();
     let transport = MqttdDeviceTransport::with_local_ports(
