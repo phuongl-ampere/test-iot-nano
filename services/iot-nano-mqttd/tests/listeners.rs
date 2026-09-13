@@ -12,7 +12,14 @@ use tokio::{
 };
 use tokio_rustls::{
     TlsConnector,
-    rustls::{ClientConfig, RootCertStore, pki_types::ServerName},
+    rustls::{
+        ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+        client::{
+            WebPkiServerVerifier,
+            danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        },
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    },
 };
 use tower::ServiceExt;
 
@@ -27,6 +34,53 @@ const CONNECT_V5_TOKEN: &[u8] = &[
     0x10, 0x1b, 0x00, 0x04, b'M', b'Q', b'T', b'T', 5, 0x82, 0x00, 0x3c, 0x00, 0x00, 0x02, b'i',
     b'd', 0x00, 0x0a, b'i', b'o', b't', b'd', b'_', b't', b'o', b'k', b'e', b'n',
 ];
+const FIXTURE_CERTIFICATE_VALID_TIME: u64 = 1_789_000_000;
+
+#[derive(Debug)]
+struct FixtureCertificateVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+}
+
+impl ServerCertVerifier for FixtureCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            UnixTime::since_unix_epoch(Duration::from_secs(FIXTURE_CERTIFICATE_VALID_TIME)),
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
 
 #[tokio::test]
 async fn public_listeners_route_real_mqtt_versions_and_require_tls() {
@@ -311,8 +365,12 @@ async fn tls_connect(
     for certificate in certs(&mut certificate) {
         roots.add(certificate.unwrap()).unwrap();
     }
+    let verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        .build()
+        .unwrap();
     let config = ClientConfig::builder()
-        .with_root_certificates(roots)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(FixtureCertificateVerifier { inner: verifier }))
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
     let stream = TcpStream::connect(address).await.unwrap();

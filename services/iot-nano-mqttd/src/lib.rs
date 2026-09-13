@@ -64,14 +64,20 @@ pub use transport::{
 
 pub struct BrokerLifecycleHandle {
     inner: Option<CoreBrokerHandle>,
+    public_accept_stop: watch::Sender<bool>,
     public_workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 impl BrokerLifecycleHandle {
     pub fn shutdown(&self) {
+        self.stop_public_accepting();
         if let Some(inner) = &self.inner {
             inner.shutdown();
         }
+    }
+
+    pub fn stop_public_accepting(&self) {
+        self.public_accept_stop.send_replace(true);
     }
 
     pub fn join(mut self) -> Result<(), MqttdError> {
@@ -160,8 +166,15 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-plaintext-mux",
             listener,
-            move |listener, shutdown| async move {
-                serve_plaintext_mux_with_shutdown(listener, backends, settings, shutdown).await
+            move |listener, accept_stop, force_stop| async move {
+                serve_plaintext_mux_with_shutdowns(
+                    listener,
+                    backends,
+                    settings,
+                    accept_stop,
+                    force_stop,
+                )
+                .await
             },
         )
     }
@@ -175,12 +188,13 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-plaintext-mux",
             listener,
-            move |listener, shutdown| async move {
-                serve_plaintext_mux_with_shutdown_and_mode(
+            move |listener, accept_stop, force_stop| async move {
+                serve_plaintext_mux_with_shutdowns_and_mode(
                     listener,
                     backends,
                     settings,
-                    shutdown,
+                    accept_stop,
+                    force_stop,
                     MuxRouteMode::DeviceOnly,
                 )
                 .await
@@ -198,8 +212,16 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-tls-mux",
             listener,
-            move |listener, shutdown| async move {
-                serve_tls_mux_with_shutdown(listener, acceptor, backends, settings, shutdown).await
+            move |listener, accept_stop, force_stop| async move {
+                serve_tls_mux_with_shutdowns(
+                    listener,
+                    acceptor,
+                    backends,
+                    settings,
+                    accept_stop,
+                    force_stop,
+                )
+                .await
             },
         )
     }
@@ -214,13 +236,14 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-tls-mux",
             listener,
-            move |listener, shutdown| async move {
-                serve_tls_mux_with_shutdown_and_mode(
+            move |listener, accept_stop, force_stop| async move {
+                serve_tls_mux_with_shutdowns_and_mode(
                     listener,
                     acceptor,
                     backends,
                     settings,
-                    shutdown,
+                    accept_stop,
+                    force_stop,
                     MuxRouteMode::DeviceOnly,
                 )
                 .await
@@ -235,13 +258,16 @@ impl BrokerLifecycleHandle {
         serve: F,
     ) -> Result<(), MqttdError>
     where
-        F: FnOnce(TcpListener, watch::Receiver<bool>) -> Fut + Send + 'static,
+        F: FnOnce(TcpListener, watch::Receiver<bool>, watch::Receiver<bool>) -> Fut
+            + Send
+            + 'static,
         Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
     {
         listener
             .set_nonblocking(true)
             .map_err(|error| MqttdError::Broker(Box::new(error)))?;
-        let shutdown = self.shutdown_receiver();
+        let accept_stop = self.public_accept_stop.subscribe();
+        let force_stop = self.shutdown_receiver();
         let worker = thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
@@ -252,7 +278,7 @@ impl BrokerLifecycleHandle {
                     Ok(runtime) => {
                         let result = runtime.block_on(async {
                             let listener = TcpListener::from_std(listener)?;
-                            serve(listener, shutdown).await
+                            serve(listener, accept_stop, force_stop).await
                         });
                         if let Err(error) = result {
                             eprintln!("iot-mqttd public listener stopped: {error}");
@@ -545,21 +571,34 @@ pub async fn serve_plaintext_mux_with_shutdown(
     settings: MuxSettings,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    serve_plaintext_mux_with_shutdown_and_mode(
+    serve_plaintext_mux_with_shutdowns(listener, backends, settings, shutdown.clone(), shutdown)
+        .await
+}
+
+pub async fn serve_plaintext_mux_with_shutdowns(
+    listener: TcpListener,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
+    accept_shutdown: watch::Receiver<bool>,
+    force_shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    serve_plaintext_mux_with_shutdowns_and_mode(
         listener,
         backends,
         settings,
-        shutdown,
+        accept_shutdown,
+        force_shutdown,
         MuxRouteMode::GenericBroker,
     )
     .await
 }
 
-async fn serve_plaintext_mux_with_shutdown_and_mode(
+async fn serve_plaintext_mux_with_shutdowns_and_mode(
     listener: TcpListener,
     backends: ProtocolBackends,
     settings: MuxSettings,
-    mut shutdown: watch::Receiver<bool>,
+    mut accept_shutdown: watch::Receiver<bool>,
+    mut force_shutdown: watch::Receiver<bool>,
     route_mode: MuxRouteMode,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
@@ -567,7 +606,7 @@ async fn serve_plaintext_mux_with_shutdown_and_mode(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result?;
-                let mut connection_shutdown = shutdown.clone();
+                let mut connection_shutdown = force_shutdown.clone();
                 connections.spawn(async move {
                     tokio::select! {
                         result = proxy_plaintext_connection(stream, backends, settings, route_mode) => {
@@ -579,7 +618,8 @@ async fn serve_plaintext_mux_with_shutdown_and_mode(
                     }
                 });
             }
-            _ = shutdown.changed() => break,
+            _ = accept_shutdown.changed() => break,
+            _ = force_shutdown.changed() => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
@@ -621,23 +661,44 @@ pub async fn serve_tls_mux_with_shutdown(
     settings: MuxSettings,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    serve_tls_mux_with_shutdown_and_mode(
+    serve_tls_mux_with_shutdowns(
         listener,
         acceptor,
         backends,
         settings,
+        shutdown.clone(),
         shutdown,
+    )
+    .await
+}
+
+pub async fn serve_tls_mux_with_shutdowns(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
+    accept_shutdown: watch::Receiver<bool>,
+    force_shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    serve_tls_mux_with_shutdowns_and_mode(
+        listener,
+        acceptor,
+        backends,
+        settings,
+        accept_shutdown,
+        force_shutdown,
         MuxRouteMode::GenericBroker,
     )
     .await
 }
 
-async fn serve_tls_mux_with_shutdown_and_mode(
+async fn serve_tls_mux_with_shutdowns_and_mode(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     backends: ProtocolBackends,
     settings: MuxSettings,
-    mut shutdown: watch::Receiver<bool>,
+    mut accept_shutdown: watch::Receiver<bool>,
+    mut force_shutdown: watch::Receiver<bool>,
     route_mode: MuxRouteMode,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
@@ -646,7 +707,7 @@ async fn serve_tls_mux_with_shutdown_and_mode(
             result = listener.accept() => {
                 let (stream, _) = result?;
                 let acceptor = acceptor.clone();
-                let mut connection_shutdown = shutdown.clone();
+                let mut connection_shutdown = force_shutdown.clone();
                 connections.spawn(async move {
                     tokio::select! {
                         _ = connection_shutdown.changed() => {}
@@ -664,7 +725,8 @@ async fn serve_tls_mux_with_shutdown_and_mode(
                     }
                 });
             }
-            _ = shutdown.changed() => break,
+            _ = accept_shutdown.changed() => break,
+            _ = force_shutdown.changed() => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
@@ -1209,12 +1271,14 @@ async fn start_broker_with_timeout_and_storage(
             )))
         })?;
     }
+    let (public_accept_stop, _public_accept_shutdown) = watch::channel(false);
     let handle = BrokerLifecycleHandle {
         inner: Some(
             Broker::new(config)
                 .map_err(|error| MqttdError::Broker(Box::new(error)))?
                 .spawn(),
         ),
+        public_accept_stop,
         public_workers: Mutex::new(Vec::new()),
     };
     if let Err(error) = wait_for_backends(

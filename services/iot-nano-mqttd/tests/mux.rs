@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use iot_nano_mqttd::{ProtocolBackends, serve_plaintext_mux};
+use iot_nano_mqttd::{ProtocolBackends, serve_plaintext_mux, serve_plaintext_mux_with_shutdowns};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 
 fn connect_packet(protocol_level: u8) -> Vec<u8> {
     let mut packet = vec![
@@ -80,6 +81,64 @@ fn v5_token_connect_packet() -> Vec<u8> {
     packet.extend_from_slice(&(username.len() as u16).to_be_bytes());
     packet.extend_from_slice(username.as_bytes());
     packet
+}
+
+#[tokio::test]
+async fn accept_shutdown_stops_new_plaintext_connections_without_cancelling_active_proxy() {
+    let backend_listener =
+        std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let public_address = public_listener.local_addr().unwrap();
+    let (accepted, mut backend_connections) = tokio::sync::mpsc::unbounded_channel();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = backend_listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            tokio::spawn(async move {
+                let mut packet = [0_u8; 16];
+                let _ = stream.read_exact(&mut packet).await;
+            });
+        }
+    });
+    let (accept_stop, accept_shutdown) = watch::channel(false);
+    let (force_stop, force_shutdown) = watch::channel(false);
+    let mux_task = tokio::spawn(serve_plaintext_mux_with_shutdowns(
+        public_listener,
+        ProtocolBackends {
+            v311: backend_address,
+            v5: backend_address,
+            device_v311: None,
+            device_v5: None,
+        },
+        Default::default(),
+        accept_shutdown,
+        force_shutdown,
+    ));
+
+    let mut active = tokio::net::TcpStream::connect(public_address)
+        .await
+        .unwrap();
+    active.write_all(&connect_packet(4)).await.unwrap();
+    backend_connections.recv().await.unwrap();
+
+    accept_stop.send(true).unwrap();
+    assert!(!mux_task.is_finished());
+    let mut late = tokio::net::TcpStream::connect(public_address)
+        .await
+        .unwrap();
+    late.write_all(&connect_packet(4)).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), backend_connections.recv())
+            .await
+            .is_err()
+    );
+
+    drop(late);
+    drop(active);
+    assert!(mux_task.await.unwrap().is_ok());
+    backend_task.abort();
+    drop(force_stop);
 }
 
 #[tokio::test]
