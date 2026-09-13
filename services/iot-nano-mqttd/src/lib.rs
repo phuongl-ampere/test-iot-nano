@@ -1399,15 +1399,17 @@ async fn start_broker_with_timeout_storage_and_prebound_listeners(
         config.storage = Some(storage.clone());
     }
     let (public_accept_stop, _public_accept_shutdown) = watch::channel(false);
-    let broker = Broker::new(config).map_err(|error| MqttdError::Broker(Box::new(error)))?;
     let inner = match listeners {
-        Some(listeners) => broker
-            .spawn_with_prebound_listeners(
-                vec![("v311".to_owned(), listeners.v311)],
-                vec![("v5".to_owned(), listeners.v5)],
-            )
-            .map_err(|error| MqttdError::Broker(Box::new(error)))?,
-        None => broker.spawn(),
+        Some(listeners) => Broker::new_with_prebound_listeners(
+            config,
+            vec![("v311".to_owned(), listeners.v311)],
+            vec![("v5".to_owned(), listeners.v5)],
+            startup_timeout,
+        )
+        .map_err(|error| MqttdError::Broker(Box::new(error)))?,
+        None => Broker::new(config)
+            .map_err(|error| MqttdError::Broker(Box::new(error)))?
+            .spawn(),
     };
     let handle = BrokerLifecycleHandle {
         inner: Some(inner),
