@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
+use std::{
+    collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration,
+};
 
 use crate::{CommandOutboxRecord, CoreSqliteStore, CoreSqliteStoreError};
 use chrono::{DateTime, Duration, Utc};
@@ -260,6 +262,7 @@ pub struct PlatformCommandDispatcher<C> {
     store: Arc<PlatformStore>,
     transport: C,
     batch_size: u32,
+    issue_times: Arc<tokio::sync::Mutex<HashMap<String, DateTime<Utc>>>>,
 }
 
 impl<C> PlatformCommandDispatcher<C>
@@ -271,6 +274,7 @@ where
             store,
             transport,
             batch_size: batch_size.max(1),
+            issue_times: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -293,8 +297,20 @@ where
         .await?;
         result.claimed = commands.len();
 
-        for command in commands.into_iter().map(PlatformClaimedCommand::from) {
-            dispatch_platform_command(&self.store, &self.transport, &command, &mut result).await?;
+        for record in commands {
+            let issued_at = {
+                let mut issue_times = self.issue_times.lock().await;
+                *issue_times
+                    .entry(record.id.clone())
+                    .or_insert(record.next_attempt_at)
+            };
+            let command = PlatformClaimedCommand::from_record(record, issued_at);
+            let retrying =
+                dispatch_platform_command(&self.store, &self.transport, &command, &mut result)
+                    .await?;
+            if !retrying {
+                self.issue_times.lock().await.remove(&command.id);
+            }
         }
         Ok(result)
     }
@@ -336,15 +352,15 @@ struct PlatformClaimedCommand {
     expires_at: DateTime<Utc>,
 }
 
-impl From<PlatformCommandOutboxRecord> for PlatformClaimedCommand {
-    fn from(command: PlatformCommandOutboxRecord) -> Self {
+impl PlatformClaimedCommand {
+    fn from_record(command: PlatformCommandOutboxRecord, issued_at: DateTime<Utc>) -> Self {
         Self {
             id: command.id,
             device_id: command.device_id,
             method: command.method,
             params: command.params,
             mode: command.mode,
-            issued_at: command.next_attempt_at,
+            issued_at,
             expires_at: command.expires_at,
         }
     }
@@ -381,22 +397,27 @@ async fn dispatch_platform_command<C>(
     transport: &C,
     command: &PlatformClaimedCommand,
     result: &mut CommandDispatchResult,
-) -> Result<(), CommandError>
+) -> Result<bool, CommandError>
 where
     C: CommandTransport,
 {
     if expire_platform_command_if_elapsed(store, command, Utc::now(), result).await? {
-        return Ok(());
+        return Ok(false);
     }
 
-    let command_id = Uuid::parse_str(&command.id)
-        .map_err(|_| CommandError::InvalidCommandId(command.id.clone()))?;
+    let command_id = match Uuid::parse_str(&command.id) {
+        Ok(command_id) => command_id,
+        Err(_) => {
+            mark_invalid_platform_command_failed(store, command, result).await?;
+            return Ok(false);
+        }
+    };
     match platform_command_request(command) {
         Ok(request) => match transport.publish(request).await {
             Ok(()) => {
                 let completed_at = Utc::now();
                 if expire_platform_command_if_elapsed(store, command, completed_at, result).await? {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if CommandLifecycleRepository::mark_command_published(
                     store,
@@ -408,10 +429,11 @@ where
                 {
                     result.published += 1;
                 }
+                Ok(false)
             }
             Err(error) => {
                 if expire_platform_command_if_elapsed(store, command, Utc::now(), result).await? {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if matches!(
                     error,
@@ -424,6 +446,7 @@ where
                         Utc::now() + COMMAND_RETRY_DELAY,
                     )
                     .await?;
+                    return Ok(true);
                 } else if CommandLifecycleRepository::mark_command_failed(
                     store,
                     command_id,
@@ -434,6 +457,7 @@ where
                 {
                     result.failed += 1;
                 }
+                Ok(false)
             }
         },
         Err(error) => {
@@ -443,7 +467,30 @@ where
             {
                 result.failed += 1;
             }
+            Ok(false)
         }
+    }
+}
+
+async fn mark_invalid_platform_command_failed(
+    store: &PlatformStore,
+    command: &PlatformClaimedCommand,
+    result: &mut CommandDispatchResult,
+) -> Result<(), CommandError> {
+    const INVALID_COMMAND_ID_ERROR: &str = "command ID is not a UUID";
+
+    // PostgreSQL enforces UUID command IDs; only legacy SQLite rows can violate this invariant.
+    let marked = match store {
+        PlatformStore::Sqlite(store) => store
+            .mark_command_failed(&command.id, INVALID_COMMAND_ID_ERROR)
+            .await
+            .map_err(PlatformStoreError::from)?,
+        PlatformStore::Timescale(_) => {
+            return Err(CommandError::InvalidCommandId(command.id.clone()));
+        }
+    };
+    if marked.is_some() {
+        result.failed += 1;
     }
     Ok(())
 }

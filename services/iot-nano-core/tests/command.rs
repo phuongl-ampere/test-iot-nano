@@ -71,6 +71,38 @@ impl CommandTransport for RecordingTransport {
     }
 }
 
+#[derive(Clone)]
+struct RetryThenSuccessTransport {
+    requests: Arc<tokio::sync::Mutex<Vec<TransportRpcPublishRequest>>>,
+    responses: Arc<tokio::sync::Mutex<Vec<Result<(), CommandTransportError>>>>,
+}
+
+impl RetryThenSuccessTransport {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            responses: Arc::new(tokio::sync::Mutex::new(vec![
+                Err(CommandTransportError::Unavailable(
+                    "broker unavailable".to_owned(),
+                )),
+                Ok(()),
+            ])),
+        }
+    }
+}
+
+impl CommandTransport for RetryThenSuccessTransport {
+    fn publish(
+        &self,
+        request: TransportRpcPublishRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CommandTransportError>> + Send + '_>> {
+        Box::pin(async move {
+            self.requests.lock().await.push(request);
+            self.responses.lock().await.remove(0)
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct WaitUntilExpiredTransport {
     requests: Arc<tokio::sync::Mutex<Vec<TransportRpcPublishRequest>>>,
@@ -433,6 +465,84 @@ async fn platform_dispatcher_releases_unavailable_commands_for_retry() {
     assert_eq!(result.failed, 0);
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].id, command_id.to_string());
+}
+
+#[tokio::test]
+async fn platform_dispatcher_marks_invalid_uuid_ids_terminal_without_publishing() {
+    let (_directory, store) = platform_store().await;
+    let now = Utc::now();
+    let invalid_id = "invalid-command-id";
+    let PlatformStore::Sqlite(sqlite) = &store else {
+        panic!("platform test requires SQLite storage");
+    };
+    sqlx::query(
+        "INSERT INTO command_outbox (
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at
+         ) VALUES (?, 'device-a', 'sample_now', '{}', 'one_way', 'queued', ?, ?)",
+    )
+    .bind(invalid_id)
+    .bind((now + Duration::seconds(30)).to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(sqlite.pool())
+    .await
+    .unwrap();
+    let transport = RecordingTransport::succeeds();
+    let dispatcher = PlatformCommandDispatcher::new(Arc::new(store.clone()), transport.clone(), 10);
+
+    let result = dispatcher.dispatch_once(now).await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, lease_until, last_error
+         FROM command_outbox WHERE id = ?",
+    )
+    .bind(invalid_id)
+    .fetch_one(sqlite.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(result.claimed, 1);
+    assert_eq!(result.failed, 1);
+    assert_eq!(transport.requests.lock().await.len(), 0);
+    assert_eq!(row.get::<String, _>("state"), "failed");
+    assert!(row.get::<Option<String>, _>("lease_until").is_none());
+    assert_eq!(
+        row.get::<Option<String>, _>("last_error").as_deref(),
+        Some("command ID is not a UUID")
+    );
+}
+
+#[tokio::test]
+async fn platform_dispatcher_preserves_original_issue_time_after_retry() {
+    let (_directory, store) = platform_store().await;
+    let issued_at = Utc::now();
+    let command_id = Uuid::now_v7();
+    store
+        .enqueue_command(PlatformCommand {
+            id: command_id.to_string(),
+            device_id: "device-a".to_owned(),
+            method: "sample_now".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: issued_at + Duration::seconds(30),
+            next_attempt_at: issued_at,
+        })
+        .await
+        .unwrap();
+    let transport = RetryThenSuccessTransport::new();
+    let dispatcher = PlatformCommandDispatcher::new(Arc::new(store), transport.clone(), 10);
+
+    let first = dispatcher.dispatch_once(issued_at).await.unwrap();
+    let second = dispatcher
+        .dispatch_once(issued_at + Duration::seconds(2))
+        .await
+        .unwrap();
+
+    assert_eq!(first.published, 0);
+    assert_eq!(first.failed, 0);
+    assert_eq!(second.published, 1);
+    let requests = transport.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].issued_at, issued_at);
+    assert_eq!(requests[1].issued_at, issued_at);
 }
 
 #[tokio::test]
