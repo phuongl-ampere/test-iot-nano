@@ -6,6 +6,7 @@ mod control;
 mod metrics;
 mod mqtt;
 mod notification;
+mod runtime;
 mod storage;
 mod stream_consumer;
 mod stream_port;
@@ -30,6 +31,7 @@ pub use notification::{
     PlatformNotificationDispatcher, ReloadingSmtpEmailSender, SmtpConfig, SmtpConfigInput,
     SmtpEmailSender, SqliteNotificationDispatcher, load_live_smtp_config,
 };
+pub use runtime::{CoreRuntime, CoreRuntimeConfig, CoreRuntimeError, CoreRuntimeWorkerError};
 pub use storage::{
     CommandOutboxRecord, CommandOutboxState, CoreSqliteStore, CoreSqliteStoreError,
     NewCommandOutboxEntry, RetentionResult,
