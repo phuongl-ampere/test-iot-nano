@@ -1,7 +1,15 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap, io::BufReader, net::SocketAddr, path::PathBuf, sync::Mutex, thread,
+    collections::HashMap,
+    io::BufReader,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
@@ -194,6 +202,31 @@ impl BrokerLifecycleHandle {
         backends: ProtocolBackends,
         settings: MuxSettings,
     ) -> Result<(), MqttdError> {
+        self.spawn_public_plaintext_device_only_mux_with_counter(listener, backends, settings, None)
+    }
+
+    pub(crate) fn spawn_public_plaintext_device_only_mux_with_connection_counter(
+        &self,
+        listener: std::net::TcpListener,
+        backends: ProtocolBackends,
+        settings: MuxSettings,
+        connection_counter: Arc<AtomicUsize>,
+    ) -> Result<(), MqttdError> {
+        self.spawn_public_plaintext_device_only_mux_with_counter(
+            listener,
+            backends,
+            settings,
+            Some(connection_counter),
+        )
+    }
+
+    fn spawn_public_plaintext_device_only_mux_with_counter(
+        &self,
+        listener: std::net::TcpListener,
+        backends: ProtocolBackends,
+        settings: MuxSettings,
+        connection_counter: Option<Arc<AtomicUsize>>,
+    ) -> Result<(), MqttdError> {
         self.spawn_public_worker(
             "iot-mqttd-plaintext-mux",
             listener,
@@ -205,6 +238,7 @@ impl BrokerLifecycleHandle {
                     accept_stop,
                     force_stop,
                     MuxRouteMode::DeviceOnly,
+                    connection_counter,
                 )
                 .await
             },
@@ -242,6 +276,36 @@ impl BrokerLifecycleHandle {
         backends: ProtocolBackends,
         settings: MuxSettings,
     ) -> Result<(), MqttdError> {
+        self.spawn_public_tls_device_only_mux_with_counter(
+            listener, acceptor, backends, settings, None,
+        )
+    }
+
+    pub(crate) fn spawn_public_tls_device_only_mux_with_connection_counter(
+        &self,
+        listener: std::net::TcpListener,
+        acceptor: TlsAcceptor,
+        backends: ProtocolBackends,
+        settings: MuxSettings,
+        connection_counter: Arc<AtomicUsize>,
+    ) -> Result<(), MqttdError> {
+        self.spawn_public_tls_device_only_mux_with_counter(
+            listener,
+            acceptor,
+            backends,
+            settings,
+            Some(connection_counter),
+        )
+    }
+
+    fn spawn_public_tls_device_only_mux_with_counter(
+        &self,
+        listener: std::net::TcpListener,
+        acceptor: TlsAcceptor,
+        backends: ProtocolBackends,
+        settings: MuxSettings,
+        connection_counter: Option<Arc<AtomicUsize>>,
+    ) -> Result<(), MqttdError> {
         self.spawn_public_worker(
             "iot-mqttd-tls-mux",
             listener,
@@ -254,6 +318,7 @@ impl BrokerLifecycleHandle {
                     accept_stop,
                     force_stop,
                     MuxRouteMode::DeviceOnly,
+                    connection_counter,
                 )
                 .await
             },
@@ -549,6 +614,25 @@ enum MuxRouteMode {
     DeviceOnly,
 }
 
+struct ActiveMuxConnection(Option<Arc<AtomicUsize>>);
+
+impl ActiveMuxConnection {
+    fn new(counter: Option<Arc<AtomicUsize>>) -> Self {
+        if let Some(counter) = &counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveMuxConnection {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.0 {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Default for MuxSettings {
     fn default() -> Self {
         Self {
@@ -598,6 +682,7 @@ pub async fn serve_plaintext_mux_with_shutdowns(
         accept_shutdown,
         force_shutdown,
         MuxRouteMode::GenericBroker,
+        None,
     )
     .await
 }
@@ -609,6 +694,7 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
     mut accept_shutdown: watch::Receiver<bool>,
     mut force_shutdown: watch::Receiver<bool>,
     route_mode: MuxRouteMode,
+    connection_counter: Option<Arc<AtomicUsize>>,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
     loop {
@@ -616,7 +702,9 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
             result = listener.accept() => {
                 let (stream, _) = result?;
                 let mut connection_shutdown = force_shutdown.clone();
+                let connection_counter = connection_counter.clone();
                 connections.spawn(async move {
+                    let _connection = ActiveMuxConnection::new(connection_counter);
                     tokio::select! {
                         result = proxy_plaintext_connection(stream, backends, settings, route_mode) => {
                             if let Err(error) = result {
@@ -697,6 +785,7 @@ pub async fn serve_tls_mux_with_shutdowns(
         accept_shutdown,
         force_shutdown,
         MuxRouteMode::GenericBroker,
+        None,
     )
     .await
 }
@@ -709,6 +798,7 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
     mut accept_shutdown: watch::Receiver<bool>,
     mut force_shutdown: watch::Receiver<bool>,
     route_mode: MuxRouteMode,
+    connection_counter: Option<Arc<AtomicUsize>>,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
     loop {
@@ -717,7 +807,9 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
                 let (stream, _) = result?;
                 let acceptor = acceptor.clone();
                 let mut connection_shutdown = force_shutdown.clone();
+                let connection_counter = connection_counter.clone();
                 connections.spawn(async move {
+                    let _connection = ActiveMuxConnection::new(connection_counter);
                     tokio::select! {
                         _ = connection_shutdown.changed() => {}
                         _ = async {

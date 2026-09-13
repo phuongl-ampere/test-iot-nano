@@ -423,14 +423,18 @@ async fn parent_cancellation_forces_held_public_preambles_during_drain() {
     let runtime = MqttRuntime::start(config).await.unwrap();
     let plaintext = TcpStream::connect(plaintext_address).await.unwrap();
     let tls = TcpStream::connect(tls_address).await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        while runtime.public_connection_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("public muxes did not accept both held preambles");
     let mut drain = tokio::spawn(async move {
         let mut runtime = runtime;
         runtime.drain(Instant::now() + Duration::from_secs(5)).await
     });
 
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
     cancellation.cancel();
 
     let result = timeout(Duration::from_secs(1), &mut drain).await;

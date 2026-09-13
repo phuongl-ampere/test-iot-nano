@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -63,6 +63,7 @@ pub struct MqttRuntime {
     force_cancellation: CancellationToken,
     parent_cancellation_watcher: Option<JoinHandle<()>>,
     accepting: Arc<AtomicBool>,
+    public_connections: Arc<AtomicUsize>,
     _cache: Arc<dyn CachePort>,
 }
 
@@ -120,6 +121,7 @@ impl MqttRuntime {
 
         let force_cancellation = config.cancellation.child_token();
         let accept_cancellation = CancellationToken::new();
+        let public_connections = Arc::new(AtomicUsize::new(0));
         let authorization: Arc<dyn DeviceAuthorizationPort> = Arc::new(
             CachedDeviceAuthorization::new(config.authorization, Arc::clone(&config.cache)),
         );
@@ -166,19 +168,21 @@ impl MqttRuntime {
             device_v311: Some(device_v311_address),
             device_v5: Some(device_v5_address),
         };
-        if let Err(error) = broker.spawn_public_plaintext_device_only_mux(
+        if let Err(error) = broker.spawn_public_plaintext_device_only_mux_with_connection_counter(
             plaintext_listener,
             backends,
             MuxSettings::default(),
+            Arc::clone(&public_connections),
         ) {
             cancel_startup(&broker, &force_cancellation, device_workers).await;
             return Err(MqttRuntimeStartError::PublicWorker(error));
         }
-        if let Err(error) = broker.spawn_public_tls_device_only_mux(
+        if let Err(error) = broker.spawn_public_tls_device_only_mux_with_connection_counter(
             tls_listener,
             tls_acceptor,
             backends,
             MuxSettings::default(),
+            Arc::clone(&public_connections),
         ) {
             cancel_startup(&broker, &force_cancellation, device_workers).await;
             return Err(MqttRuntimeStartError::PublicWorker(error));
@@ -202,6 +206,7 @@ impl MqttRuntime {
             force_cancellation,
             parent_cancellation_watcher: Some(parent_cancellation_watcher),
             accepting,
+            public_connections,
             _cache: config.cache,
         })
     }
@@ -212,6 +217,10 @@ impl MqttRuntime {
 
     pub fn is_accepting(&self) -> bool {
         self.accepting.load(Ordering::Acquire)
+    }
+
+    pub fn public_connection_count(&self) -> usize {
+        self.public_connections.load(Ordering::Relaxed)
     }
 
     pub async fn stop_accepting(&mut self) -> Result<(), MqttRuntimeError> {
