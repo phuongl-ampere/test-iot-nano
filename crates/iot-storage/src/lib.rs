@@ -2030,6 +2030,7 @@ impl PlatformStore {
         opened_notification: Option<NewNotificationOutboxEntry>,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         let incident = canonical_incident(incident);
+        let opened_notification = opened_notification.map(canonical_notification);
         match self {
             Self::Sqlite(store) => Ok(store.create_incident(incident, opened_notification).await?),
             Self::Timescale(pool) => {

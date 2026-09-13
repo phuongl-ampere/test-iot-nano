@@ -58,11 +58,19 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
     .unwrap();
     assert_eq!(pending.status, AlertIncidentStatus::Pending);
     assert_eq!(pending.state_version, 0);
+    let duplicate_notification = NewNotificationOutboxEntry {
+        id: uuid::Uuid::now_v7(),
+        kind: NotificationKind::Opened,
+        dedupe_key: "pending-duplicate-notification".to_owned(),
+        subject: "duplicate".to_owned(),
+        body: "body".to_owned(),
+        next_attempt_at: Utc::now(),
+    };
     assert!(
         AlertIncidentRepository::create_incident(
             &store,
             incident(rule_id, uuid::Uuid::now_v7(), AlertIncidentStatus::Pending),
-            None,
+            Some(duplicate_notification),
         )
         .await
         .unwrap()
@@ -106,6 +114,18 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
             .await
             .unwrap();
     assert_eq!(count, 1);
+    let notification_next_attempt_at: String =
+        sqlx::query_scalar("SELECT next_attempt_at FROM notification_outbox WHERE incident_id = ?")
+            .bind(open_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&notification_next_attempt_at)
+            .unwrap()
+            .timestamp_subsec_nanos(),
+        123_456_000
+    );
 }
 
 #[tokio::test]
@@ -150,6 +170,7 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
             .await
             .unwrap()
             .unwrap();
+    let recovery_started_at = recovering.recovery_started_at;
     let resolved = AlertIncidentRepository::resolve_incident(
         &store,
         id,
@@ -160,6 +181,7 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
     .unwrap()
     .unwrap();
     assert_eq!(resolved.status, AlertIncidentStatus::Resolved);
+    assert_eq!(resolved.recovery_started_at, recovery_started_at);
     assert!(
         AlertIncidentRepository::remind_incident(&store, id, resolved.state_version, Utc::now(),)
             .await
