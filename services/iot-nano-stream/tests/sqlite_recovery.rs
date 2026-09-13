@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use iot_core::TelemetryEvent;
 use iot_nano_stream::{
     AcknowledgeRequest, ClaimRequest, GroupStart, LocalStream, StreamConfig, StreamError,
@@ -12,6 +12,7 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 fn message(device_id: &str, sequence: u64) -> TelemetryMessage {
+    let now = Utc::now();
     TelemetryMessage {
         topic: format!("iot/v1/devices/{device_id}/telemetry"),
         payload: format!(r#"{{"sequence":{sequence}}}"#).into_bytes(),
@@ -20,11 +21,11 @@ fn message(device_id: &str, sequence: u64) -> TelemetryMessage {
             device_id: device_id.to_owned(),
             boot_id: Uuid::parse_str("c9c04d99-4e01-4f94-82a8-9e229e47c093").unwrap(),
             sequence,
-            event_at: Utc.with_ymd_and_hms(2026, 9, 12, 8, 0, 0).unwrap(),
+            event_at: now,
             measurements: serde_json::Map::from_iter([("temperature_c".to_owned(), json!(26.4))]),
             gateway_device_id: None,
         },
-        received_at: Utc.with_ymd_and_hms(2026, 9, 12, 8, 0, 1).unwrap(),
+        received_at: now,
     }
 }
 
