@@ -48,3 +48,30 @@ reclaim, and one real SQLite `PlatformStore` incident-opening integration.
 
 The worktree contains pre-existing user changes and deletions outside the task
 files. They were left untouched and excluded from the task commit.
+
+## Review Follow-up: Test Coverage
+
+### RED
+
+The event flush test now uses a test-local `StreamPort` wrapper that counts
+successful acknowledgements, and its fake repository records the count observed
+while `evaluate_alert_events` runs. To prove the assertion detects the ordering
+regression, acknowledgement was temporarily moved ahead of evaluation and the
+single test was run:
+
+```text
+CARGO_TARGET_DIR=/tmp/rush-iot-nano-controller-core cargo test -p iot-nano-core --test platform_alert event_flush_maps_events_and_acknowledges_after_evaluation -- --test-threads=1
+```
+
+It failed as expected with the fake repository observing `[1]` acknowledgements
+during evaluation where the test requires `[0]`. The production ordering was
+then restored without retaining a production-file diff.
+
+### GREEN
+
+After restoration, the focused target passed with `5 passed; 0 failed`.
+
+- Event flush now proves one event evaluation, acknowledgement count `0` during
+  that evaluation, and exactly one successful acknowledgement afterward.
+- Window flush now proves exactly one window evaluation and zero event
+  evaluations.

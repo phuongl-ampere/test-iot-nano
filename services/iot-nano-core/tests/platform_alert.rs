@@ -1,6 +1,8 @@
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -11,7 +13,9 @@ use iot_storage::{
     PlatformStoreError,
 };
 use iot_stream::{
-    GatewayEvent, GatewayEventKind, GatewayMessage, LocalStream, StreamConfig, TelemetryMessage,
+    AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GatewayEvent, GatewayEventKind,
+    GatewayMessage, GroupAssignment, HeartbeatRequest, LocalStream, StreamConfig, StreamError,
+    StreamMessage, StreamPort, TelemetryMessage,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -24,6 +28,9 @@ const TOPIC: &str = "iot/v1/devices/esp-000123/telemetry";
 struct FakeRepository {
     events: Arc<Mutex<Vec<AlertEvaluationEvent>>>,
     event_result: Arc<Mutex<Result<AlertEvaluationResult, String>>>,
+    event_calls: Arc<Mutex<usize>>,
+    event_acknowledgement_counts: Arc<Mutex<Vec<usize>>>,
+    acknowledgements: Arc<Mutex<usize>>,
     window_result: AlertEvaluationResult,
     windows_called: Arc<Mutex<usize>>,
 }
@@ -33,6 +40,9 @@ impl FakeRepository {
         Self {
             events: Arc::default(),
             event_result: Arc::new(Mutex::new(Ok(result))),
+            event_calls: Arc::default(),
+            event_acknowledgement_counts: Arc::default(),
+            acknowledgements: Arc::default(),
             window_result: AlertEvaluationResult::default(),
             windows_called: Arc::default(),
         }
@@ -42,9 +52,17 @@ impl FakeRepository {
         Self {
             events: Arc::default(),
             event_result: Arc::new(Mutex::new(Err("repository failed".to_owned()))),
+            event_calls: Arc::default(),
+            event_acknowledgement_counts: Arc::default(),
+            acknowledgements: Arc::default(),
             window_result: AlertEvaluationResult::default(),
             windows_called: Arc::default(),
         }
+    }
+
+    fn observing_acknowledgements(mut self, acknowledgements: Arc<Mutex<usize>>) -> Self {
+        self.acknowledgements = acknowledgements;
+        self
     }
 }
 
@@ -61,8 +79,16 @@ impl AlertEvaluationRepository for FakeRepository {
         >,
     > {
         let captured = Arc::clone(&self.events);
+        let event_calls = Arc::clone(&self.event_calls);
+        let event_acknowledgement_counts = Arc::clone(&self.event_acknowledgement_counts);
+        let acknowledgements = Arc::clone(&self.acknowledgements);
         let result = self.event_result.lock().unwrap().clone();
         Box::pin(async move {
+            *event_calls.lock().unwrap() += 1;
+            event_acknowledgement_counts
+                .lock()
+                .unwrap()
+                .push(*acknowledgements.lock().unwrap());
             captured.lock().unwrap().extend_from_slice(events);
             result.map_err(|_| PlatformStoreError::InvalidConfiguration)
         })
@@ -84,6 +110,72 @@ impl AlertEvaluationRepository for FakeRepository {
             *called.lock().unwrap() += 1;
             Ok(result)
         })
+    }
+}
+
+#[derive(Clone)]
+struct AcknowledgementCountingStream {
+    stream: LocalStream,
+    acknowledgements: Arc<Mutex<usize>>,
+}
+
+impl AcknowledgementCountingStream {
+    fn new(stream: LocalStream) -> Self {
+        Self {
+            stream,
+            acknowledgements: Arc::default(),
+        }
+    }
+
+    fn acknowledgements(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.acknowledgements)
+    }
+}
+
+impl StreamPort for AcknowledgementCountingStream {
+    fn append(
+        &self,
+        message: StreamMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<AppendReceipt, StreamError>> + Send + '_>> {
+        let stream = self.stream.clone();
+        Box::pin(async move { StreamPort::append(&stream, message).await })
+    }
+
+    fn claim(
+        &self,
+        request: ClaimRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ClaimedRecord>, StreamError>> + Send + '_>> {
+        let stream = self.stream.clone();
+        Box::pin(async move { StreamPort::claim(&stream, request).await })
+    }
+
+    fn acknowledge(
+        &self,
+        request: AcknowledgeRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+        let stream = self.stream.clone();
+        let acknowledgements = Arc::clone(&self.acknowledgements);
+        Box::pin(async move {
+            StreamPort::acknowledge(&stream, request).await?;
+            *acknowledgements.lock().unwrap() += 1;
+            Ok(())
+        })
+    }
+
+    fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<GroupAssignment, StreamError>> + Send + '_>> {
+        let stream = self.stream.clone();
+        Box::pin(async move { StreamPort::heartbeat(&stream, request).await })
+    }
+
+    fn drain(
+        &self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StreamError>> + Send + '_>> {
+        let stream = self.stream.clone();
+        Box::pin(async move { StreamPort::drain(&stream, deadline).await })
     }
 }
 
@@ -144,10 +236,36 @@ async fn stream_and_consumer(
     (stream, consumer)
 }
 
+async fn counted_stream_and_consumer(
+    directory: &TempDir,
+    lease_duration: StdDuration,
+) -> (
+    LocalStream,
+    AcknowledgementCountingStream,
+    CoreStreamConsumer,
+) {
+    let stream = LocalStream::open(
+        StreamConfig::sqlite(directory.path().join("stream.sqlite"))
+            .with_partitions(1)
+            .with_lease_duration(lease_duration),
+    )
+    .await
+    .unwrap();
+    let counted_stream = AcknowledgementCountingStream::new(stream.clone());
+    let consumer = CoreStreamConsumer::new(
+        Arc::new(counted_stream.clone()),
+        "platform-alert",
+        "counting-test",
+    );
+    consumer.heartbeat().await.unwrap();
+    (stream, counted_stream, consumer)
+}
+
 #[tokio::test]
 async fn event_flush_maps_events_and_acknowledges_after_evaluation() {
     let directory = tempfile::tempdir().unwrap();
-    let (stream, consumer) = stream_and_consumer(&directory, StdDuration::from_secs(1)).await;
+    let (stream, counted_stream, consumer) =
+        counted_stream_and_consumer(&directory, StdDuration::from_secs(1)).await;
     stream.append(telemetry(41.0, at(1))).await.unwrap();
     stream.append(gateway_heartbeat(at(2))).await.unwrap();
     let repository = FakeRepository::successful(AlertEvaluationResult {
@@ -155,8 +273,11 @@ async fn event_flush_maps_events_and_acknowledges_after_evaluation() {
         opened: 1,
         resolved: 2,
         reminders: 3,
-    });
+    })
+    .observing_acknowledgements(counted_stream.acknowledgements());
     let events = Arc::clone(&repository.events);
+    let event_calls = Arc::clone(&repository.event_calls);
+    let event_acknowledgement_counts = Arc::clone(&repository.event_acknowledgement_counts);
 
     let result = PlatformAlertEvaluator::new(repository, 10)
         .flush_event_rules(&consumer, at(3))
@@ -175,6 +296,9 @@ async fn event_flush_maps_events_and_acknowledges_after_evaluation() {
     assert_eq!(events[0].device_id, DEVICE_ID);
     assert_eq!(events[0].sequence, 7);
     assert_eq!(events[0].measurements["temperature_c"], json!(41.0));
+    assert_eq!(*event_calls.lock().unwrap(), 1);
+    assert_eq!(*event_acknowledgement_counts.lock().unwrap(), vec![0]);
+    assert_eq!(*counted_stream.acknowledgements().lock().unwrap(), 1);
     assert!(consumer.claim(10).await.unwrap().is_empty());
 }
 
@@ -226,6 +350,7 @@ async fn window_flush_delegates_once_without_stream_access() {
         ..FakeRepository::successful(AlertEvaluationResult::default())
     };
     let windows_called = Arc::clone(&repository.windows_called);
+    let event_calls = Arc::clone(&repository.event_calls);
 
     let result = PlatformAlertEvaluator::new(repository, 1)
         .flush_window_rules(at(4))
@@ -243,6 +368,7 @@ async fn window_flush_delegates_once_without_stream_access() {
         }
     );
     assert_eq!(*windows_called.lock().unwrap(), 1);
+    assert_eq!(*event_calls.lock().unwrap(), 0);
     assert!(consumer.claim(1).await.unwrap().is_empty());
 }
 
