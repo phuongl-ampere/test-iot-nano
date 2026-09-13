@@ -21,6 +21,7 @@ use sqlx::{
 };
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use url::Url;
 
 const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform.sql");
 
@@ -476,6 +477,8 @@ pub enum PlatformStoreError {
     EmptyApplicationClientId,
     #[error("application redirect URI must not be empty")]
     EmptyApplicationRedirectUri,
+    #[error("invalid application redirect URI: {0:?}")]
+    InvalidApplicationRedirectUri(String),
     #[error("application redirect URI is duplicated: {0:?}")]
     DuplicateApplicationRedirectUri(String),
     #[error("application scope must not be empty")]
@@ -632,8 +635,38 @@ impl std::str::FromStr for RedirectUri {
         if value.is_empty() {
             return Err(PlatformStoreError::EmptyApplicationRedirectUri);
         }
+        if value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(PlatformStoreError::InvalidApplicationRedirectUri(
+                value.to_owned(),
+            ));
+        }
+        let parsed = Url::parse(value)
+            .map_err(|_| PlatformStoreError::InvalidApplicationRedirectUri(value.to_owned()))?;
+        if !matches!(parsed.scheme(), "https" | "http")
+            || parsed.host_str().is_none()
+            || parsed.fragment().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || redirect_uri_has_userinfo(value)
+        {
+            return Err(PlatformStoreError::InvalidApplicationRedirectUri(
+                value.to_owned(),
+            ));
+        }
         Ok(Self(value.to_owned()))
     }
+}
+
+fn redirect_uri_has_userinfo(value: &str) -> bool {
+    value.split_once("://").is_some_and(|(_, remainder)| {
+        remainder
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

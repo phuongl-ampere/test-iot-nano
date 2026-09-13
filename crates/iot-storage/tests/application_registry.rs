@@ -132,6 +132,37 @@ async fn sqlite_application_registry_rejects_domain_invalid_values() {
     ));
 }
 
+#[test]
+fn redirect_uri_preserves_exact_valid_https_and_local_http_callbacks() {
+    for value in [
+        "https://App.Example.test:8443/callback?next=a%2Fb",
+        "http://localhost:3000/oauth/callback",
+    ] {
+        let redirect_uri = value.parse::<iot_storage::RedirectUri>().unwrap();
+        assert_eq!(redirect_uri.as_str(), value);
+    }
+}
+
+#[test]
+fn redirect_uri_rejects_unsafe_or_malformed_callbacks() {
+    for value in [
+        "/oauth/callback",
+        "javascript:alert(1)",
+        "com.example.app:/oauth/callback",
+        "https://example.test/oauth/callback#fragment",
+        "https://user:password@example.test/oauth/callback",
+        "https://@example.test/oauth/callback",
+        "https://example.test/oauth/call back",
+        "https://example.test/oauth/callback\n",
+        "https://[::1",
+    ] {
+        assert!(matches!(
+            value.parse::<iot_storage::RedirectUri>(),
+            Err(PlatformStoreError::InvalidApplicationRedirectUri(ref invalid)) if invalid == value
+        ));
+    }
+}
+
 #[tokio::test]
 async fn sqlite_application_registry_maps_write_time_client_id_conflicts_to_typed_errors() {
     let (_directory, store) = sqlite_store().await;
