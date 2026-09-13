@@ -191,6 +191,186 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
 }
 
 #[tokio::test]
+async fn sqlite_opens_incident_and_enqueues_opened_notification_atomically() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    rule(&store, rule_id).await;
+    let incident_id = uuid::Uuid::now_v7();
+    let created = AlertIncidentRepository::create_incident(
+        &store,
+        incident(rule_id, incident_id, AlertIncidentStatus::Pending),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let opened_at = Utc::now().with_nanosecond(123_456_789).unwrap();
+
+    let opened = AlertIncidentRepository::open_incident_with_notification(
+        &store,
+        incident_id,
+        created.state_version,
+        opened_at,
+        NewNotificationOutboxEntry {
+            id: uuid::Uuid::now_v7(),
+            kind: NotificationKind::Opened,
+            dedupe_key: "incident-opened:atomic".to_owned(),
+            subject: "opened".to_owned(),
+            body: "body".to_owned(),
+            next_attempt_at: opened_at,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(opened.status, AlertIncidentStatus::Open);
+    assert_eq!(
+        opened.opened_at.unwrap().timestamp_subsec_nanos(),
+        123_456_000
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_outbox
+             WHERE incident_id = ? AND dedupe_key = ?",
+        )
+        .bind(incident_id.to_string())
+        .bind("incident-opened:atomic")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_atomically() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    rule(&store, rule_id).await;
+    let incident_id = uuid::Uuid::now_v7();
+    let created = AlertIncidentRepository::create_incident(
+        &store,
+        incident(rule_id, incident_id, AlertIncidentStatus::Pending),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let opened_at = Utc::now().with_nanosecond(987_654_321).unwrap();
+    let opened = AlertIncidentRepository::open_incident_with_notification(
+        &store,
+        incident_id,
+        created.state_version,
+        opened_at,
+        NewNotificationOutboxEntry {
+            id: uuid::Uuid::now_v7(),
+            kind: NotificationKind::Opened,
+            dedupe_key: "incident-opened:rollback".to_owned(),
+            subject: "opened".to_owned(),
+            body: "body".to_owned(),
+            next_attempt_at: opened_at,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(opened.state_version, 1);
+
+    assert!(
+        AlertIncidentRepository::open_incident_with_notification(
+            &store,
+            incident_id,
+            created.state_version,
+            opened_at,
+            NewNotificationOutboxEntry {
+                id: uuid::Uuid::now_v7(),
+                kind: NotificationKind::Opened,
+                dedupe_key: "incident-opened:stale".to_owned(),
+                subject: "stale".to_owned(),
+                body: "body".to_owned(),
+                next_attempt_at: opened_at,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    let resolved_at = Utc::now().with_nanosecond(111_222_333).unwrap();
+    assert!(
+        AlertIncidentRepository::resolve_incident_with_notification(
+            &store,
+            incident_id,
+            opened.state_version,
+            resolved_at,
+            NewNotificationOutboxEntry {
+                id: uuid::Uuid::now_v7(),
+                kind: NotificationKind::Resolved,
+                dedupe_key: "incident-opened:rollback".to_owned(),
+                subject: "duplicate".to_owned(),
+                body: "body".to_owned(),
+                next_attempt_at: resolved_at,
+            },
+        )
+        .await
+        .is_err()
+    );
+    let after_duplicate: (String, i64) =
+        sqlx::query_as("SELECT status, state_version FROM alert_incidents WHERE id = ?")
+            .bind(incident_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(after_duplicate, ("open".to_owned(), 1));
+
+    let reminded_at = Utc::now().with_nanosecond(444_555_666).unwrap();
+    let reminded = AlertIncidentRepository::remind_incident_with_notification(
+        &store,
+        incident_id,
+        opened.state_version,
+        reminded_at,
+        NewNotificationOutboxEntry {
+            id: uuid::Uuid::now_v7(),
+            kind: NotificationKind::Reminder,
+            dedupe_key: "incident-reminder:atomic".to_owned(),
+            subject: "reminder".to_owned(),
+            body: "body".to_owned(),
+            next_attempt_at: reminded_at,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        reminded.last_reminder_at.unwrap().timestamp_subsec_nanos(),
+        444_555_000
+    );
+
+    let resolved = AlertIncidentRepository::resolve_incident_with_notification(
+        &store,
+        incident_id,
+        reminded.state_version,
+        resolved_at,
+        NewNotificationOutboxEntry {
+            id: uuid::Uuid::now_v7(),
+            kind: NotificationKind::Resolved,
+            dedupe_key: "incident-resolved:atomic".to_owned(),
+            subject: "resolved".to_owned(),
+            body: "body".to_owned(),
+            next_attempt_at: resolved_at,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        resolved.resolved_at.unwrap().timestamp_subsec_nanos(),
+        111_222_000
+    );
+}
+
+#[tokio::test]
 async fn sqlite_direct_resolution_sets_recovery_started_at() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
@@ -366,26 +546,69 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
         .unwrap()
         .is_none()
     );
-    let opened = AlertIncidentRepository::open_incident(
+    let opened_at = Utc::now().with_nanosecond(123_456_789).unwrap();
+    let opened = AlertIncidentRepository::open_incident_with_notification(
         &store,
         incident_id,
         created.state_version,
-        Utc::now(),
+        opened_at,
+        NewNotificationOutboxEntry {
+            id: uuid::Uuid::now_v7(),
+            kind: NotificationKind::Opened,
+            dedupe_key: "incident-opened:timescale".to_owned(),
+            subject: "opened".to_owned(),
+            body: "body".to_owned(),
+            next_attempt_at: opened_at,
+        },
     )
     .await
     .unwrap()
     .unwrap();
     assert_eq!(opened.status, AlertIncidentStatus::Open);
+    assert_eq!(
+        opened.opened_at.unwrap().timestamp_subsec_nanos(),
+        123_456_000
+    );
     assert!(
-        AlertIncidentRepository::open_incident(
+        AlertIncidentRepository::open_incident_with_notification(
             &store,
             incident_id,
             created.state_version,
-            Utc::now()
+            opened_at,
+            NewNotificationOutboxEntry {
+                id: uuid::Uuid::now_v7(),
+                kind: NotificationKind::Opened,
+                dedupe_key: "incident-opened:timescale-stale".to_owned(),
+                subject: "stale".to_owned(),
+                body: "body".to_owned(),
+                next_attempt_at: opened_at,
+            },
         )
         .await
         .unwrap()
         .is_none()
+    );
+    let reminded_at = Utc::now().with_nanosecond(222_333_444).unwrap();
+    let reminded = AlertIncidentRepository::remind_incident_with_notification(
+        &store,
+        incident_id,
+        opened.state_version,
+        reminded_at,
+        NewNotificationOutboxEntry {
+            id: uuid::Uuid::now_v7(),
+            kind: NotificationKind::Reminder,
+            dedupe_key: "incident-reminder:timescale".to_owned(),
+            subject: "reminder".to_owned(),
+            body: "body".to_owned(),
+            next_attempt_at: reminded_at,
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        reminded.last_reminder_at.unwrap().timestamp_subsec_nanos(),
+        222_333_000
     );
     let notification = NewNotificationOutboxEntry {
         id: uuid::Uuid::now_v7(),
@@ -412,11 +635,19 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
         .unwrap()
         .unwrap();
     let resolved_at = Utc::now() + Duration::seconds(1);
-    let resolved = AlertIncidentRepository::resolve_incident(
+    let resolved = AlertIncidentRepository::resolve_incident_with_notification(
         &store,
         direct_id,
         opened.state_version,
         resolved_at,
+        NewNotificationOutboxEntry {
+            id: uuid::Uuid::now_v7(),
+            kind: NotificationKind::Resolved,
+            dedupe_key: "incident-resolved:timescale".to_owned(),
+            subject: "resolved".to_owned(),
+            body: "body".to_owned(),
+            next_attempt_at: resolved_at,
+        },
     )
     .await
     .unwrap()
