@@ -258,6 +258,54 @@ async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() 
     sqlx::query(
         "INSERT INTO telemetry (
             event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $1, $2, $3, $4, $5, $6)",
+    )
+    .bind(at + chrono::Duration::seconds(3))
+    .bind("telemetry-device")
+    .bind(Uuid::now_v7())
+    .bind(4_i64)
+    .bind(sqlx::types::Json(json!({
+        "temperature_c": null,
+        "humidity_pct": true
+    })))
+    .bind("iot/v1/devices/telemetry-device/telemetry")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $1, $2, $3, $4, $5, $6)",
+    )
+    .bind(at + chrono::Duration::seconds(4))
+    .bind("telemetry-device")
+    .bind(Uuid::now_v7())
+    .bind(5_i64)
+    .bind(sqlx::types::Json(json!({
+        "temperature_c": {},
+        "humidity_pct": []
+    })))
+    .bind("iot/v1/devices/telemetry-device/telemetry")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6)",
+    )
+    .bind(at + chrono::Duration::seconds(5))
+    .bind("telemetry-device")
+    .bind(Uuid::now_v7())
+    .bind(6_i64)
+    .bind(r#"{"temperature_c": 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368, "humidity_pct": -179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368}"#)
+    .bind("iot/v1/devices/telemetry-device/telemetry")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
          ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6)",
     )
     .bind(at + chrono::Duration::seconds(2))
@@ -299,7 +347,7 @@ async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() 
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 3);
+    assert_eq!(body.as_array().unwrap().len(), 6);
     assert_eq!(body[0]["temperature_c"], serde_json::Value::Null);
     assert_eq!(body[0]["humidity_pct"], 51.0);
     assert_eq!(body[0]["event_count"], 1);
@@ -309,6 +357,15 @@ async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() 
     assert_eq!(body[2]["temperature_c"], serde_json::Value::Null);
     assert_eq!(body[2]["humidity_pct"], serde_json::Value::Null);
     assert_eq!(body[2]["event_count"], 1);
+    assert_eq!(body[3]["temperature_c"], serde_json::Value::Null);
+    assert_eq!(body[3]["humidity_pct"], serde_json::Value::Null);
+    assert_eq!(body[3]["event_count"], 1);
+    assert_eq!(body[4]["temperature_c"], serde_json::Value::Null);
+    assert_eq!(body[4]["humidity_pct"], serde_json::Value::Null);
+    assert_eq!(body[4]["event_count"], 1);
+    assert_eq!(body[5]["temperature_c"].as_f64(), Some(f64::MAX));
+    assert_eq!(body[5]["humidity_pct"].as_f64(), Some(-f64::MAX));
+    assert_eq!(body[5]["event_count"], 1);
 }
 
 #[tokio::test]

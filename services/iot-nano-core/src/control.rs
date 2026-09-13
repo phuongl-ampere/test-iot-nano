@@ -457,28 +457,30 @@ async fn postgres_telemetry_points(
 ) -> Result<Vec<TelemetryPoint>, ControlError> {
     let query = match bucket {
         TelemetryBucket::Raw => {
-            "SELECT
+            "WITH f64_limits AS (
+                SELECT
+                    '-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368'::numeric AS min,
+                    '179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368'::numeric AS max
+             )
+             SELECT
                 event_at AS at,
                 CASE
                     WHEN jsonb_typeof(measurements -> 'temperature_c') = 'number'
                     THEN CASE
-                        WHEN (measurements ->> 'temperature_c')::numeric BETWEEN
-                                 '-1.7976931348623157e308'::numeric
-                             AND '1.7976931348623157e308'::numeric
+                        WHEN (measurements ->> 'temperature_c')::numeric BETWEEN f64_limits.min AND f64_limits.max
                         THEN (measurements ->> 'temperature_c')::double precision
                     END
                 END AS temperature_c,
                 CASE
                     WHEN jsonb_typeof(measurements -> 'humidity_pct') = 'number'
                     THEN CASE
-                        WHEN (measurements ->> 'humidity_pct')::numeric BETWEEN
-                                 '-1.7976931348623157e308'::numeric
-                             AND '1.7976931348623157e308'::numeric
+                        WHEN (measurements ->> 'humidity_pct')::numeric BETWEEN f64_limits.min AND f64_limits.max
                         THEN (measurements ->> 'humidity_pct')::double precision
                     END
                 END AS humidity_pct,
                 1::bigint AS event_count
              FROM telemetry
+             CROSS JOIN f64_limits
              WHERE device_id = $1 AND event_at >= $2 AND event_at <= $3
              ORDER BY event_at"
         }
