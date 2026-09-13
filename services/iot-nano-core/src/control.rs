@@ -461,11 +461,21 @@ async fn postgres_telemetry_points(
                 event_at AS at,
                 CASE
                     WHEN jsonb_typeof(measurements -> 'temperature_c') = 'number'
-                    THEN (measurements ->> 'temperature_c')::double precision
+                    THEN CASE
+                        WHEN (measurements ->> 'temperature_c')::numeric BETWEEN
+                                 '-1.7976931348623157e308'::numeric
+                             AND '1.7976931348623157e308'::numeric
+                        THEN (measurements ->> 'temperature_c')::double precision
+                    END
                 END AS temperature_c,
                 CASE
                     WHEN jsonb_typeof(measurements -> 'humidity_pct') = 'number'
-                    THEN (measurements ->> 'humidity_pct')::double precision
+                    THEN CASE
+                        WHEN (measurements ->> 'humidity_pct')::numeric BETWEEN
+                                 '-1.7976931348623157e308'::numeric
+                             AND '1.7976931348623157e308'::numeric
+                        THEN (measurements ->> 'humidity_pct')::double precision
+                    END
                 END AS humidity_pct,
                 1::bigint AS event_count
              FROM telemetry

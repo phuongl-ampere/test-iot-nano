@@ -258,6 +258,20 @@ async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() 
     sqlx::query(
         "INSERT INTO telemetry (
             event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, $6)",
+    )
+    .bind(at + chrono::Duration::seconds(2))
+    .bind("telemetry-device")
+    .bind(Uuid::now_v7())
+    .bind(3_i64)
+    .bind(r#"{"temperature_c": 9e999, "humidity_pct": -9e999}"#)
+    .bind("iot/v1/devices/telemetry-device/telemetry")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
          ) VALUES ($1, $1, $2, $3, $4, $5, $6)",
     )
     .bind(at + chrono::Duration::seconds(1))
@@ -285,13 +299,16 @@ async fn timescale_telemetry_control_normalizes_malformed_raw_metrics_to_none() 
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 2);
+    assert_eq!(body.as_array().unwrap().len(), 3);
     assert_eq!(body[0]["temperature_c"], serde_json::Value::Null);
     assert_eq!(body[0]["humidity_pct"], 51.0);
     assert_eq!(body[0]["event_count"], 1);
     assert_eq!(body[1]["temperature_c"], 26.4);
     assert_eq!(body[1]["humidity_pct"], serde_json::Value::Null);
     assert_eq!(body[1]["event_count"], 1);
+    assert_eq!(body[2]["temperature_c"], serde_json::Value::Null);
+    assert_eq!(body[2]["humidity_pct"], serde_json::Value::Null);
+    assert_eq!(body[2]["event_count"], 1);
 }
 
 #[tokio::test]
