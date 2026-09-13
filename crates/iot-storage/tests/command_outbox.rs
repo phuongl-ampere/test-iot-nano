@@ -1,7 +1,14 @@
+use std::env;
+
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
-use iot_storage::{CommandOutboxState, NewCommandOutboxEntry, PlatformStore, SqliteStore};
-use sqlx::Row;
+use iot_storage::{
+    CommandLifecycleRepository, CommandOutboxState, NewCommandOutboxEntry, PlatformStore,
+    PlatformStoreError, SqliteStore,
+};
+use sqlx::{Connection, PgConnection, Row};
+
+const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
 
 async fn store() -> (tempfile::TempDir, SqliteStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -25,6 +32,41 @@ async fn store() -> (tempfile::TempDir, SqliteStore) {
     .await
     .unwrap();
     (directory, store)
+}
+
+async fn timescale_store() -> (PgConnection, PlatformStore) {
+    let database_url = env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    assert_eq!(
+        database_url, TIMESCALE_TEST_URL,
+        "refusing to reset an unexpected Timescale test database"
+    );
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        database_name, "iot_nano_test_platform",
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    (connection, store)
 }
 
 fn at(seconds: i64) -> DateTime<Utc> {
@@ -133,6 +175,43 @@ async fn sqlite_command_outbox_preserves_created_at_across_lifecycle_transitions
     assert_eq!(reclaimed.created_at, created_at);
     assert_eq!(published.created_at, created_at);
     assert_eq!(responded.created_at, created_at);
+}
+
+#[tokio::test]
+async fn sqlite_command_lifecycle_repository_marks_legacy_string_ids_failed() {
+    let (_directory, sqlite) = store().await;
+    let platform = PlatformStore::Sqlite(sqlite);
+    let now = at(1_800_000_000);
+    let command_id = "legacy-invalid-command-id";
+    sqlx::query(
+        "INSERT INTO command_outbox (
+            id, device_id, method, params, mode, state, expires_at, next_attempt_at
+         ) VALUES (?, 'device-1', 'sample_now', '{}', 'one_way', 'queued', ?, ?)",
+    )
+    .bind(command_id)
+    .bind((now + Duration::minutes(5)).to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(platform.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    CommandLifecycleRepository::claim_commands(&platform, now, now + Duration::seconds(30), 1)
+        .await
+        .unwrap();
+
+    let failed = CommandLifecycleRepository::mark_legacy_command_failed(
+        &platform,
+        command_id,
+        "command ID is not a UUID",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(failed.state, CommandOutboxState::Failed);
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some("command ID is not a UUID")
+    );
 }
 
 #[tokio::test]
@@ -450,4 +529,116 @@ async fn sqlite_store_reopens_with_the_two_way_expiry_index() {
     .unwrap();
 
     assert_eq!(index_count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for iot_nano_test_platform"]
+async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transitions() {
+    let (_connection, store) = timescale_store().await;
+    let device_id = "timescale-command-device";
+    store.register_device(device_id).await.unwrap();
+    let token_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
+         VALUES ($1, $2, 'timescale-token-prefix', 'unused-in-storage-tests')",
+    )
+    .bind(token_id)
+    .bind(device_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    assert!(matches!(
+        CommandLifecycleRepository::mark_legacy_command_failed(
+            &store,
+            "not-a-uuid",
+            "command ID is not a UUID",
+        )
+        .await,
+        Err(PlatformStoreError::InvalidCommandId(command_id)) if command_id == "not-a-uuid"
+    ));
+
+    let now = Utc::now() + Duration::seconds(1);
+    let response_id = uuid::Uuid::now_v7();
+    let mut response_command = command(&response_id.to_string(), now, now + Duration::minutes(5));
+    response_command.device_id = device_id.to_owned();
+    response_command.mode = RpcMode::TwoWay;
+    let enqueued = store.enqueue_command(response_command).await.unwrap();
+    let created_at = enqueued.created_at;
+
+    let claimed = store
+        .claim_commands(now, now + Duration::seconds(30), 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let released = store
+        .release_command_for_retry(
+            response_id,
+            "temporary broker failure",
+            now + Duration::seconds(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let reclaimed = store
+        .claim_commands(now + Duration::seconds(1), now + Duration::seconds(31), 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let published = store
+        .mark_command_published(response_id, now + Duration::seconds(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let responded = store
+        .mark_command_responded(
+            response_id,
+            device_id,
+            token_id,
+            r#"{"ok":true}"#,
+            now + Duration::seconds(3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(claimed.created_at, created_at);
+    assert_eq!(released.created_at, created_at);
+    assert_eq!(reclaimed.created_at, created_at);
+    assert_eq!(published.created_at, created_at);
+    assert_eq!(responded.created_at, created_at);
+
+    let failed_id = uuid::Uuid::now_v7();
+    let mut failed_command = command(&failed_id.to_string(), now, now + Duration::minutes(5));
+    failed_command.device_id = device_id.to_owned();
+    let failed_enqueued = store.enqueue_command(failed_command).await.unwrap();
+    let failed_claimed = store
+        .claim_commands(now, now + Duration::seconds(30), 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let failed = store
+        .mark_command_failed(failed_id, "broker unavailable")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed_claimed.created_at, failed_enqueued.created_at);
+    assert_eq!(failed.created_at, failed_enqueued.created_at);
+
+    let expired_id = uuid::Uuid::now_v7();
+    let mut expired_command = command(
+        &expired_id.to_string(),
+        now - Duration::seconds(2),
+        now - Duration::seconds(1),
+    );
+    expired_command.device_id = device_id.to_owned();
+    let expired_enqueued = store.enqueue_command(expired_command).await.unwrap();
+    let expired = store.expire_commands(now).await.unwrap();
+    let expired = expired
+        .iter()
+        .find(|record| record.id == expired_id.to_string())
+        .unwrap();
+    assert_eq!(expired.created_at, expired_enqueued.created_at);
 }

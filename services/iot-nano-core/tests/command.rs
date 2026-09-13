@@ -468,13 +468,10 @@ async fn platform_dispatcher_releases_unavailable_commands_for_retry() {
 }
 
 #[tokio::test]
-async fn platform_dispatcher_marks_invalid_uuid_ids_terminal_without_publishing() {
+async fn platform_dispatcher_marks_legacy_invalid_ids_terminal_through_the_repository() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();
     let invalid_id = "invalid-command-id";
-    let PlatformStore::Sqlite(sqlite) = &store else {
-        panic!("platform test requires SQLite storage");
-    };
     sqlx::query(
         "INSERT INTO command_outbox (
             id, device_id, method, params, mode, state, expires_at, next_attempt_at
@@ -483,7 +480,7 @@ async fn platform_dispatcher_marks_invalid_uuid_ids_terminal_without_publishing(
     .bind(invalid_id)
     .bind((now + Duration::seconds(30)).to_rfc3339())
     .bind(now.to_rfc3339())
-    .execute(sqlite.pool())
+    .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
     let transport = RecordingTransport::succeeds();
@@ -495,7 +492,7 @@ async fn platform_dispatcher_marks_invalid_uuid_ids_terminal_without_publishing(
          FROM command_outbox WHERE id = ?",
     )
     .bind(invalid_id)
-    .fetch_one(sqlite.pool())
+    .fetch_one(store.sqlite_pool().unwrap())
     .await
     .unwrap();
 

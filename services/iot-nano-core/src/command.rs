@@ -464,16 +464,12 @@ async fn mark_invalid_platform_command_failed(
 ) -> Result<(), CommandError> {
     const INVALID_COMMAND_ID_ERROR: &str = "command ID is not a UUID";
 
-    // PostgreSQL enforces UUID command IDs; only legacy SQLite rows can violate this invariant.
-    let marked = match store {
-        PlatformStore::Sqlite(store) => store
-            .mark_command_failed(&command.id, INVALID_COMMAND_ID_ERROR)
-            .await
-            .map_err(PlatformStoreError::from)?,
-        PlatformStore::Timescale(_) => {
-            return Err(CommandError::InvalidCommandId(command.id.clone()));
-        }
-    };
+    let marked = CommandLifecycleRepository::mark_legacy_command_failed(
+        store,
+        &command.id,
+        INVALID_COMMAND_ID_ERROR,
+    )
+    .await?;
     if marked.is_some() {
         result.failed += 1;
     }

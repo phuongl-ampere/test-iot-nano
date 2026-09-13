@@ -715,6 +715,17 @@ pub trait CommandLifecycleRepository: Send + Sync {
                 + 'a,
         >,
     >;
+    fn mark_legacy_command_failed<'a>(
+        &'a self,
+        command_id: &'a str,
+        error: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
     fn release_command_for_retry<'a>(
         &'a self,
         command_id: uuid::Uuid,
@@ -1915,6 +1926,21 @@ impl PlatformStore {
                 .mark_command_failed(&command_id.to_string(), error)
                 .await?),
             Self::Timescale(pool) => mark_timescale_command_failed(pool, command_id, error).await,
+        }
+    }
+
+    pub async fn mark_legacy_command_failed(
+        &self,
+        command_id: &str,
+        error: &str,
+    ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store.mark_command_failed(command_id, error).await?),
+            Self::Timescale(pool) => {
+                let command_id = uuid::Uuid::parse_str(command_id)
+                    .map_err(|_| PlatformStoreError::InvalidCommandId(command_id.to_owned()))?;
+                mark_timescale_command_failed(pool, command_id, error).await
+            }
         }
     }
 
@@ -3242,6 +3268,22 @@ impl CommandLifecycleRepository for PlatformStore {
         >,
     > {
         Box::pin(async move { PlatformStore::mark_command_failed(self, command_id, error).await })
+    }
+
+    fn mark_legacy_command_failed<'a>(
+        &'a self,
+        command_id: &'a str,
+        error: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(
+            async move { PlatformStore::mark_legacy_command_failed(self, command_id, error).await },
+        )
     }
 
     fn release_command_for_retry<'a>(
