@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "iot-nano/public-api-v1",
+  "title": "IoT Nano Public API v1",
+  "version": "v1",
+  "base_path": "/api/v1",
+  "resources": {
+    "devices": {
+      "description": "Generic physical or logical devices.",
+      "operations": {
+        "list": { "method": "GET", "path": "/api/v1/devices", "scope": "devices:read" },
+        "read": { "method": "GET", "path": "/api/v1/devices/{device_id}", "scope": "devices:read" },
+        "create": { "method": "POST", "path": "/api/v1/devices", "scope": "devices:write" },
+        "update": { "method": "PATCH", "path": "/api/v1/devices/{device_id}", "scope": "devices:write" },
+        "delete": { "method": "DELETE", "path": "/api/v1/devices/{device_id}", "scope": "devices:write" }
+      }
+    },
+    "assets": {
+      "description": "Generic user-owned or shared assets associated with devices.",
+      "operations": {
+        "list": { "method": "GET", "path": "/api/v1/assets", "scope": "assets:read" },
+        "read": { "method": "GET", "path": "/api/v1/assets/{asset_id}", "scope": "assets:read" },
+        "create": { "method": "POST", "path": "/api/v1/assets", "scope": "assets:write" },
+        "update": { "method": "PATCH", "path": "/api/v1/assets/{asset_id}", "scope": "assets:write" },
+        "delete": { "method": "DELETE", "path": "/api/v1/assets/{asset_id}", "scope": "assets:write" }
+      }
+    },
+    "telemetry": {
+      "description": "Time-series observations reported by devices.",
+      "operations": {
+        "list": { "method": "GET", "path": "/api/v1/telemetry", "scope": "telemetry:read" },
+        "read": { "method": "GET", "path": "/api/v1/telemetry/{device_id}", "scope": "telemetry:read" }
+      }
+    },
+    "alerts": {
+      "description": "Alerts raised from telemetry or configured conditions.",
+      "operations": {
+        "list": { "method": "GET", "path": "/api/v1/alerts", "scope": "alerts:read" },
+        "read": { "method": "GET", "path": "/api/v1/alerts/{alert_id}", "scope": "alerts:read" },
+        "acknowledge": { "method": "POST", "path": "/api/v1/alerts/{alert_id}/acknowledge", "scope": "alerts:write" }
+      }
+    },
+    "commands": {
+      "description": "Commands submitted to devices for asynchronous execution.",
+      "operations": {
+        "create": { "method": "POST", "path": "/api/v1/devices/{device_id}/commands", "scope": "commands:write" },
+        "read": { "method": "GET", "path": "/api/v1/commands/{command_id}", "scope": "commands:read" }
+      },
+      "idempotency": {
+        "required_header": "Idempotency-Key",
+        "header": "Idempotency-Key",
+        "required_for": "create",
+        "behavior": "same_key_and_payload_returns_original_result",
+        "replay_behavior": "same_key_and_payload_returns_original_result",
+        "conflict_behavior": "same_key_with_different_payload_returns_409"
+      }
+    },
+    "authorization": {
+      "description": "Resource grants that authorize an application or user to access a resource.",
+      "operations": {
+        "list": { "method": "GET", "path": "/api/v1/resource-grants", "scope": "authorization:read" },
+        "read": { "method": "GET", "path": "/api/v1/resource-grants/{grant_id}", "scope": "authorization:read" },
+        "create": { "method": "POST", "path": "/api/v1/resource-grants", "scope": "authorization:write" },
+        "update": { "method": "PATCH", "path": "/api/v1/resource-grants/{grant_id}", "scope": "authorization:write" },
+        "delete": { "method": "DELETE", "path": "/api/v1/resource-grants/{grant_id}", "scope": "authorization:write" }
+      }
+    }
+  },
+  "pagination": {
+    "style": "cursor",
+    "request": {
+      "after": { "type": ["string", "null"] },
+      "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+    },
+    "response": {
+      "items": { "type": "array" },
+      "next_cursor": { "type": ["string", "null"] },
+      "has_more": { "type": "boolean" }
+    },
+    "stability": "Cursors are opaque and remain valid for the documented retention window."
+  },
+  "error_envelope": {
+    "content_type": "application/json",
+    "type": "object",
+    "required": ["code", "message", "request_id"],
+    "properties": {
+      "code": { "type": "string" },
+      "message": { "type": "string" },
+      "request_id": { "type": "string" },
+      "details": { "type": ["object", "null"] }
+    }
+  },
+  "oauth": {
+    "base_path": "/oauth",
+    "authorization_code_pkce": {
+      "path": "/oauth/authorize",
+      "grant_type": "authorization_code",
+      "code_challenge_method": "S256",
+      "required_parameters": ["response_type", "client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"]
+    },
+    "client_credentials": {
+      "path": "/oauth/token",
+      "grant_type": "client_credentials",
+      "required_parameters": ["grant_type", "scope"]
+    },
+    "token_endpoint": {
+      "path": "/oauth/token",
+      "supported_grant_types": ["authorization_code", "client_credentials"]
+    },
+    "error_values": [
+      "invalid_request",
+      "invalid_client",
+      "invalid_grant",
+      "invalid_scope",
+      "unauthorized_client",
+      "unsupported_grant_type",
+      "access_denied",
+      "temporarily_unavailable"
+    ]
+  }
+}
