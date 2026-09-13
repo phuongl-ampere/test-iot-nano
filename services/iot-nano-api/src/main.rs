@@ -8,7 +8,7 @@ use iot_api::{
 };
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_core::migrate;
-use iot_storage::SqliteStore;
+use iot_storage::{PlatformStore, SqliteStore};
 use sqlx::PgPool;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -108,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let app = match storage.storage {
         DatabaseStorage::Timescale => {
+            let oauth_store = PlatformStore::open(&storage).await?;
             let pool = PgPool::connect(
                 storage
                     .database_url
@@ -119,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bootstrap_users(&pool).await?;
             bootstrap_power_switcher_profile(&pool).await?;
             let mut state = ApiState::new(pool)
+                .with_oauth_store(oauth_store)
                 .with_device_token_vault(TokenVault::from_key_material(vault_key))
                 .with_mqttd_device_transport_secret(arguments.mqttd_device_transport_secret)
                 .with_api_mqttd_control(
@@ -130,10 +132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             router(state)
         }
         DatabaseStorage::Sqlite => {
+            let oauth_store = PlatformStore::open(&storage).await?;
             let store = SqliteStore::open(&storage).await?;
             bootstrap_users_sqlite(store.pool()).await?;
             bootstrap_power_switcher_profile_sqlite(store.pool()).await?;
             let mut state = SqliteApiState::new(store)
+                .with_oauth_store(oauth_store)
                 .with_device_token_vault(TokenVault::from_key_material(vault_key))
                 .with_mqttd_device_transport_secret(arguments.mqttd_device_transport_secret)
                 .with_api_mqttd_control(

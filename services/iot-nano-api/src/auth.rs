@@ -6,8 +6,10 @@ use argon2::{
 };
 use axum::{
     extract::FromRequestParts,
-    http::{StatusCode, request::Parts},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION, request::Parts},
 };
+use chrono::{DateTime, Utc};
+use iot_storage::{OAuthRepository, PlatformStoreError};
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use sqlx::{PgPool, Row, SqlitePool};
@@ -106,6 +108,59 @@ pub struct AuthContext {
     pub default_app: String,
     pub granted_apps: Vec<String>,
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BearerAccessToken {
+    pub app_id: String,
+    pub user_id: Option<Uuid>,
+    pub scopes: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl BearerAccessToken {
+    pub fn allows_scope(&self, required_scope: &str) -> bool {
+        self.scopes.iter().any(|scope| scope == required_scope)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerAccessTokenError {
+    Missing,
+    Denied,
+    Unavailable,
+}
+
+pub fn extract_bearer_access_token(headers: &HeaderMap) -> Result<&str, BearerAccessTokenError> {
+    let value = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(BearerAccessTokenError::Missing)?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty() && !token.bytes().any(|byte| byte.is_ascii_whitespace()))
+        .ok_or(BearerAccessTokenError::Missing)?;
+    Ok(token)
+}
+
+pub async fn validate_bearer_access_token(
+    store: &impl OAuthRepository,
+    headers: &HeaderMap,
+    now: DateTime<Utc>,
+) -> Result<BearerAccessToken, BearerAccessTokenError> {
+    let token = extract_bearer_access_token(headers)?;
+    let record = OAuthRepository::resolve_access_token(store, token, now)
+        .await
+        .map_err(|error| match error {
+            PlatformStoreError::OAuthAccessTokenDenied => BearerAccessTokenError::Denied,
+            _ => BearerAccessTokenError::Unavailable,
+        })?;
+    Ok(BearerAccessToken {
+        app_id: record.app_id.as_str().to_owned(),
+        user_id: record.user_id,
+        scopes: record.scopes,
+        expires_at: record.expires_at,
+    })
 }
 
 #[derive(Debug, Clone)]

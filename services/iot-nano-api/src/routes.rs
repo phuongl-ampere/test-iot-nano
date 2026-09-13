@@ -11,7 +11,10 @@ use std::{
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Extension, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, COOKIE, SET_COOKIE},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -21,7 +24,9 @@ use iot_core::{
     RpcMode, RpcRequest, SystemConfiguration, SystemConfigurationUpdate, device_token_prefix,
     generate_device_token, hash_device_token, verify_device_token,
 };
-use iot_storage::{CommandOutboxState, NewCommandOutboxEntry, SqliteStore, SqliteStoreError};
+use iot_storage::{
+    CommandOutboxState, NewCommandOutboxEntry, PlatformStore, SqliteStore, SqliteStoreError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -173,6 +178,7 @@ pub struct ApiState {
     system_configuration: Arc<dyn SystemConfigurationService>,
     token_vault: TokenVault,
     core_facade: Option<Arc<dyn CoreFacade>>,
+    oauth_store: Option<Arc<PlatformStore>>,
 }
 
 #[derive(Clone)]
@@ -185,6 +191,7 @@ pub struct SqliteApiState {
     system_configuration: Arc<dyn SystemConfigurationService>,
     token_vault: TokenVault,
     core_facade: Option<Arc<dyn CoreFacade>>,
+    oauth_store: Option<Arc<PlatformStore>>,
 }
 
 #[derive(Clone)]
@@ -211,6 +218,7 @@ impl ApiState {
             system_configuration: default_system_configuration_service(),
             token_vault: TokenVault::from_key_material("iot-api-default-device-token-vault"),
             core_facade: None,
+            oauth_store: None,
         }
     }
 
@@ -260,6 +268,11 @@ impl ApiState {
 
     pub fn with_core_client(self, client: CoreClient) -> Self {
         self.with_core_facade(Arc::new(client))
+    }
+
+    pub fn with_oauth_store(mut self, store: PlatformStore) -> Self {
+        self.oauth_store = Some(Arc::new(store));
+        self
     }
 
     pub fn with_session(
@@ -339,6 +352,14 @@ impl ApiState {
         })
     }
 
+    pub(crate) fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<AuthContext> {
+        browser_session_id(headers).and_then(|session_id| self.authenticate_session(session_id))
+    }
+
+    pub(crate) fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
+        self.oauth_store.clone()
+    }
+
     fn revoke_session(&self, session_id: &str) {
         self.sessions
             .lock()
@@ -367,6 +388,7 @@ impl SqliteApiState {
             system_configuration: default_system_configuration_service(),
             token_vault: TokenVault::from_key_material("iot-api-default-device-token-vault"),
             core_facade: None,
+            oauth_store: None,
         }
     }
 
@@ -416,6 +438,11 @@ impl SqliteApiState {
 
     pub fn with_core_client(self, client: CoreClient) -> Self {
         self.with_core_facade(Arc::new(client))
+    }
+
+    pub fn with_oauth_store(mut self, store: PlatformStore) -> Self {
+        self.oauth_store = Some(Arc::new(store));
+        self
     }
 
     fn require_mqttd_device_transport_secret(&self, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -470,6 +497,14 @@ impl SqliteApiState {
         })
     }
 
+    pub(crate) fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<AuthContext> {
+        browser_session_id(headers).and_then(|session_id| self.authenticate_session(session_id))
+    }
+
+    pub(crate) fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
+        self.oauth_store.clone()
+    }
+
     fn revoke_session(&self, session_id: &str) {
         self.sessions
             .lock()
@@ -483,6 +518,29 @@ impl SqliteApiState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|_, session| session.username != username);
     }
+}
+
+fn browser_session_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').map(str::trim).find_map(|cookie| {
+                cookie
+                    .strip_prefix("iot_nano_session=")
+                    .filter(|session_id| !session_id.is_empty())
+            })
+        })
+}
+
+fn session_cookie_headers(session_id: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::try_from(format!(
+        "iot_nano_session={session_id}; HttpOnly; SameSite=Lax; Path=/"
+    ))
+    .expect("generated session IDs are valid cookie values");
+    headers.insert(SET_COOKIE, value);
+    headers
 }
 
 fn default_system_configuration_service() -> Arc<dyn SystemConfigurationService> {
@@ -681,7 +739,7 @@ pub struct ApiRouters {
 
 pub fn routers(state: ApiState) -> ApiRouters {
     ApiRouters {
-        public: public_router(),
+        public: public_router(state.clone()),
         management: management_router(state),
     }
 }
@@ -691,8 +749,12 @@ pub fn router(state: ApiState) -> Router {
     public.merge(management)
 }
 
-fn public_router() -> Router {
-    Router::new().route("/healthz", get(healthz))
+fn public_router(state: ApiState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/oauth/authorize", get(crate::oauth::authorize))
+        .route("/oauth/token", post(crate::oauth::token))
+        .with_state(state)
 }
 
 fn management_router(state: ApiState) -> Router {
@@ -832,6 +894,8 @@ fn management_router(state: ApiState) -> Router {
 pub fn sqlite_router(state: SqliteApiState) -> Router {
     let public = Router::new()
         .route("/healthz", get(healthz))
+        .route("/oauth/authorize", get(crate::oauth::sqlite_authorize))
+        .route("/oauth/token", post(crate::oauth::sqlite_token))
         .route("/api/auth/login", post(sqlite_login))
         .route(
             "/internal/mqttd/session-resolution",
@@ -1013,7 +1077,7 @@ async fn login(
     State(state): State<ApiState>,
     address: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(request): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, ApiError> {
+) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
     let address = address
         .map(|Extension(ConnectInfo(address))| address.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -1035,7 +1099,10 @@ async fn login(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear(address);
             let session_id = state.issue_session(user.clone());
-            Ok(Json(AuthResponse::from_user(user, Some(session_id))))
+            Ok((
+                session_cookie_headers(&session_id),
+                Json(AuthResponse::from_user(user, Some(session_id))),
+            ))
         }
         Err(AuthError::AuthenticationFailed) => {
             state
@@ -1053,7 +1120,7 @@ async fn sqlite_login(
     State(state): State<SqliteApiState>,
     address: Option<Extension<ConnectInfo<SocketAddr>>>,
     Json(request): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, ApiError> {
+) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
     let address = address
         .map(|Extension(ConnectInfo(address))| address.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -1076,7 +1143,10 @@ async fn sqlite_login(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear(address);
             let session_id = state.issue_session(user.clone());
-            Ok(Json(AuthResponse::from_user(user, Some(session_id))))
+            Ok((
+                session_cookie_headers(&session_id),
+                Json(AuthResponse::from_user(user, Some(session_id))),
+            ))
         }
         Err(AuthError::AuthenticationFailed) => {
             state

@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod application_registry;
 mod auth;
 mod core_client;
 mod core_facade;
 mod device_tokens;
+mod oauth;
 mod power_switcher;
 mod powermonitor;
 mod resource_authorization;
@@ -13,7 +15,9 @@ mod system_config;
 mod token_vault;
 
 pub use auth::{
-    AccountClass, AuthError, Role, bootstrap_users, bootstrap_users_sqlite, validate_password,
+    AccountClass, AuthError, BearerAccessToken, BearerAccessTokenError, Role, bootstrap_users,
+    bootstrap_users_sqlite, extract_bearer_access_token, validate_bearer_access_token,
+    validate_password,
 };
 pub use core_client::{
     CoreClient, CoreClientError, CoreCommandCreateRequest, CoreCommandRecord,
