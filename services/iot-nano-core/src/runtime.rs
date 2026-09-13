@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use iot_storage::PlatformStore;
 use iot_stream::{StreamError, StreamPort};
 use thiserror::Error;
@@ -20,15 +20,21 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    CoreStreamConsumer, IngestMetrics, PlatformAlertEvaluator, PlatformTelemetryWriter, WriterError,
+    CommandTransport, CoreStreamConsumer, EmailSender, IngestMetrics, PlatformAlertEvaluator,
+    PlatformCommandDispatcher, PlatformNotificationDispatcher, PlatformTelemetryWriter,
+    WriterError,
 };
 
 #[derive(Clone)]
 pub struct CoreRuntimeConfig {
     pub store: Arc<PlatformStore>,
     pub stream: Arc<dyn StreamPort>,
+    pub command_transport: Arc<dyn CommandTransport>,
+    pub email_sender: Arc<dyn EmailSender>,
     pub writer_batch_size: usize,
     pub alert_batch_size: usize,
+    pub command_batch_size: u32,
+    pub notification_batch_size: usize,
     pub writer_group: String,
     pub alert_group: String,
     pub writer_member_id: String,
@@ -36,8 +42,14 @@ pub struct CoreRuntimeConfig {
     pub writer_interval: Duration,
     pub event_alert_interval: Duration,
     pub window_alert_interval: Duration,
+    pub command_interval: Duration,
+    pub notification_interval: Duration,
     pub writer_heartbeat_interval: Duration,
     pub alert_heartbeat_interval: Duration,
+    pub notification_send_timeout: Duration,
+    pub notification_lease_duration: ChronoDuration,
+    pub notification_retry_base: ChronoDuration,
+    pub notification_retry_max: ChronoDuration,
     pub cancellation: CancellationToken,
     pub metrics: Arc<IngestMetrics>,
 }
@@ -113,7 +125,25 @@ impl CoreRuntime {
             (*config.store).clone(),
             config.alert_batch_size,
         ));
-        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(3);
+        let command_dispatcher = Arc::new(PlatformCommandDispatcher::new(
+            Arc::clone(&config.store),
+            Arc::clone(&config.command_transport),
+            config.command_batch_size,
+        ));
+        let notification_dispatcher = Arc::new(
+            PlatformNotificationDispatcher::new(
+                Arc::clone(&config.store),
+                Arc::clone(&config.email_sender),
+                config.notification_batch_size,
+            )
+            .with_timeout(config.notification_send_timeout)
+            .with_delivery_policy(
+                config.notification_lease_duration,
+                config.notification_retry_base,
+                config.notification_retry_max,
+            ),
+        );
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(5);
         let writer_stop = Arc::clone(&stop_claiming);
         let writer_handle = tokio::spawn(run_worker(
             "writer",
@@ -174,7 +204,7 @@ impl CoreRuntime {
             config.window_alert_interval,
             cancellation.clone(),
             Arc::clone(&config.metrics),
-            ready_tx,
+            ready_tx.clone(),
             Box::new(move || {
                 let evaluator = Arc::clone(&window_evaluator);
                 Box::pin(async move {
@@ -186,15 +216,58 @@ impl CoreRuntime {
                 })
             }),
         ));
+        let command_handle = tokio::spawn(run_outbox_worker(
+            "commands",
+            config.command_interval,
+            cancellation.clone(),
+            Arc::clone(&config.metrics),
+            ready_tx.clone(),
+            Box::new(move || {
+                let dispatcher = Arc::clone(&command_dispatcher);
+                Box::pin(async move {
+                    dispatcher
+                        .dispatch_once(Utc::now())
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| WorkError::Storage(error.to_string()))
+                })
+            }),
+        ));
+        let notification_metrics = Arc::clone(&config.metrics);
+        let notification_handle = tokio::spawn(run_outbox_worker(
+            "notifications",
+            config.notification_interval,
+            cancellation.clone(),
+            Arc::clone(&config.metrics),
+            ready_tx,
+            Box::new(move || {
+                let dispatcher = Arc::clone(&notification_dispatcher);
+                let metrics = Arc::clone(&notification_metrics);
+                Box::pin(async move {
+                    let result = dispatcher
+                        .dispatch_once(Utc::now())
+                        .await
+                        .map_err(|error| WorkError::Storage(error.to_string()))?;
+                    metrics.record_notification_failures(result.retried);
+                    Ok(())
+                })
+            }),
+        ));
         let runtime = Self {
             stop_claiming,
             cancellation,
             stream: config.stream,
-            workers: Mutex::new(Some(vec![writer_handle, event_handle, window_handle])),
+            workers: Mutex::new(Some(vec![
+                writer_handle,
+                event_handle,
+                window_handle,
+                command_handle,
+                notification_handle,
+            ])),
             drain_lock: AsyncMutex::new(()),
             drain_started: AtomicBool::new(false),
         };
-        for _ in 0..3 {
+        for _ in 0..5 {
             match ready_rx.recv().await {
                 Some(Ok(())) => {}
                 Some(Err(error)) => {
@@ -269,10 +342,16 @@ impl CoreRuntime {
             .take()
             .unwrap_or_default();
         let mut first_error = None;
-        let mut handles = ["writer", "event alerts", "window alerts"]
-            .into_iter()
-            .zip(worker_handles)
-            .collect::<Vec<_>>();
+        let mut handles = [
+            "writer",
+            "event alerts",
+            "window alerts",
+            "commands",
+            "notifications",
+        ]
+        .into_iter()
+        .zip(worker_handles)
+        .collect::<Vec<_>>();
         for index in 0..handles.len() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let worker = handles[index].0;
@@ -314,7 +393,11 @@ impl CoreRuntime {
 }
 
 fn validate(config: &CoreRuntimeConfig) -> Result<(), CoreRuntimeError> {
-    if config.writer_batch_size == 0 || config.alert_batch_size == 0 {
+    if config.writer_batch_size == 0
+        || config.alert_batch_size == 0
+        || config.command_batch_size == 0
+        || config.notification_batch_size == 0
+    {
         return Err(CoreRuntimeError::Configuration(
             "batch sizes must be greater than zero".to_owned(),
         ));
@@ -323,6 +406,8 @@ fn validate(config: &CoreRuntimeConfig) -> Result<(), CoreRuntimeError> {
         ("writer interval", config.writer_interval),
         ("event alert interval", config.event_alert_interval),
         ("window alert interval", config.window_alert_interval),
+        ("command interval", config.command_interval),
+        ("notification interval", config.notification_interval),
         (
             "writer heartbeat interval",
             config.writer_heartbeat_interval,
@@ -330,6 +415,25 @@ fn validate(config: &CoreRuntimeConfig) -> Result<(), CoreRuntimeError> {
         ("alert heartbeat interval", config.alert_heartbeat_interval),
     ] {
         if duration.is_zero() {
+            return Err(CoreRuntimeError::Configuration(format!(
+                "{name} must be greater than zero"
+            )));
+        }
+    }
+    if config.notification_send_timeout.is_zero() {
+        return Err(CoreRuntimeError::Configuration(
+            "notification send timeout must be greater than zero".to_owned(),
+        ));
+    }
+    for (name, duration) in [
+        (
+            "notification lease duration",
+            config.notification_lease_duration,
+        ),
+        ("notification retry base", config.notification_retry_base),
+        ("notification retry max", config.notification_retry_max),
+    ] {
+        if duration <= ChronoDuration::zero() {
             return Err(CoreRuntimeError::Configuration(format!(
                 "{name} must be greater than zero"
             )));
@@ -402,6 +506,36 @@ async fn run_worker(
 }
 
 async fn run_window_worker(
+    name: &'static str,
+    work_interval: Duration,
+    cancellation: CancellationToken,
+    metrics: Arc<IngestMetrics>,
+    ready: tokio::sync::mpsc::Sender<Result<(), CoreRuntimeError>>,
+    mut work: Work,
+) -> Result<(), CoreRuntimeWorkerError> {
+    let _ = ready.send(Ok(())).await;
+    let mut work_tick = time::interval(work_interval);
+    work_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    work_tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = work_tick.tick() => {
+                if let Err(error) = work().await {
+                    match &error {
+                        WorkError::Stream(_) => metrics.record_stream_failure(),
+                        WorkError::Storage(_) => metrics.record_database_failure(),
+                        WorkError::Alert(_) => metrics.record_alert_failure(),
+                    }
+                    cancellation.cancel();
+                    return Err(worker_error(name, error));
+                }
+            }
+        }
+    }
+}
+
+async fn run_outbox_worker(
     name: &'static str,
     work_interval: Duration,
     cancellation: CancellationToken,

@@ -28,6 +28,19 @@ pub trait EmailSender: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), NotificationError>> + Send + '_>>;
 }
 
+impl<T> EmailSender for std::sync::Arc<T>
+where
+    T: EmailSender + ?Sized,
+{
+    fn send(
+        &self,
+        subject: String,
+        body: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NotificationError>> + Send + '_>> {
+        self.as_ref().send(subject, body)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NotificationError {
     #[error(transparent)]

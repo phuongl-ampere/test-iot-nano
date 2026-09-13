@@ -9,18 +9,21 @@ use std::{
 };
 
 use chrono::Utc;
+use iot_core::RpcMode;
 use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_nano_core::{
-    CoreRuntime, CoreRuntimeConfig, CoreRuntimeError, CoreRuntimeWorkerError, CoreStreamConsumer,
-    IngestMetrics, PlatformTelemetryWriter, WriterError,
+    CommandTransport, CommandTransportError, CoreRuntime, CoreRuntimeConfig, CoreRuntimeError,
+    CoreRuntimeWorkerError, CoreStreamConsumer, EmailSender, IngestMetrics, NotificationError,
+    PlatformTelemetryWriter, TransportRpcPublishRequest, WriterError,
 };
-use iot_storage::PlatformStore;
+use iot_storage::{NewCommandOutboxEntry as PlatformCommand, PlatformStore};
 use iot_stream::{
     AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment,
     HeartbeatRequest, LocalStream, PartitionId, StreamConfig, StreamError, StreamMessage,
     StreamPort, TelemetryMessage,
 };
 use serde_json::{Map, json};
+use sqlx::Row;
 use tempfile::TempDir;
 use tokio::{
     sync::Notify,
@@ -28,6 +31,35 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct UnavailableTransport;
+
+impl CommandTransport for UnavailableTransport {
+    fn publish(
+        &self,
+        _request: TransportRpcPublishRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CommandTransportError>> + Send + '_>> {
+        Box::pin(async {
+            Err(CommandTransportError::Unavailable(
+                "broker unavailable".to_owned(),
+            ))
+        })
+    }
+}
+
+#[derive(Clone)]
+struct FailingEmailSender;
+
+impl EmailSender for FailingEmailSender {
+    fn send(
+        &self,
+        _subject: String,
+        _body: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NotificationError>> + Send + '_>> {
+        Box::pin(async { Err(NotificationError::Send("email delivery failed".to_owned())) })
+    }
+}
 
 struct ActiveClaim {
     active_claims: Arc<AtomicUsize>,
@@ -359,8 +391,12 @@ async fn runtime_config(stream: Arc<dyn StreamPort>) -> (TempDir, CoreRuntimeCon
         CoreRuntimeConfig {
             store: Arc::new(store),
             stream,
+            command_transport: Arc::new(UnavailableTransport),
+            email_sender: Arc::new(FailingEmailSender),
             writer_batch_size: 10,
             alert_batch_size: 10,
+            command_batch_size: 10,
+            notification_batch_size: 10,
             writer_group: "writer".to_owned(),
             alert_group: "alerts".to_owned(),
             writer_member_id: "runtime-test".to_owned(),
@@ -368,12 +404,144 @@ async fn runtime_config(stream: Arc<dyn StreamPort>) -> (TempDir, CoreRuntimeCon
             writer_interval: Duration::from_millis(10),
             event_alert_interval: Duration::from_millis(10),
             window_alert_interval: Duration::from_millis(10),
+            command_interval: Duration::from_millis(10),
+            notification_interval: Duration::from_millis(10),
             writer_heartbeat_interval: Duration::from_millis(10),
             alert_heartbeat_interval: Duration::from_millis(10),
+            notification_send_timeout: Duration::from_millis(100),
+            notification_lease_duration: chrono::Duration::seconds(30),
+            notification_retry_base: chrono::Duration::seconds(1),
+            notification_retry_max: chrono::Duration::seconds(60),
             cancellation: CancellationToken::new(),
             metrics: Arc::new(IngestMetrics::default()),
         },
     )
+}
+
+async fn seed_platform_notification(store: &PlatformStore, now: chrono::DateTime<Utc>) -> Uuid {
+    let rule_id = Uuid::new_v4();
+    let incident_id = Uuid::new_v4();
+    let notification_id = Uuid::new_v4();
+    let pool = store.sqlite_pool().expect("runtime test uses SQLite");
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold, window_seconds,
+            for_seconds, resolve_after_seconds, reopen_grace_seconds, severity,
+            reminder_interval_seconds
+         ) VALUES (?, 'Runtime rule', 'temperature_c', 'event_threshold', 'gt', 40, 0,
+                   0, 0, 3600, 'warning', 86400)",
+    )
+    .bind(rule_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, rule_id, device_id, status, condition_started_at, opened_at, state_version
+         ) VALUES (?, ?, 'runtime-device', 'open', ?, ?, 1)",
+    )
+    .bind(incident_id.to_string())
+    .bind(rule_id.to_string())
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO notification_outbox (
+            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES (?, ?, 'opened', ?, 'subject', 'body', ?)",
+    )
+    .bind(notification_id.to_string())
+    .bind(incident_id.to_string())
+    .bind(format!("runtime-{notification_id}"))
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+    notification_id
+}
+
+#[tokio::test]
+async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
+    let stream = RecordingStream::default();
+    let (_directory, config) = runtime_config(Arc::new(stream)).await;
+    config
+        .store
+        .register_device("runtime-device")
+        .await
+        .unwrap();
+    let command_id = Uuid::now_v7();
+    let now = Utc::now();
+    config
+        .store
+        .enqueue_command(PlatformCommand {
+            id: command_id.to_string(),
+            device_id: "runtime-device".to_owned(),
+            method: "sample_now".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: now + chrono::Duration::minutes(5),
+            next_attempt_at: now,
+        })
+        .await
+        .unwrap();
+    let pool = config.store.sqlite_pool().unwrap().clone();
+
+    let runtime = CoreRuntime::start(config).await.unwrap();
+    sleep(Duration::from_millis(30)).await;
+
+    assert!(runtime.ready());
+    let row = sqlx::query("SELECT state, last_error FROM command_outbox WHERE id = ?")
+        .bind(command_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<String, _>("state"),
+        "queued",
+        "{}",
+        row.get::<Option<String>, _>("last_error")
+            .unwrap_or_default()
+    );
+    runtime
+        .drain(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
+    let stream = RecordingStream::default();
+    let (_directory, config) = runtime_config(Arc::new(stream)).await;
+    config
+        .store
+        .register_device("runtime-device")
+        .await
+        .unwrap();
+    let notification_id = seed_platform_notification(&config.store, Utc::now()).await;
+    let metrics = Arc::clone(&config.metrics);
+    let pool = config.store.sqlite_pool().unwrap().clone();
+
+    let runtime = CoreRuntime::start(config).await.unwrap();
+    sleep(Duration::from_millis(30)).await;
+
+    assert!(runtime.ready());
+    let state =
+        sqlx::query_scalar::<_, String>("SELECT state FROM notification_outbox WHERE id = ?")
+            .bind(notification_id.to_string())
+            .fetch_one(&pool)
+            .await;
+    assert_eq!(state.unwrap(), "pending");
+    assert!(
+        metrics
+            .render_prometheus()
+            .contains("iot_ingest_notification_failures_total 1\n")
+    );
+    runtime
+        .drain(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
 }
 
 fn telemetry_record(device_id: &str) -> ClaimedRecord {
