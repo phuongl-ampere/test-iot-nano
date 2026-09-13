@@ -4227,7 +4227,7 @@ async fn sqlite_window_aggregates(
                AND json_extract(measurements, ?) < 1.0e999
          ),
          device_scales AS (
-             SELECT device_id, MAX(ABS(finite_value)) AS scale
+             SELECT device_id, MAX(ABS(1.0 * finite_value)) AS scale
              FROM finite_telemetry
              GROUP BY device_id
          )

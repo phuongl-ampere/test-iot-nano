@@ -281,6 +281,49 @@ async fn sqlite_window_evaluation_keeps_near_max_finite_averages_finite() {
 }
 
 #[tokio::test]
+async fn sqlite_window_evaluation_accepts_min_i64_json_integer() {
+    let (_directory, store) = store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            window_seconds, for_seconds
+         ) VALUES (?, 'temperature average low', 'device-1', 'temperature_c',
+                   'window_average', 'lt', -9.0e18, 60, 0)",
+    )
+    .bind(rule_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let evaluated_at = Utc.timestamp_opt(1_700_000_090, 0).unwrap();
+    insert_sqlite_window_telemetry(
+        &store,
+        &evaluated_at.to_rfc3339(),
+        "device-1",
+        1,
+        r#"{"temperature_c":-9223372036854775808}"#,
+    )
+    .await;
+
+    assert_eq!(
+        store.evaluate_alert_windows(evaluated_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let last_value =
+        sqlx::query_scalar::<_, f64>("SELECT last_value FROM alert_incidents WHERE rule_id = ?")
+            .bind(rule_id.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert!(last_value.is_finite());
+    assert!(last_value < -9.0e18);
+}
+
+#[tokio::test]
 async fn sqlite_window_evaluation_handles_all_zero_finite_averages() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
@@ -2110,4 +2153,49 @@ async fn timescale_window_evaluation_keeps_near_max_finite_averages_finite() {
             .unwrap();
     assert!(last_value.is_finite());
     assert!((last_value / 1.7e308 - 1.0).abs() <= 2.0 * f64::EPSILON);
+}
+
+#[tokio::test]
+#[ignore = "requires the guarded disposable Timescale URL"]
+async fn timescale_window_evaluation_accepts_min_i64_json_integer() {
+    let (_lock, store) = timescale_store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            window_seconds, for_seconds
+         ) VALUES ($1, 'temperature average low', 'device-1', 'temperature_c',
+                   'window_average', 'lt', $2, 60, 0)",
+    )
+    .bind(rule_id)
+    .bind(-9.0e18_f64)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let evaluated_at = Utc.timestamp_opt(1_700_003_690, 0).unwrap();
+    insert_timescale_window_telemetry(
+        &store,
+        evaluated_at,
+        "device-1",
+        1,
+        r#"{"temperature_c":-9223372036854775808}"#,
+    )
+    .await;
+
+    assert_eq!(
+        store.evaluate_alert_windows(evaluated_at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    let last_value =
+        sqlx::query_scalar::<_, f64>("SELECT last_value FROM alert_incidents WHERE rule_id = $1")
+            .bind(rule_id)
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap();
+    assert!(last_value.is_finite());
+    assert!(last_value < -9.0e18);
 }
