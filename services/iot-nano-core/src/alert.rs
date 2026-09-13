@@ -1,5 +1,6 @@
 use crate::CoreSqliteStore;
 use chrono::{DateTime, Duration, Utc};
+use iot_storage::{AlertEvaluationEvent, AlertEvaluationRepository, PlatformStoreError};
 use iot_stream::{ClaimedRecord, StreamError};
 use sqlx::{PgPool, Postgres, Row, Sqlite, Transaction};
 use thiserror::Error;
@@ -85,6 +86,8 @@ pub enum AlertError {
     Stream(#[from] StreamError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    Store(#[from] PlatformStoreError),
     #[error("invalid stored alert rule: {0}")]
     InvalidRule(String),
 }
@@ -343,6 +346,76 @@ impl SqliteAlertEvaluator {
         transaction.commit().await?;
         Ok(result)
     }
+}
+
+pub struct PlatformAlertEvaluator<S> {
+    store: S,
+    batch_size: usize,
+}
+
+impl<S> PlatformAlertEvaluator<S>
+where
+    S: AlertEvaluationRepository,
+{
+    pub fn new(store: S, batch_size: usize) -> Self {
+        Self {
+            store,
+            batch_size: batch_size.max(1),
+        }
+    }
+
+    pub async fn flush_event_rules(
+        &self,
+        consumer: &CoreStreamConsumer,
+        now: DateTime<Utc>,
+    ) -> Result<AlertFlushResult, AlertError> {
+        let batch = consumer.claim(self.batch_size).await?;
+        if batch.is_empty() {
+            return Ok(empty_alert_flush_result());
+        }
+
+        let events = batch
+            .records()
+            .iter()
+            .filter_map(platform_alert_event)
+            .collect::<Vec<_>>();
+        let evaluated = self.store.evaluate_alert_events(&events, now).await?;
+        let result = AlertFlushResult {
+            read: batch.records().len(),
+            evaluated: evaluated.evaluated,
+            opened: evaluated.opened,
+            resolved: evaluated.resolved,
+            reminders: evaluated.reminders,
+        };
+        consumer.acknowledge(&batch).await?;
+        Ok(result)
+    }
+
+    pub async fn flush_window_rules(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<AlertFlushResult, AlertError> {
+        let evaluated = self.store.evaluate_alert_windows(now).await?;
+        Ok(AlertFlushResult {
+            read: 0,
+            evaluated: evaluated.evaluated,
+            opened: evaluated.opened,
+            resolved: evaluated.resolved,
+            reminders: evaluated.reminders,
+        })
+    }
+}
+
+fn platform_alert_event(record: &ClaimedRecord) -> Option<AlertEvaluationEvent> {
+    let (event, received_at, _) = record.message.telemetry_parts()?;
+    Some(AlertEvaluationEvent {
+        event_at: event.event_at,
+        received_at,
+        device_id: event.device_id.clone(),
+        boot_id: event.boot_id,
+        sequence: event.sequence,
+        measurements: event.measurements.clone(),
+    })
 }
 
 fn empty_alert_flush_result() -> AlertFlushResult {

@@ -11,7 +11,9 @@ mod stream_consumer;
 mod stream_port;
 mod writer;
 
-pub use alert::{AlertError, AlertEvaluator, AlertFlushResult, SqliteAlertEvaluator};
+pub use alert::{
+    AlertError, AlertEvaluator, AlertFlushResult, PlatformAlertEvaluator, SqliteAlertEvaluator,
+};
 pub use command::{
     CommandDispatchResult, CommandDispatcher, CommandError, CommandTransport,
     CommandTransport as TransportRpcClient, CommandTransportError, HttpTransportRpcClient,
