@@ -570,6 +570,24 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
         123_456_000
     );
     assert!(
+        AlertIncidentRepository::remind_incident_with_notification(
+            &store,
+            incident_id,
+            opened.state_version,
+            opened_at + Duration::seconds(1),
+            NewNotificationOutboxEntry {
+                id: uuid::Uuid::now_v7(),
+                kind: NotificationKind::Reminder,
+                dedupe_key: "incident-opened:timescale".to_owned(),
+                subject: "duplicate".to_owned(),
+                body: "body".to_owned(),
+                next_attempt_at: opened_at + Duration::seconds(1),
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert!(
         AlertIncidentRepository::open_incident_with_notification(
             &store,
             incident_id,
