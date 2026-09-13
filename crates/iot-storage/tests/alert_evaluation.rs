@@ -1092,6 +1092,75 @@ async fn sqlite_within_grace_positive_duration_reopen_reuses_pending_incident() 
 
 #[tokio::test]
 #[ignore = "requires a disposable Timescale URL"]
+async fn timescale_concurrent_distinct_events_serialize_first_incident_transition() {
+    let (_lock, store) = timescale_store().await;
+    let rule_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
+         ) VALUES ($1, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
+    )
+    .bind(rule_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+
+    let at = Utc.timestamp_opt(1_700_002_000, 123_456_789).unwrap();
+    let first = event(at, 1, 31.25, uuid::Uuid::now_v7());
+    let second = event(at, 2, 32.0, uuid::Uuid::now_v7());
+    let first_events = [first];
+    let second_events = [second];
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let (first_result, second_result) = tokio::join!(
+        first_store.evaluate_alert_events(&first_events, at),
+        second_store.evaluate_alert_events(&second_events, at),
+    );
+
+    let first_result = first_result.unwrap();
+    let second_result = second_result.unwrap();
+    assert_eq!(first_result.evaluated, 1);
+    assert_eq!(second_result.evaluated, 1);
+    assert_eq!(first_result.opened + second_result.opened, 1);
+    assert_eq!(first_result.reminders + second_result.reminders, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents
+             WHERE rule_id = $1 AND device_id = 'device-1' AND status IN ('pending', 'open')",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_rule_event_evaluations WHERE rule_id = $1",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_outbox WHERE incident_id IN (
+                SELECT id FROM alert_incidents WHERE rule_id = $1
+             )",
+        )
+        .bind(rule_id)
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable Timescale URL"]
 async fn timescale_event_evaluation_matches_sqlite_state_sequence_and_duplicate_contract() {
     let (_lock, store) = timescale_store().await;
     let rule_id = uuid::Uuid::now_v7();

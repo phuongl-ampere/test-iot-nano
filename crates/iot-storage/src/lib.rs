@@ -3763,6 +3763,15 @@ async fn evaluate_timescale_event_transition(
     value: f64,
     evaluated_at: DateTime<Utc>,
 ) -> Result<EventTransition, PlatformStoreError> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(
+            hashtextextended($1, 0)
+         )",
+    )
+    .bind(format!("iot_nano:alert-event:{}:{device_id}", rule.id))
+    .execute(&mut **transaction)
+    .await?;
+
     let condition = event_condition(rule, value);
     if condition != Some(true) {
         if condition == Some(false) {
