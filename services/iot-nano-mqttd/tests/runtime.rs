@@ -381,6 +381,30 @@ async fn expired_drain_closes_listeners_and_joins_runtime_work() {
 }
 
 #[tokio::test]
+async fn parent_cancellation_releases_configured_public_listener_addresses() {
+    let directory = tempfile::tempdir().unwrap();
+    let plaintext_address = reserve_address().await;
+    let tls_address = reserve_address().await;
+    let cancellation = CancellationToken::new();
+    let mut config = runtime_config(
+        directory.path(),
+        plaintext_address,
+        tls_address,
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestAuthorization::allowing()),
+        fixture_certificate(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server.key"),
+    );
+    config.cancellation = cancellation.clone();
+    let mut runtime = MqttRuntime::start(config).await.unwrap();
+
+    cancellation.cancel();
+
+    assert_public_addresses_rebindable(plaintext_address, tls_address).await;
+    shutdown(&mut runtime).await;
+}
+
+#[tokio::test]
 async fn runtime_rejects_missing_and_non_device_mqtt311_and_mqtt5_before_broker_dispatch() {
     let directory = tempfile::tempdir().unwrap();
     let plaintext_address = reserve_address().await;
@@ -586,6 +610,23 @@ async fn reserve_address() -> SocketAddr {
 async fn assert_bindable(address: SocketAddr) {
     let listener = TcpListener::bind(address).await.unwrap();
     drop(listener);
+}
+
+async fn assert_public_addresses_rebindable(plaintext_address: SocketAddr, tls_address: SocketAddr) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(plaintext_listener) = TcpListener::bind(plaintext_address).await {
+                if let Ok(tls_listener) = TcpListener::bind(tls_address).await {
+                    drop((plaintext_listener, tls_listener));
+                    return;
+                }
+                drop(plaintext_listener);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("parent cancellation did not release both public listener addresses");
 }
 
 fn v311_connect(client_id: &str, username: &str, password: &str) -> Vec<u8> {

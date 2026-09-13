@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -56,12 +56,13 @@ pub struct MqttRuntimeConfig {
 }
 
 pub struct MqttRuntime {
-    broker: Option<BrokerLifecycleHandle>,
+    broker: Arc<Mutex<Option<BrokerLifecycleHandle>>>,
     device_workers: Vec<JoinHandle<()>>,
     session_router: RpcSessionRouter,
     accept_cancellation: CancellationToken,
     force_cancellation: CancellationToken,
-    accepting: AtomicBool,
+    parent_cancellation_watcher: Option<JoinHandle<()>>,
+    accepting: Arc<AtomicBool>,
     _cache: Arc<dyn CachePort>,
 }
 
@@ -183,13 +184,24 @@ impl MqttRuntime {
             return Err(MqttRuntimeStartError::PublicWorker(error));
         }
 
+        let broker = Arc::new(Mutex::new(Some(broker)));
+        let accepting = Arc::new(AtomicBool::new(true));
+        let parent_cancellation_watcher = spawn_parent_cancellation_watcher(
+            config.cancellation,
+            accept_cancellation.clone(),
+            force_cancellation.clone(),
+            Arc::clone(&broker),
+            Arc::clone(&accepting),
+        );
+
         Ok(Self {
-            broker: Some(broker),
+            broker,
             device_workers,
             session_router: config.session_router,
             accept_cancellation,
             force_cancellation,
-            accepting: AtomicBool::new(true),
+            parent_cancellation_watcher: Some(parent_cancellation_watcher),
+            accepting,
             _cache: config.cache,
         })
     }
@@ -205,7 +217,11 @@ impl MqttRuntime {
     pub async fn stop_accepting(&mut self) -> Result<(), MqttRuntimeError> {
         if self.accepting.swap(false, Ordering::AcqRel) {
             self.accept_cancellation.cancel();
-            if let Some(broker) = &self.broker {
+            let broker = self
+                .broker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(broker) = broker.as_ref() {
                 broker.stop_public_accepting();
             }
         }
@@ -213,11 +229,16 @@ impl MqttRuntime {
     }
 
     pub async fn drain(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
+        self.stop_parent_cancellation_watcher().await;
         self.stop_accepting().await?;
-        let mut public_join = self.broker.as_ref().map(|broker| {
-            let workers = broker.take_public_workers();
-            tokio::task::spawn_blocking(move || join_public_workers(workers))
-        });
+        let public_workers = self
+            .broker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(BrokerLifecycleHandle::take_public_workers);
+        let mut public_join = public_workers
+            .map(|workers| tokio::task::spawn_blocking(move || join_public_workers(workers)));
         let mut drain_result = self.drain_device_workers(deadline).await;
         if drain_result.is_ok() {
             if let Some(join) = public_join.as_mut() {
@@ -232,9 +253,7 @@ impl MqttRuntime {
 
         if let Err(error) = drain_result {
             self.force_cancellation.cancel();
-            if let Some(broker) = &self.broker {
-                broker.shutdown();
-            }
+            self.shutdown_broker();
             self.abort_and_join_device_workers().await;
             if let Some(join) = public_join.take() {
                 let _ = join.await;
@@ -273,7 +292,7 @@ impl MqttRuntime {
     }
 
     async fn join_broker_until(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
-        let Some(broker) = self.broker.take() else {
+        let Some(broker) = self.take_broker() else {
             return Ok(());
         };
         let mut join = tokio::task::spawn_blocking(move || broker.join());
@@ -289,23 +308,69 @@ impl MqttRuntime {
     }
 
     async fn join_broker_after_shutdown(&mut self) {
-        let Some(broker) = self.broker.take() else {
+        let Some(broker) = self.take_broker() else {
             return;
         };
         let _ = tokio::task::spawn_blocking(move || broker.join()).await;
     }
+
+    async fn stop_parent_cancellation_watcher(&mut self) {
+        if let Some(watcher) = self.parent_cancellation_watcher.take() {
+            watcher.abort();
+            let _ = watcher.await;
+        }
+    }
+
+    fn shutdown_broker(&self) {
+        let broker = self
+            .broker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(broker) = broker.as_ref() {
+            broker.shutdown();
+        }
+    }
+
+    fn take_broker(&self) -> Option<BrokerLifecycleHandle> {
+        self.broker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+fn spawn_parent_cancellation_watcher(
+    parent_cancellation: CancellationToken,
+    accept_cancellation: CancellationToken,
+    force_cancellation: CancellationToken,
+    broker: Arc<Mutex<Option<BrokerLifecycleHandle>>>,
+    accepting: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        parent_cancellation.cancelled().await;
+        accepting.store(false, Ordering::Release);
+        accept_cancellation.cancel();
+        force_cancellation.cancel();
+        let broker = broker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(broker) = broker.as_ref() {
+            broker.shutdown();
+        }
+    })
 }
 
 impl Drop for MqttRuntime {
     fn drop(&mut self) {
+        if let Some(watcher) = self.parent_cancellation_watcher.take() {
+            watcher.abort();
+        }
         self.accept_cancellation.cancel();
         self.force_cancellation.cancel();
         for worker in &self.device_workers {
             worker.abort();
         }
-        if let Some(broker) = &self.broker {
-            broker.shutdown();
-        }
+        self.shutdown_broker();
     }
 }
 
