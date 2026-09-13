@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createCallbackHandler, createLoginHandler } from "../lib/oauth";
+import { createCallbackHandler, createLoginHandler, readSession } from "../lib/oauth";
 
 process.env.SESSION_SECRET = "test-session-secret-with-sufficient-length";
 
@@ -84,5 +84,27 @@ describe("PowerMonitor OAuth BFF", () => {
       redirectUri,
     });
     expect(response.headers.get("location")).toBe("https://powermonitor.example.test/");
+  });
+
+  it("recovers only a valid encrypted application session for BFF bearer requests", async () => {
+    const cookies = {
+      get: vi.fn().mockReturnValue({ value: "sealed-state" }),
+      set: vi.fn(),
+    };
+
+    await createCallbackHandler({
+      requestUrl:
+        "https://powermonitor.example.test/api/auth/callback?code=code-123&state=state-123",
+      cookies,
+      exchangeCode: vi.fn().mockResolvedValue({ accessToken: "opaque-access-token" }),
+      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      unsealState: vi.fn().mockReturnValue({ state: "state-123", verifier: "verifier-123" }),
+    });
+
+    const sessionValue = cookies.set.mock.calls.find(
+      ([name]) => name === "powermonitor_session",
+    )?.[1] as string;
+    expect(readSession(sessionValue)).toMatchObject({ accessToken: "opaque-access-token" });
+    expect(readSession("not-an-encrypted-session")).toBeNull();
   });
 });

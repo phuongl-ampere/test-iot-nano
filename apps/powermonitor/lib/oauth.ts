@@ -22,6 +22,18 @@ export type OAuthToken = {
   expiresIn?: number;
 };
 
+export function readSession(value: string | undefined): OAuthToken | null {
+  if (value === undefined) {
+    return null;
+  }
+  try {
+    const session = unseal<OAuthToken>(value);
+    return typeof session.accessToken === "string" && session.accessToken.length > 0 ? session : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function createLoginHandler(input: {
   requestUrl: string;
   cookies: Pick<OAuthCookies, "set">;
@@ -69,7 +81,7 @@ export async function createCallbackHandler(input: {
     return new Response("Invalid OAuth callback", { status: 400 });
   }
 
-  const unsealState = input.unsealState ?? unseal;
+  const unsealState = input.unsealState ?? ((value: string) => unseal<OAuthState>(value));
   let oauthState: OAuthState;
   try {
     oauthState = unsealState(sealedState);
@@ -177,7 +189,7 @@ function seal(value: object): string {
   return [iv, cipher.getAuthTag(), ciphertext].map((part) => part.toString("base64url")).join(".");
 }
 
-function unseal(value: string): OAuthState {
+function unseal<T>(value: string): T {
   const [encodedIv, encodedTag, encodedCiphertext] = value.split(".");
   if (encodedIv === undefined || encodedTag === undefined || encodedCiphertext === undefined) {
     throw new Error("Invalid sealed value");
@@ -192,7 +204,7 @@ function unseal(value: string): OAuthState {
     decipher.update(Buffer.from(encodedCiphertext, "base64url")),
     decipher.final(),
   ]);
-  return JSON.parse(plaintext.toString("utf8")) as OAuthState;
+  return JSON.parse(plaintext.toString("utf8")) as T;
 }
 
 function encryptionKey(): Buffer {

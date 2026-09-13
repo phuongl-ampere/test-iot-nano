@@ -9,14 +9,14 @@ describe("account-class routing", () => {
       role: "admin",
       accountClass: "system",
       username: "system",
-      defaultApp: "/apps/powermonitor",
+      defaultApp: "/",
       grantedApps: [],
     } as UserSession;
 
     expect(rootPath(system)).toBe("/management/settings");
     expect(canAccessPath(system, "/management/settings")).toBe(true);
     expect(canAccessPath(system, "/management")).toBe(false);
-    expect(canAccessPath(system, "/apps/powermonitor")).toBe(false);
+    expect(canAccessPath(system, "/apps/legacy")).toBe(false);
   });
 
   it("keeps admin out of system configuration", () => {
@@ -24,12 +24,25 @@ describe("account-class routing", () => {
       role: "admin",
       accountClass: "admin",
       username: "admin",
-      defaultApp: "/apps/powermonitor",
-      grantedApps: ["powermonitor"],
+      defaultApp: "/management",
+      grantedApps: [],
     } as UserSession;
 
     expect(rootPath(admin)).toBe("/management");
     expect(canAccessPath(admin, "/management/entities/devices")).toBe(true);
     expect(canAccessPath(admin, "/management/settings")).toBe(false);
+  });
+
+  it("keeps non-operator accounts at the console boundary", () => {
+    const user = {
+      role: "viewer",
+      accountClass: "user",
+      username: "viewer",
+      defaultApp: "/",
+      grantedApps: [],
+    } as UserSession;
+
+    expect(rootPath(user)).toBe("/");
+    expect(canAccessPath(user, "/management")).toBe(false);
   });
 });

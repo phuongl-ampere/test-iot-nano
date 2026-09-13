@@ -72,16 +72,29 @@ function useSession() {
 
 export function PortalHome() {
   const router = useRouter();
-  const { authenticated, ready, session, sessionError } = useSession();
+  const { authenticated, clear, ready, session, sessionError } = useSession();
 
   useEffect(() => {
-    if (session !== null) {
+    if (session !== null && session.user.accountClass !== "user") {
       router.replace(rootPath(session.user));
     }
   }, [router, session]);
 
-  if (!ready || session !== null) {
+  if (!ready || (session !== null && session.user.accountClass !== "user")) {
     return <main aria-busy="true" className="login-shell" />;
+  }
+
+  if (session !== null) {
+    return (
+      <main className="login-shell">
+        <section className="login-card">
+          <span className="eyebrow">Platform console</span>
+          <h1>Operator access required</h1>
+          <p>This console is reserved for platform operators.</p>
+          <button onClick={clear} type="button">Sign out</button>
+        </section>
+      </main>
+    );
   }
 
   return (

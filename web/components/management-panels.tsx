@@ -1,7 +1,6 @@
 "use client";
 
 import { Copy, Pencil, Plus, Save, Trash2, X } from "lucide-react";
-import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 
 import {
@@ -686,13 +685,7 @@ function Users({ client, onUnauthorized }: PanelProps) {
 function Apps() {
   return (
     <section className="management-section">
-      <ManagementTable headings={["App", "Route", "Grant"]}>
-        <tr>
-          <td>Power Monitor</td>
-          <td><Link href="/apps/powermonitor">/apps/powermonitor</Link></td>
-          <td>powermonitor</td>
-        </tr>
-      </ManagementTable>
+      <p className="system-empty">No embedded domain applications are served by this console.</p>
     </section>
   );
 }

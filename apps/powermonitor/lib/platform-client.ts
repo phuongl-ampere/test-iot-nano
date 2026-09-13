@@ -5,6 +5,8 @@ export type PlatformSession = {
   fetcher?: PlatformFetcher;
 };
 
+export type PlatformRequestOptions = Pick<RequestInit, "body" | "headers" | "method">;
+
 export class PlatformApiError extends Error {
   constructor(
     readonly status: number,
@@ -15,7 +17,11 @@ export class PlatformApiError extends Error {
   }
 }
 
-export async function platformRequest(path: string, session: PlatformSession): Promise<Response> {
+export async function platformRequest(
+  path: string,
+  session: PlatformSession,
+  init: PlatformRequestOptions = {},
+): Promise<Response> {
   if (!path.startsWith("/") || path.startsWith("//") || path.includes("://")) {
     throw new TypeError("Platform paths must be relative");
   }
@@ -25,11 +31,12 @@ export async function platformRequest(path: string, session: PlatformSession): P
   if (url.pathname !== "/api/v1" && !url.pathname.startsWith("/api/v1/")) {
     throw new TypeError("Platform paths must remain under /api/v1");
   }
+  const headers = new Headers(init.headers);
+  headers.set("accept", headers.get("accept") ?? "application/json");
+  headers.set("authorization", "Bearer " + session.accessToken);
   const response = await (session.fetcher ?? fetch)(url, {
-    headers: {
-      accept: "application/json",
-      authorization: `Bearer ${session.accessToken}`,
-    },
+    ...init,
+    headers,
     cache: "no-store",
   });
 

@@ -89,7 +89,6 @@ export function ManagementApp({ section }: ManagementAppProps) {
                   </Link>
                   ))}
               </nav>
-              <Link className="management-domain-link" href="/apps/powermonitor">Open Power Monitor</Link>
             </aside>
             <section className="management-workspace">
               <header className="workspace-header management-header">

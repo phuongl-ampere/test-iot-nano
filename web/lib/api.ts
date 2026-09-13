@@ -57,65 +57,6 @@ export interface TelemetryPoint {
   event_count: number;
 }
 
-export interface PowerSummary {
-  device_count: number;
-  online_device_count: number;
-  asset_count: number;
-  total_power_w: number;
-  total_energy_kwh: number;
-}
-
-export interface PowerAsset {
-  id: string;
-  name: string;
-  permission: ResourcePermission;
-  asset_profile_id: string | null;
-  parent_asset_id: string | null;
-  metadata: Record<string, unknown>;
-  device_count: number;
-  total_power_w: number;
-  total_energy_kwh: number;
-}
-
-export interface PowerDevice {
-  device_id: string;
-  display_name: string | null;
-  permission: ResourcePermission;
-  asset_id: string | null;
-  device_profile_id?: string | null;
-  device_profile_name?: string | null;
-  online: boolean;
-  last_seen_at: string | null;
-  is_gateway?: boolean;
-  gateway_device_id?: string | null;
-  gateway_status?: "online" | "offline" | null;
-  child_status?: "fresh" | "stale" | "unavailable" | null;
-  voltage_v: number | null;
-  current_a: number | null;
-  power_w: number | null;
-  energy_kwh: number | null;
-  frequency_hz: number | null;
-  power_factor: number | null;
-  switch_state?: boolean | null;
-  brightness_pct?: number | null;
-}
-
-export interface PowerTelemetryPoint {
-  at: string;
-  voltage_v: number | null;
-  current_a: number | null;
-  power_w: number | null;
-  energy_kwh: number | null;
-  frequency_hz: number | null;
-  power_factor: number | null;
-  event_count: number;
-}
-
-export interface PowerTelemetryRecord {
-  at: string;
-  measurements: Record<string, unknown>;
-}
-
 export interface ManagementDevice {
   device_id: string;
   display_name: string | null;
@@ -356,7 +297,7 @@ export async function login(
     accountClass: body.account_class ?? (body.role === "admin" ? "admin" : "user"),
     sessionId: body.session_id,
     username: body.username,
-    defaultApp: body.default_app ?? "/apps/powermonitor",
+    defaultApp: body.default_app ?? "/",
     grantedApps: body.granted_apps ?? [],
   };
 }
@@ -379,7 +320,7 @@ export async function getCurrentUser(client: ApiClient): Promise<UserSession> {
     role: body.role,
     accountClass: body.account_class ?? (body.role === "admin" ? "admin" : "user"),
     username: body.username,
-    defaultApp: body.default_app ?? "/apps/powermonitor",
+    defaultApp: body.default_app ?? "/",
     grantedApps: body.granted_apps ?? [],
   };
 }
@@ -512,80 +453,6 @@ export async function fetchTelemetry(
   );
   assertOk(response, "Telemetry request failed");
   return response.json() as Promise<TelemetryPoint[]>;
-}
-
-function powerTelemetryPath(
-  resourcePath: string,
-  range: TimeRange,
-  now = new Date(),
-): string {
-  const configuration = rangeConfiguration[range];
-  const from = new Date(now.getTime() - configuration.milliseconds);
-  return `${resourcePath}?${new URLSearchParams({
-    from: from.toISOString(),
-    to: now.toISOString(),
-    bucket: configuration.bucket,
-  }).toString()}`;
-}
-
-export async function fetchPowerSummary(client: ApiClient): Promise<PowerSummary> {
-  const response = await authenticatedRequest(client, "/api/apps/powermonitor/summary");
-  assertOk(response, "Power Monitor summary request failed");
-  return response.json() as Promise<PowerSummary>;
-}
-
-export async function fetchPowerAssets(client: ApiClient): Promise<PowerAsset[]> {
-  const response = await authenticatedRequest(client, "/api/apps/powermonitor/assets");
-  assertOk(response, "Power Monitor assets request failed");
-  return response.json() as Promise<PowerAsset[]>;
-}
-
-export async function fetchPowerDevices(client: ApiClient): Promise<PowerDevice[]> {
-  const response = await authenticatedRequest(client, "/api/apps/powermonitor/devices");
-  assertOk(response, "Power Monitor devices request failed");
-  return response.json() as Promise<PowerDevice[]>;
-}
-
-export async function fetchPowerDeviceTelemetry(
-  client: ApiClient,
-  deviceId: string,
-  range: TimeRange,
-): Promise<PowerTelemetryPoint[]> {
-  const path = powerTelemetryPath(
-    `/api/apps/powermonitor/devices/${encodeURIComponent(deviceId)}/telemetry`,
-    range,
-  );
-  const response = await authenticatedRequest(client, path);
-  assertOk(response, "Power Monitor telemetry request failed");
-  return response.json() as Promise<PowerTelemetryPoint[]>;
-}
-
-export async function fetchPowerDeviceTelemetryRecords(
-  client: ApiClient,
-  deviceId: string,
-  range: TimeRange,
-): Promise<PowerTelemetryRecord[]> {
-  const path = powerTelemetryPath(
-    `/api/apps/powermonitor/devices/${encodeURIComponent(deviceId)}/telemetry/records`,
-    range,
-  );
-  const response = await authenticatedRequest(client, path);
-  assertOk(response, "Power Monitor telemetry records request failed");
-  return response.json() as Promise<PowerTelemetryRecord[]>;
-}
-
-export async function fetchPowerAssetTelemetry(
-  client: ApiClient,
-  assetId: string,
-  range: TimeRange,
-): Promise<PowerTelemetryPoint[]> {
-  const path = powerTelemetryPath(
-    `/api/apps/powermonitor/assets/${encodeURIComponent(assetId)}/telemetry`,
-    range,
-  );
-  const response = await authenticatedRequest(client, path);
-  assertOk(response, "Power Monitor asset telemetry request failed");
-  return response.json() as Promise<PowerTelemetryPoint[]>;
 }
 
 export async function fetchManagementDevices(client: ApiClient): Promise<ManagementDevice[]> {

@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ const forbidden = [
   /IOT_NANO_INTERNAL_DIR/,
   /\/internal\//,
   /from ["'](?:@[^"']+\/)?(?:platform|web|iot-nano)/,
+  /from ["']\.\.\/(?:\.\.\/)*(?:web|platform)/,
 ];
 
 describe("application isolation", () => {
@@ -24,6 +25,28 @@ describe("application isolation", () => {
         expect(source, `${file} matches ${pattern}`).not.toMatch(pattern);
       }
     }
+  });
+
+  it("keeps OAuth and service credentials out of client modules", () => {
+    const clientSource = ["app", "components", "lib"]
+      .flatMap((directory) => listTypeScriptFiles(join(sourceRoot, directory)))
+      .filter((file) => file.endsWith("browser-api.ts") || readFileSync(file, "utf8").includes('"use client"'));
+
+    expect(clientSource).not.toHaveLength(0);
+    for (const file of clientSource) {
+      expect(readFileSync(file, "utf8"), file + " references a server secret").not.toMatch(
+        /OAUTH_(?:CLIENT|SERVICE_CLIENT)_SECRET|SESSION_SECRET|PLATFORM_BASE_URL/,
+      );
+    }
+  });
+
+  it("ships an independent Docker image without platform volume mounts", () => {
+    const dockerfile = join(sourceRoot, "Dockerfile");
+
+    expect(existsSync(dockerfile), "PowerMonitor requires its own Dockerfile").toBe(true);
+    expect(readFileSync(dockerfile, "utf8")).not.toMatch(
+      /(?:VOLUME|--mount=type=bind|volumes:).*(?:platform|iot-nano|web)/i,
+    );
   });
 });
 

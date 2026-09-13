@@ -143,8 +143,8 @@ describe("authenticated alert lifecycle API", () => {
           role: "admin",
           session_id: "session_test",
           username: "admin",
-          default_app: "/apps/powermonitor",
-          granted_apps: ["powermonitor"],
+          default_app: "/management",
+          granted_apps: ["operator-console"],
         }),
         { status: 200 },
       ),
@@ -156,8 +156,8 @@ describe("authenticated alert lifecycle API", () => {
       accountClass: "admin",
       sessionId: "session_test",
       username: "admin",
-      defaultApp: "/apps/powermonitor",
-      grantedApps: ["powermonitor"],
+      defaultApp: "/management",
+      grantedApps: ["operator-console"],
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -176,8 +176,8 @@ describe("authenticated alert lifecycle API", () => {
       vi.fn().mockResolvedValue(new Response(JSON.stringify({
         role: "viewer",
         username: "viewer",
-        default_app: "/apps/powermonitor",
-        granted_apps: ["powermonitor"],
+        default_app: "/",
+        granted_apps: [],
       }), { status: 200 })),
     );
     const client = createApiClient("http://127.0.0.1:8080", "session_viewer");
@@ -186,8 +186,8 @@ describe("authenticated alert lifecycle API", () => {
       role: "viewer",
       accountClass: "user",
       username: "viewer",
-      defaultApp: "/apps/powermonitor",
-      grantedApps: ["powermonitor"],
+      defaultApp: "/",
+      grantedApps: [],
     });
   });
 
