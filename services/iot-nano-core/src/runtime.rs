@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -77,6 +77,8 @@ pub enum CoreRuntimeWorkerError {
 }
 
 type WorkerHandle = JoinHandle<Result<(), CoreRuntimeWorkerError>>;
+const WORKER_COUNT: usize = 5;
+
 #[derive(Debug, Error)]
 enum WorkError {
     #[error("stream: {0}")]
@@ -94,6 +96,7 @@ pub struct CoreRuntime {
     cancellation: CancellationToken,
     stream: Arc<dyn StreamPort>,
     workers: Mutex<Option<Vec<WorkerHandle>>>,
+    startup_barriers: AtomicUsize,
     drain_lock: AsyncMutex<()>,
     drain_started: AtomicBool,
 }
@@ -143,7 +146,7 @@ impl CoreRuntime {
                 config.notification_retry_max,
             ),
         );
-        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(5);
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(WORKER_COUNT);
         let writer_stop = Arc::clone(&stop_claiming);
         let writer_handle = tokio::spawn(run_worker(
             "writer",
@@ -264,12 +267,15 @@ impl CoreRuntime {
                 command_handle,
                 notification_handle,
             ])),
+            startup_barriers: AtomicUsize::new(0),
             drain_lock: AsyncMutex::new(()),
             drain_started: AtomicBool::new(false),
         };
-        for _ in 0..5 {
+        for _ in 0..WORKER_COUNT {
             match ready_rx.recv().await {
-                Some(Ok(())) => {}
+                Some(Ok(())) => {
+                    runtime.startup_barriers.fetch_add(1, Ordering::Release);
+                }
                 Some(Err(error)) => {
                     runtime.cancellation.cancel();
                     let _ = runtime
@@ -293,11 +299,16 @@ impl CoreRuntime {
 
     pub fn ready(&self) -> bool {
         !self.cancellation.is_cancelled()
+            && self.startup_barrier_count() == WORKER_COUNT
             && self
                 .workers
                 .lock()
                 .expect("runtime worker mutex poisoned")
                 .is_some()
+    }
+
+    pub fn startup_barrier_count(&self) -> usize {
+        self.startup_barriers.load(Ordering::Acquire)
     }
 
     pub fn stop_claiming(&self) {

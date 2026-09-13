@@ -473,6 +473,7 @@ async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
         .unwrap();
     let command_id = Uuid::now_v7();
     let now = Utc::now();
+    let original_next_attempt_at = now;
     config
         .store
         .enqueue_command(PlatformCommand {
@@ -492,11 +493,12 @@ async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
     sleep(Duration::from_millis(30)).await;
 
     assert!(runtime.ready());
-    let row = sqlx::query("SELECT state, last_error FROM command_outbox WHERE id = ?")
-        .bind(command_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let row =
+        sqlx::query("SELECT state, last_error, next_attempt_at FROM command_outbox WHERE id = ?")
+            .bind(command_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         row.get::<String, _>("state"),
         "queued",
@@ -504,6 +506,13 @@ async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
         row.get::<Option<String>, _>("last_error")
             .unwrap_or_default()
     );
+    let last_error = row.get::<Option<String>, _>("last_error");
+    assert!(!last_error.as_deref().unwrap_or_default().is_empty());
+    let next_attempt_at =
+        chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("next_attempt_at"))
+            .unwrap()
+            .with_timezone(&Utc);
+    assert!(next_attempt_at > original_next_attempt_at);
     runtime
         .drain(Instant::now() + Duration::from_secs(1))
         .await
@@ -519,7 +528,8 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
         .register_device("runtime-device")
         .await
         .unwrap();
-    let notification_id = seed_platform_notification(&config.store, Utc::now()).await;
+    let original_next_attempt_at = Utc::now();
+    let notification_id = seed_platform_notification(&config.store, original_next_attempt_at).await;
     let metrics = Arc::clone(&config.metrics);
     let pool = config.store.sqlite_pool().unwrap().clone();
 
@@ -527,12 +537,21 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
     sleep(Duration::from_millis(30)).await;
 
     assert!(runtime.ready());
-    let state =
-        sqlx::query_scalar::<_, String>("SELECT state FROM notification_outbox WHERE id = ?")
-            .bind(notification_id.to_string())
-            .fetch_one(&pool)
-            .await;
-    assert_eq!(state.unwrap(), "pending");
+    let row = sqlx::query(
+        "SELECT state, last_error, next_attempt_at FROM notification_outbox WHERE id = ?",
+    )
+    .bind(notification_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    let last_error = row.get::<Option<String>, _>("last_error");
+    assert!(!last_error.as_deref().unwrap_or_default().is_empty());
+    let next_attempt_at =
+        chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("next_attempt_at"))
+            .unwrap()
+            .with_timezone(&Utc);
+    assert!(next_attempt_at > original_next_attempt_at);
     assert!(
         metrics
             .render_prometheus()
@@ -542,6 +561,80 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
         .drain(Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn command_repository_failure_is_returned_by_join_and_records_database_failure() {
+    let stream = RecordingStream::default();
+    let (_directory, mut config) = runtime_config(Arc::new(stream)).await;
+    config.writer_interval = Duration::from_secs(60);
+    config.event_alert_interval = Duration::from_secs(60);
+    config.window_alert_interval = Duration::from_secs(60);
+    config.command_interval = Duration::from_millis(10);
+    config.notification_interval = Duration::from_secs(60);
+    let metrics = Arc::clone(&config.metrics);
+    let pool = config.store.sqlite_pool().unwrap().clone();
+
+    let runtime = CoreRuntime::start(config).await.unwrap();
+    assert_eq!(runtime.startup_barrier_count(), 5);
+    sqlx::query("DROP TABLE command_outbox")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let result = timeout(Duration::from_secs(1), runtime.join()).await;
+
+    assert!(matches!(
+        result,
+        Ok(Err(CoreRuntimeError::Worker(
+            CoreRuntimeWorkerError::Failed {
+                worker: "commands",
+                ..
+            }
+        )))
+    ));
+    assert!(
+        metrics
+            .render_prometheus()
+            .contains("iot_ingest_database_failures_total 1\n")
+    );
+}
+
+#[tokio::test]
+async fn notification_repository_failure_is_returned_by_join_and_records_database_failure() {
+    let stream = RecordingStream::default();
+    let (_directory, mut config) = runtime_config(Arc::new(stream)).await;
+    config.writer_interval = Duration::from_secs(60);
+    config.event_alert_interval = Duration::from_secs(60);
+    config.window_alert_interval = Duration::from_secs(60);
+    config.command_interval = Duration::from_secs(60);
+    config.notification_interval = Duration::from_millis(10);
+    let metrics = Arc::clone(&config.metrics);
+    let pool = config.store.sqlite_pool().unwrap().clone();
+
+    let runtime = CoreRuntime::start(config).await.unwrap();
+    assert_eq!(runtime.startup_barrier_count(), 5);
+    sqlx::query("DROP TABLE notification_outbox")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let result = timeout(Duration::from_secs(1), runtime.join()).await;
+
+    assert!(matches!(
+        result,
+        Ok(Err(CoreRuntimeError::Worker(
+            CoreRuntimeWorkerError::Failed {
+                worker: "notifications",
+                ..
+            }
+        )))
+    ));
+    assert!(
+        metrics
+            .render_prometheus()
+            .contains("iot_ingest_database_failures_total 1\n")
+    );
 }
 
 fn telemetry_record(device_id: &str) -> ClaimedRecord {
@@ -588,6 +681,7 @@ async fn all_startup_barriers_are_required_before_ready() {
     let runtime = CoreRuntime::start(config).await.unwrap();
 
     assert!(runtime.ready());
+    assert_eq!(runtime.startup_barrier_count(), 5);
     assert!(stream.heartbeats.load(Ordering::SeqCst) >= 2);
     runtime.stop_claiming();
     runtime

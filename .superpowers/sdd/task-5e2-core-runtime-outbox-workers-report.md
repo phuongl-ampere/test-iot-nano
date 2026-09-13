@@ -37,3 +37,27 @@ runtime cancellation after stream drain.
 The three failing notification tests require the local Timescale test
 database and were not runnable in this environment without `DATABASE_URL`.
 SQLite and platform notification dispatcher tests passed.
+
+## Review Fix Evidence
+
+- `CoreRuntime` tracks received startup barriers and `ready()` now requires
+  exactly five before reporting readiness. The runtime test asserts the count.
+- Command retry coverage now proves the queued state, nonempty durable error,
+  and a retry schedule later than the command's original due time.
+- Notification retry coverage now proves the pending state, nonempty durable
+  error, and a retry schedule later than the notification's original due time.
+- Command and notification repository-failure tests drop their respective
+  temporary SQLite outbox table after startup. Each proves `join()` returns
+  the named worker failure and increments the database-failure metric.
+
+## Review Verification
+
+- Runtime target: 20 passed.
+- Command target against a disposable local Timescale database: 17 passed.
+- Notification target against the same disposable local Timescale database:
+  16 passed.
+- `cargo check -p iot-nano-core`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+The previous `DATABASE_URL` limitation is resolved for this review pass; the
+disposable database was removed after verification.
