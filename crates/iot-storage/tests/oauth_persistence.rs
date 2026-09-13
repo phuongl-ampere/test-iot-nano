@@ -1041,6 +1041,17 @@ async fn timescale_oauth_repository_matches_sqlite_contract() {
         mismatch,
         Err(PlatformStoreError::OAuthAuthorizationCodeDenied)
     ));
+    let consumed_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT consumed_at FROM oauth_authorization_codes")
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap();
+    assert!(consumed_at.is_none());
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_access_tokens")
+        .fetch_one(store.timescale_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(token_count, 0);
     let code_token = OAuthRepository::consume_authorization_code_and_issue_access_token(
         &store,
         OAuthAuthorizationCodeExchange {
