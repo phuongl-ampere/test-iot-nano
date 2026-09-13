@@ -40,9 +40,10 @@ pub use management::{
 };
 pub use policy::{PolicyAdapters, PolicyError, build_policy};
 pub use ports::{
-    AuthorizationError, CommandResponseError, CommandResponsePort, DeviceAuthorizationPort,
-    GatewayAuthorization, GatewayAuthorizationRequest, LocalDeviceAuthenticator,
-    LocalRpcResponseForwarder, LocalStreamUplinkForwarder, LocalUplinkForwarder,
+    AuthorizationError, CacheEntry, CacheError, CachePort, CommandResponseError,
+    CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization,
+    GatewayAuthorizationRequest, LocalDeviceAuthenticator, LocalRpcResponseForwarder,
+    LocalStreamUplinkForwarder, LocalUplinkForwarder,
 };
 pub use rumqttd::{
     BrokerStorage, BrokerStorageState, InboundQos2CommitResult, InboundQos2CompletionResult,

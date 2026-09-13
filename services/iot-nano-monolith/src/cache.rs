@@ -8,15 +8,11 @@ use std::{
 
 const HOT_CACHE_CAPACITY: usize = 1_024;
 
+use iot_nano_mqttd::{CacheError as PortCacheError, CachePort};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CacheEntry {
-    pub key: String,
-    pub value: Vec<u8>,
-    pub expires_at_ms: u64,
-}
+pub use iot_nano_mqttd::CacheEntry;
 
 #[derive(Clone)]
 pub struct PersistentCache {
@@ -108,6 +104,42 @@ impl PersistentCache {
         })
         .await
         .map_err(|error| CacheError::Task(error.to_string()))?
+    }
+}
+
+impl CachePort for PersistentCache {
+    fn get(
+        &self,
+        key: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Vec<u8>>, PortCacheError>> + Send + '_>,
+    > {
+        let key = key.to_owned();
+        Box::pin(async move {
+            PersistentCache::get(self, &key)
+                .await
+                .map_err(port_cache_error)
+        })
+    }
+
+    fn put(
+        &self,
+        entry: CacheEntry,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PortCacheError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            PersistentCache::put(self, entry)
+                .await
+                .map_err(port_cache_error)
+        })
+    }
+}
+
+fn port_cache_error(error: CacheError) -> PortCacheError {
+    match error {
+        CacheError::EmptyKey => PortCacheError::EmptyKey,
+        CacheError::InvalidExpiration => PortCacheError::InvalidExpiration,
+        error => PortCacheError::Unavailable(error.to_string()),
     }
 }
 

@@ -28,6 +28,35 @@ pub enum CommandResponseError {
     Unavailable(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CacheError {
+    #[error("cache key cannot be empty")]
+    EmptyKey,
+    #[error("cache expiration timestamp is out of range")]
+    InvalidExpiration,
+    #[error("cache service unavailable: {0}")]
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntry {
+    pub key: String,
+    pub value: Vec<u8>,
+    pub expires_at_ms: u64,
+}
+
+pub trait CachePort: Send + Sync {
+    fn get(
+        &self,
+        key: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, CacheError>> + Send + '_>>;
+
+    fn put(
+        &self,
+        entry: CacheEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CacheError>> + Send + '_>>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayAuthorizationRequest {
     pub gateway_device_id: String,
