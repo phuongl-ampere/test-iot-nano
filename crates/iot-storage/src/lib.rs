@@ -5,7 +5,9 @@ use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Duration as ChronoDuration, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
+};
 use iot_core::{
     DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent, device_token_prefix,
     verify_device_token,
@@ -406,6 +408,8 @@ pub enum PlatformStoreError {
     DeviceTokenDenied,
     #[error("telemetry sequence does not fit PostgreSQL BIGINT")]
     TelemetrySequenceOverflow,
+    #[error("telemetry metric key must be a valid identifier: {0:?}")]
+    InvalidTelemetryMetricKey(String),
     #[error("filesystem backups are available only for SQLite platform storage")]
     BackupUnsupported,
     #[error("invalid application ID: {0:?}")]
@@ -754,6 +758,26 @@ pub trait TelemetryRepository: Send + Sync {
         received_at: DateTime<Utc>,
         topic: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TelemetryAggregate {
+    pub average: f64,
+    pub sample_count: u64,
+}
+
+pub trait TelemetryAggregateRepository: Send + Sync {
+    fn average_metric<'a>(
+        &'a self,
+        device_id: &'a str,
+        metric_key: &'a str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<TelemetryAggregate>, PlatformStoreError>> + Send + 'a,
+        >,
+    >;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2346,6 +2370,91 @@ impl PlatformStore {
         }
     }
 
+    pub async fn average_metric(
+        &self,
+        device_id: &str,
+        metric_key: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Option<TelemetryAggregate>, PlatformStoreError> {
+        validate_telemetry_metric_key(metric_key)?;
+        let from = canonical_postgres_timestamp(from);
+        let to = canonical_postgres_timestamp(to);
+        match self {
+            Self::Sqlite(store) => {
+                let path = format!("$.{metric_key}");
+                let row = sqlx::query(
+                    "SELECT AVG(json_extract(measurements, ?)) AS average,
+                            COUNT(*) AS sample_count
+                     FROM telemetry
+                     WHERE device_id = ?
+                       AND event_at >= ?
+                       AND event_at <= ?
+                       AND json_type(measurements, ?) IN ('integer', 'real')",
+                )
+                .bind(&path)
+                .bind(device_id)
+                .bind(sqlite_timestamp(from))
+                .bind(sqlite_timestamp(to))
+                .bind(&path)
+                .fetch_one(store.pool())
+                .await?;
+                let sample_count = row.get::<i64, _>("sample_count");
+                if sample_count == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(TelemetryAggregate {
+                        average: row.get("average"),
+                        sample_count: u64::try_from(sample_count)
+                            .expect("SQLite COUNT(*) is nonnegative"),
+                    }))
+                }
+            }
+            Self::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT AVG(
+                                CASE
+                                    WHEN jsonb_typeof(measurements -> $1) = 'number'
+                                    THEN CASE
+                                        WHEN isfinite((measurements ->> $1)::double precision)
+                                        THEN (measurements ->> $1)::double precision
+                                    END
+                                END
+                            ) AS average,
+                            COUNT(
+                                CASE
+                                    WHEN jsonb_typeof(measurements -> $1) = 'number'
+                                    THEN CASE
+                                        WHEN isfinite((measurements ->> $1)::double precision)
+                                        THEN 1
+                                    END
+                                END
+                            ) AS sample_count
+                     FROM telemetry
+                     WHERE device_id = $2
+                       AND event_at >= $3
+                       AND event_at <= $4",
+                )
+                .bind(metric_key)
+                .bind(device_id)
+                .bind(from)
+                .bind(to)
+                .fetch_one(pool)
+                .await?;
+                let sample_count = row.get::<i64, _>("sample_count");
+                if sample_count == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(TelemetryAggregate {
+                        average: row.get("average"),
+                        sample_count: u64::try_from(sample_count)
+                            .expect("PostgreSQL COUNT(*) is nonnegative"),
+                    }))
+                }
+            }
+        }
+    }
+
     async fn require_sqlite_registered_device(
         &self,
         device_id: &str,
@@ -2931,6 +3040,23 @@ fn canonical_postgres_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
         .expect("a valid UTC timestamp can be represented at microsecond precision")
 }
 
+fn sqlite_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+fn validate_telemetry_metric_key(metric_key: &str) -> Result<(), PlatformStoreError> {
+    let mut characters = metric_key.chars();
+    let valid = matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if valid {
+        Ok(())
+    } else {
+        Err(PlatformStoreError::InvalidTelemetryMetricKey(
+            metric_key.to_owned(),
+        ))
+    }
+}
+
 fn canonical_incident(mut incident: NewAlertIncident) -> NewAlertIncident {
     incident.condition_started_at = canonical_postgres_timestamp(incident.condition_started_at);
     incident
@@ -3148,6 +3274,24 @@ impl TelemetryRepository for PlatformStore {
         Box::pin(
             async move { PlatformStore::write_telemetry(self, event, received_at, topic).await },
         )
+    }
+}
+
+impl TelemetryAggregateRepository for PlatformStore {
+    fn average_metric<'a>(
+        &'a self,
+        device_id: &'a str,
+        metric_key: &'a str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<TelemetryAggregate>, PlatformStoreError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::average_metric(self, device_id, metric_key, from, to).await
+        })
     }
 }
 
