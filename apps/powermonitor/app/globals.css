@@ -437,6 +437,109 @@ button:disabled {
   font-size: 12px;
 }
 
+.device-control-panel {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid #c7d8da;
+}
+
+.device-control-panel > header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.device-control-panel h2 {
+  margin: 4px 0 0;
+  font-size: 17px;
+  line-height: 1.2;
+}
+
+.switch-state {
+  min-width: 58px;
+  padding: 6px 9px;
+  border: 1px solid #aabec1;
+  border-radius: 5px;
+  color: #37545a;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.device-control-actions {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.relay-actions {
+  display: inline-flex;
+  width: fit-content;
+  overflow: hidden;
+  border: 1px solid #aabec1;
+  border-radius: 5px;
+}
+
+.relay-actions button {
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 0;
+  border-right: 1px solid #aabec1;
+  background: #f7fbfb;
+  color: #0f666d;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.relay-actions button:last-child {
+  border-right: 0;
+  color: #9b4035;
+}
+
+.relay-actions button:hover:not(:disabled) {
+  background: #d9eeee;
+}
+
+.brightness-control {
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr) 64px auto;
+  align-items: center;
+  gap: 10px;
+  max-width: 540px;
+}
+
+.brightness-control label {
+  color: #5b747b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.brightness-control input[type="range"] {
+  accent-color: #167b83;
+  min-width: 0;
+}
+
+.brightness-control input[type="number"] {
+  min-height: 34px;
+  padding: 0 7px;
+  border: 1px solid #aabec1;
+  border-radius: 5px;
+  background: #fff;
+  color: #16252b;
+}
+
+.brightness-control button {
+  min-height: 34px;
+  padding: 7px 11px;
+  border: 1px solid #167b83;
+  border-radius: 5px;
+  background: #167b83;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .detail-link {
   display: inline-block;
   margin-top: 16px;
@@ -509,6 +612,15 @@ button:disabled {
   .workspace-actions,
   .command-controls {
     flex-wrap: wrap;
+  }
+
+  .brightness-control {
+    grid-template-columns: 1fr 64px;
+  }
+
+  .brightness-control label,
+  .brightness-control button {
+    grid-column: 1 / -1;
   }
 
   .reading-strip {

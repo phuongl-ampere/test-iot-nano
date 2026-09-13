@@ -1,24 +1,27 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   BffApiError,
   acknowledgeAlert,
+  getAssetTelemetry,
   getDeviceTelemetry,
   listAlerts,
   listAssets,
   listDevices,
-  submitDeviceCommand,
+  sendDeviceCommandAndWait,
   type Alert,
   type Asset,
   type CommandLifecycle,
+  type CommandMode,
   type Device,
   type TelemetryPoint,
   type TimeRange,
 } from "../lib/browser-api";
 import { AlertPanel } from "./alert-panel";
 import { CommandPanel } from "./command-panel";
+import { DeviceControlPanel } from "./device-control-panel";
 import { PowerTelemetryChart } from "./power-telemetry-chart";
 import { PowerTelemetryTable } from "./power-telemetry-table";
 import { PowerMonitorTree } from "./powermonitor-tree";
@@ -46,6 +49,8 @@ export function PowerMonitorDashboard({
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
   const [telemetryLoading, setTelemetryLoading] = useState(false);
   const [workingAlertId, setWorkingAlertId] = useState<string | null>(null);
+  const selectedAssetIdRef = useRef<string | null>(initialAssetId ?? null);
+  const selectedDeviceIdRef = useRef<string | null>(initialDeviceId ?? null);
 
   const selectedDevice = useMemo(
     () => devices.find((device) => device.id === selectedDeviceId) ?? null,
@@ -69,22 +74,20 @@ export function PowerMonitorDashboard({
       setDevices(nextDevices);
       setAssets(nextAssets);
       setAlerts(nextAlerts);
-      setSelectedDeviceId((current) => {
-        if (initialDeviceId !== undefined && nextDevices.some((device) => device.id === initialDeviceId)) {
-          return initialDeviceId;
-        }
-        return current !== null && nextDevices.some((device) => device.id === current)
-          ? current
+      const requestedAssetId = initialAssetId ?? selectedAssetIdRef.current;
+      const nextAssetId = requestedAssetId !== null && nextAssets.some((asset) => asset.id === requestedAssetId)
+        ? requestedAssetId
+        : null;
+      const requestedDeviceId = initialDeviceId ?? selectedDeviceIdRef.current;
+      const nextDeviceId = nextAssetId !== null
+        ? null
+        : requestedDeviceId !== null && nextDevices.some((device) => device.id === requestedDeviceId)
+          ? requestedDeviceId
           : nextDevices[0]?.id ?? null;
-      });
-      setSelectedAssetId((current) => {
-        if (initialAssetId !== undefined && nextAssets.some((asset) => asset.id === initialAssetId)) {
-          return initialAssetId;
-        }
-        return current !== null && nextAssets.some((asset) => asset.id === current)
-          ? current
-          : null;
-      });
+      selectedAssetIdRef.current = nextAssetId;
+      selectedDeviceIdRef.current = nextDeviceId;
+      setSelectedAssetId(nextAssetId);
+      setSelectedDeviceId(nextDeviceId);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -97,13 +100,16 @@ export function PowerMonitorDashboard({
   }, [refresh]);
 
   useEffect(() => {
-    if (selectedDeviceId === null) {
+    if (selectedAssetId === null && selectedDeviceId === null) {
       setTelemetry([]);
       return;
     }
     let cancelled = false;
     setTelemetryLoading(true);
-    void getDeviceTelemetry(selectedDeviceId, range)
+    const requestTelemetry = selectedAssetId !== null
+      ? getAssetTelemetry(selectedAssetId, range)
+      : getDeviceTelemetry(selectedDeviceId as string, range);
+    void requestTelemetry
       .then((points) => {
         if (!cancelled) {
           setTelemetry(points);
@@ -122,16 +128,26 @@ export function PowerMonitorDashboard({
     return () => {
       cancelled = true;
     };
-  }, [range, selectedDeviceId]);
+  }, [range, selectedAssetId, selectedDeviceId]);
 
-  const sendCommand = async (method: string, params: Record<string, unknown>) => {
+  const sendCommand = async (
+    method: string,
+    params: Record<string, unknown>,
+    mode: CommandMode = "one_way",
+  ) => {
     if (selectedDevice === null) {
       return;
     }
     setCommandBusy(true);
     setError(null);
     try {
-      setCommand(await submitDeviceCommand(selectedDevice.id, method, params));
+      setCommand(await sendDeviceCommandAndWait(
+        selectedDevice.id,
+        method,
+        params,
+        mode,
+        { onProgress: setCommand },
+      ));
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -174,10 +190,14 @@ export function PowerMonitorDashboard({
           assets={assets}
           devices={devices}
           onSelectAsset={(assetId) => {
+            selectedAssetIdRef.current = assetId;
+            selectedDeviceIdRef.current = null;
             setSelectedAssetId(assetId);
             setSelectedDeviceId(null);
           }}
           onSelectDevice={(deviceId) => {
+            selectedAssetIdRef.current = null;
+            selectedDeviceIdRef.current = deviceId;
             setSelectedDeviceId(deviceId);
             setSelectedAssetId(null);
           }}
@@ -218,12 +238,12 @@ export function PowerMonitorDashboard({
         <section aria-label="Telemetry" className="telemetry-section">
           <header className="section-heading">
             <div>
-              <span className="eyebrow">Selected device</span>
+              <span className="eyebrow">{selectedAsset !== null ? "Selected asset" : "Selected device"}</span>
               <h2>Telemetry</h2>
             </div>
             <span>{telemetryLoading ? "Updating" : telemetry.length + " samples"}</span>
           </header>
-          {selectedDevice === null ? (
+          {selectedDevice === null && selectedAsset === null ? (
             <>
               <p className="empty-state">Select a device to inspect telemetry and send commands.</p>
               <CommandPanel busy={false} disabled onSubmit={sendCommand} />
@@ -232,8 +252,21 @@ export function PowerMonitorDashboard({
             <>
               <PowerTelemetryChart points={telemetry} />
               <PowerTelemetryTable points={telemetry} />
-              <CommandPanel busy={commandBusy} onSubmit={sendCommand} state={command?.state} />
-              <a className="detail-link" href={"/devices/" + encodeURIComponent(selectedDevice.id)}>Open device details</a>
+              {selectedDevice !== null && (
+                <>
+                  <DeviceControlPanel
+                    brightnessPct={selectedDevice.brightness_pct}
+                    busy={commandBusy}
+                    canControl={selectedDevice.permission !== "viewer"}
+                    capabilities={selectedDevice.capabilities}
+                    commandState={command?.state ?? null}
+                    onCommand={(method, params, mode) => void sendCommand(method, params, mode)}
+                    switchState={selectedDevice.switch_state}
+                  />
+                  <CommandPanel busy={commandBusy} onSubmit={sendCommand} state={command?.state} />
+                  <a className="detail-link" href={"/devices/" + encodeURIComponent(selectedDevice.id)}>Open device details</a>
+                </>
+              )}
             </>
           )}
         </section>
