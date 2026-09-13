@@ -297,6 +297,20 @@ async fn public_device_list_uses_opaque_cursor_pagination_and_bounded_limits() {
     let cursor = first["next_cursor"].as_str().unwrap();
     assert_ne!(cursor, "device-002");
 
+    let forged = URL_SAFE_NO_PAD.encode("device-002");
+    let forged = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices?after={forged}&limit=2"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(forged, StatusCode::BAD_REQUEST, "invalid_request").await;
+
     let second = app
         .clone()
         .oneshot(

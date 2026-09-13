@@ -19,7 +19,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use iot_core::{
     RpcMode, RpcRequest, SystemConfiguration, SystemConfigurationUpdate, device_token_prefix,
@@ -844,11 +843,6 @@ async fn public_list_devices(
 ) -> Result<Json<PublicDeviceListResponse>, PublicApiError> {
     let Query(query) = query.map_err(|_| PublicApiError::BadRequest)?;
     let limit = public_device_list_limit(query.limit)?;
-    let after = query
-        .after
-        .as_deref()
-        .map(decode_public_device_cursor)
-        .transpose()?;
     extract_bearer_access_token(&headers).map_err(PublicApiError::from)?;
     let oauth_store = state.oauth_store().ok_or(PublicApiError::Unavailable)?;
     let token = validate_bearer_access_token(oauth_store.as_ref(), &headers, Utc::now()).await?;
@@ -856,10 +850,21 @@ async fn public_list_devices(
         return Err(PublicApiError::Forbidden);
     }
     let subject = public_authorization_subject(&state.pool, token.user_id).await?;
+    let after = query
+        .after
+        .as_deref()
+        .map(|cursor| decode_public_device_cursor(&state.token_vault, &subject, cursor))
+        .transpose()?;
     let rows = public_device_rows(&state.pool, after.as_deref()).await?;
-    public_device_page(oauth_store.as_ref(), &subject, rows, limit)
-        .await
-        .map(Json)
+    public_device_page(
+        oauth_store.as_ref(),
+        &state.token_vault,
+        &subject,
+        rows,
+        limit,
+    )
+    .await
+    .map(Json)
 }
 
 async fn sqlite_public_list_devices(
@@ -869,11 +874,6 @@ async fn sqlite_public_list_devices(
 ) -> Result<Json<PublicDeviceListResponse>, PublicApiError> {
     let Query(query) = query.map_err(|_| PublicApiError::BadRequest)?;
     let limit = public_device_list_limit(query.limit)?;
-    let after = query
-        .after
-        .as_deref()
-        .map(decode_public_device_cursor)
-        .transpose()?;
     extract_bearer_access_token(&headers).map_err(PublicApiError::from)?;
     let oauth_store = state.oauth_store().ok_or(PublicApiError::Unavailable)?;
     let token = validate_bearer_access_token(oauth_store.as_ref(), &headers, Utc::now()).await?;
@@ -881,10 +881,21 @@ async fn sqlite_public_list_devices(
         return Err(PublicApiError::Forbidden);
     }
     let subject = sqlite_public_authorization_subject(state.store.pool(), token.user_id).await?;
+    let after = query
+        .after
+        .as_deref()
+        .map(|cursor| decode_public_device_cursor(&state.token_vault, &subject, cursor))
+        .transpose()?;
     let rows = sqlite_public_device_rows(state.store.pool(), after.as_deref()).await?;
-    public_device_page(oauth_store.as_ref(), &subject, rows, limit)
-        .await
-        .map(Json)
+    public_device_page(
+        oauth_store.as_ref(),
+        &state.token_vault,
+        &subject,
+        rows,
+        limit,
+    )
+    .await
+    .map(Json)
 }
 
 fn public_device_list_limit(limit: Option<usize>) -> Result<usize, PublicApiError> {
@@ -895,19 +906,46 @@ fn public_device_list_limit(limit: Option<usize>) -> Result<usize, PublicApiErro
     Ok(limit)
 }
 
-fn encode_public_device_cursor(device_id: &str) -> String {
-    URL_SAFE_NO_PAD.encode(device_id.as_bytes())
+#[derive(Serialize, Deserialize)]
+struct PublicDeviceCursor {
+    version: u8,
+    subject_user_id: Uuid,
+    device_id: String,
 }
 
-fn decode_public_device_cursor(cursor: &str) -> Result<String, PublicApiError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
+fn encode_public_device_cursor(
+    vault: &TokenVault,
+    subject: &AuthorizationSubject,
+    device_id: &str,
+) -> Result<String, PublicApiError> {
+    let plaintext = serde_json::to_string(&PublicDeviceCursor {
+        version: 1,
+        subject_user_id: subject.user_id,
+        device_id: device_id.to_owned(),
+    })
+    .map_err(|_| PublicApiError::Unavailable)?;
+    vault
+        .encrypt(&plaintext)
+        .map_err(|_| PublicApiError::Unavailable)
+}
+
+fn decode_public_device_cursor(
+    vault: &TokenVault,
+    subject: &AuthorizationSubject,
+    cursor: &str,
+) -> Result<String, PublicApiError> {
+    let plaintext = vault
+        .decrypt(cursor)
         .map_err(|_| PublicApiError::BadRequest)?;
-    let device_id = String::from_utf8(bytes).map_err(|_| PublicApiError::BadRequest)?;
-    if device_id.is_empty() {
+    let cursor = serde_json::from_str::<PublicDeviceCursor>(&plaintext)
+        .map_err(|_| PublicApiError::BadRequest)?;
+    if cursor.version != 1
+        || cursor.subject_user_id != subject.user_id
+        || cursor.device_id.is_empty()
+    {
         return Err(PublicApiError::BadRequest);
     }
-    Ok(device_id)
+    Ok(cursor.device_id)
 }
 
 fn public_authorization_subject_from_account_class(
@@ -1048,6 +1086,7 @@ async fn sqlite_public_device_rows(
 
 async fn public_device_page(
     oauth_store: &PlatformStore,
+    cursor_vault: &TokenVault,
     subject: &AuthorizationSubject,
     rows: Vec<PublicDeviceRow>,
     limit: usize,
@@ -1081,7 +1120,8 @@ async fn public_device_page(
     let next_cursor = if has_more {
         items
             .last()
-            .map(|device| encode_public_device_cursor(&device.device_id))
+            .map(|device| encode_public_device_cursor(cursor_vault, subject, &device.device_id))
+            .transpose()?
     } else {
         None
     };
