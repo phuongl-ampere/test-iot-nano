@@ -459,8 +459,14 @@ async fn postgres_telemetry_points(
         TelemetryBucket::Raw => {
             "SELECT
                 event_at AS at,
-                (measurements ->> 'temperature_c')::double precision AS temperature_c,
-                (measurements ->> 'humidity_pct')::double precision AS humidity_pct,
+                CASE
+                    WHEN jsonb_typeof(measurements -> 'temperature_c') = 'number'
+                    THEN (measurements ->> 'temperature_c')::double precision
+                END AS temperature_c,
+                CASE
+                    WHEN jsonb_typeof(measurements -> 'humidity_pct') = 'number'
+                    THEN (measurements ->> 'humidity_pct')::double precision
+                END AS humidity_pct,
                 1::bigint AS event_count
              FROM telemetry
              WHERE device_id = $1 AND event_at >= $2 AND event_at <= $3
