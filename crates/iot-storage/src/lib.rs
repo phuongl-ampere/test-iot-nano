@@ -479,6 +479,12 @@ pub enum PlatformStoreError {
     EmptyApplicationRedirectUri,
     #[error("invalid application redirect URI: {0:?}")]
     InvalidApplicationRedirectUri(String),
+    #[error("invalid device last-seen timestamp: {value}")]
+    InvalidDeviceLastSeenTimestamp {
+        value: String,
+        #[source]
+        source: chrono::ParseError,
+    },
     #[error("application redirect URI is duplicated: {0:?}")]
     DuplicateApplicationRedirectUri(String),
     #[error("application scope must not be empty")]
@@ -1286,7 +1292,26 @@ pub struct AuthorizationSubject {
     pub account_class: AccountClass,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizedDeviceSummary {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
 pub trait AuthorizationRepository: Send + Sync {
+    fn list_authorized_devices<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        after: Option<&'a str>,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<AuthorizedDeviceSummary>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
     fn device_permission<'a>(
         &'a self,
         subject: &'a AuthorizationSubject,
@@ -2398,6 +2423,131 @@ impl PlatformStore {
             Ok(())
         } else {
             Err(PlatformStoreError::DeviceTokenDenied)
+        }
+    }
+
+    pub async fn list_authorized_devices(
+        &self,
+        subject: &AuthorizationSubject,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AuthorizedDeviceSummary>, PlatformStoreError> {
+        let limit = i64::from(limit);
+        match self {
+            Self::Sqlite(store) => {
+                let user_id = subject.user_id.to_string();
+                let rows = sqlx::query(
+                    "SELECT d.device_id, d.display_name, d.last_seen_at
+                     FROM devices AS d
+                     WHERE d.deleted_at IS NULL
+                       AND (? IS NULL OR d.device_id > ?)
+                       AND (
+                           ? = 1
+                           OR d.owner_user_id = ?
+                           OR EXISTS (
+                               SELECT 1 FROM resource_shares AS shares
+                               WHERE shares.resource_type = 'device'
+                                 AND shares.resource_id = d.device_id
+                                 AND shares.target_user_id = ?
+                                 AND shares.state = 'active'
+                           )
+                           OR EXISTS (
+                               WITH RECURSIVE ancestors(id, depth) AS (
+                                   SELECT d.asset_id, 0 WHERE d.asset_id IS NOT NULL
+                                   UNION ALL
+                                   SELECT assets.parent_asset_id, ancestors.depth + 1
+                                   FROM ancestors
+                                   JOIN assets ON assets.id = ancestors.id
+                                   WHERE assets.parent_asset_id IS NOT NULL
+                                     AND ancestors.depth < 64
+                               )
+                               SELECT 1 FROM resource_shares AS shares
+                               JOIN ancestors ON shares.resource_id = ancestors.id
+                               WHERE shares.resource_type = 'asset'
+                                 AND shares.target_user_id = ?
+                                 AND shares.state = 'active'
+                                 AND shares.inherit_children = 1
+                           )
+                       )
+                     ORDER BY d.device_id
+                     LIMIT ?",
+                )
+                .bind(after)
+                .bind(after)
+                .bind(i64::from(subject.account_class == AccountClass::Admin))
+                .bind(&user_id)
+                .bind(&user_id)
+                .bind(&user_id)
+                .bind(limit)
+                .fetch_all(store.pool())
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        let last_seen_at = row
+                            .try_get::<Option<String>, _>("last_seen_at")?
+                            .map(|value| parse_authorized_device_timestamp(&value))
+                            .transpose()?;
+                        Ok(AuthorizedDeviceSummary {
+                            device_id: row.try_get("device_id")?,
+                            display_name: row.try_get("display_name")?,
+                            last_seen_at,
+                        })
+                    })
+                    .collect()
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "SELECT d.device_id, d.display_name, d.last_seen_at
+                     FROM devices AS d
+                     WHERE d.deleted_at IS NULL
+                       AND ($1::text IS NULL OR d.device_id > $1)
+                       AND (
+                           $2::boolean
+                           OR d.owner_user_id = $3
+                           OR EXISTS (
+                               SELECT 1 FROM resource_shares AS shares
+                               WHERE shares.resource_type = 'device'
+                                 AND shares.resource_id = d.device_id
+                                 AND shares.target_user_id = $3
+                                 AND shares.state = 'active'
+                           )
+                           OR EXISTS (
+                               WITH RECURSIVE ancestors(id, depth) AS (
+                                   SELECT d.asset_id, 0 WHERE d.asset_id IS NOT NULL
+                                   UNION ALL
+                                   SELECT assets.parent_asset_id, ancestors.depth + 1
+                                   FROM ancestors
+                                   JOIN assets ON assets.id = ancestors.id
+                                   WHERE assets.parent_asset_id IS NOT NULL
+                                     AND ancestors.depth < 64
+                               )
+                               SELECT 1 FROM resource_shares AS shares
+                               JOIN ancestors ON shares.resource_id = ancestors.id::text
+                               WHERE shares.resource_type = 'asset'
+                                 AND shares.target_user_id = $3
+                                 AND shares.state = 'active'
+                                 AND shares.inherit_children = TRUE
+                           )
+                       )
+                     ORDER BY d.device_id
+                     LIMIT $4",
+                )
+                .bind(after)
+                .bind(subject.account_class == AccountClass::Admin)
+                .bind(subject.user_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok(AuthorizedDeviceSummary {
+                            device_id: row.try_get("device_id")?,
+                            display_name: row.try_get("display_name")?,
+                            last_seen_at: row.try_get("last_seen_at")?,
+                        })
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -5771,6 +5921,23 @@ impl TelemetryAggregateRepository for PlatformStore {
 }
 
 impl AuthorizationRepository for PlatformStore {
+    fn list_authorized_devices<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        after: Option<&'a str>,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<AuthorizedDeviceSummary>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::list_authorized_devices(self, subject, after, limit).await
+        })
+    }
+
     fn device_permission<'a>(
         &'a self,
         subject: &'a AuthorizationSubject,
@@ -6084,6 +6251,21 @@ fn strongest_share_permission(rows: Vec<String>) -> Option<ResourcePermission> {
     rows.into_iter()
         .filter_map(|value| ResourcePermission::parse_share(&value))
         .max()
+}
+
+fn parse_authorized_device_timestamp(value: &str) -> Result<DateTime<Utc>, PlatformStoreError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+                .map(|timestamp| timestamp.and_utc())
+        })
+        .map_err(
+            |source| PlatformStoreError::InvalidDeviceLastSeenTimestamp {
+                value: value.to_owned(),
+                source,
+            },
+        )
 }
 
 fn validate_application(application: &mut NewApplication) -> Result<(), PlatformStoreError> {

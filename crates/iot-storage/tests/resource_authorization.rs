@@ -225,6 +225,13 @@ async fn assert_approved_authorization_contract(
             .unwrap(),
         None
     );
+    let page = store.list_authorized_devices(&user, None, 2).await.unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|device| device.device_id.as_str())
+            .collect::<Vec<_>>(),
+        [DEVICE_ASSET_ID, DEVICE_DIRECT_ID]
+    );
 }
 
 #[tokio::test]
@@ -260,6 +267,37 @@ async fn sqlite_resource_authorization_returns_none_for_existing_unshared_resour
     let (_directory, store) = sqlite_store().await;
     let fixtures = seed_sqlite(&store).await;
     assert_existing_unshared_resources_have_no_permission(&store, &fixtures).await;
+}
+
+#[tokio::test]
+async fn sqlite_authorized_device_page_uses_keyset_order_and_resource_grants() {
+    let (_directory, store) = sqlite_store().await;
+    let _fixtures = seed_sqlite(&store).await;
+    let subject = user_subject(AccountClass::User);
+
+    let first = store
+        .list_authorized_devices(&subject, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|device| device.device_id.as_str())
+            .collect::<Vec<_>>(),
+        [DEVICE_ASSET_ID, DEVICE_DIRECT_ID]
+    );
+
+    let second = store
+        .list_authorized_devices(&subject, Some(DEVICE_DIRECT_ID), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .map(|device| device.device_id.as_str())
+            .collect::<Vec<_>>(),
+        [DEVICE_OWNER_ID]
+    );
 }
 
 async fn assert_pending_only_shares_have_no_permission(
