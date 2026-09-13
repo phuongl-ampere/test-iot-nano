@@ -37,6 +37,6 @@ pub use storage::{
 pub use stream_consumer::{HttpStreamConsumer, HttpStreamConsumerError};
 pub use stream_port::{ClaimedBatch, CoreStreamConsumer};
 pub use writer::{
-    FlushResult, SqliteTelemetryWriter, TelemetryWriter, WriterError, connect_core_database,
-    migrate,
+    FlushResult, PlatformTelemetryWriter, SqliteTelemetryWriter, TelemetryWriter, WriterError,
+    connect_core_database, migrate,
 };
