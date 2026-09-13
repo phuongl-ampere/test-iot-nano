@@ -44,7 +44,7 @@ Additional focused PlatformStore tests passed:
 ## Verification
 
 - `cargo fmt --all -- --check`: blocked by a pre-existing formatting difference in `crates/iot-storage/tests/alert_incident.rs`, outside task scope. Task-owned files pass `rustfmt --edition 2024`.
-- `cargo check -p iot-nano-core`: run in an isolated target; no diagnostics observed while the workspace's concurrent Cargo checks were active.
+- `cargo check -p iot-nano-core`: started in an isolated target but canceled after it remained queued behind concurrent workspace Cargo checks; no diagnostics were emitted before cancellation.
 - `git diff --check`: passed.
 - The exact full command-test invocation was started, but the test binary did not return while other concurrent workspace Cargo jobs were active. The focused PlatformStore tests and individual legacy tests completed successfully.
 
