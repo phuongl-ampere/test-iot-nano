@@ -16,6 +16,8 @@ use crate::{meters, ConnectionSettings, Meter};
 use flume::{RecvError, SendError, Sender};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex};
 use tracing::{error, field, info, warn, Instrument};
 
@@ -124,6 +126,110 @@ struct StartupStatus {
 }
 
 type StartupSender = mpsc::Sender<StartupStatus>;
+
+#[cfg(test)]
+type PreboundServerSpawnHook = Arc<dyn Fn(&str) -> io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+type PreboundStartupStatusHook = Arc<dyn Fn(&PreboundListenerSource) -> bool + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct PreboundTestHooks {
+    server_spawn: Option<PreboundServerSpawnHook>,
+    suppress_startup_status: Option<PreboundStartupStatusHook>,
+    withheld_startup_senders: Vec<StartupSender>,
+}
+
+#[cfg(test)]
+static PREBOUND_TEST_HOOKS: OnceLock<Mutex<PreboundTestHooks>> = OnceLock::new();
+
+#[cfg(test)]
+static PREBOUND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+struct PreboundTestHooksGuard;
+
+#[cfg(test)]
+impl Drop for PreboundTestHooksGuard {
+    fn drop(&mut self) {
+        *PREBOUND_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+            .lock()
+            .expect("prebound test hook mutex is not poisoned") = PreboundTestHooks::default();
+    }
+}
+
+#[cfg(test)]
+fn install_prebound_test_hooks(
+    server_spawn: Option<PreboundServerSpawnHook>,
+    suppress_startup_status: Option<PreboundStartupStatusHook>,
+) -> PreboundTestHooksGuard {
+    *PREBOUND_TEST_HOOKS
+        .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+        .lock()
+        .expect("prebound test hook mutex is not poisoned") = PreboundTestHooks {
+        server_spawn,
+        suppress_startup_status,
+        withheld_startup_senders: Vec::new(),
+    };
+    PreboundTestHooksGuard
+}
+
+#[cfg(test)]
+fn prebound_test_serial() -> &'static Mutex<()> {
+    PREBOUND_TEST_SERIAL.get_or_init(|| Mutex::new(()))
+}
+
+fn before_prebound_server_spawn(name: &str) -> io::Result<()> {
+    #[cfg(test)]
+    let hook = {
+        PREBOUND_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+            .lock()
+            .expect("prebound test hook mutex is not poisoned")
+            .server_spawn
+            .clone()
+    };
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        return hook(name);
+    }
+    let _ = name;
+    Ok(())
+}
+
+fn suppress_prebound_startup_status(source: &PreboundListenerSource) -> bool {
+    #[cfg(test)]
+    let hook = {
+        PREBOUND_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+            .lock()
+            .expect("prebound test hook mutex is not poisoned")
+            .suppress_startup_status
+            .clone()
+    };
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        return hook(source);
+    }
+    let _ = source;
+    false
+}
+
+fn hold_prebound_startup_sender(sender: StartupSender) {
+    #[cfg(test)]
+    {
+        PREBOUND_TEST_HOOKS
+            .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+            .lock()
+            .expect("prebound test hook mutex is not poisoned")
+            .withheld_startup_senders
+            .push(sender);
+    }
+    #[cfg(not(test))]
+    drop(sender);
+}
 
 struct PreboundListeners {
     v4: HashMap<String, StdTcpListener>,
@@ -424,9 +530,12 @@ impl Broker {
     ) -> Result<BrokerHandle, Error> {
         let (shutdown, receiver) = watch::channel(false);
         let router_tx = self.router_tx.clone();
+        let shutdown_for_thread = shutdown.clone();
         let join = thread::Builder::new()
             .name("iot-mqtt-core-broker".to_owned())
-            .spawn(move || self.start_with_shutdown(receiver, listeners, startup))?;
+            .spawn(move || {
+                self.start_with_shutdown(receiver, shutdown_for_thread, listeners, startup)
+            })?;
         Ok(BrokerHandle {
             shutdown,
             join: Some(join),
@@ -495,14 +604,15 @@ impl Broker {
 
     #[tracing::instrument(skip(self))]
     pub fn start(&mut self) -> Result<(), Error> {
-        let (_shutdown, receiver) = watch::channel(false);
-        self.start_with_shutdown(receiver, None, None)
+        let (shutdown, receiver) = watch::channel(false);
+        self.start_with_shutdown(receiver, shutdown, None, None)
     }
 
     #[tracing::instrument(skip(self, listeners, startup))]
     fn start_with_shutdown(
         &mut self,
         shutdown: watch::Receiver<bool>,
+        shutdown_sender: watch::Sender<bool>,
         mut listeners: Option<PreboundListeners>,
         startup: Option<StartupSender>,
     ) -> Result<(), Error> {
@@ -550,7 +660,7 @@ impl Broker {
             let bridge_thread = thread::Builder::new().name(bridge_config.name.clone());
             let router_tx = self.router_tx.clone();
             let shutdown = shutdown.clone();
-            let handle = bridge_thread.spawn(move || {
+            let handle = match bridge_thread.spawn(move || {
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
                 let runtime = runtime.enable_all().build().unwrap();
 
@@ -561,14 +671,21 @@ impl Broker {
                         error!(error=?e, "Bridge Link error");
                     };
                 });
-            })?;
+            }) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                    return Err(error.into());
+                }
+            };
             server_thread_handles.push(handle);
         }
 
         // Spawn servers in a separate thread.
         if let Some(v4_config) = &self.config.v4 {
             for (name, config) in v4_config.clone() {
-                let server_thread = thread::Builder::new().name(config.name.clone());
+                let server_name = config.name.clone();
+                let server_thread = thread::Builder::new().name(server_name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
                 let shutdown = shutdown.clone();
                 let listener = listeners.as_mut().map(|listeners| {
@@ -579,7 +696,11 @@ impl Broker {
                 });
                 let startup = startup.clone();
                 let source = listener_source("v4", &name);
-                let handle = server_thread.spawn(move || {
+                if let Err(error) = before_prebound_server_spawn(&server_name) {
+                    self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                    return Err(error.into());
+                }
+                let handle = match server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
@@ -602,14 +723,21 @@ impl Broker {
                             error!(error=?e, "Server error - V4");
                         }
                     });
-                })?;
+                }) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                        return Err(error.into());
+                    }
+                };
                 server_thread_handles.push(handle)
             }
         }
 
         if let Some(v5_config) = &self.config.v5 {
             for (name, config) in v5_config.clone() {
-                let server_thread = thread::Builder::new().name(config.name.clone());
+                let server_name = config.name.clone();
+                let server_thread = thread::Builder::new().name(server_name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V5);
                 let shutdown = shutdown.clone();
                 let listener = listeners.as_mut().map(|listeners| {
@@ -620,7 +748,11 @@ impl Broker {
                 });
                 let startup = startup.clone();
                 let source = listener_source("v5", &name);
-                let handle = server_thread.spawn(move || {
+                if let Err(error) = before_prebound_server_spawn(&server_name) {
+                    self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                    return Err(error.into());
+                }
+                let handle = match server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
@@ -643,7 +775,13 @@ impl Broker {
                             error!(error=?e, "Server error - V5");
                         }
                     });
-                })?;
+                }) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                        return Err(error.into());
+                    }
+                };
                 server_thread_handles.push(handle)
             }
         }
@@ -662,7 +800,7 @@ impl Broker {
                 //TODO: Add support for V5 procotol with websockets. Registered in config or on ServerSettings
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
                 let shutdown = shutdown.clone();
-                let handle = server_thread.spawn(move || {
+                let handle = match server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
 
@@ -671,7 +809,13 @@ impl Broker {
                             error!(error=?e, "Server error - WS");
                         }
                     });
-                })?;
+                }) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                        return Err(error.into());
+                    }
+                };
                 server_thread_handles.push(handle)
             }
         }
@@ -742,6 +886,18 @@ impl Broker {
 
         self.shutdown_router()?;
         Ok(())
+    }
+
+    fn shutdown_started_threads(
+        &mut self,
+        shutdown: &watch::Sender<bool>,
+        server_thread_handles: Vec<thread::JoinHandle<()>>,
+    ) {
+        shutdown.send_replace(true);
+        for handle in server_thread_handles {
+            let _ = handle.join();
+        }
+        let _ = self.shutdown_router();
     }
 
     fn shutdown_router(&mut self) -> Result<(), Error> {
@@ -879,10 +1035,14 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
     ) -> Result<(), Error> {
         let listener = match TcpListener::from_std(listener) {
             Ok(listener) => {
-                let _ = startup.send(StartupStatus {
-                    listener: source,
-                    result: Ok(()),
-                });
+                if suppress_prebound_startup_status(&source) {
+                    hold_prebound_startup_sender(startup);
+                } else {
+                    let _ = startup.send(StartupStatus {
+                        listener: source,
+                        result: Ok(()),
+                    });
+                }
                 listener
             }
             Err(error) => {
@@ -893,7 +1053,6 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                 return Err(error.into());
             }
         };
-        drop(startup);
         self.accept(listener, link_type, shutdown).await
     }
 
@@ -999,6 +1158,9 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                 _ = time::sleep(delay) => {}
                 _ = shutdown.changed() => break,
             }
+        }
+        for task in &remote_tasks {
+            task.abort();
         }
         for task in remote_tasks {
             let _ = task.await;
@@ -1196,8 +1358,9 @@ async fn remote<P: Protocol>(
 mod tests {
     use std::{
         collections::HashMap,
+        io::Write,
         net::{SocketAddr, TcpListener, TcpStream},
-        sync::mpsc,
+        sync::{mpsc, Arc, Mutex},
         thread,
         time::{Duration, Instant},
     };
@@ -1207,7 +1370,195 @@ mod tests {
         BridgeConfig, Config, ConnectionSettings, PrometheusSetting, ServerSettings, Transport,
     };
 
-    use super::{Broker, BrokerHandle, Error};
+    use super::{
+        install_prebound_test_hooks, prebound_test_serial, Broker, BrokerHandle, Error,
+        PreboundListenerSource,
+    };
+
+    #[test]
+    fn prebound_v5_spawn_failure_joins_the_started_v4_server() {
+        let _serial = prebound_test_serial()
+            .lock()
+            .expect("prebound test serial mutex is not poisoned");
+        let v4_name = "v311-spawn-failure";
+        let v5_name = "v5-spawn-failure";
+        let (mut config, v4_listener, v5_listener) = prebound_test_config_named(v4_name, v5_name);
+        let v4_address = v4_listener.local_addr().unwrap();
+        let v5_address = v5_listener.local_addr().unwrap();
+        let (authorization_started_tx, authorization_started_rx) = mpsc::channel();
+        let (authorization_release_tx, authorization_release_rx) = tokio::sync::oneshot::channel();
+        let authorization_release = Arc::new(Mutex::new(Some(authorization_release_rx)));
+        install_blocking_v4_auth(
+            &mut config,
+            v4_name,
+            authorization_started_tx,
+            Arc::clone(&authorization_release),
+        );
+
+        let (v5_spawned_tx, v5_spawned_rx) = mpsc::sync_channel(1);
+        let (allow_v5_failure_tx, allow_v5_failure_rx) = mpsc::sync_channel(1);
+        let allow_v5_failure_rx = Arc::new(Mutex::new(allow_v5_failure_rx));
+        let (v4_ready_tx, v4_ready_rx) = mpsc::sync_channel(1);
+        let _hooks = install_prebound_test_hooks(
+            Some(Arc::new(move |name| {
+                if name == v5_name {
+                    v5_spawned_tx.send(()).unwrap();
+                    allow_v5_failure_rx.lock().unwrap().recv().unwrap();
+                    return Err(std::io::Error::other("injected v5 spawn failure"));
+                }
+                Ok(())
+            })),
+            Some(Arc::new(move |source: &PreboundListenerSource| {
+                if source.protocol == "v4" && source.name == v4_name {
+                    let _ = v4_ready_tx.send(());
+                }
+                false
+            })),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let starter = thread::spawn(move || {
+            result_tx
+                .send(Broker::new_with_prebound_listeners(
+                    config,
+                    vec![(v4_name.to_owned(), v4_listener)],
+                    vec![(v5_name.to_owned(), v5_listener)],
+                    Duration::from_secs(2),
+                ))
+                .unwrap();
+        });
+
+        v5_spawned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("v5 startup hook was not reached");
+        v4_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("v4 listener did not report ready");
+        let stream = connect_until(v4_address);
+        if authorization_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .is_err()
+        {
+            allow_v5_failure_tx.send(()).unwrap();
+            let _ = result_rx.recv_timeout(Duration::from_secs(1));
+            starter.join().unwrap();
+            panic!("v4 authorization did not start");
+        }
+        allow_v5_failure_tx.send(()).unwrap();
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spawn failure did not return");
+        assert!(result.is_err());
+
+        let v4_rebindable = TcpListener::bind(v4_address).is_ok();
+        let v5_rebindable = TcpListener::bind(v5_address).is_ok();
+
+        drop(stream);
+        let _ = authorization_release_tx.send(());
+        starter.join().unwrap();
+        wait_until_bindable(v4_address);
+        wait_until_bindable(v5_address);
+
+        assert!(v4_rebindable, "started v4 listener remained detached");
+        assert!(v5_rebindable, "unspawned v5 listener remained owned");
+    }
+
+    #[test]
+    fn prebound_startup_timeout_aborts_stalled_ready_remote_work() {
+        let _serial = prebound_test_serial()
+            .lock()
+            .expect("prebound test serial mutex is not poisoned");
+        let v4_name = "v311-startup-timeout";
+        let v5_name = "v5-startup-timeout";
+        let (mut config, v4_listener, v5_listener) = prebound_test_config_named(v4_name, v5_name);
+        let v4_address = v4_listener.local_addr().unwrap();
+        let v5_address = v5_listener.local_addr().unwrap();
+        let (authorization_started_tx, authorization_started_rx) = mpsc::channel();
+        let (authorization_release_tx, authorization_release_rx) = tokio::sync::oneshot::channel();
+        let authorization_release = Arc::new(Mutex::new(Some(authorization_release_rx)));
+        install_blocking_v4_auth(
+            &mut config,
+            v4_name,
+            authorization_started_tx,
+            Arc::clone(&authorization_release),
+        );
+        let (v4_ready_tx, v4_ready_rx) = mpsc::sync_channel(1);
+        let (v5_status_tx, v5_status_rx) = mpsc::sync_channel(1);
+        let (allow_v5_status_tx, allow_v5_status_rx) = mpsc::sync_channel(1);
+        let allow_v5_status_rx = Arc::new(Mutex::new(allow_v5_status_rx));
+        let _hooks = install_prebound_test_hooks(
+            None,
+            Some(Arc::new(move |source: &PreboundListenerSource| {
+                if source.protocol == "v4" && source.name == v4_name {
+                    let _ = v4_ready_tx.send(());
+                }
+                if source.protocol == "v5" && source.name == v5_name {
+                    let _ = v5_status_tx.send(());
+                    allow_v5_status_rx.lock().unwrap().recv().unwrap();
+                    return true;
+                }
+                false
+            })),
+        );
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let starter = thread::spawn(move || {
+            result_tx
+                .send(Broker::new_with_prebound_listeners(
+                    config,
+                    vec![(v4_name.to_owned(), v4_listener)],
+                    vec![(v5_name.to_owned(), v5_listener)],
+                    Duration::from_secs(1),
+                ))
+                .unwrap();
+        });
+
+        v4_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("v4 listener did not report ready");
+        v5_status_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("v5 listener did not reach the readiness gate");
+        let stream = connect_until(v4_address);
+        let authorization_started = authorization_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok();
+        allow_v5_status_tx.send(()).unwrap();
+        if !authorization_started {
+            drop(stream);
+            let _ = authorization_release_tx.send(());
+            let _ = result_rx.recv_timeout(Duration::from_secs(2));
+            starter.join().unwrap();
+            panic!("v4 authorization did not start");
+        }
+        let result = result_rx.recv_timeout(Duration::from_millis(1500));
+        let returned_before_bound = result.is_ok();
+
+        drop(stream);
+        let _ = authorization_release_tx.send(());
+        if returned_before_bound {
+            starter.join().unwrap();
+            let error = match result.unwrap() {
+                Ok(handle) => {
+                    handle.shutdown();
+                    let _ = handle.join();
+                    panic!("startup timeout unexpectedly returned a broker handle");
+                }
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                Error::PreboundListenerStartupTimeout { .. }
+            ));
+        } else {
+            starter.join().unwrap();
+        }
+        wait_until_bindable(v4_address);
+        wait_until_bindable(v5_address);
+
+        assert!(
+            returned_before_bound,
+            "startup timeout must abort stalled remote work before returning"
+        );
+    }
 
     #[test]
     fn prebound_listeners_reject_missing_names_without_rebinding_configured_addresses() {
@@ -1392,6 +1743,13 @@ mod tests {
     }
 
     fn prebound_test_config() -> (Config, TcpListener, TcpListener) {
+        prebound_test_config_named("v311", "v5")
+    }
+
+    fn prebound_test_config_named(
+        v4_name: &str,
+        v5_name: &str,
+    ) -> (Config, TcpListener, TcpListener) {
         let v4_guard = TcpListener::bind("127.0.0.1:0").unwrap();
         let v5_guard = TcpListener::bind("127.0.0.1:0").unwrap();
         let v4_address = v4_guard.local_addr().unwrap();
@@ -1406,9 +1764,9 @@ mod tests {
             dynamic_filters: true,
         };
         let v4 = HashMap::from([(
-            "v311".to_owned(),
+            v4_name.to_owned(),
             ServerSettings {
-                name: "v311".to_owned(),
+                name: v4_name.to_owned(),
                 listen: v4_address,
                 tls: None,
                 next_connection_delay_ms: 0,
@@ -1416,9 +1774,9 @@ mod tests {
             },
         )]);
         let v5 = HashMap::from([(
-            "v5".to_owned(),
+            v5_name.to_owned(),
             ServerSettings {
-                name: "v5".to_owned(),
+                name: v5_name.to_owned(),
                 listen: v5_address,
                 tls: None,
                 next_connection_delay_ms: 0,
@@ -1434,6 +1792,94 @@ mod tests {
             v4_guard,
             v5_guard,
         )
+    }
+
+    fn install_blocking_v4_auth(
+        config: &mut Config,
+        v4_name: &str,
+        started: mpsc::Sender<()>,
+        release: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    ) {
+        config
+            .v4
+            .as_mut()
+            .unwrap()
+            .get_mut(v4_name)
+            .unwrap()
+            .connections
+            .external_auth = Some(Arc::new(move |_, _, _| {
+            let started = started.clone();
+            let release = release
+                .lock()
+                .expect("authorization release mutex is not poisoned")
+                .take()
+                .expect("authorization is invoked once");
+            Box::pin(async move {
+                started.send(()).unwrap();
+                release.await.is_ok()
+            })
+        }));
+    }
+
+    fn connect_until(address: SocketAddr) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match TcpStream::connect(address) {
+                Ok(mut stream) => {
+                    stream.write_all(&mqtt_v4_connect_with_login()).unwrap();
+                    return stream;
+                }
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("listener did not start: {error}"),
+            }
+        }
+    }
+
+    fn mqtt_v4_connect_with_login() -> Vec<u8> {
+        let client_id = b"test";
+        let username = b"user";
+        let password = b"pass";
+        let remaining = 10 + 2 + client_id.len() + 2 + username.len() + 2 + password.len();
+        let mut packet = vec![
+            0x10,
+            remaining as u8,
+            0x00,
+            0x04,
+            b'M',
+            b'Q',
+            b'T',
+            b'T',
+            0x04,
+            0xc2,
+            0x00,
+            0x3c,
+            0x00,
+            client_id.len() as u8,
+        ];
+        packet.extend_from_slice(client_id);
+        packet.extend_from_slice(&[0x00, username.len() as u8]);
+        packet.extend_from_slice(username);
+        packet.extend_from_slice(&[0x00, password.len() as u8]);
+        packet.extend_from_slice(password);
+        packet
+    }
+
+    fn wait_until_bindable(address: SocketAddr) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(listener) = TcpListener::bind(address) {
+                drop(listener);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "listener {address} was not released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn assert_configured_addresses_remained_guarded(
