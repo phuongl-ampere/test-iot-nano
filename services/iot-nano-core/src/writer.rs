@@ -45,6 +45,8 @@ pub enum WriterError {
     Database(#[from] sqlx::Error),
     #[error(transparent)]
     Sqlite(#[from] CoreSqliteStoreError),
+    #[error(transparent)]
+    Platform(#[from] PlatformStoreError),
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), WriterError> {
@@ -450,7 +452,7 @@ where
                         .store
                         .ingest_gateway(gateway_ingest_request(message))
                         .await
-                        .map_err(platform_writer_error)?;
+                        .map_err(WriterError::Platform)?;
                     if message.telemetry_event.is_some() {
                         inserted += usize::from(result.telemetry_inserted);
                     }
@@ -461,7 +463,7 @@ where
                         self.store
                             .write_telemetry(&message.event, message.received_at, &message.topic)
                             .await
-                            .map_err(platform_writer_error)?,
+                            .map_err(WriterError::Platform)?,
                     );
                 }
             }
@@ -492,12 +494,6 @@ fn gateway_ingest_request(message: &GatewayMessage) -> GatewayIngestRequest {
         topic: message.topic.clone(),
         received_at: message.received_at,
     }
-}
-
-fn platform_writer_error(error: PlatformStoreError) -> WriterError {
-    WriterError::Stream(StreamError::InvalidConfig(format!(
-        "platform telemetry writer: {error}"
-    )))
 }
 
 fn empty_flush_result() -> FlushResult {

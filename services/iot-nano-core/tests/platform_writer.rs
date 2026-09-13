@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
-use iot_nano_core::{CoreStreamConsumer, PlatformTelemetryWriter};
+use iot_nano_core::{CoreStreamConsumer, PlatformTelemetryWriter, WriterError};
 use iot_storage::{
     GatewayIngestEventKind, GatewayIngestRepository, GatewayIngestRequest, GatewayIngestResult,
     PlatformStore, PlatformStoreError, TelemetryRepository,
@@ -27,6 +27,7 @@ struct FakeRepository {
     telemetry_calls: Arc<Mutex<Vec<(TelemetryEvent, DateTime<Utc>, String)>>>,
     gateway_calls: Arc<Mutex<Vec<GatewayIngestRequest>>>,
     telemetry_result: Arc<Mutex<Result<bool, ()>>>,
+    telemetry_failure_call: Arc<Mutex<Option<usize>>>,
     gateway_result: Arc<Mutex<Result<GatewayIngestResult, ()>>>,
 }
 
@@ -34,6 +35,13 @@ impl FakeRepository {
     fn failing_direct() -> Self {
         Self {
             telemetry_result: Arc::new(Mutex::new(Err(()))),
+            ..Self::default()
+        }
+    }
+
+    fn failing_direct_on_call(call: usize) -> Self {
+        Self {
+            telemetry_failure_call: Arc::new(Mutex::new(Some(call))),
             ..Self::default()
         }
     }
@@ -52,6 +60,7 @@ impl Default for FakeRepository {
             telemetry_calls: Arc::default(),
             gateway_calls: Arc::default(),
             telemetry_result: Arc::new(Mutex::new(Ok(true))),
+            telemetry_failure_call: Arc::default(),
             gateway_result: Arc::new(Mutex::new(Ok(GatewayIngestResult {
                 receipt_inserted: true,
                 telemetry_inserted: false,
@@ -69,12 +78,15 @@ impl TelemetryRepository for FakeRepository {
     ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>> {
         let calls = Arc::clone(&self.telemetry_calls);
         let result = *self.telemetry_result.lock().unwrap();
+        let failure_call = *self.telemetry_failure_call.lock().unwrap();
         Box::pin(async move {
-            calls
-                .lock()
-                .unwrap()
-                .push((event.clone(), received_at, topic.to_owned()));
-            result.map_err(|()| PlatformStoreError::InvalidConfiguration)
+            let mut calls = calls.lock().unwrap();
+            calls.push((event.clone(), received_at, topic.to_owned()));
+            if failure_call == Some(calls.len()) {
+                Err(PlatformStoreError::InvalidConfiguration)
+            } else {
+                result.map_err(|()| PlatformStoreError::InvalidConfiguration)
+            }
         })
     }
 }
@@ -168,7 +180,12 @@ async fn repository_failure_leaves_direct_batch_reclaimable() {
     stream.append(telemetry_message(1, at(1))).await.unwrap();
 
     let writer = PlatformTelemetryWriter::new(FakeRepository::failing_direct(), 1);
-    assert!(writer.flush_once(&consumer, at(2)).await.is_err());
+    assert!(matches!(
+        writer.flush_once(&consumer, at(2)).await,
+        Err(WriterError::Platform(
+            PlatformStoreError::InvalidConfiguration
+        ))
+    ));
     tokio::time::sleep(StdDuration::from_millis(40)).await;
     assert_eq!(consumer.claim(1).await.unwrap().records().len(), 1);
 }
@@ -217,13 +234,47 @@ async fn later_repository_failure_keeps_the_entire_batch_reclaimable() {
 }
 
 #[tokio::test]
-async fn gateway_mapping_and_telemetry_accounting_are_exact() {
+async fn later_direct_failure_keeps_the_entire_batch_reclaimable() {
+    let directory = tempfile::tempdir().unwrap();
+    let (stream, consumer) = stream_and_consumer(&directory, StdDuration::from_millis(25)).await;
+    stream.append(telemetry_message(1, at(1))).await.unwrap();
+    stream.append(telemetry_message(2, at(2))).await.unwrap();
+
+    let writer = PlatformTelemetryWriter::new(FakeRepository::failing_direct_on_call(2), 10);
+    assert!(matches!(
+        writer.flush_once(&consumer, at(3)).await,
+        Err(WriterError::Platform(
+            PlatformStoreError::InvalidConfiguration
+        ))
+    ));
+    tokio::time::sleep(StdDuration::from_millis(40)).await;
+    assert_eq!(consumer.claim(10).await.unwrap().records().len(), 2);
+}
+
+#[tokio::test]
+async fn every_gateway_kind_maps_to_the_platform_request() {
     let directory = tempfile::tempdir().unwrap();
     let (stream, consumer) = stream_and_consumer(&directory, StdDuration::from_secs(1)).await;
     let received_at = at(10);
     let child_event = event("child-1", Some("gateway-1"), 7);
     stream
-        .append(telemetry_message(2, received_at))
+        .append(gateway_message(
+            GatewayEventKind::Connect,
+            Some("child-1"),
+            None,
+            received_at,
+            "connect-1",
+        ))
+        .await
+        .unwrap();
+    stream
+        .append(gateway_message(
+            GatewayEventKind::Disconnect,
+            Some("child-1"),
+            None,
+            received_at,
+            "disconnect-1",
+        ))
         .await
         .unwrap();
     stream
@@ -248,7 +299,6 @@ async fn gateway_mapping_and_telemetry_accounting_are_exact() {
         .unwrap();
 
     let repository = FakeRepository {
-        telemetry_result: Arc::new(Mutex::new(Ok(false))),
         gateway_result: Arc::new(Mutex::new(Ok(GatewayIngestResult {
             receipt_inserted: true,
             telemetry_inserted: false,
@@ -258,13 +308,33 @@ async fn gateway_mapping_and_telemetry_accounting_are_exact() {
     let writer = PlatformTelemetryWriter::new(repository.clone(), 10);
     let result = writer.flush_once(&consumer, received_at).await.unwrap();
 
-    assert_eq!(result.read, 3);
+    assert_eq!(result.read, 4);
     assert_eq!(result.inserted, 0);
-    assert_eq!(result.duplicates, 2);
-    assert_eq!(repository.telemetry_calls.lock().unwrap().len(), 1);
+    assert_eq!(result.duplicates, 1);
+    assert!(repository.telemetry_calls.lock().unwrap().is_empty());
     assert_eq!(
         repository.gateway_calls.lock().unwrap().as_slice(),
         &[
+            GatewayIngestRequest {
+                gateway_device_id: "gateway-1".to_owned(),
+                child_device_id: Some("child-1".to_owned()),
+                event_kind: GatewayIngestEventKind::Connect,
+                event_at: received_at - Duration::seconds(1),
+                idempotency_key: "connect-1".to_owned(),
+                telemetry_event: None,
+                topic: "iot/v1/gateways/gateway-1/events".to_owned(),
+                received_at,
+            },
+            GatewayIngestRequest {
+                gateway_device_id: "gateway-1".to_owned(),
+                child_device_id: Some("child-1".to_owned()),
+                event_kind: GatewayIngestEventKind::Disconnect,
+                event_at: received_at - Duration::seconds(1),
+                idempotency_key: "disconnect-1".to_owned(),
+                telemetry_event: None,
+                topic: "iot/v1/gateways/gateway-1/events".to_owned(),
+                received_at,
+            },
             GatewayIngestRequest {
                 gateway_device_id: "gateway-1".to_owned(),
                 child_device_id: Some("child-1".to_owned()),
@@ -287,6 +357,40 @@ async fn gateway_mapping_and_telemetry_accounting_are_exact() {
             }
         ]
     );
+}
+
+#[tokio::test]
+async fn gateway_telemetry_insert_is_independent_of_a_direct_duplicate() {
+    let directory = tempfile::tempdir().unwrap();
+    let (stream, consumer) = stream_and_consumer(&directory, StdDuration::from_secs(1)).await;
+    let received_at = at(10);
+    stream
+        .append(telemetry_message(1, received_at))
+        .await
+        .unwrap();
+    stream
+        .append(gateway_message(
+            GatewayEventKind::ChildTelemetry,
+            Some("child-1"),
+            Some(event("child-1", Some("gateway-1"), 2)),
+            received_at,
+            "child-1:2",
+        ))
+        .await
+        .unwrap();
+
+    let repository = FakeRepository {
+        telemetry_result: Arc::new(Mutex::new(Ok(false))),
+        gateway_result: Arc::new(Mutex::new(Ok(GatewayIngestResult {
+            receipt_inserted: true,
+            telemetry_inserted: true,
+        }))),
+        ..FakeRepository::default()
+    };
+    let writer = PlatformTelemetryWriter::new(repository, 10);
+    let result = writer.flush_once(&consumer, received_at).await.unwrap();
+
+    assert_eq!((result.read, result.inserted, result.duplicates), (2, 1, 1));
 }
 
 async fn sqlite_store() -> (TempDir, PlatformStore) {

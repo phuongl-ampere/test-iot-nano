@@ -559,6 +559,10 @@ async fn run_http_telemetry_writer(
                         metrics.record_database_failure();
                         eprintln!("SQLite flush error: {error}");
                     }
+                    Err(WriterError::Platform(error)) => {
+                        metrics.record_database_failure();
+                        eprintln!("platform storage flush error: {error}");
+                    }
                     Err(WriterError::Stream(error)) => {
                         metrics.record_stream_failure();
                         eprintln!("stream writer error: {error}");
@@ -598,6 +602,10 @@ async fn run_http_sqlite_telemetry_writer(
                     Err(WriterError::Sqlite(error)) => {
                         metrics.record_database_failure();
                         eprintln!("SQLite flush error: {error}");
+                    }
+                    Err(WriterError::Platform(error)) => {
+                        metrics.record_database_failure();
+                        eprintln!("platform storage flush error: {error}");
                     }
                     Err(WriterError::Stream(error)) => {
                         metrics.record_stream_failure();
