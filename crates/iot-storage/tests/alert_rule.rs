@@ -1,4 +1,4 @@
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, TimeZone, Timelike, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AlertComparison, AlertRepository, AlertRuleKind, AlertSeverity, PlatformStore,
@@ -216,6 +216,55 @@ async fn sqlite_alert_rule_event_claim_is_idempotent_and_concurrency_safe() {
     assert_eq!(count, 2);
 }
 
+#[tokio::test]
+async fn sqlite_alert_rule_event_claim_canonicalizes_submicrosecond_timestamps() {
+    let (_directory, store) = sqlite_store().await;
+    let rule_id = Uuid::now_v7();
+    insert_rule(
+        &store,
+        rule_id,
+        "canonical-claim",
+        true,
+        false,
+        "event_threshold",
+        None,
+        "2026-01-01T00:00:00Z",
+    )
+    .await;
+    let event_at = Utc
+        .with_ymd_and_hms(2026, 2, 1, 0, 0, 0)
+        .unwrap()
+        .with_nanosecond(123_456_100)
+        .unwrap();
+    let same_microsecond = event_at.with_nanosecond(123_456_900).unwrap();
+    let boot_id = Uuid::now_v7();
+
+    assert!(
+        AlertRepository::claim_rule_event(&store, rule_id, event_at, "device-a", boot_id, 7)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !AlertRepository::claim_rule_event(
+            &store,
+            rule_id,
+            same_microsecond,
+            "device-a",
+            boot_id,
+            7,
+        )
+        .await
+        .unwrap()
+    );
+
+    let count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM alert_rule_event_evaluations")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap()
+        .get("count");
+    assert_eq!(count, 1);
+}
+
 struct TimescaleTestLock {
     _connection: PgConnection,
 }
@@ -292,5 +341,25 @@ async fn timescale_alert_rule_repository_matches_sqlite_claim_contract() {
         !AlertRepository::claim_rule_event(&store, rule_id, event_at, "device-a", boot_id, 7)
             .await
             .unwrap()
+    );
+
+    let submicrosecond = event_at.with_nanosecond(100).unwrap();
+    let same_microsecond = event_at.with_nanosecond(900).unwrap();
+    assert!(
+        AlertRepository::claim_rule_event(&store, rule_id, submicrosecond, "device-a", boot_id, 8,)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !AlertRepository::claim_rule_event(
+            &store,
+            rule_id,
+            same_microsecond,
+            "device-a",
+            boot_id,
+            8,
+        )
+        .await
+        .unwrap()
     );
 }

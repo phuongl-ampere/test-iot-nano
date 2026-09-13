@@ -976,6 +976,7 @@ impl PlatformStore {
         boot_id: uuid::Uuid,
         sequence: u64,
     ) -> Result<bool, PlatformStoreError> {
+        let event_at = canonical_postgres_timestamp(event_at);
         match self {
             Self::Sqlite(store) => {
                 let result = sqlx::query(
@@ -1700,8 +1701,8 @@ impl PlatformStore {
         command.id = id.to_string();
         command.params =
             serde_json::to_string(&params).map_err(|_| PlatformStoreError::InvalidCommandParams)?;
-        command.expires_at = canonical_command_timestamp(command.expires_at);
-        command.next_attempt_at = canonical_command_timestamp(command.next_attempt_at);
+        command.expires_at = canonical_postgres_timestamp(command.expires_at);
+        command.next_attempt_at = canonical_postgres_timestamp(command.next_attempt_at);
 
         match self {
             Self::Sqlite(store) => {
@@ -2340,7 +2341,7 @@ fn command_payload_matches(
         && existing.next_attempt_at == command.next_attempt_at
 }
 
-fn canonical_command_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+fn canonical_postgres_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
     timestamp
         .with_nanosecond(timestamp.nanosecond() / 1_000 * 1_000)
         .expect("a valid UTC timestamp can be represented at microsecond precision")
