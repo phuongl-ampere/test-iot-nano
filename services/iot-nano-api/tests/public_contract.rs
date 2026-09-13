@@ -1,6 +1,6 @@
 use std::fs;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const CONTRACT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -81,6 +81,30 @@ fn public_api_v1_contract_contains_only_the_required_public_surface() {
         contract["oauth"]["client_credentials"]["path"],
         "/oauth/token"
     );
+    let authorization_code_exchange = &contract["oauth"]["token_endpoint"]["authorization_code"];
+    assert_eq!(
+        authorization_code_exchange["path"], "/oauth/token",
+        "authorization-code exchange must use the token endpoint"
+    );
+    assert_eq!(
+        authorization_code_exchange["required_parameters"]["grant_type"], "authorization_code",
+        "authorization-code exchange must require grant_type=authorization_code"
+    );
+    for parameter in ["code", "code_verifier", "redirect_uri", "client_id"] {
+        assert!(
+            authorization_code_exchange["required_parameters"][parameter].is_object(),
+            "authorization-code exchange must require {parameter}"
+        );
+    }
+    assert_eq!(
+        authorization_code_exchange["pkce"]["code_challenge_method"], "S256",
+        "authorization-code exchange must use S256 PKCE"
+    );
+    assert_eq!(
+        authorization_code_exchange["pkce"]["code_verifier_requirement"],
+        "must_match_original_s256_code_challenge",
+        "authorization-code verifier must match the original S256 challenge"
+    );
     for flow in ["authorization_code_pkce", "client_credentials"] {
         assert!(
             contract["oauth"][flow]["path"]
@@ -89,20 +113,31 @@ fn public_api_v1_contract_contains_only_the_required_public_surface() {
             "OAuth flow {flow} must be mounted under /oauth"
         );
     }
-    for error_value in [
-        "invalid_request",
-        "invalid_client",
-        "invalid_grant",
-        "invalid_scope",
-        "unauthorized_client",
-    ] {
-        assert!(
-            contract["oauth"]["error_values"]
-                .as_array()
-                .is_some_and(|values| values.iter().any(|value| value == error_value)),
-            "OAuth error values must include {error_value}"
-        );
-    }
+    assert_eq!(
+        contract["oauth"]["authorization_endpoint"]["error_values"],
+        json!([
+            "invalid_request",
+            "unauthorized_client",
+            "access_denied",
+            "unsupported_response_type",
+            "invalid_scope",
+            "server_error",
+            "temporarily_unavailable"
+        ]),
+        "authorization endpoint must declare its complete OAuth error set"
+    );
+    assert_eq!(
+        contract["oauth"]["token_endpoint"]["error_values"],
+        json!([
+            "invalid_request",
+            "invalid_client",
+            "invalid_grant",
+            "unauthorized_client",
+            "unsupported_grant_type",
+            "invalid_scope"
+        ]),
+        "token endpoint must declare its complete OAuth error set"
+    );
 
     let serialized = contract.to_string().to_ascii_lowercase();
     assert!(!serialized.contains("/internal"));

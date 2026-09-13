@@ -103,19 +103,43 @@
       "grant_type": "client_credentials",
       "required_parameters": ["grant_type", "scope"]
     },
+    "authorization_endpoint": {
+      "path": "/oauth/authorize",
+      "error_values": [
+        "invalid_request",
+        "unauthorized_client",
+        "access_denied",
+        "unsupported_response_type",
+        "invalid_scope",
+        "server_error",
+        "temporarily_unavailable"
+      ]
+    },
     "token_endpoint": {
       "path": "/oauth/token",
-      "supported_grant_types": ["authorization_code", "client_credentials"]
-    },
-    "error_values": [
-      "invalid_request",
-      "invalid_client",
-      "invalid_grant",
-      "invalid_scope",
-      "unauthorized_client",
-      "unsupported_grant_type",
-      "access_denied",
-      "temporarily_unavailable"
-    ]
+      "supported_grant_types": ["authorization_code", "client_credentials"],
+      "authorization_code": {
+        "path": "/oauth/token",
+        "required_parameters": {
+          "grant_type": "authorization_code",
+          "code": { "type": "string", "minLength": 1 },
+          "code_verifier": { "type": "string", "minLength": 43 },
+          "redirect_uri": { "type": "string", "minLength": 1 },
+          "client_id": { "type": "string", "minLength": 1 }
+        },
+        "pkce": {
+          "code_challenge_method": "S256",
+          "code_verifier_requirement": "must_match_original_s256_code_challenge"
+        }
+      },
+      "error_values": [
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope"
+      ]
+    }
   }
 }
