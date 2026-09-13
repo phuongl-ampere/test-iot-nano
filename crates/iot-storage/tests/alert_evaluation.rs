@@ -1248,7 +1248,8 @@ async fn timescale_opposite_ordered_event_batches_do_not_deadlock() {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM notification_outbox
              WHERE kind = 'opened' AND incident_id IN (
-                 SELECT id FROM alert_incidents WHERE rule_id = $1
+                 SELECT id FROM alert_incidents
+                 WHERE rule_id = $1 AND status IN ('pending', 'open')
              )",
         )
         .bind(rule_id)
