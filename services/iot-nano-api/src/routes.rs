@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Extension, Path, Query, Request, State},
+    extract::{ConnectInfo, Extension, Path, Query, Request, State, rejection::QueryRejection},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{AUTHORIZATION, COOKIE, SET_COOKIE},
@@ -19,12 +19,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use iot_core::{
     RpcMode, RpcRequest, SystemConfiguration, SystemConfigurationUpdate, device_token_prefix,
     generate_device_token, hash_device_token, verify_device_token,
 };
 use iot_storage::{
+    AccountClass as StorageAccountClass, AuthorizationRepository, AuthorizationSubject,
     CommandOutboxState, NewCommandOutboxEntry, PlatformStore, SqliteStore, SqliteStoreError,
 };
 use serde::{Deserialize, Serialize};
@@ -45,9 +47,10 @@ use crate::{
     CoreClient, CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest,
     CoreFacade, CoreFacadeError, CoreTelemetryBucket, CoreTelemetryQuery, TokenVault,
     auth::{
-        AccountClass, Admin, AuthContext, AuthError, AuthenticatedUser, POWER_MONITOR_APP, Role,
-        System, authenticate_credentials, authenticate_credentials_sqlite, change_password,
-        change_password_sqlite, default_user, generate_session_id, hash_password,
+        AccountClass, Admin, AuthContext, AuthError, AuthenticatedUser, BearerAccessTokenError,
+        POWER_MONITOR_APP, Role, System, authenticate_credentials, authenticate_credentials_sqlite,
+        change_password, change_password_sqlite, default_user, extract_bearer_access_token,
+        generate_session_id, hash_password, validate_bearer_access_token,
     },
     device_tokens::{
         DeviceTokenResponse, DeviceTokenStoreError, create as create_device_token,
@@ -754,7 +757,339 @@ fn public_router(state: ApiState) -> Router {
         .route("/healthz", get(healthz))
         .route("/oauth/authorize", get(crate::oauth::authorize))
         .route("/oauth/token", post(crate::oauth::token))
+        .route("/api/v1/devices", get(public_list_devices))
         .with_state(state)
+}
+
+const DEFAULT_PUBLIC_DEVICE_LIST_LIMIT: usize = 50;
+const MAX_PUBLIC_DEVICE_LIST_LIMIT: usize = 100;
+
+#[derive(Debug, Deserialize)]
+struct PublicDeviceListQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicDeviceListResponse {
+    items: Vec<DeviceSummary>,
+    next_cursor: Option<String>,
+    has_more: bool,
+}
+
+struct PublicDeviceRow {
+    device_id: String,
+    display_name: Option<String>,
+    last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublicApiError {
+    BadRequest,
+    Unauthorized,
+    Forbidden,
+    Unavailable,
+}
+
+impl From<BearerAccessTokenError> for PublicApiError {
+    fn from(error: BearerAccessTokenError) -> Self {
+        match error {
+            BearerAccessTokenError::Missing | BearerAccessTokenError::Denied => Self::Unauthorized,
+            BearerAccessTokenError::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl IntoResponse for PublicApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::BadRequest => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the request is invalid",
+            ),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "OAuth bearer authentication is required",
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "the access token is not authorized for this resource",
+            ),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "the service is temporarily unavailable",
+            ),
+        };
+        (
+            status,
+            Json(json!({
+                "code": code,
+                "message": message,
+                "request_id": Uuid::now_v7().to_string(),
+                "details": serde_json::Value::Null,
+            })),
+        )
+            .into_response()
+    }
+}
+
+async fn public_list_devices(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    query: Result<Query<PublicDeviceListQuery>, QueryRejection>,
+) -> Result<Json<PublicDeviceListResponse>, PublicApiError> {
+    let Query(query) = query.map_err(|_| PublicApiError::BadRequest)?;
+    let limit = public_device_list_limit(query.limit)?;
+    let after = query
+        .after
+        .as_deref()
+        .map(decode_public_device_cursor)
+        .transpose()?;
+    extract_bearer_access_token(&headers).map_err(PublicApiError::from)?;
+    let oauth_store = state.oauth_store().ok_or(PublicApiError::Unavailable)?;
+    let token = validate_bearer_access_token(oauth_store.as_ref(), &headers, Utc::now()).await?;
+    if !token.allows_scope("devices:read") {
+        return Err(PublicApiError::Forbidden);
+    }
+    let subject = public_authorization_subject(&state.pool, token.user_id).await?;
+    let rows = public_device_rows(&state.pool, after.as_deref()).await?;
+    public_device_page(oauth_store.as_ref(), &subject, rows, limit)
+        .await
+        .map(Json)
+}
+
+async fn sqlite_public_list_devices(
+    State(state): State<SqliteApiState>,
+    headers: HeaderMap,
+    query: Result<Query<PublicDeviceListQuery>, QueryRejection>,
+) -> Result<Json<PublicDeviceListResponse>, PublicApiError> {
+    let Query(query) = query.map_err(|_| PublicApiError::BadRequest)?;
+    let limit = public_device_list_limit(query.limit)?;
+    let after = query
+        .after
+        .as_deref()
+        .map(decode_public_device_cursor)
+        .transpose()?;
+    extract_bearer_access_token(&headers).map_err(PublicApiError::from)?;
+    let oauth_store = state.oauth_store().ok_or(PublicApiError::Unavailable)?;
+    let token = validate_bearer_access_token(oauth_store.as_ref(), &headers, Utc::now()).await?;
+    if !token.allows_scope("devices:read") {
+        return Err(PublicApiError::Forbidden);
+    }
+    let subject = sqlite_public_authorization_subject(state.store.pool(), token.user_id).await?;
+    let rows = sqlite_public_device_rows(state.store.pool(), after.as_deref()).await?;
+    public_device_page(oauth_store.as_ref(), &subject, rows, limit)
+        .await
+        .map(Json)
+}
+
+fn public_device_list_limit(limit: Option<usize>) -> Result<usize, PublicApiError> {
+    let limit = limit.unwrap_or(DEFAULT_PUBLIC_DEVICE_LIST_LIMIT);
+    if !(1..=MAX_PUBLIC_DEVICE_LIST_LIMIT).contains(&limit) {
+        return Err(PublicApiError::BadRequest);
+    }
+    Ok(limit)
+}
+
+fn encode_public_device_cursor(device_id: &str) -> String {
+    URL_SAFE_NO_PAD.encode(device_id.as_bytes())
+}
+
+fn decode_public_device_cursor(cursor: &str) -> Result<String, PublicApiError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| PublicApiError::BadRequest)?;
+    let device_id = String::from_utf8(bytes).map_err(|_| PublicApiError::BadRequest)?;
+    if device_id.is_empty() {
+        return Err(PublicApiError::BadRequest);
+    }
+    Ok(device_id)
+}
+
+fn public_authorization_subject_from_account_class(
+    user_id: Uuid,
+    account_class: &str,
+) -> Result<AuthorizationSubject, PublicApiError> {
+    let account_class = match account_class {
+        "system" => StorageAccountClass::System,
+        "admin" => StorageAccountClass::Admin,
+        "user" => StorageAccountClass::User,
+        _ => return Err(PublicApiError::Unavailable),
+    };
+    Ok(AuthorizationSubject {
+        user_id,
+        account_class,
+    })
+}
+
+async fn public_authorization_subject(
+    pool: &PgPool,
+    user_id: Option<Uuid>,
+) -> Result<AuthorizationSubject, PublicApiError> {
+    let user_id = user_id.ok_or(PublicApiError::Forbidden)?;
+    let account_class =
+        sqlx::query_scalar::<_, String>("SELECT account_class FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| PublicApiError::Unavailable)?
+            .ok_or(PublicApiError::Forbidden)?;
+    public_authorization_subject_from_account_class(user_id, &account_class)
+}
+
+async fn sqlite_public_authorization_subject(
+    pool: &sqlx::SqlitePool,
+    user_id: Option<Uuid>,
+) -> Result<AuthorizationSubject, PublicApiError> {
+    let user_id = user_id.ok_or(PublicApiError::Forbidden)?;
+    let account_class =
+        sqlx::query_scalar::<_, String>("SELECT account_class FROM users WHERE id = ?")
+            .bind(user_id.to_string())
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| PublicApiError::Unavailable)?
+            .ok_or(PublicApiError::Forbidden)?;
+    public_authorization_subject_from_account_class(user_id, &account_class)
+}
+
+async fn public_device_rows(
+    pool: &PgPool,
+    after: Option<&str>,
+) -> Result<Vec<PublicDeviceRow>, PublicApiError> {
+    let rows = if let Some(after) = after {
+        sqlx::query(
+            "SELECT device_id, display_name, last_seen_at
+             FROM devices
+             WHERE deleted_at IS NULL AND device_id > $1
+             ORDER BY device_id",
+        )
+        .bind(after)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT device_id, display_name, last_seen_at
+             FROM devices
+             WHERE deleted_at IS NULL
+             ORDER BY device_id",
+        )
+        .fetch_all(pool)
+        .await
+    }
+    .map_err(|_| PublicApiError::Unavailable)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(PublicDeviceRow {
+                device_id: row
+                    .try_get("device_id")
+                    .map_err(|_| PublicApiError::Unavailable)?,
+                display_name: row
+                    .try_get("display_name")
+                    .map_err(|_| PublicApiError::Unavailable)?,
+                last_seen_at: row
+                    .try_get("last_seen_at")
+                    .map_err(|_| PublicApiError::Unavailable)?,
+            })
+        })
+        .collect()
+}
+
+async fn sqlite_public_device_rows(
+    pool: &sqlx::SqlitePool,
+    after: Option<&str>,
+) -> Result<Vec<PublicDeviceRow>, PublicApiError> {
+    let rows = if let Some(after) = after {
+        sqlx::query(
+            "SELECT device_id, display_name, last_seen_at
+             FROM devices
+             WHERE deleted_at IS NULL AND device_id > ?
+             ORDER BY device_id",
+        )
+        .bind(after)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query(
+            "SELECT device_id, display_name, last_seen_at
+             FROM devices
+             WHERE deleted_at IS NULL
+             ORDER BY device_id",
+        )
+        .fetch_all(pool)
+        .await
+    }
+    .map_err(|_| PublicApiError::Unavailable)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let last_seen_at = row
+                .try_get::<Option<String>, _>("last_seen_at")
+                .map_err(|_| PublicApiError::Unavailable)?
+                .map(|value| sqlite_timestamp(&value))
+                .transpose()
+                .map_err(|_| PublicApiError::Unavailable)?;
+            Ok(PublicDeviceRow {
+                device_id: row
+                    .try_get("device_id")
+                    .map_err(|_| PublicApiError::Unavailable)?,
+                display_name: row
+                    .try_get("display_name")
+                    .map_err(|_| PublicApiError::Unavailable)?,
+                last_seen_at,
+            })
+        })
+        .collect()
+}
+
+async fn public_device_page(
+    oauth_store: &PlatformStore,
+    subject: &AuthorizationSubject,
+    rows: Vec<PublicDeviceRow>,
+    limit: usize,
+) -> Result<PublicDeviceListResponse, PublicApiError> {
+    let online_threshold = Utc::now() - Duration::minutes(5);
+    let mut items = Vec::new();
+    for row in rows {
+        if AuthorizationRepository::device_permission(oauth_store, subject, &row.device_id)
+            .await
+            .map_err(|_| PublicApiError::Unavailable)?
+            .is_none()
+        {
+            continue;
+        }
+        items.push(DeviceSummary {
+            device_id: row.device_id,
+            display_name: row.display_name,
+            online: row
+                .last_seen_at
+                .is_some_and(|last_seen_at| last_seen_at >= online_threshold),
+            last_seen_at: row.last_seen_at,
+        });
+        if items.len() > limit {
+            break;
+        }
+    }
+    let has_more = items.len() > limit;
+    if has_more {
+        items.pop();
+    }
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(|device| encode_public_device_cursor(&device.device_id))
+    } else {
+        None
+    };
+    Ok(PublicDeviceListResponse {
+        items,
+        next_cursor,
+        has_more,
+    })
 }
 
 fn management_router(state: ApiState) -> Router {
@@ -896,6 +1231,7 @@ pub fn sqlite_router(state: SqliteApiState) -> Router {
         .route("/healthz", get(healthz))
         .route("/oauth/authorize", get(crate::oauth::sqlite_authorize))
         .route("/oauth/token", post(crate::oauth::sqlite_token))
+        .route("/api/v1/devices", get(sqlite_public_list_devices))
         .route("/api/auth/login", post(sqlite_login))
         .route(
             "/internal/mqttd/session-resolution",
