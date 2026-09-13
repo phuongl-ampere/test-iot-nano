@@ -193,6 +193,33 @@ async fn sqlite_telemetry_aggregate_returns_none_without_numeric_samples() {
     assert!(result.is_none());
 }
 
+#[tokio::test]
+async fn sqlite_telemetry_aggregate_excludes_nonfinite_json_numbers() {
+    let (_directory, store) = sqlite_store().await;
+    for (event_at, sequence, measurements) in [
+        ("2026-01-01T00:00:00Z", 1, r#"{"temperature_c":1.25}"#),
+        ("2026-01-01T00:00:10Z", 2, r#"{"temperature_c":-2.5}"#),
+        ("2026-01-01T00:00:20Z", 3, r#"{"temperature_c":9e999}"#),
+        ("2026-01-01T00:00:30Z", 4, r#"{"temperature_c":-9e999}"#),
+    ] {
+        insert_sqlite_telemetry(&store, event_at, sequence, measurements).await;
+    }
+
+    let aggregate = TelemetryAggregateRepository::average_metric(
+        &store,
+        "aggregate-device",
+        "temperature_c",
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(aggregate.average, -0.625);
+    assert_eq!(aggregate.sample_count, 2);
+}
+
 async fn timescale_store() -> (String, PlatformStore, PgConnection) {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
@@ -246,6 +273,8 @@ async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
             4,
             r#"{"temperature_c":"not-a-number"}"#,
         ),
+        ("2026-01-01T00:00:50Z", 5, r#"{"other":99}"#),
+        ("2026-01-01T00:00:55Z", 6, r#"{"temperature_c":null}"#),
     ] {
         let event_at = chrono::DateTime::parse_from_rfc3339(event_at)
             .unwrap()
@@ -263,5 +292,17 @@ async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
         .await
         .unwrap();
     }
-    exercise_aggregate_contract(&store).await;
+    let aggregate = TelemetryAggregateRepository::average_metric(
+        &store,
+        "aggregate-device",
+        "temperature_c",
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(aggregate.average, 20.0);
+    assert_eq!(aggregate.sample_count, 3);
 }

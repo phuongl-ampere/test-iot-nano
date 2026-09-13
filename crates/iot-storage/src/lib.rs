@@ -2428,12 +2428,16 @@ impl PlatformStore {
                      FROM canonical_telemetry
                      WHERE event_at_micros >= ?
                        AND event_at_micros <= ?
-                       AND json_type(measurements, ?) IN ('integer', 'real')",
+                       AND json_type(measurements, ?) IN ('integer', 'real')
+                       AND json_extract(measurements, ?) > -1.0e999
+                       AND json_extract(measurements, ?) < 1.0e999",
                 )
                 .bind(device_id)
                 .bind(&path)
                 .bind(from.timestamp_micros())
                 .bind(to.timestamp_micros())
+                .bind(&path)
+                .bind(&path)
                 .bind(&path)
                 .fetch_one(store.pool())
                 .await?;
