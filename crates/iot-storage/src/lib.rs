@@ -389,6 +389,17 @@ pub enum PlatformStoreError {
         #[source]
         source: chrono::ParseError,
     },
+    #[error("incident ID is not a UUID: {0:?}")]
+    InvalidIncidentId(String),
+    #[error("invalid alert incident status: {0:?}")]
+    InvalidIncidentStatus(String),
+    #[error("invalid alert incident {column} timestamp: {value}")]
+    InvalidIncidentTimestamp {
+        column: &'static str,
+        value: String,
+        #[source]
+        source: chrono::ParseError,
+    },
     #[error("device is not registered: {0:?}")]
     UnknownDevice(String),
     #[error("device token authentication denied")]
@@ -797,6 +808,114 @@ pub trait AlertRepository: Send + Sync {
         boot_id: uuid::Uuid,
         sequence: u64,
     ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertIncidentStatus {
+    Pending,
+    Open,
+    Resolved,
+}
+
+impl AlertIncidentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, PlatformStoreError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "open" => Ok(Self::Open),
+            "resolved" => Ok(Self::Resolved),
+            _ => Err(PlatformStoreError::InvalidIncidentStatus(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewAlertIncident {
+    pub id: uuid::Uuid,
+    pub rule_id: uuid::Uuid,
+    pub device_id: String,
+    pub status: AlertIncidentStatus,
+    pub condition_started_at: DateTime<Utc>,
+    pub last_value: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlertIncident {
+    pub id: uuid::Uuid,
+    pub rule_id: uuid::Uuid,
+    pub device_id: String,
+    pub status: AlertIncidentStatus,
+    pub condition_started_at: DateTime<Utc>,
+    pub recovery_started_at: Option<DateTime<Utc>>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub last_value: Option<f64>,
+    pub last_notified_at: Option<DateTime<Utc>>,
+    pub last_reminder_at: Option<DateTime<Utc>>,
+    pub state_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewNotificationOutboxEntry {
+    pub id: uuid::Uuid,
+    pub kind: NotificationKind,
+    pub dedupe_key: String,
+    pub subject: String,
+    pub body: String,
+    pub next_attempt_at: DateTime<Utc>,
+}
+
+pub trait AlertIncidentRepository: Send + Sync {
+    fn create_incident<'a>(
+        &'a self,
+        incident: NewAlertIncident,
+        opened_notification: Option<NewNotificationOutboxEntry>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
+    fn update_incident_last_value<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        last_value: Option<f64>,
+        updated_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
+    fn open_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        opened_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
+    fn recover_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        recovery_started_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
+    fn resolve_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        resolved_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
+    fn remind_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        reminded_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
+    fn enqueue_notification<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        notification: NewNotificationOutboxEntry,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<NotificationOutboxRecord, PlatformStoreError>> + Send + 'a>,
+    >;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1905,6 +2024,143 @@ impl PlatformStore {
         }
     }
 
+    pub async fn create_incident(
+        &self,
+        incident: NewAlertIncident,
+        opened_notification: Option<NewNotificationOutboxEntry>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        let incident = canonical_incident(incident);
+        match self {
+            Self::Sqlite(store) => Ok(store.create_incident(incident, opened_notification).await?),
+            Self::Timescale(pool) => {
+                create_timescale_incident(pool, incident, opened_notification).await
+            }
+        }
+    }
+
+    pub async fn update_incident_last_value(
+        &self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        last_value: Option<f64>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .update_incident_last_value(
+                    &incident_id.to_string(),
+                    expected_version,
+                    last_value,
+                    canonical_postgres_timestamp(updated_at),
+                )
+                .await?),
+            Self::Timescale(pool) => {
+                update_timescale_incident_last_value(
+                    pool,
+                    incident_id,
+                    expected_version,
+                    last_value,
+                    canonical_postgres_timestamp(updated_at),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn open_incident(
+        &self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        opened_at: DateTime<Utc>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        self.update_incident_transition(
+            incident_id,
+            expected_version,
+            AlertIncidentTransition::Open(canonical_postgres_timestamp(opened_at)),
+        )
+        .await
+    }
+
+    pub async fn recover_incident(
+        &self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        recovery_started_at: DateTime<Utc>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        self.update_incident_transition(
+            incident_id,
+            expected_version,
+            AlertIncidentTransition::Recover(canonical_postgres_timestamp(recovery_started_at)),
+        )
+        .await
+    }
+
+    pub async fn resolve_incident(
+        &self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        resolved_at: DateTime<Utc>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        self.update_incident_transition(
+            incident_id,
+            expected_version,
+            AlertIncidentTransition::Resolve(canonical_postgres_timestamp(resolved_at)),
+        )
+        .await
+    }
+
+    pub async fn remind_incident(
+        &self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        reminded_at: DateTime<Utc>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        self.update_incident_transition(
+            incident_id,
+            expected_version,
+            AlertIncidentTransition::Remind(canonical_postgres_timestamp(reminded_at)),
+        )
+        .await
+    }
+
+    async fn update_incident_transition(
+        &self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        transition: AlertIncidentTransition,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .update_incident_transition(&incident_id.to_string(), expected_version, transition)
+                .await?),
+            Self::Timescale(pool) => {
+                update_timescale_incident_transition(
+                    pool,
+                    incident_id,
+                    expected_version,
+                    transition,
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn enqueue_notification(
+        &self,
+        incident_id: uuid::Uuid,
+        notification: NewNotificationOutboxEntry,
+    ) -> Result<NotificationOutboxRecord, PlatformStoreError> {
+        let notification = canonical_notification(notification);
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .enqueue_notification(&incident_id.to_string(), notification)
+                .await?),
+            Self::Timescale(pool) => {
+                enqueue_timescale_notification(pool, incident_id, notification).await
+            }
+        }
+    }
+
     pub async fn release_notification_for_retry(
         &self,
         notification_id: uuid::Uuid,
@@ -2220,6 +2476,164 @@ async fn claim_timescale_notifications(
         .collect()
 }
 
+async fn create_timescale_incident(
+    pool: &PgPool,
+    incident: NewAlertIncident,
+    opened_notification: Option<NewNotificationOutboxEntry>,
+) -> Result<Option<AlertIncident>, PlatformStoreError> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, rule_id, device_id, status, condition_started_at, opened_at, last_value
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(incident.id)
+    .bind(incident.rule_id)
+    .bind(&incident.device_id)
+    .bind(incident.status.as_str())
+    .bind(incident.condition_started_at)
+    .bind((incident.status == AlertIncidentStatus::Open).then_some(incident.condition_started_at))
+    .bind(incident.last_value)
+    .execute(&mut *transaction)
+    .await?;
+    if let Some(notification) = opened_notification {
+        sqlx::query(
+            "INSERT INTO notification_outbox (
+                id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(notification.id)
+        .bind(incident.id)
+        .bind(notification.kind.as_str())
+        .bind(notification.dedupe_key)
+        .bind(notification.subject)
+        .bind(notification.body)
+        .bind(notification.next_attempt_at)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    let row = sqlx::query(
+        "SELECT id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                state_version
+         FROM alert_incidents WHERE id = $1",
+    )
+    .bind(incident.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    postgres_alert_incident_record(row).map(Some)
+}
+
+async fn update_timescale_incident_last_value(
+    pool: &PgPool,
+    incident_id: uuid::Uuid,
+    expected_version: i64,
+    last_value: Option<f64>,
+    updated_at: DateTime<Utc>,
+) -> Result<Option<AlertIncident>, PlatformStoreError> {
+    let row = sqlx::query(
+        "UPDATE alert_incidents
+         SET last_value = $1, state_version = state_version + 1, updated_at = $2
+         WHERE id = $3 AND state_version = $4 AND status IN ('pending', 'open')
+         RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                   opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                   state_version",
+    )
+    .bind(last_value)
+    .bind(updated_at)
+    .bind(incident_id)
+    .bind(expected_version)
+    .fetch_optional(pool)
+    .await?;
+    row.map(postgres_alert_incident_record).transpose()
+}
+
+async fn update_timescale_incident_transition(
+    pool: &PgPool,
+    incident_id: uuid::Uuid,
+    expected_version: i64,
+    transition: AlertIncidentTransition,
+) -> Result<Option<AlertIncident>, PlatformStoreError> {
+    let query = match transition {
+        AlertIncidentTransition::Open(_) => sqlx::query(
+            "UPDATE alert_incidents
+             SET status = 'open', opened_at = $1, updated_at = $1,
+                 state_version = state_version + 1
+             WHERE id = $2 AND state_version = $3 AND status = 'pending'
+             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                       opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                       state_version",
+        ),
+        AlertIncidentTransition::Recover(_) => sqlx::query(
+            "UPDATE alert_incidents
+             SET recovery_started_at = $1, updated_at = $1,
+                 state_version = state_version + 1
+             WHERE id = $2 AND state_version = $3 AND status = 'open'
+                   AND recovery_started_at IS NULL
+             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                       opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                       state_version",
+        ),
+        AlertIncidentTransition::Resolve(_) => sqlx::query(
+            "UPDATE alert_incidents
+             SET status = 'resolved', resolved_at = $1, updated_at = $1,
+                 state_version = state_version + 1
+             WHERE id = $2 AND state_version = $3 AND status = 'open'
+             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                       opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                       state_version",
+        ),
+        AlertIncidentTransition::Remind(_) => sqlx::query(
+            "UPDATE alert_incidents
+             SET last_reminder_at = $1, updated_at = $1,
+                 state_version = state_version + 1
+             WHERE id = $2 AND state_version = $3 AND status = 'open'
+             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                       opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                       state_version",
+        ),
+    };
+    let row = query
+        .bind(transition.timestamp())
+        .bind(incident_id)
+        .bind(expected_version)
+        .fetch_optional(pool)
+        .await?;
+    row.map(postgres_alert_incident_record).transpose()
+}
+
+async fn enqueue_timescale_notification(
+    pool: &PgPool,
+    incident_id: uuid::Uuid,
+    notification: NewNotificationOutboxEntry,
+) -> Result<NotificationOutboxRecord, PlatformStoreError> {
+    sqlx::query(
+        "INSERT INTO notification_outbox (
+            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (dedupe_key) DO NOTHING",
+    )
+    .bind(notification.id)
+    .bind(incident_id)
+    .bind(notification.kind.as_str())
+    .bind(&notification.dedupe_key)
+    .bind(&notification.subject)
+    .bind(&notification.body)
+    .bind(notification.next_attempt_at)
+    .execute(pool)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id, incident_id, kind, dedupe_key, subject, body, state,
+                next_attempt_at, lease_until, attempt_count, last_error, sent_at
+         FROM notification_outbox WHERE dedupe_key = $1",
+    )
+    .bind(notification.dedupe_key)
+    .fetch_one(pool)
+    .await?;
+    postgres_notification_outbox_record(row)
+}
+
 async fn mark_timescale_notification_sent(
     pool: &PgPool,
     notification_id: uuid::Uuid,
@@ -2345,6 +2759,36 @@ fn canonical_postgres_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {
     timestamp
         .with_nanosecond(timestamp.nanosecond() / 1_000 * 1_000)
         .expect("a valid UTC timestamp can be represented at microsecond precision")
+}
+
+fn canonical_incident(mut incident: NewAlertIncident) -> NewAlertIncident {
+    incident.condition_started_at = canonical_postgres_timestamp(incident.condition_started_at);
+    incident
+}
+
+fn canonical_notification(
+    mut notification: NewNotificationOutboxEntry,
+) -> NewNotificationOutboxEntry {
+    notification.next_attempt_at = canonical_postgres_timestamp(notification.next_attempt_at);
+    notification
+}
+
+enum AlertIncidentTransition {
+    Open(DateTime<Utc>),
+    Recover(DateTime<Utc>),
+    Resolve(DateTime<Utc>),
+    Remind(DateTime<Utc>),
+}
+
+impl AlertIncidentTransition {
+    fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            Self::Open(timestamp)
+            | Self::Recover(timestamp)
+            | Self::Resolve(timestamp)
+            | Self::Remind(timestamp) => *timestamp,
+        }
+    }
 }
 
 impl AlertRepository for PlatformStore {
@@ -2560,6 +3004,93 @@ impl AuthorizationRepository for PlatformStore {
         >,
     > {
         Box::pin(async move { PlatformStore::asset_permission(self, subject, asset_id).await })
+    }
+}
+
+impl AlertIncidentRepository for PlatformStore {
+    fn create_incident<'a>(
+        &'a self,
+        incident: NewAlertIncident,
+        opened_notification: Option<NewNotificationOutboxEntry>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { self.create_incident(incident, opened_notification).await })
+    }
+
+    fn update_incident_last_value<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        last_value: Option<f64>,
+        updated_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.update_incident_last_value(incident_id, expected_version, last_value, updated_at)
+                .await
+        })
+    }
+
+    fn open_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        opened_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.open_incident(incident_id, expected_version, opened_at)
+                .await
+        })
+    }
+
+    fn recover_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        recovery_started_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.recover_incident(incident_id, expected_version, recovery_started_at)
+                .await
+        })
+    }
+
+    fn resolve_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        resolved_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.resolve_incident(incident_id, expected_version, resolved_at)
+                .await
+        })
+    }
+
+    fn remind_incident<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        expected_version: i64,
+        reminded_at: DateTime<Utc>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.remind_incident(incident_id, expected_version, reminded_at)
+                .await
+        })
+    }
+
+    fn enqueue_notification<'a>(
+        &'a self,
+        incident_id: uuid::Uuid,
+        notification: NewNotificationOutboxEntry,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<NotificationOutboxRecord, PlatformStoreError>> + Send + 'a>,
+    > {
+        Box::pin(async move { self.enqueue_notification(incident_id, notification).await })
     }
 }
 
@@ -3041,6 +3572,14 @@ pub enum NotificationKind {
 }
 
 impl NotificationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Opened => "opened",
+            Self::Resolved => "resolved",
+            Self::Reminder => "reminder",
+        }
+    }
+
     fn from_database(value: &str) -> Result<Self, PlatformStoreError> {
         match value {
             "opened" => Ok(Self::Opened),
@@ -3344,6 +3883,175 @@ impl SqliteStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(notification_outbox_record).collect()
+    }
+
+    async fn create_incident(
+        &self,
+        incident: NewAlertIncident,
+        opened_notification: Option<NewNotificationOutboxEntry>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO alert_incidents (
+                id, rule_id, device_id, status, condition_started_at, opened_at, last_value
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(incident.id.to_string())
+        .bind(incident.rule_id.to_string())
+        .bind(&incident.device_id)
+        .bind(incident.status.as_str())
+        .bind(incident.condition_started_at.to_rfc3339())
+        .bind(
+            (incident.status == AlertIncidentStatus::Open)
+                .then(|| incident.condition_started_at.to_rfc3339()),
+        )
+        .bind(incident.last_value)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(notification) = opened_notification {
+            sqlx::query(
+                "INSERT INTO notification_outbox (
+                    id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(notification.id.to_string())
+            .bind(incident.id.to_string())
+            .bind(notification.kind.as_str())
+            .bind(notification.dedupe_key)
+            .bind(notification.subject)
+            .bind(notification.body)
+            .bind(notification.next_attempt_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        let row = sqlx::query(
+            "SELECT id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                    opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                    state_version
+             FROM alert_incidents WHERE id = ?",
+        )
+        .bind(incident.id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        sqlite_alert_incident_record(row).map(Some)
+    }
+
+    async fn update_incident_last_value(
+        &self,
+        incident_id: &str,
+        expected_version: i64,
+        last_value: Option<f64>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        let row = sqlx::query(
+            "UPDATE alert_incidents
+             SET last_value = ?, state_version = state_version + 1, updated_at = ?
+             WHERE id = ? AND state_version = ? AND status IN ('pending', 'open')
+             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                       opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                       state_version",
+        )
+        .bind(last_value)
+        .bind(updated_at.to_rfc3339())
+        .bind(incident_id)
+        .bind(expected_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(sqlite_alert_incident_record).transpose()
+    }
+
+    async fn update_incident_transition(
+        &self,
+        incident_id: &str,
+        expected_version: i64,
+        transition: AlertIncidentTransition,
+    ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        let timestamp = transition.timestamp().to_rfc3339();
+        let query = match transition {
+            AlertIncidentTransition::Open(_) => sqlx::query(
+                "UPDATE alert_incidents
+                 SET status = 'open', opened_at = ?, updated_at = ?,
+                     state_version = state_version + 1
+                 WHERE id = ? AND state_version = ? AND status = 'pending'
+                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                           opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                           state_version",
+            )
+            .bind(&timestamp)
+            .bind(&timestamp),
+            AlertIncidentTransition::Recover(_) => sqlx::query(
+                "UPDATE alert_incidents
+                 SET recovery_started_at = ?, updated_at = ?,
+                     state_version = state_version + 1
+                 WHERE id = ? AND state_version = ? AND status = 'open'
+                       AND recovery_started_at IS NULL
+                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                           opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                           state_version",
+            )
+            .bind(&timestamp)
+            .bind(&timestamp),
+            AlertIncidentTransition::Resolve(_) => sqlx::query(
+                "UPDATE alert_incidents
+                 SET status = 'resolved', resolved_at = ?, updated_at = ?,
+                     state_version = state_version + 1
+                 WHERE id = ? AND state_version = ? AND status = 'open'
+                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                           opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                           state_version",
+            )
+            .bind(&timestamp)
+            .bind(&timestamp),
+            AlertIncidentTransition::Remind(_) => sqlx::query(
+                "UPDATE alert_incidents
+                 SET last_reminder_at = ?, updated_at = ?,
+                     state_version = state_version + 1
+                 WHERE id = ? AND state_version = ? AND status = 'open'
+                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                           opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
+                           state_version",
+            )
+            .bind(&timestamp)
+            .bind(&timestamp),
+        };
+        let row = query
+            .bind(incident_id)
+            .bind(expected_version)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(sqlite_alert_incident_record).transpose()
+    }
+
+    async fn enqueue_notification(
+        &self,
+        incident_id: &str,
+        notification: NewNotificationOutboxEntry,
+    ) -> Result<NotificationOutboxRecord, PlatformStoreError> {
+        sqlx::query(
+            "INSERT INTO notification_outbox (
+                id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(dedupe_key) DO NOTHING",
+        )
+        .bind(notification.id.to_string())
+        .bind(incident_id)
+        .bind(notification.kind.as_str())
+        .bind(&notification.dedupe_key)
+        .bind(&notification.subject)
+        .bind(&notification.body)
+        .bind(notification.next_attempt_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        let row = sqlx::query(
+            "SELECT id, incident_id, kind, dedupe_key, subject, body, state,
+                    next_attempt_at, lease_until, attempt_count, last_error, sent_at
+             FROM notification_outbox WHERE dedupe_key = ?",
+        )
+        .bind(notification.dedupe_key)
+        .fetch_one(&self.pool)
+        .await?;
+        notification_outbox_record(row)
     }
 
     pub async fn mark_notification_sent(
@@ -3834,6 +4542,77 @@ fn command_outbox_record(row: SqliteRow) -> Result<CommandOutboxRecord, SqliteSt
         response: row.try_get("response")?,
         responded_at: command_optional_timestamp(&row, "responded_at")?,
     })
+}
+
+fn sqlite_alert_incident_record(row: SqliteRow) -> Result<AlertIncident, PlatformStoreError> {
+    let id: String = row.try_get("id")?;
+    let rule_id: String = row.try_get("rule_id")?;
+    Ok(AlertIncident {
+        id: uuid::Uuid::parse_str(&id).map_err(|_| PlatformStoreError::InvalidIncidentId(id))?,
+        rule_id: uuid::Uuid::parse_str(&rule_id)
+            .map_err(|_| PlatformStoreError::InvalidIncidentId(rule_id))?,
+        device_id: row.try_get("device_id")?,
+        status: AlertIncidentStatus::from_database(&row.try_get::<String, _>("status")?)?,
+        condition_started_at: incident_timestamp(&row, "condition_started_at")?,
+        recovery_started_at: incident_optional_timestamp(&row, "recovery_started_at")?,
+        opened_at: incident_optional_timestamp(&row, "opened_at")?,
+        resolved_at: incident_optional_timestamp(&row, "resolved_at")?,
+        last_value: row.try_get("last_value")?,
+        last_notified_at: incident_optional_timestamp(&row, "last_notified_at")?,
+        last_reminder_at: incident_optional_timestamp(&row, "last_reminder_at")?,
+        state_version: row.try_get("state_version")?,
+    })
+}
+
+fn postgres_alert_incident_record(row: PgRow) -> Result<AlertIncident, PlatformStoreError> {
+    Ok(AlertIncident {
+        id: row.try_get("id")?,
+        rule_id: row.try_get("rule_id")?,
+        device_id: row.try_get("device_id")?,
+        status: AlertIncidentStatus::from_database(&row.try_get::<String, _>("status")?)?,
+        condition_started_at: row.try_get("condition_started_at")?,
+        recovery_started_at: row.try_get("recovery_started_at")?,
+        opened_at: row.try_get("opened_at")?,
+        resolved_at: row.try_get("resolved_at")?,
+        last_value: row.try_get("last_value")?,
+        last_notified_at: row.try_get("last_notified_at")?,
+        last_reminder_at: row.try_get("last_reminder_at")?,
+        state_version: i64::from(row.try_get::<i32, _>("state_version")?),
+    })
+}
+
+fn incident_timestamp(
+    row: &SqliteRow,
+    column: &'static str,
+) -> Result<DateTime<Utc>, PlatformStoreError> {
+    let value: String = row.try_get(column)?;
+    parse_incident_timestamp(value, column)
+}
+
+fn incident_optional_timestamp(
+    row: &SqliteRow,
+    column: &'static str,
+) -> Result<Option<DateTime<Utc>>, PlatformStoreError> {
+    row.try_get::<Option<String>, _>(column)?
+        .map(|value| parse_incident_timestamp(value, column))
+        .transpose()
+}
+
+fn parse_incident_timestamp(
+    value: String,
+    column: &'static str,
+) -> Result<DateTime<Utc>, PlatformStoreError> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
+                .map(|timestamp| timestamp.and_utc())
+        })
+        .map_err(|source| PlatformStoreError::InvalidIncidentTimestamp {
+            column,
+            value,
+            source,
+        })
 }
 
 fn notification_outbox_record(
