@@ -2549,8 +2549,10 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let rows = sqlx::query(
-                    "SELECT d.device_id, d.display_name, d.last_seen_at
+                    "SELECT d.device_id, d.display_name, runtime.last_seen_at
                      FROM devices AS d
+                     LEFT JOIN device_runtime_state AS runtime
+                       ON runtime.device_id = d.device_id
                      WHERE d.deleted_at IS NULL
                        AND ($1::text IS NULL OR d.device_id > $1)
                        AND (
