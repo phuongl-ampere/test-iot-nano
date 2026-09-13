@@ -2,11 +2,9 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use iot_core::RpcMode;
+use iot_nano_core::{CommandTransport, CommandTransportError, TransportRpcPublishRequest};
 use iot_nano_monolith::PlatformCommandTransport;
 use iot_nano_mqttd::{RpcSessionRouter, SessionRegistration};
-use iot_nano_core::{
-    CommandTransport, CommandTransportError, TransportRpcPublishRequest,
-};
 use serde_json::json;
 use uuid::Uuid;
 

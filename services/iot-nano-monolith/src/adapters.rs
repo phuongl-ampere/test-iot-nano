@@ -2,13 +2,11 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use chrono::Utc;
 use iot_core::RpcRequest;
-use iot_nano_core::{
-    CommandTransport, CommandTransportError, TransportRpcPublishRequest,
-};
+use iot_nano_core::{CommandTransport, CommandTransportError, TransportRpcPublishRequest};
 use iot_nano_mqttd::{
     AuthenticatedDevice, AuthorizationError, CommandResponseError, CommandResponsePort,
-    DeviceAuthorizationPort, GatewayAuthorization, GatewayAuthorizationRequest,
-    RpcSessionRouter, SessionError, TransportAuthRequest, TransportRpcResponse,
+    DeviceAuthorizationPort, GatewayAuthorization, GatewayAuthorizationRequest, RpcSessionRouter,
+    SessionError, TransportAuthRequest, TransportRpcResponse,
 };
 use iot_storage::{
     DeviceAuthorizationRepository, IdentityRepository, PlatformStore, PlatformStoreError,
@@ -46,9 +44,7 @@ impl PlatformCommandTransport {
             request.expires_at,
             request.mode,
         )
-        .map_err(|_| {
-            CommandTransportError::Configuration("request is not valid".to_owned())
-        })?;
+        .map_err(|_| CommandTransportError::Configuration("request is not valid".to_owned()))?;
         self.router
             .publish_to_device(&device_id, rpc)
             .await
