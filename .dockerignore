@@ -1,0 +1,7 @@
+.git
+.codebase-memory
+.superpowers
+target
+**/node_modules
+**/.next
+**/.pio
