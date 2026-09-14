@@ -50,6 +50,14 @@ pub struct MonolithRuntime {
 }
 
 impl MonolithRuntime {
+    pub async fn migrate(config: &MonolithConfig) -> Result<(), StartupError> {
+        let platform = PlatformStore::open(&config.storage)
+            .await
+            .map_err(StartupError::PlatformMigration)?;
+        drop(platform);
+        Ok(())
+    }
+
     pub async fn start(config: MonolithConfig) -> Result<Self, StartupError> {
         let internal_directory = prepare_internal_directory(&config.internal_dir)?;
         let instance_lock = InstanceLock::acquire(&internal_directory)?;

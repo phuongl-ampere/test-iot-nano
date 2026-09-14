@@ -22,10 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if arguments.migrate_only {
-        return Err(io::Error::other(
-            "migrations are not available until platform storage is wired",
-        )
-        .into());
+        MonolithRuntime::migrate(&configuration).await?;
+        return Ok(());
     }
 
     let mut runtime = MonolithRuntime::start(configuration.clone()).await?;

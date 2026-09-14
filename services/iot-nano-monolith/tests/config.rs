@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::{SocketAddr, TcpListener};
 use std::process::Command;
 
 use iot_core::{DatabaseStorage, StorageConfiguration};
@@ -281,4 +282,61 @@ fn config_check_validates_without_logging_secret_values() {
         .unwrap();
     assert!(!invalid.status.success());
     assert!(!String::from_utf8_lossy(&invalid.stderr).contains("not-for-output"));
+}
+
+#[test]
+fn migrate_only_applies_platform_storage_without_binding_listeners() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let addresses = [
+        reserve_address(),
+        reserve_address(),
+        reserve_address(),
+        reserve_address(),
+    ];
+    let platform_path = root.join("platform.sqlite").display().to_string();
+    let internal_path = root.join("internal").display().to_string();
+    let certificate_path = root.join("server.crt").display().to_string();
+    let key_path = root.join("server.key").display().to_string();
+    let public_address = addresses[0].to_string();
+    let management_address = addresses[1].to_string();
+    let mqtt_tcp_address = addresses[2].to_string();
+    let mqtt_tls_address = addresses[3].to_string();
+    let configuration = values(&[
+        ("IOT_NANO_STORAGE", "sqlite"),
+        ("IOT_NANO_SQLITE_PATH", &platform_path),
+        (
+            "IOT_DEVICE_TOKEN_VAULT_KEY",
+            "test-device-token-vault-key-material-0001",
+        ),
+        ("IOT_NANO_INTERNAL_DIR", &internal_path),
+        ("IOT_NANO_TLS_CERT_PATH", &certificate_path),
+        ("IOT_NANO_TLS_KEY_PATH", &key_path),
+        ("IOT_NANO_PUBLIC_HTTP_ADDRESS", &public_address),
+        ("IOT_NANO_MANAGEMENT_ADDRESS", &management_address),
+        ("IOT_NANO_MQTT_TCP_ADDRESS", &mqtt_tcp_address),
+        ("IOT_NANO_MQTT_TLS_ADDRESS", &mqtt_tls_address),
+    ]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_iot-nano-monolith"))
+        .arg("--migrate-only")
+        .env_clear()
+        .envs(configuration)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(root.join("platform.sqlite").exists());
+    assert!(!root.join("internal").exists());
+    for address in addresses {
+        let listener = TcpListener::bind(address).unwrap();
+        drop(listener);
+    }
+}
+
+fn reserve_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    address
 }
