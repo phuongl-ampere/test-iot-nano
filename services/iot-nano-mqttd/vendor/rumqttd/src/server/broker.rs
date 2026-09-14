@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 #[cfg(test)]
 use std::sync::OnceLock;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use tracing::{error, field, info, warn, Instrument};
 
 #[cfg(feature = "websocket")]
@@ -134,10 +134,14 @@ type PreboundServerSpawnHook = Arc<dyn Fn(&str) -> io::Result<()> + Send + Sync>
 type PreboundStartupStatusHook = Arc<dyn Fn(&PreboundListenerSource) -> bool + Send + Sync>;
 
 #[cfg(test)]
+type PostAcceptAdmissionHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Default)]
 struct PreboundTestHooks {
     server_spawn: Option<PreboundServerSpawnHook>,
     suppress_startup_status: Option<PreboundStartupStatusHook>,
+    post_accept_admission: Option<PostAcceptAdmissionHook>,
     withheld_startup_senders: Vec<StartupSender>,
 }
 
@@ -171,9 +175,33 @@ fn install_prebound_test_hooks(
         .expect("prebound test hook mutex is not poisoned") = PreboundTestHooks {
         server_spawn,
         suppress_startup_status,
+        post_accept_admission: None,
         withheld_startup_senders: Vec::new(),
     };
     PreboundTestHooksGuard
+}
+
+#[cfg(test)]
+fn install_post_accept_admission_hook(hook: PostAcceptAdmissionHook) -> PreboundTestHooksGuard {
+    PREBOUND_TEST_HOOKS
+        .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+        .lock()
+        .expect("prebound test hook mutex is not poisoned")
+        .post_accept_admission = Some(hook);
+    PreboundTestHooksGuard
+}
+
+#[cfg(test)]
+fn before_accept_admission(server_name: &str) {
+    let hook = PREBOUND_TEST_HOOKS
+        .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+        .lock()
+        .expect("prebound test hook mutex is not poisoned")
+        .post_accept_admission
+        .clone();
+    if let Some(hook) = hook {
+        hook(server_name);
+    }
 }
 
 #[cfg(test)]
@@ -393,6 +421,34 @@ pub struct Broker {
     router_join: Option<thread::JoinHandle<Result<(), crate::router::RouterError>>>,
 }
 
+struct ServerAcceptanceGate {
+    closed: RwLock<bool>,
+}
+
+impl ServerAcceptanceGate {
+    fn new() -> Self {
+        Self {
+            closed: RwLock::new(false),
+        }
+    }
+
+    fn close(&self) {
+        *self
+            .closed
+            .write()
+            .expect("server acceptance gate lock is not poisoned") = true;
+    }
+
+    fn admit(&self, shutdown: &watch::Receiver<bool>) -> bool {
+        let closed = self
+            .closed
+            .read()
+            .expect("server acceptance gate lock is not poisoned");
+        let shutting_down = shutdown.borrow();
+        !*closed && !*shutting_down
+    }
+}
+
 impl Broker {
     pub fn new(config: Config) -> Result<Broker, Error> {
         let config = Arc::new(config);
@@ -529,15 +585,24 @@ impl Broker {
         startup: Option<StartupSender>,
     ) -> Result<BrokerHandle, Error> {
         let (shutdown, receiver) = watch::channel(false);
+        let acceptance_gate = Arc::new(ServerAcceptanceGate::new());
         let router_tx = self.router_tx.clone();
         let shutdown_for_thread = shutdown.clone();
+        let acceptance_gate_for_thread = Arc::clone(&acceptance_gate);
         let join = thread::Builder::new()
             .name("iot-mqtt-core-broker".to_owned())
             .spawn(move || {
-                self.start_with_shutdown(receiver, shutdown_for_thread, listeners, startup)
+                self.start_with_shutdown(
+                    receiver,
+                    shutdown_for_thread,
+                    acceptance_gate_for_thread,
+                    listeners,
+                    startup,
+                )
             })?;
         Ok(BrokerHandle {
             shutdown,
+            acceptance_gate,
             join: Some(join),
             router_tx,
         })
@@ -605,14 +670,21 @@ impl Broker {
     #[tracing::instrument(skip(self))]
     pub fn start(&mut self) -> Result<(), Error> {
         let (shutdown, receiver) = watch::channel(false);
-        self.start_with_shutdown(receiver, shutdown, None, None)
+        self.start_with_shutdown(
+            receiver,
+            shutdown,
+            Arc::new(ServerAcceptanceGate::new()),
+            None,
+            None,
+        )
     }
 
-    #[tracing::instrument(skip(self, listeners, startup))]
+    #[tracing::instrument(skip(self, acceptance_gate, listeners, startup))]
     fn start_with_shutdown(
         &mut self,
         shutdown: watch::Receiver<bool>,
         shutdown_sender: watch::Sender<bool>,
+        acceptance_gate: Arc<ServerAcceptanceGate>,
         mut listeners: Option<PreboundListeners>,
         startup: Option<StartupSender>,
     ) -> Result<(), Error> {
@@ -674,7 +746,11 @@ impl Broker {
             }) {
                 Ok(handle) => handle,
                 Err(error) => {
-                    self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                    self.shutdown_started_threads(
+                        &shutdown_sender,
+                        &acceptance_gate,
+                        server_thread_handles,
+                    );
                     return Err(error.into());
                 }
             };
@@ -687,6 +763,7 @@ impl Broker {
                 let server_name = config.name.clone();
                 let server_thread = thread::Builder::new().name(server_name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
+                server.set_acceptance_gate(Arc::clone(&acceptance_gate));
                 let shutdown = shutdown.clone();
                 let listener = listeners.as_mut().map(|listeners| {
                     listeners
@@ -697,7 +774,11 @@ impl Broker {
                 let startup = startup.clone();
                 let source = listener_source("v4", &name);
                 if let Err(error) = before_prebound_server_spawn(&server_name) {
-                    self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                    self.shutdown_started_threads(
+                        &shutdown_sender,
+                        &acceptance_gate,
+                        server_thread_handles,
+                    );
                     return Err(error.into());
                 }
                 let handle = match server_thread.spawn(move || {
@@ -726,7 +807,11 @@ impl Broker {
                 }) {
                     Ok(handle) => handle,
                     Err(error) => {
-                        self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                        self.shutdown_started_threads(
+                            &shutdown_sender,
+                            &acceptance_gate,
+                            server_thread_handles,
+                        );
                         return Err(error.into());
                     }
                 };
@@ -739,6 +824,7 @@ impl Broker {
                 let server_name = config.name.clone();
                 let server_thread = thread::Builder::new().name(server_name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V5);
+                server.set_acceptance_gate(Arc::clone(&acceptance_gate));
                 let shutdown = shutdown.clone();
                 let listener = listeners.as_mut().map(|listeners| {
                     listeners
@@ -749,7 +835,11 @@ impl Broker {
                 let startup = startup.clone();
                 let source = listener_source("v5", &name);
                 if let Err(error) = before_prebound_server_spawn(&server_name) {
-                    self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                    self.shutdown_started_threads(
+                        &shutdown_sender,
+                        &acceptance_gate,
+                        server_thread_handles,
+                    );
                     return Err(error.into());
                 }
                 let handle = match server_thread.spawn(move || {
@@ -778,7 +868,11 @@ impl Broker {
                 }) {
                     Ok(handle) => handle,
                     Err(error) => {
-                        self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                        self.shutdown_started_threads(
+                            &shutdown_sender,
+                            &acceptance_gate,
+                            server_thread_handles,
+                        );
                         return Err(error.into());
                     }
                 };
@@ -799,6 +893,7 @@ impl Broker {
                 let server_thread = thread::Builder::new().name(config.name.clone());
                 //TODO: Add support for V5 procotol with websockets. Registered in config or on ServerSettings
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
+                server.set_acceptance_gate(Arc::clone(&acceptance_gate));
                 let shutdown = shutdown.clone();
                 let handle = match server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
@@ -812,7 +907,11 @@ impl Broker {
                 }) {
                     Ok(handle) => handle,
                     Err(error) => {
-                        self.shutdown_started_threads(&shutdown_sender, server_thread_handles);
+                        self.shutdown_started_threads(
+                            &shutdown_sender,
+                            &acceptance_gate,
+                            server_thread_handles,
+                        );
                         return Err(error.into());
                     }
                 };
@@ -891,8 +990,10 @@ impl Broker {
     fn shutdown_started_threads(
         &mut self,
         shutdown: &watch::Sender<bool>,
+        acceptance_gate: &ServerAcceptanceGate,
         server_thread_handles: Vec<thread::JoinHandle<()>>,
     ) {
+        acceptance_gate.close();
         shutdown.send_replace(true);
         for handle in server_thread_handles {
             let _ = handle.join();
@@ -940,12 +1041,14 @@ fn shutdown_prebound_startup(handle: BrokerHandle, error: Error) -> Result<Broke
 
 pub struct BrokerHandle {
     shutdown: watch::Sender<bool>,
+    acceptance_gate: Arc<ServerAcceptanceGate>,
     join: Option<thread::JoinHandle<Result<(), Error>>>,
     router_tx: Sender<(ConnectionId, Event)>,
 }
 
 impl BrokerHandle {
     pub fn shutdown(&self) {
+        self.acceptance_gate.close();
         let _ = self.shutdown.send(true);
     }
 
@@ -985,6 +1088,7 @@ pub struct Server<P> {
     config: ServerSettings,
     router_tx: Sender<(ConnectionId, Event)>,
     protocol: P,
+    acceptance_gate: Arc<ServerAcceptanceGate>,
     awaiting_will_handler: Arc<Mutex<HashMap<String, Sender<AwaitingWill>>>>,
 }
 
@@ -998,8 +1102,13 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             config,
             router_tx,
             protocol,
+            acceptance_gate: Arc::new(ServerAcceptanceGate::new()),
             awaiting_will_handler: Arc::new(Mutex::new(HashMap::default())),
         }
+    }
+
+    fn set_acceptance_gate(&mut self, acceptance_gate: Arc<ServerAcceptanceGate>) {
+        self.acceptance_gate = acceptance_gate;
     }
 
     // Depending on TLS or not create a new Network
@@ -1084,6 +1193,13 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                 },
                 _ = shutdown.changed() => break,
             };
+
+            #[cfg(test)]
+            before_accept_admission(&self.config.name);
+
+            if !self.acceptance_gate.admit(&shutdown) {
+                continue;
+            }
 
             let (network, tenant_id) = match tokio::select! {
                 result = self.tls_accept(stream) => result,
@@ -1358,7 +1474,7 @@ async fn remote<P: Protocol>(
 mod tests {
     use std::{
         collections::HashMap,
-        io::Write,
+        io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
         sync::{mpsc, Arc, Mutex},
         thread,
@@ -1369,10 +1485,11 @@ mod tests {
     use crate::{
         BridgeConfig, Config, ConnectionSettings, PrometheusSetting, ServerSettings, Transport,
     };
+    use tokio::sync::watch;
 
     use super::{
-        install_prebound_test_hooks, prebound_test_serial, Broker, BrokerHandle, Error,
-        PreboundListenerSource,
+        install_post_accept_admission_hook, install_prebound_test_hooks, prebound_test_serial,
+        Broker, BrokerHandle, Error, PreboundListenerSource,
     };
 
     #[test]
@@ -1733,6 +1850,28 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_rejects_v4_prebound_connection_accepted_before_admission() {
+        shutdown_rejects_prebound_connection_accepted_before_admission("v4");
+    }
+
+    #[test]
+    fn shutdown_rejects_v5_prebound_connection_accepted_before_admission() {
+        shutdown_rejects_prebound_connection_accepted_before_admission("v5");
+    }
+
+    #[test]
+    fn acceptance_gate_rejects_admission_when_shutdown_closes_first() {
+        let gate = super::ServerAcceptanceGate::new();
+        let (shutdown, receiver) = watch::channel(false);
+
+        gate.close();
+
+        assert!(!gate.admit(&receiver));
+        shutdown.send(true).unwrap();
+        assert!(!gate.admit(&receiver));
+    }
+
+    #[test]
     fn dropping_an_unspawned_broker_stops_the_router() {
         let broker = Broker::new(Config::default()).unwrap();
         let router_tx = broker.router_tx.clone();
@@ -1744,6 +1883,66 @@ mod tests {
 
     fn prebound_test_config() -> (Config, TcpListener, TcpListener) {
         prebound_test_config_named("v311", "v5")
+    }
+
+    fn shutdown_rejects_prebound_connection_accepted_before_admission(protocol: &str) {
+        let _serial = prebound_test_serial()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (config, v4_listener, v5_listener) = prebound_test_config();
+        let v4_address = v4_listener.local_addr().unwrap();
+        let v5_address = v5_listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let expected_server = match protocol {
+            "v4" => "v311",
+            "v5" => "v5",
+            _ => panic!("unsupported protocol {protocol}"),
+        }
+        .to_owned();
+        let hook_server = expected_server.clone();
+        let _hooks = install_post_accept_admission_hook(Arc::new(move |server_name| {
+            if server_name == hook_server {
+                accepted_tx.send(server_name.to_owned()).unwrap();
+                release_rx
+                    .lock()
+                    .expect("admission release mutex is not poisoned")
+                    .recv()
+                    .expect("admission test must release the server");
+            }
+        }));
+        let handle = Broker::new_with_prebound_listeners(
+            config,
+            vec![("v311".to_owned(), v4_listener)],
+            vec![("v5".to_owned(), v5_listener)],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let address = if protocol == "v4" {
+            v4_address
+        } else {
+            v5_address
+        };
+        let mut stream = TcpStream::connect(address).unwrap();
+        let connect = if protocol == "v4" {
+            mqtt_v4_connect_with_login()
+        } else {
+            mqtt_v5_connect_with_login()
+        };
+        stream.write_all(&connect).unwrap();
+        assert_eq!(
+            accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            expected_server
+        );
+
+        handle.shutdown();
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+
+        assert_socket_closed_without_response(&mut stream);
+        assert!(TcpListener::bind(v4_address).is_ok());
+        assert!(TcpListener::bind(v5_address).is_ok());
     }
 
     fn prebound_test_config_named(
@@ -1867,6 +2066,66 @@ mod tests {
         packet
     }
 
+    fn mqtt_v5_connect_with_login() -> Vec<u8> {
+        let client_id = b"test";
+        let username = b"user";
+        let password = b"pass";
+        let remaining = 11 + 2 + client_id.len() + 2 + username.len() + 2 + password.len();
+        let mut packet = vec![
+            0x10,
+            remaining as u8,
+            0x00,
+            0x04,
+            b'M',
+            b'Q',
+            b'T',
+            b'T',
+            0x05,
+            0xc2,
+            0x00,
+            0x3c,
+            0x00,
+            0x00,
+            client_id.len() as u8,
+        ];
+        packet.extend_from_slice(client_id);
+        packet.extend_from_slice(&[0x00, username.len() as u8]);
+        packet.extend_from_slice(username);
+        packet.extend_from_slice(&[0x00, password.len() as u8]);
+        packet.extend_from_slice(password);
+        packet
+    }
+
+    fn assert_socket_closed_without_response(stream: &mut TcpStream) {
+        let mut response = [0; 16];
+        match stream.read(&mut response) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) => {}
+            Ok(read) => panic!("shutdown sent {read} response bytes after admission closed"),
+            Err(error) => panic!("shutdown did not close accepted socket: {error}"),
+        }
+    }
+
+    fn connect_before_deadline(address: SocketAddr) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match TcpStream::connect(address) {
+                Ok(stream) => return stream,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    thread::yield_now();
+                }
+                Err(error) => panic!("listener did not start: {error}"),
+            }
+        }
+    }
+
     fn wait_until_bindable(address: SocketAddr) {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -1974,6 +2233,67 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
             "shutdown must cancel bridge reconnect delay"
         );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn shutdown_rejects_websocket_upgrade_accepted_before_admission() {
+        let _serial = prebound_test_serial()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let _hooks = install_post_accept_admission_hook(Arc::new(move |server_name| {
+            if server_name == "ws-admission" {
+                accepted_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .expect("admission release mutex is not poisoned")
+                    .recv()
+                    .expect("admission test must release the server");
+            }
+        }));
+        let handle = Broker::new(Config {
+            ws: Some(HashMap::from([(
+                "ws-admission".to_owned(),
+                ServerSettings {
+                    name: "ws-admission".to_owned(),
+                    listen: address,
+                    tls: None,
+                    next_connection_delay_ms: 0,
+                    connections: ConnectionSettings {
+                        connection_timeout_ms: 60_000,
+                        max_payload_size: 1024,
+                        max_inflight_count: 10,
+                        auth: None,
+                        external_auth: None,
+                        authorization_handler: None,
+                        dynamic_filters: true,
+                    },
+                },
+            )])),
+            ..Config::default()
+        })
+        .unwrap()
+        .spawn();
+        let mut stream = connect_before_deadline(address);
+        stream
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n",
+            )
+            .unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        handle.shutdown();
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+
+        assert_socket_closed_without_response(&mut stream);
+        assert!(TcpListener::bind(address).is_ok());
     }
 
     #[cfg(feature = "websocket")]
