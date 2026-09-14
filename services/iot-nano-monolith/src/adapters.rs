@@ -282,52 +282,42 @@ async fn record_command_response(
         serde_json::to_string(&request.response).map_err(|_| CoreFacadeError::Rejected(400))?;
     let response_at = request.responded_at.to_rfc3339();
 
+    if store
+        .mark_command_responded(
+            request.command_id,
+            &request.device_id,
+            request.token_id,
+            &response,
+            request.responded_at,
+        )
+        .await
+        .map_err(|_| CoreFacadeError::Unavailable)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
     if let Some(pool) = store.sqlite_pool() {
-        let updated = sqlx::query(
+        let expired = sqlx::query(
             "UPDATE command_outbox AS command
-             SET state = 'responded',
-                 response = CASE
-                     WHEN command.state = 'responded' THEN command.response
-                     ELSE ?
-                 END,
-                 responded_at = CASE
-                     WHEN command.state = 'responded' THEN command.responded_at
-                     ELSE ?
-                 END,
-                 lease_until = NULL
+             SET state = 'expired', lease_until = NULL
              WHERE command.id = ?
                AND command.device_id = ?
                AND command.mode = 'two_way'
-               AND (
-                   (command.state = 'published_to_broker' AND command.expires_at > ?)
-                   OR (command.state = 'responded' AND command.response = ?)
+               AND command.state = 'published_to_broker'
+               AND command.expires_at <= ?
+               AND EXISTS (
+                    SELECT 1
+                    FROM device_tokens
+                    WHERE id = ?
+                      AND device_id = command.device_id
+                      AND revoked_at IS NULL
                )",
         )
-        .bind(&response)
-        .bind(&response_at)
         .bind(request.command_id.to_string())
         .bind(&request.device_id)
         .bind(&response_at)
-        .bind(&response)
-        .execute(pool)
-        .await
-        .map_err(|_| CoreFacadeError::Unavailable)?
-        .rows_affected();
-        if updated == 1 {
-            return Ok(());
-        }
-        let expired = sqlx::query(
-            "UPDATE command_outbox
-             SET state = 'expired', lease_until = NULL
-             WHERE id = ?
-               AND device_id = ?
-               AND mode = 'two_way'
-               AND state = 'published_to_broker'
-               AND expires_at <= ?",
-        )
-        .bind(request.command_id.to_string())
-        .bind(&request.device_id)
-        .bind(&response_at)
+        .bind(request.token_id.to_string())
         .execute(pool)
         .await
         .map_err(|_| CoreFacadeError::Unavailable)?
@@ -340,50 +330,26 @@ async fn record_command_response(
     }
 
     let pool = store.timescale_pool().ok_or(CoreFacadeError::Unavailable)?;
-    let response_value = sqlx::types::Json(request.response);
-    let updated = sqlx::query(
+    let expired = sqlx::query(
         "UPDATE command_outbox AS command
-         SET state = 'responded',
-             response = CASE
-                 WHEN command.state = 'responded' THEN command.response
-                 ELSE $1::jsonb
-             END,
-             responded_at = CASE
-                 WHEN command.state = 'responded' THEN command.responded_at
-                 ELSE $2
-             END,
-             lease_until = NULL
-         WHERE command.id = $3
-           AND command.device_id = $4
+         SET state = 'expired', lease_until = NULL
+         WHERE command.id = $1
+           AND command.device_id = $2
            AND command.mode = 'two_way'
-           AND (
-               (command.state = 'published_to_broker' AND command.expires_at > $2)
-               OR (command.state = 'responded' AND command.response = $1::jsonb)
+           AND command.state = 'published_to_broker'
+           AND command.expires_at <= $3
+           AND EXISTS (
+                SELECT 1
+                FROM device_tokens
+                WHERE id = $4
+                  AND device_id = command.device_id
+                  AND revoked_at IS NULL
            )",
     )
-    .bind(response_value)
-    .bind(request.responded_at)
-    .bind(request.command_id)
-    .bind(&request.device_id)
-    .execute(pool)
-    .await
-    .map_err(|_| CoreFacadeError::Unavailable)?
-    .rows_affected();
-    if updated == 1 {
-        return Ok(());
-    }
-    let expired = sqlx::query(
-        "UPDATE command_outbox
-         SET state = 'expired', lease_until = NULL
-         WHERE id = $1
-           AND device_id = $2
-           AND mode = 'two_way'
-           AND state = 'published_to_broker'
-           AND expires_at <= $3",
-    )
     .bind(request.command_id)
     .bind(&request.device_id)
     .bind(request.responded_at)
+    .bind(request.token_id)
     .execute(pool)
     .await
     .map_err(|_| CoreFacadeError::Unavailable)?
@@ -486,19 +452,30 @@ async fn postgres_telemetry_points(
 ) -> Result<Vec<CoreTelemetryPoint>, CoreFacadeError> {
     let query = match bucket {
         CoreTelemetryBucket::Raw => {
-            "SELECT
+            "WITH f64_limits AS (
+                SELECT
+                    '-179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368'::numeric AS min,
+                    '179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368'::numeric AS max
+             )
+             SELECT
                 event_at AS at,
-                temperature_c,
-                humidity_pct,
+                CASE
+                    WHEN jsonb_typeof(measurements -> 'temperature_c') = 'number'
+                    THEN CASE
+                        WHEN (measurements ->> 'temperature_c')::numeric BETWEEN f64_limits.min AND f64_limits.max
+                        THEN (measurements ->> 'temperature_c')::double precision
+                    END
+                END AS temperature_c,
+                CASE
+                    WHEN jsonb_typeof(measurements -> 'humidity_pct') = 'number'
+                    THEN CASE
+                        WHEN (measurements ->> 'humidity_pct')::numeric BETWEEN f64_limits.min AND f64_limits.max
+                        THEN (measurements ->> 'humidity_pct')::double precision
+                    END
+                END AS humidity_pct,
                 1::bigint AS event_count
-             FROM (
-                 SELECT device_id, event_at,
-                        CASE WHEN jsonb_typeof(measurements -> 'temperature_c') = 'number'
-                             THEN (measurements ->> 'temperature_c')::double precision END AS temperature_c,
-                        CASE WHEN jsonb_typeof(measurements -> 'humidity_pct') = 'number'
-                             THEN (measurements ->> 'humidity_pct')::double precision END AS humidity_pct
-                 FROM telemetry
-             ) AS points
+             FROM telemetry
+             CROSS JOIN f64_limits
              WHERE device_id = $1 AND event_at >= $2 AND event_at <= $3
              ORDER BY event_at"
         }

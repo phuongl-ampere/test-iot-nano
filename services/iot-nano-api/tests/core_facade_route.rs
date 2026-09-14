@@ -265,6 +265,7 @@ async fn sqlite_routes_delegate_command_response_and_telemetry_to_core_facade() 
     assert_eq!(calls.recorded_responses.len(), 1);
     assert_eq!(calls.recorded_responses[0].command_id, command_id);
     assert_eq!(calls.recorded_responses[0].device_id, "facade-device");
+    assert_eq!(calls.recorded_responses[0].token_id, token_id);
     assert_eq!(calls.recorded_responses[0].response, json!({"ok": true}));
     assert_eq!(calls.telemetry_queries.len(), 1);
     assert_eq!(calls.telemetry_queries[0].device_id, "facade-device");

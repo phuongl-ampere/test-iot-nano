@@ -63,6 +63,7 @@ async fn client_authenticates_and_round_trips_a_core_command() {
         .record_response(CoreCommandResponseRequest {
             command_id: id,
             device_id: "core-client-device".to_owned(),
+            token_id: Uuid::now_v7(),
             response: json!({"ok": true}),
             responded_at: Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 30).unwrap(),
         })
@@ -75,7 +76,10 @@ async fn client_authenticates_and_round_trips_a_core_command() {
     assert_eq!(fetched.mode, RpcMode::TwoWay);
     assert_eq!(telemetry.len(), 1);
     assert_eq!(telemetry[0].event_count, 1);
-    assert_eq!(state.received.lock().await.len(), 2);
+    let received = state.received.lock().await;
+    assert_eq!(received.len(), 2);
+    assert!(received[1].get("token_id").is_none());
+    drop(received);
     server.abort();
 }
 

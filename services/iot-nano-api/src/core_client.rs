@@ -27,6 +27,8 @@ pub struct CoreCommandCreateRequest {
 pub struct CoreCommandResponseRequest {
     pub command_id: Uuid,
     pub device_id: String,
+    #[serde(skip_serializing)]
+    pub token_id: Uuid,
     pub response: serde_json::Value,
     pub responded_at: DateTime<Utc>,
 }

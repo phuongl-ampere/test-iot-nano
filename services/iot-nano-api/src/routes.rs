@@ -3455,6 +3455,7 @@ async fn sqlite_mqttd_device_transport_rpc_response(
             .record_command_response(CoreCommandResponseRequest {
                 command_id: request.command_id,
                 device_id: request.device_id,
+                token_id: request.token_id,
                 response: request.response,
                 responded_at: now,
             })
@@ -6465,6 +6466,7 @@ async fn mqttd_device_transport_rpc_response(
             .record_command_response(CoreCommandResponseRequest {
                 command_id: request.command_id,
                 device_id: request.device_id,
+                token_id: request.token_id,
                 response: request.response,
                 responded_at: now,
             })

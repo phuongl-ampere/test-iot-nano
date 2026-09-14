@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{env, sync::Arc};
 
 use chrono::{Duration, TimeZone, Utc};
 use iot_api::{
@@ -74,6 +74,21 @@ async fn write_telemetry(
         .unwrap();
 }
 
+async fn insert_active_sqlite_token(store: &PlatformStore, device_id: &str) -> Uuid {
+    let token_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
+         VALUES (?, ?, ?, 'unused')",
+    )
+    .bind(token_id.to_string())
+    .bind(device_id)
+    .bind(format!("facade-token-{token_id}"))
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    token_id
+}
+
 #[tokio::test]
 async fn sqlite_core_facade_replays_matching_commands_and_rejects_conflicts() {
     let (_directory, store) = sqlite_store().await;
@@ -123,6 +138,7 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
     TopologyRepository::register_device(store.as_ref(), "facade-device")
         .await
         .unwrap();
+    let token_id = insert_active_sqlite_token(store.as_ref(), "facade-device").await;
     let facade = PlatformCoreFacade::new(store.clone());
     let now = Utc.with_ymd_and_hms(2026, 9, 14, 10, 1, 0).unwrap();
     let command_id = Uuid::now_v7();
@@ -149,6 +165,7 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
     let response = CoreCommandResponseRequest {
         command_id,
         device_id: "facade-device".to_owned(),
+        token_id,
         response: json!({"ok": true, "value": 42}),
         responded_at: now + Duration::seconds(2),
     };
@@ -166,6 +183,7 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
             .record_command_response(CoreCommandResponseRequest {
                 command_id,
                 device_id: "facade-device".to_owned(),
+                token_id,
                 response: json!({"ok": false}),
                 responded_at: now + Duration::seconds(3),
             })
@@ -235,6 +253,7 @@ async fn sqlite_core_facade_rejects_invalid_queries_and_unpublished_responses() 
     TopologyRepository::register_device(store.as_ref(), "facade-device")
         .await
         .unwrap();
+    let token_id = insert_active_sqlite_token(store.as_ref(), "facade-device").await;
     let facade = PlatformCoreFacade::new(store);
     let now = Utc.with_ymd_and_hms(2026, 9, 14, 10, 0, 0).unwrap();
 
@@ -254,10 +273,132 @@ async fn sqlite_core_facade_rejects_invalid_queries_and_unpublished_responses() 
             .record_command_response(CoreCommandResponseRequest {
                 command_id: Uuid::now_v7(),
                 device_id: "facade-device".to_owned(),
+                token_id,
                 response: json!({"ok": true}),
                 responded_at: now,
             })
             .await,
         Err(CoreFacadeError::Rejected(409))
     ));
+}
+
+#[tokio::test]
+async fn sqlite_core_facade_rejects_response_for_a_revoked_token() {
+    let (_directory, store) = sqlite_store().await;
+    TopologyRepository::register_device(store.as_ref(), "facade-device")
+        .await
+        .unwrap();
+    let revoked_token_id = insert_active_sqlite_token(store.as_ref(), "facade-device").await;
+    let facade = PlatformCoreFacade::new(store.clone());
+    let now = Utc.with_ymd_and_hms(2026, 9, 14, 10, 0, 0).unwrap();
+    let command_id = Uuid::now_v7();
+
+    facade
+        .create_command(command_request(
+            command_id,
+            "facade-device",
+            json!({"channel": "temperature"}),
+            now,
+        ))
+        .await
+        .unwrap();
+    store
+        .claim_commands(now, now + Duration::seconds(30), 1)
+        .await
+        .unwrap();
+    store
+        .mark_command_published(command_id, now + Duration::seconds(1))
+        .await
+        .unwrap()
+        .unwrap();
+
+    sqlx::query("UPDATE device_tokens SET revoked_at = ? WHERE id = ?")
+        .bind((now + Duration::seconds(2)).to_rfc3339())
+        .bind(revoked_token_id.to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    insert_active_sqlite_token(store.as_ref(), "facade-device").await;
+
+    assert!(matches!(
+        facade
+            .record_command_response(CoreCommandResponseRequest {
+                command_id,
+                device_id: "facade-device".to_owned(),
+                token_id: revoked_token_id,
+                response: json!({"ok": true}),
+                responded_at: now + Duration::seconds(3),
+            })
+            .await,
+        Err(CoreFacadeError::Rejected(409))
+    ));
+    let command = facade.get_command(command_id).await.unwrap();
+    assert_eq!(command.state, "published_to_broker");
+    assert_eq!(command.response, None);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_core_facade_normalizes_malformed_and_out_of_range_raw_metrics() {
+    let database_url = env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let store = Arc::new(
+        PlatformStore::open(&StorageConfiguration {
+            storage: DatabaseStorage::Timescale,
+            database_url: Some(database_url),
+            sqlite_path: None,
+            sqlite_busy_timeout_ms: 5_000,
+        })
+        .await
+        .unwrap(),
+    );
+    let device_id = format!("facade-metrics-{}", Uuid::now_v7());
+    store.register_device(&device_id).await.unwrap();
+    let first_at = Utc::now();
+    let second_at = first_at + Duration::milliseconds(1);
+    let pool = store.timescale_pool().unwrap();
+
+    for (sequence, event_at, measurements) in [
+        (
+            1_i64,
+            first_at,
+            r#"{"temperature_c":1e400,"humidity_pct":51.0}"#,
+        ),
+        (
+            2_i64,
+            second_at,
+            r#"{"temperature_c":"not-a-number","humidity_pct":52.0}"#,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO telemetry (
+                event_at, received_at, device_id, boot_id, sequence, measurements, topic
+             ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'iot/v1/devices/telemetry')",
+        )
+        .bind(event_at)
+        .bind(event_at)
+        .bind(&device_id)
+        .bind(Uuid::now_v7())
+        .bind(sequence)
+        .bind(measurements)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let points = PlatformCoreFacade::new(store)
+        .telemetry(CoreTelemetryQuery {
+            device_id,
+            from: first_at - Duration::seconds(1),
+            to: second_at + Duration::seconds(1),
+            bucket: CoreTelemetryBucket::Raw,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(points.len(), 2);
+    assert_eq!(points[0].temperature_c, None);
+    assert_eq!(points[0].humidity_pct, Some(51.0));
+    assert_eq!(points[1].temperature_c, None);
+    assert_eq!(points[1].humidity_pct, Some(52.0));
 }
