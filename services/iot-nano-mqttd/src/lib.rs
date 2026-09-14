@@ -83,13 +83,19 @@ struct PublicWorker {
 }
 
 pub(crate) fn join_public_workers(workers: Vec<PublicWorker>) -> Result<(), MqttdError> {
+    let mut first_error = None;
     for PublicWorker { name, handle } in workers {
-        match handle.join() {
-            Ok(result) => result?,
-            Err(_) => return Err(MqttdError::PublicWorkerPanic { worker: name }),
+        let result = match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(MqttdError::PublicWorkerPanic { worker: name }),
+        };
+        if first_error.is_none()
+            && let Err(error) = result
+        {
+            first_error = Some(error);
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 #[derive(Clone)]
@@ -334,9 +340,12 @@ impl BrokerLifecycleHandle {
                                 let Ok(Some(rumqttd::Notification::Forward(forward))) = notification else {
                                     continue;
                                 };
-                                link_tx
-                                    .publish(rule.target_topic.clone(), forward.publish.payload)
-                                    .map_err(MqttdError::LocalLink)?;
+                                if let Err(error) = link_tx.publish(
+                                    rule.target_topic.clone(),
+                                    forward.publish.payload,
+                                ) {
+                                    eprintln!("iot-mqttd republish rule failed: {error}");
+                                }
                             }
                         }
                     }
@@ -938,7 +947,7 @@ async fn start_broker_for_public_worker_test() -> BrokerLifecycleHandle {
 #[cfg(test)]
 mod mux_shutdown_tests {
     use super::*;
-    use std::{fs::File, io::BufReader, path::PathBuf};
+    use std::{fs::File, io::BufReader, path::PathBuf, sync::mpsc as std_mpsc};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
@@ -954,6 +963,68 @@ mod mux_shutdown_tests {
             0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 4, 0x02, 0x00, 0x3c, 0x00, 0x02, b'i',
             b'd',
         ]
+    }
+
+    #[test]
+    fn public_worker_join_waits_for_every_worker_and_retains_the_first_error() {
+        let (failure_finished_tx, failure_finished_rx) = std_mpsc::channel();
+        let (held_started_tx, held_started_rx) = std_mpsc::channel();
+        let (held_release_tx, held_release_rx) = std_mpsc::channel();
+        let (held_finished_tx, held_finished_rx) = std_mpsc::channel();
+        let workers = vec![
+            PublicWorker {
+                name: "first-error".to_owned(),
+                handle: std::thread::spawn(move || {
+                    failure_finished_tx.send(()).unwrap();
+                    Err(MqttdError::PublicWorkerIo {
+                        worker: "first-error".to_owned(),
+                        source: std::io::Error::other("injected first failure"),
+                    })
+                }),
+            },
+            PublicWorker {
+                name: "held-worker".to_owned(),
+                handle: std::thread::spawn(move || {
+                    held_started_tx.send(()).unwrap();
+                    held_release_rx.recv().unwrap();
+                    held_finished_tx.send(()).unwrap();
+                    Ok(())
+                }),
+            },
+        ];
+        failure_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        held_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (join_result_tx, join_result_rx) = std_mpsc::channel();
+        let join = std::thread::spawn(move || {
+            join_result_tx.send(join_public_workers(workers)).unwrap();
+        });
+        let before_release = join_result_rx.recv_timeout(Duration::from_millis(100));
+        let waited_for_held_worker =
+            matches!(&before_release, Err(std_mpsc::RecvTimeoutError::Timeout));
+        held_release_tx.send(()).unwrap();
+        held_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let result = match before_release {
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                join_result_rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            }
+            Ok(result) => result,
+            Err(error) => panic!("public worker join failed before held worker release: {error}"),
+        };
+        join.join().unwrap();
+
+        assert!(waited_for_held_worker);
+        assert!(matches!(
+            result,
+            Err(MqttdError::PublicWorkerIo { worker, source })
+                if worker == "first-error" && source.to_string() == "injected first failure"
+        ));
     }
 
     fn spawn_backend_notifier(
@@ -1487,21 +1558,62 @@ mod mux_shutdown_tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_join_returns_a_fatal_public_listener_io_error() {
+    async fn lifecycle_join_waits_for_all_public_workers_and_returns_the_first_fatal_error() {
         let broker = start_broker_for_public_worker_test().await;
+        let (failure_finished_tx, failure_finished_rx) = tokio::sync::oneshot::channel();
         broker
             .spawn_public_worker(
                 "injected-listener-error",
                 StdTcpListener::bind("127.0.0.1:0").unwrap(),
-                |_listener, _accept_stop, _force_stop, _accept_gate| async {
+                move |_listener, _accept_stop, _force_stop, _accept_gate| async move {
+                    let _ = failure_finished_tx.send(());
                     Err(std::io::Error::other("injected listener failure"))
                 },
             )
             .unwrap();
+        failure_finished_rx.await.unwrap();
+        let (held_started_tx, held_started_rx) = tokio::sync::oneshot::channel();
+        let (held_release_tx, held_release_rx) = tokio::sync::oneshot::channel();
+        let (held_finished_tx, held_finished_rx) = tokio::sync::oneshot::channel();
+        broker
+            .spawn_public_worker(
+                "held-listener-worker",
+                StdTcpListener::bind("127.0.0.1:0").unwrap(),
+                move |_listener, _accept_stop, _force_stop, _accept_gate| async move {
+                    let _ = held_started_tx.send(());
+                    let _ = held_release_rx.await;
+                    let _ = held_finished_tx.send(());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        timeout(Duration::from_secs(1), held_started_rx)
+            .await
+            .expect("held public worker did not start")
+            .unwrap();
 
-        let error = broker
-            .join()
-            .expect_err("fatal public listener I/O error must reach lifecycle join");
+        let join = tokio::task::spawn_blocking(move || broker.join());
+        tokio::pin!(join);
+        let before_release = timeout(Duration::from_millis(100), &mut join).await;
+        let waited_for_held_worker = before_release.is_err();
+        held_release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(1), held_finished_rx)
+            .await
+            .expect("held public worker did not release")
+            .unwrap();
+        let result = match before_release {
+            Err(_) => timeout(Duration::from_secs(1), &mut join)
+                .await
+                .expect("lifecycle join did not finish after held worker release")
+                .unwrap(),
+            Ok(result) => result.unwrap(),
+        };
+
+        assert!(
+            waited_for_held_worker,
+            "lifecycle join returned before joining the held public worker"
+        );
+        let error = result.expect_err("fatal public listener I/O error must reach lifecycle join");
 
         match error {
             MqttdError::PublicWorkerIo { worker, source } => {

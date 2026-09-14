@@ -815,7 +815,10 @@ mod tests {
         AuthenticatedDevice, BrokerLifecycleHandle, CacheEntry, CacheError, CachePort,
         DeviceAuthenticator, MqttdError, TransportError, TransportUplink, UplinkForwarder,
     };
-    use tokio::{sync::watch, task::JoinHandle};
+    use tokio::{
+        sync::{oneshot, watch},
+        task::JoinHandle,
+    };
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -894,23 +897,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_returns_a_fatal_public_listener_io_error() {
+    async fn drain_joins_all_public_workers_and_returns_the_first_fatal_error() {
         let broker = crate::start_broker_for_public_worker_test().await;
+        let (failure_finished_tx, failure_finished_rx) = oneshot::channel();
         broker
             .spawn_public_worker(
                 "injected-runtime-listener-error",
                 StdTcpListener::bind("127.0.0.1:0").unwrap(),
-                |_listener, _accept_stop, _force_stop, _accept_gate| async {
+                move |_listener, _accept_stop, _force_stop, _accept_gate| async move {
+                    let _ = failure_finished_tx.send(());
                     Err(std::io::Error::other("injected runtime listener failure"))
                 },
             )
             .unwrap();
+        failure_finished_rx.await.unwrap();
+        let (held_started_tx, held_started_rx) = oneshot::channel();
+        let (held_release_tx, held_release_rx) = oneshot::channel();
+        let (held_finished_tx, held_finished_rx) = oneshot::channel();
+        broker
+            .spawn_public_worker(
+                "held-runtime-listener-worker",
+                StdTcpListener::bind("127.0.0.1:0").unwrap(),
+                move |_listener, _accept_stop, _force_stop, _accept_gate| async move {
+                    let _ = held_started_tx.send(());
+                    let _ = held_release_rx.await;
+                    let _ = held_finished_tx.send(());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        timeout(Duration::from_secs(1), held_started_rx)
+            .await
+            .expect("held public worker did not start")
+            .unwrap();
         let mut runtime = runtime_with_broker(broker);
 
-        let error = runtime
-            .drain(Instant::now() + Duration::from_secs(2))
+        let mut drain = Box::pin(runtime.drain(Instant::now() + Duration::from_secs(2)));
+        let before_release = timeout(Duration::from_millis(100), &mut drain).await;
+        let waited_for_held_worker = before_release.is_err();
+        held_release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(1), held_finished_rx)
             .await
-            .expect_err("fatal public listener I/O error must reach runtime drain");
+            .expect("held public worker did not release")
+            .unwrap();
+        let result = match before_release {
+            Err(_) => timeout(Duration::from_secs(1), &mut drain)
+                .await
+                .expect("runtime drain did not finish after held worker release"),
+            Ok(result) => result,
+        };
+
+        assert!(
+            waited_for_held_worker,
+            "runtime drain returned before joining the held public worker"
+        );
+        let error = result.expect_err("fatal public listener I/O error must reach runtime drain");
 
         match error {
             MqttRuntimeError::PublicWorker(MqttdError::PublicWorkerIo { worker, source }) => {
