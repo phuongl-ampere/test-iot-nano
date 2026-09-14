@@ -312,6 +312,7 @@ impl Router {
                 return Ok(());
             }
             self.run_inner_managed(&cancellation).await?;
+            tokio::time::sleep(std::time::Duration::ZERO).await;
         }
     }
 
@@ -2346,6 +2347,7 @@ mod tests {
 
     use super::*;
     use crate::link::local::{LinkBuilder, LinkRx, LinkTx};
+    use crate::protocol::{Packet, Publish, QoS};
     use crate::router::Ack;
     use crate::{
         InboundQos2CommitResult, InboundQos2CompletionResult, InboundQos2PrepareResult,
@@ -2390,6 +2392,155 @@ mod tests {
         })
         .await
         .expect("managed router must notify the local link")
+    }
+
+    fn build_local_link_before_managed_run(
+        router: &mut Router,
+        client_id: String,
+    ) -> (LinkTx, LinkRx, Notification) {
+        let link = router.link();
+        let link_builder = std::thread::spawn(move || LinkBuilder::new(&client_id, link).build());
+
+        router
+            .run_inner()
+            .expect("router must process the local link before managed run starts");
+
+        link_builder
+            .join()
+            .expect("link builder must not panic")
+            .expect("router must accept the local link")
+    }
+
+    #[tokio::test]
+    async fn managed_router_link_accepts_a_connection_before_parent_spawns_run() {
+        let cancellation = CancellationToken::new();
+        let managed = Router::new(0, router_config())
+            .unwrap()
+            .into_managed(cancellation.clone());
+        let link = managed.link();
+
+        let link_builder = tokio::task::spawn_blocking(move || {
+            LinkBuilder::new("managed-pre-spawn-client", link).build()
+        });
+        tokio::task::yield_now().await;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
+
+        let (_, _, notification) = tokio::time::timeout(Duration::from_secs(1), link_builder)
+            .await
+            .expect("pre-spawn link builder must complete after the parent starts the router")
+            .expect("link builder must not panic")
+            .expect("router must accept the pre-spawn link");
+        assert!(matches!(notification, Notification::DeviceAck(_)));
+
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("managed router must stop after cancellation"),
+            Some(Ok(Ok(())))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_router_yields_to_sibling_cancellation_during_active_workload() {
+        const ACTIVE_CLIENTS: usize = 200;
+        const PUBLISHES_PER_CLIENT: usize = 198;
+
+        let cancellation = CancellationToken::new();
+        let mut config = router_config();
+        config.max_connections = ACTIVE_CLIENTS * 2 + 1;
+        config.max_outgoing_packet_count = 1;
+        let mut router = Router::new(0, config).unwrap();
+        let link = router.link();
+
+        let (mut feeder_tx, _feeder_rx, _) =
+            build_local_link_before_managed_run(&mut router, "managed-workload-feeder".to_owned());
+        let mut publishers = Vec::with_capacity(ACTIVE_CLIENTS);
+        let mut subscribers = Vec::with_capacity(ACTIVE_CLIENTS);
+        for client in 0..ACTIVE_CLIENTS {
+            let topic = format!("managed/active/{client}");
+            let (mut subscriber_tx, mut subscriber_rx, _) = build_local_link_before_managed_run(
+                &mut router,
+                format!("managed-subscriber-{client}"),
+            );
+            subscriber_tx.subscribe(topic.clone()).unwrap();
+            router
+                .run_inner()
+                .expect("router must process managed workload subscription");
+            let notification = subscriber_rx
+                .recv()
+                .expect("subscriber must receive managed workload subscription acknowledgement")
+                .expect("subscription acknowledgement must be present");
+            assert!(matches!(
+                notification,
+                Notification::DeviceAck(Ack::SubAck(_))
+            ));
+            subscribers.push((subscriber_tx, subscriber_rx));
+
+            let (publisher_tx, publisher_rx, _) = build_local_link_before_managed_run(
+                &mut router,
+                format!("managed-publisher-{client}"),
+            );
+            publishers.push((topic, publisher_tx, publisher_rx));
+        }
+
+        for (topic, publisher_tx, _) in &publishers {
+            let mut buffer = publisher_tx.buffer();
+            for _ in 0..PUBLISHES_PER_CLIENT {
+                buffer.push_back(Packet::Publish(
+                    Publish {
+                        dup: false,
+                        qos: QoS::AtMostOnce,
+                        retain: false,
+                        topic: topic.clone().into(),
+                        pkid: 0,
+                        payload: b"payload".as_slice().into(),
+                    },
+                    None,
+                ));
+            }
+            link.send((publisher_tx.connection_id, Event::DeviceData))
+                .unwrap();
+        }
+
+        router
+            .run_inner()
+            .expect("router must prepare the active managed workload");
+        let started = std::time::Instant::now();
+        let managed = router.into_managed(cancellation.clone());
+        let cancellation_signal = cancellation.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancellation_signal.cancel();
+        });
+        let feeder_cancellation = cancellation.clone();
+        let feeder = tokio::spawn(async move {
+            while !feeder_cancellation.is_cancelled() {
+                let _ = feeder_tx.try_publish("managed/active/0", "payload");
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
+
+        tokio::time::timeout(Duration::from_millis(20), async {
+            canceller
+                .await
+                .expect("cancellation sibling must not panic");
+            assert!(matches!(tasks.join_next().await, Some(Ok(Ok(())))));
+        })
+        .await
+        .expect("managed router must yield so sibling cancellation can complete");
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "managed router must yield so sibling cancellation can complete within the bound"
+        );
+        assert!(tasks.is_empty());
+        feeder.await.expect("workload feeder must not panic");
+        drop(publishers);
+        drop(subscribers);
     }
 
     #[tokio::test]
