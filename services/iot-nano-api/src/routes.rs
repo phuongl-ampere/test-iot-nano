@@ -70,6 +70,7 @@ use crate::{
         device_telemetry_records as power_device_telemetry_records,
         list_assets as list_power_assets, list_devices as list_power_devices,
     },
+    public_v1::PublicApiContext,
     resource_authorization::{
         ResourceKind, ResourcePermission, asset_permission, device_permission,
         sqlite_asset_permission, sqlite_device_permission,
@@ -362,6 +363,14 @@ impl ApiState {
         self.oauth_store.clone()
     }
 
+    pub(crate) fn public_api_context(&self) -> PublicApiContext {
+        PublicApiContext::new(
+            self.oauth_store.clone(),
+            self.token_vault.clone(),
+            self.core_facade.clone(),
+        )
+    }
+
     fn revoke_session(&self, session_id: &str) {
         self.sessions
             .lock()
@@ -505,6 +514,14 @@ impl SqliteApiState {
 
     pub(crate) fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
         self.oauth_store.clone()
+    }
+
+    pub(crate) fn public_api_context(&self) -> PublicApiContext {
+        PublicApiContext::new(
+            self.oauth_store.clone(),
+            self.token_vault.clone(),
+            self.core_facade.clone(),
+        )
     }
 
     fn revoke_session(&self, session_id: &str) {
@@ -758,6 +775,7 @@ fn public_router(state: ApiState) -> Router {
         .route("/oauth/token", post(crate::oauth::token))
         .route("/api/v1/devices", get(public_list_devices))
         .route("/api/v1/devices/{device_id}", get(public_get_device))
+        .merge(crate::public_v1::router(state.public_api_context()))
         .with_state(state)
 }
 
@@ -778,10 +796,11 @@ struct PublicDeviceListResponse {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PublicApiError {
+pub(crate) enum PublicApiError {
     BadRequest,
     Unauthorized,
     Forbidden,
+    Conflict,
     Unavailable,
 }
 
@@ -811,6 +830,11 @@ impl IntoResponse for PublicApiError {
                 StatusCode::FORBIDDEN,
                 "forbidden",
                 "the access token is not authorized for this resource",
+            ),
+            Self::Conflict => (
+                StatusCode::CONFLICT,
+                "conflict",
+                "the request conflicts with an existing resource",
             ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1201,6 +1225,7 @@ fn sqlite_public_router(state: SqliteApiState) -> Router {
         .route("/oauth/token", post(crate::oauth::sqlite_token))
         .route("/api/v1/devices", get(sqlite_public_list_devices))
         .route("/api/v1/devices/{device_id}", get(sqlite_public_get_device))
+        .merge(crate::public_v1::router(state.public_api_context()))
         .with_state(state)
 }
 

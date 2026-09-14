@@ -415,6 +415,7 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "oauth_access_tokens",
             "oauth_authorization_codes",
             "oauth_client_secrets",
+            "resource_grants",
             "resource_shares",
             "telemetry",
             "telemetry_rollups_1h",

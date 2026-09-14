@@ -1,0 +1,144 @@
+use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_storage::{
+    AccountClass, NewPublicAsset, NewPublicResourceGrant, PlatformStore, PublicApiRepository,
+    PublicPrincipal, ResourcePermission,
+};
+use serde_json::json;
+use uuid::Uuid;
+
+async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("public-api.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    (directory, store)
+}
+
+#[tokio::test]
+async fn sqlite_public_repository_filters_assets_and_persists_grants() {
+    let (_directory, store) = sqlite_store().await;
+    let user_id = Uuid::now_v7();
+    let other_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, 'public-repository-user', 'unused', 'viewer', 'user'),
+                (?, 'public-repository-other', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .bind(other_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let principal = PublicPrincipal {
+        user_id: Some(user_id),
+        app_id: "public-repository-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let asset = PublicApiRepository::create_public_asset(
+        &store,
+        &principal,
+        NewPublicAsset {
+            name: "contract asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({"zone":"lab"}),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        PublicApiRepository::public_asset_permission(&store, &principal, asset.id)
+            .await
+            .unwrap(),
+        Some(ResourcePermission::Owner)
+    );
+    let assets = PublicApiRepository::list_public_assets(&store, &principal, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(assets, [asset.clone()]);
+
+    let grant = PublicApiRepository::create_public_grant(
+        &store,
+        &principal,
+        NewPublicResourceGrant {
+            resource_type: "asset".to_owned(),
+            resource_id: asset.id.to_string(),
+            grantee_type: "user".to_owned(),
+            grantee_id: other_id.to_string(),
+            permission: "viewer".to_owned(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(grant.permission, "viewer");
+    assert_eq!(
+        PublicApiRepository::get_public_grant(&store, &principal, grant.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        grant.id
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_repository_creates_and_reads_an_asset() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES ($1, 'timescale-public-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let asset = PublicApiRepository::create_public_asset(
+        &store,
+        &PublicPrincipal {
+            user_id: Some(user_id),
+            app_id: "timescale-public-app".to_owned(),
+            account_class: AccountClass::User,
+        },
+        NewPublicAsset {
+            name: "timescale contract asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        PublicApiRepository::get_public_asset(
+            &store,
+            &PublicPrincipal {
+                user_id: Some(user_id),
+                app_id: "timescale-public-app".to_owned(),
+                account_class: AccountClass::User,
+            },
+            asset.id,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id,
+        asset.id
+    );
+}

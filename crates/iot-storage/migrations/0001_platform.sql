@@ -134,6 +134,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS resource_shares_one_pending_index
     ON resource_shares (resource_type, resource_id, target_user_id) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS resource_shares_target_state_index ON resource_shares (target_user_id, state, created_at DESC);
 CREATE INDEX IF NOT EXISTS resource_shares_resource_state_index ON resource_shares (resource_type, resource_id, state);
+CREATE TABLE IF NOT EXISTS resource_grants (
+    id UUID PRIMARY KEY,
+    resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
+    resource_id TEXT NOT NULL,
+    grantee_type TEXT NOT NULL CHECK (grantee_type IN ('user', 'application')),
+    grantee_id TEXT NOT NULL,
+    permission TEXT NOT NULL CHECK (permission IN ('viewer', 'controller', 'manager')),
+    created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (resource_type, resource_id, grantee_type, grantee_id)
+);
+CREATE INDEX IF NOT EXISTS resource_grants_resource_index ON resource_grants (resource_type, resource_id);
+CREATE INDEX IF NOT EXISTS resource_grants_grantee_index ON resource_grants (grantee_type, grantee_id);
 CREATE TABLE IF NOT EXISTS audit_events (
     id UUID PRIMARY KEY, actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     actor_account_class TEXT NOT NULL CHECK (actor_account_class IN ('system', 'admin', 'user')),

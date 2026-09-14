@@ -8,6 +8,7 @@ mod device_tokens;
 mod oauth;
 mod power_switcher;
 mod powermonitor;
+mod public_v1;
 mod resource_authorization;
 mod routes;
 mod storage;
