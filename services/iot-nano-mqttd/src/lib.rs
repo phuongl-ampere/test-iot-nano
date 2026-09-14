@@ -228,6 +228,26 @@ impl BrokerLifecycleHandle {
         self.public_accept_stop.send_replace(true);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_handle() -> Self {
+        let (public_accept_stop, _) = watch::channel(false);
+        Self {
+            inner: None,
+            public_accept_gate: PublicMuxAcceptanceGate::default(),
+            public_accept_stop,
+            public_workers: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_public_accepting(&self) -> bool {
+        *self
+            .public_accept_gate
+            .accepting
+            .lock()
+            .expect("public accept gate is not poisoned")
+    }
+
     pub fn take_public_workers(&self) -> Vec<thread::JoinHandle<()>> {
         std::mem::take(
             &mut *self
