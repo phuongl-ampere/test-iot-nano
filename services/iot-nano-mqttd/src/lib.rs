@@ -16,8 +16,8 @@ use std::{
 use reqwest::StatusCode;
 use rumqttd::{
     AuthHandler, AuthorizationHandler, BridgeConfig as CoreBridgeConfig, Broker,
-    BrokerHandle as CoreBrokerHandle, Config, ConnectionSettings, RouterConfig, ServerSettings,
-    TlsConfig,
+    BrokerHandle as CoreBrokerHandle, Config, ConnectionSettings, InProcessBroker,
+    InProcessBrokerControl, RouterConfig, ServerSettings, TlsConfig,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -249,35 +249,6 @@ impl BrokerLifecycleHandle {
         self.public_accept_stop.send_replace(true);
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_handle() -> Self {
-        let (public_accept_stop, _) = watch::channel(false);
-        Self {
-            inner: None,
-            public_accept_gate: PublicMuxAcceptanceGate::default(),
-            public_accept_stop,
-            public_workers: Mutex::new(Vec::new()),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_public_accepting(&self) -> bool {
-        *self
-            .public_accept_gate
-            .accepting
-            .lock()
-            .expect("public accept gate is not poisoned")
-    }
-
-    pub(crate) fn take_public_workers(&self) -> Vec<PublicWorker> {
-        std::mem::take(
-            &mut *self
-                .public_workers
-                .lock()
-                .expect("public worker mutex is not poisoned"),
-        )
-    }
-
     pub fn join(mut self) -> Result<(), MqttdError> {
         self.shutdown();
         let public_result = join_public_workers(
@@ -395,21 +366,6 @@ impl BrokerLifecycleHandle {
         self.spawn_public_plaintext_device_only_mux_with_counter(listener, backends, settings, None)
     }
 
-    pub(crate) fn spawn_public_plaintext_device_only_mux_with_connection_counter(
-        &self,
-        listener: std::net::TcpListener,
-        backends: ProtocolBackends,
-        settings: MuxSettings,
-        connection_counter: Arc<AtomicUsize>,
-    ) -> Result<(), MqttdError> {
-        self.spawn_public_plaintext_device_only_mux_with_counter(
-            listener,
-            backends,
-            settings,
-            Some(connection_counter),
-        )
-    }
-
     fn spawn_public_plaintext_device_only_mux_with_counter(
         &self,
         listener: std::net::TcpListener,
@@ -470,23 +426,6 @@ impl BrokerLifecycleHandle {
     ) -> Result<(), MqttdError> {
         self.spawn_public_tls_device_only_mux_with_counter(
             listener, acceptor, backends, settings, None,
-        )
-    }
-
-    pub(crate) fn spawn_public_tls_device_only_mux_with_connection_counter(
-        &self,
-        listener: std::net::TcpListener,
-        acceptor: TlsAcceptor,
-        backends: ProtocolBackends,
-        settings: MuxSettings,
-        connection_counter: Arc<AtomicUsize>,
-    ) -> Result<(), MqttdError> {
-        self.spawn_public_tls_device_only_mux_with_counter(
-            listener,
-            acceptor,
-            backends,
-            settings,
-            Some(connection_counter),
         )
     }
 
@@ -2590,6 +2529,28 @@ pub async fn start_broker_with_prebound_listeners(
     .await
 }
 
+pub(crate) fn create_in_process_broker_with_prebound_listeners(
+    configuration: ListenerConfiguration,
+    listeners: PreboundBackendListeners,
+    storage: std::sync::Arc<dyn BrokerStorage>,
+) -> Result<(InProcessBroker, InProcessBrokerControl), MqttdError> {
+    let mut config = broker_config(&configuration)?;
+    let now = now_ms();
+    storage
+        .load(now)
+        .map_err(|error| MqttdError::Broker(Box::new(error)))?;
+    storage
+        .prune(now, config.storage_policy)
+        .map_err(|error| MqttdError::Broker(Box::new(error)))?;
+    config.storage = Some(storage);
+    InProcessBroker::new_with_prebound_listeners(
+        config,
+        vec![("v311".to_owned(), listeners.v311)],
+        vec![("v5".to_owned(), listeners.v5)],
+    )
+    .map_err(|error| MqttdError::Broker(Box::new(error)))
+}
+
 pub async fn start_broker_with_storage_and_policy(
     configuration: ListenerConfiguration,
     storage: std::sync::Arc<dyn BrokerStorage>,
@@ -2680,7 +2641,7 @@ fn now_ms() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
-async fn wait_for_backends(
+pub(crate) async fn wait_for_backends(
     addresses: [SocketAddr; 2],
     timeout: Duration,
 ) -> Result<(), MqttdError> {

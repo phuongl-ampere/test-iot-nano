@@ -1239,7 +1239,7 @@ impl InProcessBroker {
                     .get(&name)
                     .expect("prebound v4 server names were validated")
                     .clone();
-                let source = listener_source("v4", &name);
+                let source = listener_source("v4", &settings.name);
                 let mut server = Server::new(settings, router_tx.clone(), V4);
                 server.set_acceptance_gate(Arc::clone(&acceptance_gate));
                 let managed = server.into_managed_prebound(
@@ -1268,7 +1268,7 @@ impl InProcessBroker {
                     .get(&name)
                     .expect("prebound v5 server names were validated")
                     .clone();
-                let source = listener_source("v5", &name);
+                let source = listener_source("v5", &settings.name);
                 let mut server = Server::new(settings, router_tx.clone(), V5);
                 server.set_acceptance_gate(Arc::clone(&acceptance_gate));
                 let managed = server.into_managed_prebound(
@@ -2726,6 +2726,43 @@ mod tests {
         ));
         assert!(TcpListener::bind(v4_address).is_ok());
         assert!(TcpListener::bind(v5_address).is_ok());
+    }
+
+    #[tokio::test]
+    async fn in_process_broker_accepts_prebound_keys_that_differ_from_server_names() {
+        let (mut config, v4_listener, v5_listener) =
+            prebound_test_config_named("v4-map-key", "v5-map-key");
+        config
+            .v4
+            .as_mut()
+            .unwrap()
+            .get_mut("v4-map-key")
+            .unwrap()
+            .name = "runtime-v4".to_owned();
+        config
+            .v5
+            .as_mut()
+            .unwrap()
+            .get_mut("v5-map-key")
+            .unwrap()
+            .name = "runtime-v5".to_owned();
+
+        let (broker, control) = InProcessBroker::new_with_prebound_listeners(
+            config,
+            vec![("v4-map-key".to_owned(), v4_listener)],
+            vec![("v5-map-key".to_owned(), v5_listener)],
+        )
+        .expect("prebound listener map keys must remain independent from server names");
+
+        let mut tasks = JoinSet::new();
+        tasks.spawn(broker.run());
+        control.stop_accepting();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("in-process broker must stop after graceful admission closure"),
+            Some(Ok(Ok(())))
+        ));
     }
 
     #[test]

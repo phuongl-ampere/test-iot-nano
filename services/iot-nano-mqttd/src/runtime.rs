@@ -12,6 +12,7 @@ use std::{
 };
 
 use iot_nano_stream::StreamPort;
+use rumqttd::InProcessBrokerControl;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -24,12 +25,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AuthenticatedDevice, AuthorizationError, BrokerLifecycleHandle, BrokerStorage, CacheEntry,
-    CachePort, CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization,
+    AuthenticatedDevice, AuthorizationError, BrokerStorage, CacheEntry, CachePort,
+    CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization,
     GatewayAuthorizationRequest, ListenerConfiguration, MqttdDeviceTransport, MqttdError,
-    MuxSettings, PreboundBackendListeners, ProtocolBackends, RpcSessionRouter,
-    TransportAuthRequest, join_public_workers, load_tls_acceptor,
-    start_broker_with_prebound_listeners,
+    MuxSettings, PreboundBackendListeners, ProtocolBackends, PublicMuxAcceptanceGate,
+    RpcSessionRouter, TransportAuthRequest, create_in_process_broker_with_prebound_listeners,
+    load_tls_acceptor, serve_public_plaintext_device_only_mux, serve_public_tls_device_only_mux,
+    wait_for_backends,
 };
 
 const AUTHORIZATION_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -58,16 +60,121 @@ pub struct MqttRuntimeConfig {
 }
 
 pub struct MqttRuntime {
-    broker: Arc<Mutex<Option<BrokerLifecycleHandle>>>,
-    device_workers: Vec<JoinHandle<()>>,
+    supervisor: RuntimeTaskSupervisor,
     session_router: RpcSessionRouter,
-    device_admission: DeviceAdmissionControl,
-    force_cancellation: CancellationToken,
+    shutdown: RuntimeShutdownControl,
     parent_cancellation_watcher: Option<JoinHandle<()>>,
-    accepting: Arc<AtomicBool>,
     drain_started: watch::Sender<bool>,
     public_connections: Arc<AtomicUsize>,
     _cache: Arc<dyn CachePort>,
+}
+
+#[derive(Clone)]
+struct RuntimeShutdownControl {
+    broker: InProcessBrokerControl,
+    device_admission: DeviceAdmissionControl,
+    force_cancellation: CancellationToken,
+    public_accept_gate: PublicMuxAcceptanceGate,
+    public_accept_shutdown: watch::Sender<bool>,
+    public_force_shutdown: watch::Sender<bool>,
+    accepting: Arc<AtomicBool>,
+}
+
+impl RuntimeShutdownControl {
+    fn stop_accepting(&self) {
+        if self.accepting.swap(false, Ordering::AcqRel) {
+            self.public_accept_gate.close();
+            self.public_accept_shutdown.send_replace(true);
+            self.broker.stop_accepting();
+            self.device_admission.stop();
+        }
+    }
+
+    fn force_stop(&self) {
+        self.stop_accepting();
+        self.public_force_shutdown.send_replace(true);
+        self.force_cancellation.cancel();
+        self.broker.force_stop();
+    }
+
+    fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeTaskName {
+    Broker,
+    DeviceV311,
+    DeviceV5,
+    PublicPlaintext,
+    PublicTls,
+}
+
+impl std::fmt::Display for RuntimeTaskName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Broker => "broker",
+            Self::DeviceV311 => "device MQTT 3.1.1 listener",
+            Self::DeviceV5 => "device MQTT 5 listener",
+            Self::PublicPlaintext => "public plaintext listener",
+            Self::PublicTls => "public TLS listener",
+        })
+    }
+}
+
+struct RuntimeTaskSupervisor {
+    tasks: JoinSet<(RuntimeTaskName, Result<(), MqttRuntimeError>)>,
+}
+
+impl RuntimeTaskSupervisor {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn spawn<F>(&mut self, name: RuntimeTaskName, task: F)
+    where
+        F: Future<Output = Result<(), MqttRuntimeError>> + Send + 'static,
+    {
+        self.tasks.spawn(async move { (name, task.await) });
+    }
+
+    async fn join_until(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
+        while !self.tasks.is_empty() {
+            let joined = timeout_until(deadline, self.tasks.join_next())
+                .await
+                .map_err(|_| MqttRuntimeError::DeadlineElapsed)?;
+            match joined {
+                Some(Ok((_name, Ok(())))) => {}
+                Some(Ok((name, Err(error)))) => {
+                    return Err(match error {
+                        MqttRuntimeError::Worker(message) => {
+                            MqttRuntimeError::Worker(format!("{name} task failed: {message}"))
+                        }
+                        error => error,
+                    });
+                }
+                Some(Err(error)) => {
+                    return Err(MqttRuntimeError::Worker(format!(
+                        "managed task join failure: {error}"
+                    )));
+                }
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn abort_all(&mut self) {
+        self.tasks.abort_all();
+    }
+
+    async fn abort_and_join(&mut self) {
+        self.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+    }
 }
 
 #[derive(Clone)]
@@ -110,14 +217,6 @@ impl DeviceAdmissionControl {
     }
 
     #[cfg(test)]
-    fn is_accepting(&self) -> bool {
-        *self
-            .accepting
-            .lock()
-            .expect("device admission gate is not poisoned")
-    }
-
-    #[cfg(test)]
     fn test_admission_barrier(&self) -> DeviceAdmissionBarrier {
         let barrier = DeviceAdmissionBarrier::default();
         *self
@@ -151,13 +250,6 @@ struct DeviceAdmissionBarrier {
 }
 
 #[cfg(test)]
-#[derive(Clone, Default)]
-struct ParentCancellationBarrier {
-    reached: Arc<tokio::sync::Notify>,
-    proceed: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(test)]
 impl DeviceAdmissionBarrier {
     async fn wait_until_reached(&self, description: &str) {
         tokio::time::timeout(Duration::from_secs(1), self.reached.notified())
@@ -167,26 +259,6 @@ impl DeviceAdmissionBarrier {
 
     fn release(&self) {
         self.proceed.notify_one();
-    }
-}
-
-#[cfg(test)]
-impl ParentCancellationBarrier {
-    async fn wait_until_reached(&self, description: &str) {
-        tokio::time::timeout(Duration::from_secs(1), self.reached.notified())
-            .await
-            .unwrap_or_else(|_| panic!("{description} was not reached within one second"));
-    }
-
-    fn release(&self) {
-        self.proceed.notify_one();
-    }
-
-    async fn wait(&self) {
-        self.reached.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), self.proceed.notified())
-            .await
-            .expect("parent cancellation test barrier was not released within one second");
     }
 }
 
@@ -225,7 +297,7 @@ impl MqttRuntime {
             .local_addr()
             .map_err(MqttRuntimeStartError::DeviceBackendBind)?;
 
-        let broker = start_broker_with_prebound_listeners(
+        let (broker, broker_control) = create_in_process_broker_with_prebound_listeners(
             ListenerConfiguration {
                 plaintext_address: config.listeners.plaintext_address,
                 tls_address: config.listeners.tls_address,
@@ -249,11 +321,40 @@ impl MqttRuntime {
             },
             Arc::clone(&config.storage),
         )
-        .await
         .map_err(MqttRuntimeStartError::Broker)?;
 
         let force_cancellation = CancellationToken::new();
         let device_admission = DeviceAdmissionControl::new();
+        let public_accept_gate = PublicMuxAcceptanceGate::default();
+        let (public_accept_shutdown, _) = watch::channel(false);
+        let (public_force_shutdown, _) = watch::channel(false);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let shutdown = RuntimeShutdownControl {
+            broker: broker_control,
+            device_admission: device_admission.clone(),
+            force_cancellation: force_cancellation.clone(),
+            public_accept_gate: public_accept_gate.clone(),
+            public_accept_shutdown,
+            public_force_shutdown,
+            accepting,
+        };
+        let mut supervisor = RuntimeTaskSupervisor::new();
+        supervisor.spawn(RuntimeTaskName::Broker, async move {
+            broker
+                .run()
+                .await
+                .map_err(|error| MqttRuntimeError::Broker(MqttdError::Broker(Box::new(error))))
+        });
+        if let Err(error) = wait_for_backends(
+            [v311_backend_address, v5_backend_address],
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            cancel_startup(&shutdown, &mut supervisor).await;
+            return Err(MqttRuntimeStartError::Broker(error));
+        }
+
         let public_connections = Arc::new(AtomicUsize::new(0));
         let authorization: Arc<dyn DeviceAuthorizationPort> = Arc::new(
             CachedDeviceAuthorization::new(config.authorization, Arc::clone(&config.cache)),
@@ -264,34 +365,45 @@ impl MqttRuntime {
             config.stream,
             config.command_responses,
         );
-        let device_workers = vec![
-            tokio::spawn(serve_device_backend(
+        let v311_transport = transport.clone();
+        let v311_admission = device_admission.clone();
+        let v311_force_cancellation = force_cancellation.clone();
+        supervisor.spawn(RuntimeTaskName::DeviceV311, async move {
+            serve_device_backend(
                 device_v311_listener,
-                transport.clone(),
+                v311_transport,
                 false,
-                device_admission.clone(),
-                force_cancellation.clone(),
-            )),
-            tokio::spawn(serve_device_backend(
+                v311_admission,
+                v311_force_cancellation,
+            )
+            .await;
+            Ok(())
+        });
+        let v5_admission = shutdown.device_admission.clone();
+        let v5_force_cancellation = shutdown.force_cancellation.clone();
+        supervisor.spawn(RuntimeTaskName::DeviceV5, async move {
+            serve_device_backend(
                 device_v5_listener,
                 transport,
                 true,
-                device_admission.clone(),
-                force_cancellation.clone(),
-            )),
-        ];
+                v5_admission,
+                v5_force_cancellation,
+            )
+            .await;
+            Ok(())
+        });
 
-        let plaintext_listener = match StdTcpListener::bind(config.listeners.plaintext_address) {
+        let plaintext_listener = match TcpListener::bind(config.listeners.plaintext_address).await {
             Ok(listener) => listener,
             Err(error) => {
-                cancel_startup(&broker, &force_cancellation, device_workers).await;
+                cancel_startup(&shutdown, &mut supervisor).await;
                 return Err(MqttRuntimeStartError::PlaintextListenerBind(error));
             }
         };
-        let tls_listener = match StdTcpListener::bind(config.listeners.tls_address) {
+        let tls_listener = match TcpListener::bind(config.listeners.tls_address).await {
             Ok(listener) => listener,
             Err(error) => {
-                cancel_startup(&broker, &force_cancellation, device_workers).await;
+                cancel_startup(&shutdown, &mut supervisor).await;
                 return Err(MqttRuntimeStartError::TlsListenerBind(error));
             }
         };
@@ -301,47 +413,65 @@ impl MqttRuntime {
             device_v311: Some(device_v311_address),
             device_v5: Some(device_v5_address),
         };
-        if let Err(error) = broker.spawn_public_plaintext_device_only_mux_with_connection_counter(
-            plaintext_listener,
-            backends,
-            MuxSettings::default(),
-            Arc::clone(&public_connections),
-        ) {
-            cancel_startup(&broker, &force_cancellation, device_workers).await;
-            return Err(MqttRuntimeStartError::PublicWorker(error));
-        }
-        if let Err(error) = broker.spawn_public_tls_device_only_mux_with_connection_counter(
-            tls_listener,
-            tls_acceptor,
-            backends,
-            MuxSettings::default(),
-            Arc::clone(&public_connections),
-        ) {
-            cancel_startup(&broker, &force_cancellation, device_workers).await;
-            return Err(MqttRuntimeStartError::PublicWorker(error));
-        }
+        supervisor.spawn(RuntimeTaskName::PublicPlaintext, {
+            let accept_shutdown = shutdown.public_accept_shutdown.subscribe();
+            let force_shutdown = shutdown.public_force_shutdown.subscribe();
+            let accept_gate = shutdown.public_accept_gate.clone();
+            let connection_counter = Arc::clone(&public_connections);
+            async move {
+                serve_public_plaintext_device_only_mux(
+                    plaintext_listener,
+                    backends,
+                    MuxSettings::default(),
+                    accept_shutdown,
+                    force_shutdown,
+                    accept_gate,
+                    connection_counter,
+                )
+                .await
+                .map_err(|source| {
+                    MqttRuntimeError::PublicWorker(MqttdError::PublicWorkerIo {
+                        worker: "public plaintext mux".to_owned(),
+                        source,
+                    })
+                })
+            }
+        });
+        supervisor.spawn(RuntimeTaskName::PublicTls, {
+            let accept_shutdown = shutdown.public_accept_shutdown.subscribe();
+            let force_shutdown = shutdown.public_force_shutdown.subscribe();
+            let accept_gate = shutdown.public_accept_gate.clone();
+            let connection_counter = Arc::clone(&public_connections);
+            async move {
+                serve_public_tls_device_only_mux(
+                    tls_listener,
+                    tls_acceptor,
+                    backends,
+                    MuxSettings::default(),
+                    accept_shutdown,
+                    force_shutdown,
+                    accept_gate,
+                    connection_counter,
+                )
+                .await
+                .map_err(|source| {
+                    MqttRuntimeError::PublicWorker(MqttdError::PublicWorkerIo {
+                        worker: "public TLS mux".to_owned(),
+                        source,
+                    })
+                })
+            }
+        });
 
-        let broker = Arc::new(Mutex::new(Some(broker)));
-        let accepting = Arc::new(AtomicBool::new(true));
         let (drain_started, _) = watch::channel(false);
-        let parent_cancellation_watcher = spawn_parent_cancellation_watcher(
-            config.cancellation,
-            device_admission.clone(),
-            force_cancellation.clone(),
-            Arc::clone(&broker),
-            Arc::clone(&accepting),
-            #[cfg(test)]
-            None,
-        );
+        let parent_cancellation_watcher =
+            spawn_parent_cancellation_watcher(config.cancellation, shutdown.clone());
 
         Ok(Self {
-            broker,
-            device_workers,
+            supervisor,
             session_router: config.session_router,
-            device_admission,
-            force_cancellation,
+            shutdown,
             parent_cancellation_watcher: Some(parent_cancellation_watcher),
-            accepting,
             drain_started,
             public_connections,
             _cache: config.cache,
@@ -353,7 +483,7 @@ impl MqttRuntime {
     }
 
     pub fn is_accepting(&self) -> bool {
-        self.accepting.load(Ordering::Acquire)
+        self.shutdown.is_accepting()
     }
 
     /// Returns the number of public mux connections accepted and still in flight.
@@ -367,110 +497,20 @@ impl MqttRuntime {
     }
 
     pub async fn stop_accepting(&mut self) -> Result<(), MqttRuntimeError> {
-        if self.accepting.swap(false, Ordering::AcqRel) {
-            let broker = self
-                .broker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(broker) = broker.as_ref() {
-                broker.stop_public_accepting();
-            }
-            self.device_admission.stop();
-        }
+        self.shutdown.stop_accepting();
         Ok(())
     }
 
     pub async fn drain(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
         self.stop_accepting().await?;
         self.drain_started.send_replace(true);
-        let public_workers = self
-            .broker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(BrokerLifecycleHandle::take_public_workers);
-        let mut public_join = public_workers
-            .map(|workers| tokio::task::spawn_blocking(move || join_public_workers(workers)));
-        let mut drain_result = self.drain_device_workers(deadline).await;
-        if drain_result.is_ok() {
-            if let Some(mut join) = public_join.take() {
-                match timeout_until(deadline, &mut join).await {
-                    Ok(result) => {
-                        drain_result = result
-                            .map_err(|error| MqttRuntimeError::Worker(error.to_string()))
-                            .and_then(|result| result.map_err(MqttRuntimeError::PublicWorker));
-                    }
-                    Err(()) => {
-                        public_join = Some(join);
-                        drain_result = Err(MqttRuntimeError::DeadlineElapsed);
-                    }
-                }
-            }
-        }
-
-        let result = if let Err(error) = drain_result {
-            self.force_cancellation.cancel();
-            self.shutdown_broker();
-            self.abort_and_join_device_workers().await;
-            if let Some(join) = public_join.take() {
-                let _ = join.await;
-            }
-            self.join_broker_after_shutdown().await;
-            Err(error)
-        } else {
-            drop(public_join);
-            self.force_cancellation.cancel();
-            self.join_broker_until(deadline).await
+        let result = self.supervisor.join_until(deadline).await;
+        if result.is_err() {
+            self.shutdown.force_stop();
+            self.supervisor.abort_and_join().await;
         };
         self.stop_parent_cancellation_watcher().await;
         result
-    }
-
-    async fn drain_device_workers(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
-        while let Some(mut worker) = self.device_workers.pop() {
-            match timeout_until(deadline, &mut worker).await {
-                Ok(result) => {
-                    result.map_err(|error| MqttRuntimeError::Worker(error.to_string()))?
-                }
-                Err(()) => {
-                    self.device_workers.push(worker);
-                    return Err(MqttRuntimeError::DeadlineElapsed);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn abort_and_join_device_workers(&mut self) {
-        for worker in &self.device_workers {
-            worker.abort();
-        }
-        while let Some(worker) = self.device_workers.pop() {
-            let _ = worker.await;
-        }
-    }
-
-    async fn join_broker_until(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
-        let Some(broker) = self.take_broker() else {
-            return Ok(());
-        };
-        let mut join = tokio::task::spawn_blocking(move || broker.join());
-        match timeout_until(deadline, &mut join).await {
-            Ok(result) => result
-                .map_err(|error| MqttRuntimeError::Worker(error.to_string()))?
-                .map_err(MqttRuntimeError::Broker),
-            Err(()) => {
-                let _ = join.await;
-                Err(MqttRuntimeError::DeadlineElapsed)
-            }
-        }
-    }
-
-    async fn join_broker_after_shutdown(&mut self) {
-        let Some(broker) = self.take_broker() else {
-            return;
-        };
-        let _ = tokio::task::spawn_blocking(move || broker.join()).await;
     }
 
     async fn stop_parent_cancellation_watcher(&mut self) {
@@ -479,56 +519,16 @@ impl MqttRuntime {
             let _ = watcher.await;
         }
     }
-
-    fn shutdown_broker(&self) {
-        let broker = self
-            .broker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(broker) = broker.as_ref() {
-            broker.shutdown();
-        }
-    }
-
-    fn take_broker(&self) -> Option<BrokerLifecycleHandle> {
-        self.broker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-    }
 }
 
 fn spawn_parent_cancellation_watcher(
     parent_cancellation: CancellationToken,
-    device_admission: DeviceAdmissionControl,
-    force_cancellation: CancellationToken,
-    broker: Arc<Mutex<Option<BrokerLifecycleHandle>>>,
-    accepting: Arc<AtomicBool>,
-    #[cfg(test)] parent_cancellation_barrier: Option<ParentCancellationBarrier>,
+    shutdown: RuntimeShutdownControl,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         parent_cancellation.cancelled().await;
-        accepting.store(false, Ordering::Release);
-        {
-            let broker_handle = broker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(broker) = broker_handle.as_ref() {
-                broker.stop_public_accepting();
-            }
-        }
-        device_admission.stop();
-        #[cfg(test)]
-        if let Some(barrier) = parent_cancellation_barrier {
-            barrier.wait().await;
-        }
-        force_cancellation.cancel();
-        let broker = broker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(broker) = broker.as_ref() {
-            broker.shutdown();
-        }
+        shutdown.stop_accepting();
+        shutdown.force_stop();
     })
 }
 
@@ -537,12 +537,8 @@ impl Drop for MqttRuntime {
         if let Some(watcher) = self.parent_cancellation_watcher.take() {
             watcher.abort();
         }
-        self.device_admission.stop();
-        self.force_cancellation.cancel();
-        for worker in &self.device_workers {
-            worker.abort();
-        }
-        self.shutdown_broker();
+        self.shutdown.force_stop();
+        self.supervisor.abort_all();
     }
 }
 
@@ -707,17 +703,9 @@ fn authorization_cache_expiration_ms() -> u64 {
         .saturating_add(AUTHORIZATION_CACHE_TTL.as_millis() as u64)
 }
 
-async fn cancel_startup(
-    broker: &BrokerLifecycleHandle,
-    cancellation: &CancellationToken,
-    workers: Vec<JoinHandle<()>>,
-) {
-    cancellation.cancel();
-    for worker in workers {
-        worker.abort();
-        let _ = worker.await;
-    }
-    broker.shutdown();
+async fn cancel_startup(shutdown: &RuntimeShutdownControl, supervisor: &mut RuntimeTaskSupervisor) {
+    shutdown.force_stop();
+    supervisor.abort_and_join().await;
 }
 
 async fn serve_device_backend(
@@ -791,11 +779,10 @@ where
 mod tests {
     use std::{
         future::Future,
-        net::TcpListener as StdTcpListener,
         pin::Pin,
         sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -807,18 +794,13 @@ mod tests {
     };
 
     use super::{
-        DeviceAdmissionControl, MqttRuntime, MqttRuntimeError, MqttdDeviceTransport,
-        ParentCancellationBarrier, TransportAuthRequest, serve_device_backend,
-        spawn_parent_cancellation_watcher,
+        DeviceAdmissionControl, MqttRuntimeError, MqttdDeviceTransport, RuntimeTaskName,
+        RuntimeTaskSupervisor, TransportAuthRequest, serve_device_backend,
     };
     use crate::{
-        AuthenticatedDevice, BrokerLifecycleHandle, CacheEntry, CacheError, CachePort,
-        DeviceAuthenticator, MqttdError, TransportError, TransportUplink, UplinkForwarder,
+        AuthenticatedDevice, DeviceAuthenticator, TransportError, TransportUplink, UplinkForwarder,
     };
-    use tokio::{
-        sync::{oneshot, watch},
-        task::JoinHandle,
-    };
+    use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -847,25 +829,6 @@ mod tests {
 
     struct UnusedUplink;
 
-    struct UnusedCache;
-
-    impl CachePort for UnusedCache {
-        fn get(
-            &self,
-            _key: &str,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, CacheError>> + Send + '_>>
-        {
-            Box::pin(async { Ok(None) })
-        }
-
-        fn put(
-            &self,
-            _entry: CacheEntry,
-        ) -> Pin<Box<dyn Future<Output = Result<(), CacheError>> + Send + '_>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
     impl UplinkForwarder for UnusedUplink {
         fn forward(
             &self,
@@ -880,115 +843,42 @@ mod tests {
         MqttdDeviceTransport::new(CountingAuthenticator { calls }, UnusedUplink)
     }
 
-    fn runtime_with_broker(broker: BrokerLifecycleHandle) -> MqttRuntime {
-        let (drain_started, _) = watch::channel(false);
-        MqttRuntime {
-            broker: Arc::new(Mutex::new(Some(broker))),
-            device_workers: Vec::<JoinHandle<()>>::new(),
-            session_router: Default::default(),
-            device_admission: DeviceAdmissionControl::new(),
-            force_cancellation: CancellationToken::new(),
-            parent_cancellation_watcher: None,
-            accepting: Arc::new(AtomicBool::new(true)),
-            drain_started,
-            public_connections: Arc::new(AtomicUsize::new(0)),
-            _cache: Arc::new(UnusedCache),
-        }
-    }
-
     #[tokio::test]
-    async fn drain_joins_all_public_workers_and_returns_the_first_fatal_error() {
-        let broker = crate::start_broker_for_public_worker_test().await;
-        let (failure_finished_tx, failure_finished_rx) = oneshot::channel();
-        broker
-            .spawn_public_worker(
-                "injected-runtime-listener-error",
-                StdTcpListener::bind("127.0.0.1:0").unwrap(),
-                move |_listener, _accept_stop, _force_stop, _accept_gate| async move {
-                    let _ = failure_finished_tx.send(());
-                    Err(std::io::Error::other("injected runtime listener failure"))
-                },
-            )
-            .unwrap();
-        failure_finished_rx.await.unwrap();
+    async fn managed_supervisor_surfaces_the_first_failure_before_forcing_remaining_tasks() {
+        let mut supervisor = RuntimeTaskSupervisor::new();
         let (held_started_tx, held_started_rx) = oneshot::channel();
-        let (held_release_tx, held_release_rx) = oneshot::channel();
-        let (held_finished_tx, held_finished_rx) = oneshot::channel();
-        broker
-            .spawn_public_worker(
-                "held-runtime-listener-worker",
-                StdTcpListener::bind("127.0.0.1:0").unwrap(),
-                move |_listener, _accept_stop, _force_stop, _accept_gate| async move {
-                    let _ = held_started_tx.send(());
-                    let _ = held_release_rx.await;
-                    let _ = held_finished_tx.send(());
-                    Ok(())
-                },
-            )
-            .unwrap();
-        timeout(Duration::from_secs(1), held_started_rx)
-            .await
-            .expect("held public worker did not start")
-            .unwrap();
-        let mut runtime = runtime_with_broker(broker);
+        let (_held_release_tx, held_release_rx) = oneshot::channel::<()>();
 
-        let mut drain = Box::pin(runtime.drain(Instant::now() + Duration::from_secs(2)));
-        let before_release = timeout(Duration::from_millis(100), &mut drain).await;
-        let waited_for_held_worker = before_release.is_err();
-        held_release_tx.send(()).unwrap();
-        timeout(Duration::from_secs(1), held_finished_rx)
-            .await
-            .expect("held public worker did not release")
-            .unwrap();
-        let result = match before_release {
-            Err(_) => timeout(Duration::from_secs(1), &mut drain)
-                .await
-                .expect("runtime drain did not finish after held worker release"),
-            Ok(result) => result,
-        };
+        supervisor.spawn(RuntimeTaskName::PublicPlaintext, async {
+            Err(MqttRuntimeError::Worker(
+                "injected public plaintext failure".to_owned(),
+            ))
+        });
+        supervisor.spawn(RuntimeTaskName::DeviceV311, async move {
+            let _ = held_started_tx.send(());
+            let _ = held_release_rx.await;
+            Ok(())
+        });
 
+        held_started_rx
+            .await
+            .expect("held managed task did not start");
+        let error = timeout(
+            Duration::from_secs(1),
+            supervisor.join_until(Instant::now() + Duration::from_secs(2)),
+        )
+        .await
+        .expect("supervisor did not surface the failed task before the held task drained")
+        .expect_err("first managed task failure must reach the supervisor");
         assert!(
-            waited_for_held_worker,
-            "runtime drain returned before joining the held public worker"
+            matches!(
+                error,
+                MqttRuntimeError::Worker(ref message)
+                    if message == "public plaintext listener task failed: injected public plaintext failure"
+            ),
+            "unexpected supervisor error: {error:?}"
         );
-        let error = result.expect_err("fatal public listener I/O error must reach runtime drain");
-
-        match error {
-            MqttRuntimeError::PublicWorker(MqttdError::PublicWorkerIo { worker, source }) => {
-                assert_eq!(worker, "injected-runtime-listener-error");
-                assert_eq!(source.kind(), std::io::ErrorKind::Other);
-                assert_eq!(source.to_string(), "injected runtime listener failure");
-            }
-            error => panic!("expected public listener I/O error, got {error:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn drain_returns_a_fatal_public_listener_panic() {
-        let broker = crate::start_broker_for_public_worker_test().await;
-        broker
-            .spawn_public_worker(
-                "injected-runtime-listener-panic",
-                StdTcpListener::bind("127.0.0.1:0").unwrap(),
-                |_listener, _accept_stop, _force_stop, _accept_gate| async {
-                    panic!("injected runtime listener panic");
-                    #[allow(unreachable_code)]
-                    Ok(())
-                },
-            )
-            .unwrap();
-        let mut runtime = runtime_with_broker(broker);
-
-        let error = runtime
-            .drain(Instant::now() + Duration::from_secs(2))
-            .await
-            .expect_err("fatal public listener panic must reach runtime drain");
-
-        assert!(matches!(
-            error,
-            MqttRuntimeError::PublicWorker(MqttdError::PublicWorkerPanic { worker })
-                if worker == "injected-runtime-listener-panic"
-        ));
+        supervisor.abort_and_join().await;
     }
 
     fn v311_connect() -> Vec<u8> {
@@ -1136,73 +1026,5 @@ mod tests {
             .expect("V5 private device worker did not stop after normal admission closure")
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn parent_cancellation_closes_private_admission_before_forcing_transport() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let parent_cancellation = CancellationToken::new();
-        let admission = DeviceAdmissionControl::new();
-        let force_cancellation = CancellationToken::new();
-        let accepting = Arc::new(AtomicBool::new(true));
-        let broker = Arc::new(Mutex::new(Some(BrokerLifecycleHandle::test_handle())));
-        let barrier = ParentCancellationBarrier::default();
-        let watcher = spawn_parent_cancellation_watcher(
-            parent_cancellation.clone(),
-            admission.clone(),
-            force_cancellation.clone(),
-            Arc::clone(&broker),
-            Arc::clone(&accepting),
-            Some(barrier.clone()),
-        );
-        let calls = Arc::new(AtomicUsize::new(0));
-        let worker = tokio::spawn(serve_device_backend(
-            listener,
-            transport(Arc::clone(&calls)),
-            false,
-            admission.clone(),
-            force_cancellation.clone(),
-        ));
-
-        let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(&v311_connect()).await.unwrap();
-        let mut connack = [0_u8; 4];
-        client.read_exact(&mut connack).await.unwrap();
-        wait_for_authentication(&calls).await;
-
-        parent_cancellation.cancel();
-        barrier
-            .wait_until_reached("parent cancellation coordinator barrier")
-            .await;
-        assert!(!accepting.load(Ordering::Acquire));
-        assert!(
-            !broker
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .test_public_accepting()
-        );
-        assert!(!admission.is_accepting());
-        assert!(admission.accept_cancellation().is_cancelled());
-        assert!(!force_cancellation.is_cancelled());
-
-        barrier.release();
-        let mut response = Vec::new();
-        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
-            .await
-            .expect("parent cancellation did not force the admitted private transport")
-            .unwrap();
-        timeout(Duration::from_secs(1), worker)
-            .await
-            .expect("private device worker did not join after parent cancellation")
-            .unwrap();
-        watcher.await.unwrap();
-
-        assert!(!accepting.load(Ordering::Acquire));
-        assert!(!admission.is_accepting());
-        assert!(admission.accept_cancellation().is_cancelled());
-        assert!(force_cancellation.is_cancelled());
     }
 }

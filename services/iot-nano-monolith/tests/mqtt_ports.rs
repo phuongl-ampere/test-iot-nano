@@ -257,6 +257,7 @@ async fn qos_one_ack_follows_stream_commit() {
         vec![0x40, 0x02, 0x00, 0x07]
     );
     assert_eq!(fixture.stream.appended.load(Ordering::SeqCst), 1);
+    drop(device);
     fixture.shutdown().await;
 }
 
@@ -362,6 +363,7 @@ async fn shared_router_waits_for_puback_records_response_and_honors_revocation()
         expires_at: now + ChronoDuration::seconds(30),
     });
     assert_eq!(revoked.await, Err(CommandTransportError::NoActiveSession));
+    drop(device);
     fixture.shutdown().await;
 }
 
