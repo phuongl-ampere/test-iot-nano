@@ -27,7 +27,7 @@ mod waiters;
 
 pub use alertlog::Alert;
 pub use connection::Connection;
-pub use routing::{Router, RouterError};
+pub use routing::{ManagedRouter, Router, RouterError, RouterTaskError};
 pub use scheduler::Tracker;
 pub use waiters::Waiters;
 

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use super::alertlog::{Alert, AlertLog};
@@ -56,6 +57,42 @@ pub enum RouterError {
     Shutdown,
     #[error("storage {0}")]
     Storage(#[from] StorageError),
+}
+
+#[derive(Error, Debug)]
+pub enum RouterTaskError {
+    #[error(transparent)]
+    Router(#[from] RouterError),
+    #[error("router task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+}
+
+/// Owns a Tokio task that runs a router and aborts it if left unjoined.
+pub struct ManagedRouter {
+    link: Sender<(ConnectionId, Event)>,
+    join: Option<tokio::task::JoinHandle<Result<(), RouterError>>>,
+}
+
+impl ManagedRouter {
+    pub fn link(&self) -> Sender<(ConnectionId, Event)> {
+        self.link.clone()
+    }
+
+    pub async fn join(mut self) -> Result<(), RouterTaskError> {
+        self.join
+            .take()
+            .expect("managed router join handle must be present")
+            .await??;
+        Ok(())
+    }
+}
+
+impl Drop for ManagedRouter {
+    fn drop(&mut self) {
+        if let Some(join) = &self.join {
+            join.abort();
+        }
+    }
 }
 
 pub struct Router {
@@ -266,6 +303,31 @@ impl Router {
         (link, join)
     }
 
+    /// Starts the router on the current Tokio runtime. Cancellation completes
+    /// this managed path successfully; router errors and task panics are
+    /// returned by [`ManagedRouter::join`].
+    #[tracing::instrument(skip_all)]
+    pub fn spawn_managed(self, cancellation: CancellationToken) -> ManagedRouter {
+        let link = self.link();
+        let join = tokio::spawn(async move { self.run_managed(cancellation).await });
+        ManagedRouter {
+            link,
+            join: Some(join),
+        }
+    }
+
+    /// Runs the router on a Tokio worker without blocking it while waiting for
+    /// new router events.
+    #[tracing::instrument(skip_all)]
+    pub async fn run_managed(mut self, cancellation: CancellationToken) -> Result<(), RouterError> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            self.run_inner_managed(&cancellation).await?;
+        }
+    }
+
     /// Waits on incoming events when ready queue is empty.
     /// After pulling 1 event, tries to pull 500 more events
     /// before polling ready queue 100 times (connections)
@@ -315,6 +377,45 @@ impl Router {
             }
         }
 
+        self.complete_iteration()
+    }
+
+    async fn run_inner_managed(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RouterError> {
+        if let Some(storage) = &self.storage {
+            let now = now_ms();
+            if now >= self.next_prune_ms {
+                storage.prune(now, self.storage_policy)?;
+                self.next_prune_ms = now.saturating_add(self.storage_policy.prune_interval_ms);
+            }
+        }
+        if self.consume().is_none() {
+            let interval =
+                std::time::Duration::from_millis(self.storage_policy.prune_interval_ms.max(1));
+            let (id, data) = tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                event = self.router_rx.recv_async() => match event {
+                    Ok(event) => event,
+                    Err(_) => return Err(RouterError::Disconnected),
+                },
+                _ = tokio::time::sleep(interval) => {
+                    if let Some(storage) = &self.storage {
+                        storage.prune(now_ms(), self.storage_policy)?;
+                    }
+                    return Ok(());
+                }
+            };
+            if !self.events(id, data) {
+                return Err(RouterError::Shutdown);
+            }
+        }
+
+        self.complete_iteration()
+    }
+
+    fn complete_iteration(&mut self) -> Result<(), RouterError> {
         // Try reading more from connections in a non-blocking
         // fashion to accumulate data and handle subscriptions.
         // Accumulating more data lets requests retrieve bigger
@@ -2245,6 +2346,222 @@ fn extract_group(filter: &str) -> Option<(String, String)> {
             .map(|(group, path)| (group.to_string(), path.to_string()))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::link::local::LinkBuilder;
+    use crate::{
+        InboundQos2CommitResult, InboundQos2CompletionResult, InboundQos2PrepareResult,
+        MemoryStorage, RouterConfig, StoredPublish, StoredSession,
+    };
+
+    fn router_config() -> RouterConfig {
+        RouterConfig {
+            max_connections: 10,
+            max_outgoing_packet_count: 100,
+            max_segment_size: 1024,
+            max_segment_count: 10,
+            ..RouterConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_router_processes_a_local_link() {
+        let cancellation = CancellationToken::new();
+        let router = Router::new(0, router_config()).unwrap();
+        let managed = router.spawn_managed(cancellation.clone());
+        let link = managed.link();
+
+        let notification = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || LinkBuilder::new("managed-client", link).build()),
+        )
+        .await
+        .expect("managed router must process the local link")
+        .expect("link builder must not panic")
+        .expect("router must accept the local link")
+        .2;
+
+        assert!(matches!(notification, Notification::DeviceAck(_)));
+
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), managed.join())
+                .await
+                .expect("managed router must stop after cancellation"),
+            Ok(())
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_router_cancellation_completes_cleanly() {
+        let cancellation = CancellationToken::new();
+        let managed = Router::new(0, router_config())
+            .unwrap()
+            .spawn_managed(cancellation.clone());
+
+        cancellation.cancel();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), managed.join())
+                .await
+                .expect("managed router must stop after cancellation"),
+            Ok(())
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_router_propagates_router_failures() {
+        let storage = Arc::new(FailingPruneStorage::default());
+        let managed = Router::new_with_storage(
+            0,
+            router_config(),
+            Some(storage),
+            RetentionPolicy::default(),
+        )
+        .unwrap()
+        .spawn_managed(CancellationToken::new());
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), managed.join())
+                .await
+                .expect("managed router must report its storage failure"),
+            Err(RouterTaskError::Router(RouterError::Storage(error)))
+                if error.message == "injected prune failure"
+        ));
+    }
+
+    #[test]
+    fn legacy_router_thread_path_still_reports_shutdown() {
+        let (link, join) = Router::new(0, router_config()).unwrap().spawn_with_join();
+
+        link.send((0, Event::Shutdown)).unwrap();
+
+        assert!(matches!(join.join(), Ok(Err(RouterError::Shutdown))));
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingPruneStorage {
+        inner: MemoryStorage,
+        prune_calls: AtomicUsize,
+    }
+
+    impl BrokerStorage for FailingPruneStorage {
+        fn load(&self, now_ms: u64) -> Result<BrokerStorageState, StorageError> {
+            self.inner.load(now_ms)
+        }
+
+        fn save_retained(
+            &self,
+            topic: &str,
+            publish: &StoredPublish,
+            now_ms: u64,
+        ) -> Result<(), StorageError> {
+            self.inner.save_retained(topic, publish, now_ms)
+        }
+
+        fn delete_retained(&self, topic: &str) -> Result<(), StorageError> {
+            self.inner.delete_retained(topic)
+        }
+
+        fn commit_inbound(
+            &self,
+            client_id: &str,
+            publish: &StoredPublish,
+            now_ms: u64,
+        ) -> Result<(), StorageError> {
+            self.inner.commit_inbound(client_id, publish, now_ms)
+        }
+
+        fn load_inbound_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> Result<Option<StoredPublish>, StorageError> {
+            self.inner.load_inbound_qos2(client_id, packet_id)
+        }
+
+        fn complete_inbound(&self, client_id: &str, packet_id: u16) -> Result<(), StorageError> {
+            self.inner.complete_inbound(client_id, packet_id)
+        }
+
+        fn prepare_inbound_qos2(
+            &self,
+            client_id: &str,
+            publish: &StoredPublish,
+            now_ms: u64,
+        ) -> Result<InboundQos2PrepareResult, StorageError> {
+            self.inner.prepare_inbound_qos2(client_id, publish, now_ms)
+        }
+
+        fn complete_inbound_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+        ) -> Result<InboundQos2CompletionResult, StorageError> {
+            self.inner.complete_inbound_qos2(client_id, packet_id)
+        }
+
+        fn commit_inbound_qos2(
+            &self,
+            client_id: &str,
+            packet_id: u16,
+            now_ms: u64,
+        ) -> Result<InboundQos2CommitResult, StorageError> {
+            self.inner.commit_inbound_qos2(client_id, packet_id, now_ms)
+        }
+
+        fn save_session(&self, session: &StoredSession, now_ms: u64) -> Result<(), StorageError> {
+            self.inner.save_session(session, now_ms)
+        }
+
+        fn delete_session(&self, client_id: &str) -> Result<(), StorageError> {
+            self.inner.delete_session(client_id)
+        }
+
+        fn enqueue_offline(
+            &self,
+            client_id: &str,
+            publish: &StoredPublish,
+            now_ms: u64,
+            policy: RetentionPolicy,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .enqueue_offline(client_id, publish, now_ms, policy)
+        }
+
+        fn lease_offline(
+            &self,
+            client_id: &str,
+            now_ms: u64,
+            policy: RetentionPolicy,
+        ) -> Result<Vec<LeasedOffline>, StorageError> {
+            self.inner.lease_offline(client_id, now_ms, policy)
+        }
+
+        fn acknowledge_offline(&self, client_id: &str, lease_id: u64) -> Result<(), StorageError> {
+            self.inner.acknowledge_offline(client_id, lease_id)
+        }
+
+        fn prune(&self, now_ms: u64, policy: RetentionPolicy) -> Result<(), StorageError> {
+            if self.prune_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.inner.prune(now_ms, policy)
+            } else {
+                Err(StorageError::new("injected prune failure"))
+            }
+        }
+    }
+}
+
 // #[cfg(test)]
 // #[allow(non_snake_case)]
 // mod test {
