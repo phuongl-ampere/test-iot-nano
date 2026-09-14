@@ -11,6 +11,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use iot_core::{RpcMode, RpcRequest};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{PgPool, Row};
 use thiserror::Error;
 use uuid::Uuid;
@@ -164,7 +165,7 @@ async fn create_command(
 
     let response = match state {
         CoreControlState::Sqlite { store, .. } => {
-            let record = store
+            let record = match store
                 .enqueue_command(NewCommandOutboxEntry {
                     id: command.id.to_string(),
                     device_id: request.device_id,
@@ -174,26 +175,67 @@ async fn create_command(
                     expires_at: command.expires_at,
                     next_attempt_at: command.issued_at,
                 })
-                .await?;
+                .await
+            {
+                Ok(record) => record,
+                Err(crate::CoreSqliteStoreError::CommandConflict) => {
+                    return Err(ControlError::Conflict);
+                }
+                Err(error) => return Err(ControlError::Sqlite(error)),
+            };
             command_response_from_sqlite(record)?
         }
         CoreControlState::Timescale { pool, .. } => {
             let mut transaction = pool.begin().await?;
-            let row = sqlx::query(
+            let result = sqlx::query(
                 "INSERT INTO command_outbox (
-                    id, device_id, method, params, mode, expires_at, next_attempt_at
+                 id, device_id, method, params, mode, expires_at, next_attempt_at
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (id) DO NOTHING
                  RETURNING id, device_id, state, expires_at, mode, response, responded_at",
             )
             .bind(command.id)
             .bind(&request.device_id)
-            .bind(command.method)
-            .bind(sqlx::types::Json(command.params))
+            .bind(&command.method)
+            .bind(sqlx::types::Json(command.params.clone()))
             .bind(mode_name(command.mode))
             .bind(command.expires_at)
             .bind(command.issued_at)
-            .fetch_one(&mut *transaction)
-            .await?;
+            .fetch_optional(&mut *transaction)
+            .await;
+            let row = match result? {
+                Some(row) => row,
+                None => {
+                    let row = sqlx::query(
+                        "SELECT
+                            id, device_id, method, params, state, expires_at, mode, response, responded_at
+                         FROM command_outbox
+                         WHERE id = $1
+                         FOR UPDATE",
+                    )
+                    .bind(command.id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                    let row = row.ok_or(ControlError::Database(sqlx::Error::RowNotFound))?;
+                    let existing_device_id: String = row.try_get("device_id")?;
+                    let existing_method: String = row.try_get("method")?;
+                    let existing_params: sqlx::types::Json<Value> = row.try_get("params")?;
+                    let existing_mode: String = row.try_get("mode")?;
+                    if !crate::storage::command_payload_matches(
+                        &existing_device_id,
+                        &existing_method,
+                        &existing_params.0,
+                        mode_from_name(&existing_mode)?,
+                        &request.device_id,
+                        &command.method,
+                        &command.params,
+                        command.mode,
+                    ) {
+                        return Err(ControlError::Conflict);
+                    }
+                    row
+                }
+            };
             transaction.commit().await?;
             command_response_from_postgres(row)?
         }

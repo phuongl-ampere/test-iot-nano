@@ -50,7 +50,7 @@ fn builds_and_validates_a_two_way_rpc_request() {
 }
 
 #[test]
-fn rejects_a_request_id_that_is_not_uuidv7() {
+fn rejects_a_request_id_that_is_not_uuidv7_or_uuidv5() {
     let issued_at = issued_at();
 
     let actual = RpcRequest::new(
@@ -61,7 +61,21 @@ fn rejects_a_request_id_that_is_not_uuidv7() {
         issued_at + Duration::seconds(30),
     );
 
-    assert_eq!(actual, Err(RpcRequestValidationError::IdMustBeUuidV7));
+    assert_eq!(actual, Err(RpcRequestValidationError::IdMustBeUuidV7OrV5));
+}
+
+#[test]
+fn builds_a_deterministic_uuidv5_rpc_request() {
+    let issued_at = issued_at();
+    let actual = RpcRequest::new(
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, b"public-command"),
+        "sample_now",
+        json!({}),
+        issued_at,
+        issued_at + Duration::seconds(30),
+    );
+
+    assert!(actual.is_ok());
 }
 
 #[test]

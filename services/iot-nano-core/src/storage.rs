@@ -3,6 +3,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use iot_sqldb_common::{SqlitePoolError, open_owned_sqlite_pool};
+use serde_json::Value;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction, sqlite::SqliteRow};
 use thiserror::Error;
 
@@ -109,24 +110,62 @@ impl CoreSqliteStore {
         &self,
         command: NewCommandOutboxEntry,
     ) -> Result<CommandOutboxRecord, CoreSqliteStoreError> {
-        let row = sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO command_outbox (
                 id, device_id, method, params, mode, expires_at, next_attempt_at
              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO NOTHING
              RETURNING
                 id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
-        .bind(command.id)
-        .bind(command.device_id)
-        .bind(command.method)
-        .bind(command.params)
+        .bind(&command.id)
+        .bind(&command.device_id)
+        .bind(&command.method)
+        .bind(&command.params)
         .bind(command_mode_value(command.mode))
         .bind(command.expires_at.to_rfc3339())
         .bind(command.next_attempt_at.to_rfc3339())
-        .fetch_one(&self.pool)
-        .await?;
-        command_outbox_record(row)
+        .fetch_optional(&self.pool)
+        .await;
+        match result {
+            Ok(Some(row)) => command_outbox_record(row),
+            Ok(None) => {
+                let row = sqlx::query(
+                    "SELECT
+                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                        lease_until, attempt_count, last_error, published_at, response, responded_at
+                     FROM command_outbox
+                     WHERE id = ?",
+                )
+                .bind(&command.id)
+                .fetch_optional(&self.pool)
+                .await?;
+                let row = row.ok_or(CoreSqliteStoreError::Database(sqlx::Error::RowNotFound))?;
+                let record = command_outbox_record(row)?;
+                let existing_params = serde_json::from_str::<Value>(&record.params).ok();
+                let requested_params = serde_json::from_str::<Value>(&command.params).ok();
+                if existing_params.as_ref().is_some_and(|existing_params| {
+                    requested_params.as_ref().is_some_and(|requested_params| {
+                        command_payload_matches(
+                            &record.device_id,
+                            &record.method,
+                            existing_params,
+                            record.mode,
+                            &command.device_id,
+                            &command.method,
+                            requested_params,
+                            command.mode,
+                        )
+                    })
+                }) {
+                    Ok(record)
+                } else {
+                    Err(CoreSqliteStoreError::CommandConflict)
+                }
+            }
+            Err(error) => Err(CoreSqliteStoreError::Database(error)),
+        }
     }
 
     pub async fn claim_commands(
@@ -910,8 +949,26 @@ pub enum CoreSqliteStoreError {
     SequenceOverflow,
     #[error("telemetry measurements cannot be serialized")]
     Serialization(#[source] serde_json::Error),
+    #[error("command payload conflicts with the existing command ID")]
+    CommandConflict,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
     Common(#[from] SqlitePoolError),
+}
+
+pub(crate) fn command_payload_matches(
+    existing_device_id: &str,
+    existing_method: &str,
+    existing_params: &Value,
+    existing_mode: RpcMode,
+    requested_device_id: &str,
+    requested_method: &str,
+    requested_params: &Value,
+    requested_mode: RpcMode,
+) -> bool {
+    existing_device_id == requested_device_id
+        && existing_method == requested_method
+        && existing_params == requested_params
+        && existing_mode == requested_mode
 }

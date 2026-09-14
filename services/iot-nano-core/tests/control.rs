@@ -110,6 +110,138 @@ async fn authenticated_command_control_creates_and_reads_a_sqlite_command() {
 }
 
 #[tokio::test]
+async fn authenticated_command_control_replays_matching_sqlite_commands_and_conflicts_on_changes() {
+    let (_directory, store) = store().await;
+    let app = core_control_router(CoreControlState::sqlite(store, CORE_SECRET).unwrap());
+    let id = Uuid::now_v7();
+    let first_issued_at = Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 0).unwrap();
+    let first_expires_at = Utc.with_ymd_and_hms(2026, 9, 10, 8, 5, 0).unwrap();
+    let create = |issued_at, expires_at, params| {
+        Request::builder()
+            .method("POST")
+            .uri("/internal/commands")
+            .header("x-iot-nano-api-core-secret", CORE_SECRET)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id": id,
+                    "device_id": "replay-device",
+                    "method": "setRelay",
+                    "params": params,
+                    "mode": "two_way",
+                    "issued_at": issued_at,
+                    "expires_at": expires_at
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let first = app
+        .clone()
+        .oneshot(create(
+            first_issued_at,
+            first_expires_at,
+            json!({"enabled": true, "level": 1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let replay = app
+        .clone()
+        .oneshot(create(
+            first_issued_at + chrono::Duration::seconds(1),
+            first_expires_at + chrono::Duration::seconds(1),
+            json!({"level": 1, "enabled": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay_body = to_bytes(replay.into_body(), 16 * 1024).await.unwrap();
+    let replay_body: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+    assert_eq!(replay_body["id"], id.to_string());
+    assert_eq!(replay_body["expires_at"], "2026-09-10T08:05:00Z");
+
+    let conflict = app
+        .oneshot(create(
+            first_issued_at + chrono::Duration::seconds(2),
+            first_expires_at + chrono::Duration::seconds(2),
+            json!({"enabled": false, "level": 1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+#[ignore = "requires the exact disposable IOT_NANO_TIMESCALE_TEST_URL"]
+async fn authenticated_command_control_replays_matching_timescale_commands_and_conflicts_on_changes()
+ {
+    let (_lock, pool) = timescale_pool().await;
+    let app = core_control_router(CoreControlState::timescale(pool, CORE_SECRET).unwrap());
+    let id = Uuid::now_v7();
+    let first_issued_at = Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 0).unwrap();
+    let first_expires_at = Utc.with_ymd_and_hms(2026, 9, 10, 8, 5, 0).unwrap();
+    let create = |issued_at, expires_at, params| {
+        Request::builder()
+            .method("POST")
+            .uri("/internal/commands")
+            .header("x-iot-nano-api-core-secret", CORE_SECRET)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "id": id,
+                    "device_id": "replay-timescale-device",
+                    "method": "setRelay",
+                    "params": params,
+                    "mode": "two_way",
+                    "issued_at": issued_at,
+                    "expires_at": expires_at
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let first = app
+        .clone()
+        .oneshot(create(
+            first_issued_at,
+            first_expires_at,
+            json!({"enabled": true, "level": 1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+    let replay = app
+        .clone()
+        .oneshot(create(
+            first_issued_at + chrono::Duration::seconds(1),
+            first_expires_at + chrono::Duration::seconds(1),
+            json!({"level": 1, "enabled": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay_body = to_bytes(replay.into_body(), 16 * 1024).await.unwrap();
+    let replay_body: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+    assert_eq!(replay_body["id"], id.to_string());
+    assert_eq!(replay_body["expires_at"], "2026-09-10T08:05:00Z");
+
+    let conflict = app
+        .oneshot(create(
+            first_issued_at + chrono::Duration::seconds(2),
+            first_expires_at + chrono::Duration::seconds(2),
+            json!({"enabled": false, "level": 1}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn authenticated_command_control_records_a_two_way_response_after_publish() {
     let (_directory, store) = store().await;
     let app = core_control_router(CoreControlState::sqlite(store.clone(), CORE_SECRET).unwrap());

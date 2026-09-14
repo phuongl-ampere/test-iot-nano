@@ -85,8 +85,8 @@ impl RpcRequest {
     }
 
     pub fn validate(&self) -> Result<(), RpcRequestValidationError> {
-        if self.id.get_version_num() != 7 {
-            return Err(RpcRequestValidationError::IdMustBeUuidV7);
+        if !matches!(self.id.get_version_num(), 5 | 7) {
+            return Err(RpcRequestValidationError::IdMustBeUuidV7OrV5);
         }
         if !is_identifier(&self.method) {
             return Err(RpcRequestValidationError::InvalidMethod);
@@ -111,8 +111,8 @@ fn is_identifier(value: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RpcRequestValidationError {
-    #[error("RPC request ID must be UUIDv7")]
-    IdMustBeUuidV7,
+    #[error("RPC request ID must be UUIDv7 or UUIDv5")]
+    IdMustBeUuidV7OrV5,
     #[error("RPC method must be 1 to 64 ASCII alphanumeric, underscore, or hyphen characters")]
     InvalidMethod,
     #[error("RPC params must be a JSON object")]

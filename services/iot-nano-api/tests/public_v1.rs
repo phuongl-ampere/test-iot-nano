@@ -7,11 +7,12 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iot_api::{
-    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
-    CoreFacadeError, CoreTelemetryPoint, CoreTelemetryQuery,
+    CoreClient, CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest,
+    CoreFacade, CoreFacadeError, CoreTelemetryPoint, CoreTelemetryQuery,
 };
 use iot_api::{SqliteApiState, bootstrap_users_sqlite, sqlite_router};
 use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_core::{CoreControlState, CoreSqliteStore, core_control_router};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, PlatformStore, SqliteStore,
 };
@@ -29,6 +30,7 @@ use uuid::Uuid;
 const CLIENT_ID: &str = "public-v1-client";
 const REDIRECT_URI: &str = "https://client.example.test/public-v1/callback";
 const VERIFIER: &str = "public-v1-pkce-verifier-with-at-least-forty-three-characters";
+const CORE_SECRET: &str = "core-control-secret-must-have-at-least-32";
 
 async fn public_app() -> (tempfile::TempDir, SqliteStore, axum::Router) {
     let directory = tempfile::tempdir().unwrap();
@@ -165,6 +167,58 @@ async fn public_app_with_core() -> (tempfile::TempDir, SqliteStore, axum::Router
         .with_oauth_store(oauth_store)
         .with_core_facade(Arc::new(RecordingCore::default()));
     (directory, api_store, sqlite_router(state))
+}
+
+async fn public_app_with_real_core() -> (
+    tempfile::TempDir,
+    SqliteStore,
+    axum::Router,
+    tokio::task::JoinHandle<()>,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("public-v1-real-core.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    };
+    let oauth_store = PlatformStore::open(&configuration).await.unwrap();
+    let api_store = SqliteStore::open(&configuration).await.unwrap();
+    let core_store = CoreSqliteStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("core.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    bootstrap_users_sqlite(api_store.pool()).await.unwrap();
+    ApplicationRepository::upsert_application(
+        &oauth_store,
+        NewApplication {
+            app_id: "public-v1-app".parse().unwrap(),
+            kind: ApplicationKind::FullStack,
+            launch_url: "https://client.example.test".to_owned(),
+            client_id: CLIENT_ID.parse().unwrap(),
+            redirect_uris: vec![REDIRECT_URI.parse().unwrap()],
+            allowed_scopes: vec!["commands:write".to_owned(), "commands:read".to_owned()],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let core_app = core_control_router(CoreControlState::sqlite(core_store, CORE_SECRET).unwrap());
+    let core_server = tokio::spawn(async move {
+        axum::serve(listener, core_app).await.unwrap();
+    });
+    let core_client = CoreClient::new(format!("http://{address}"), CORE_SECRET).unwrap();
+    let state = SqliteApiState::new(api_store.clone())
+        .with_oauth_store(oauth_store)
+        .with_core_client(core_client);
+    (directory, api_store, sqlite_router(state), core_server)
 }
 
 async fn oauth_bearer_token(app: &axum::Router, scope: &str) -> String {
@@ -450,6 +504,61 @@ async fn public_commands_replay_identical_idempotency_keys_and_conflict_on_paylo
         .await
         .unwrap();
     assert_public_error(conflict, StatusCode::CONFLICT, "conflict").await;
+}
+
+#[tokio::test]
+async fn public_commands_replay_through_the_real_core_control_path() {
+    let (_directory, store, app, core_server) = public_app_with_real_core().await;
+    let viewer_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'viewer'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, owner_user_id) VALUES ('real-core-device', ?)")
+        .bind(viewer_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let token = oauth_bearer_token(&app, "commands:write").await;
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/devices/real-core-device/commands")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", "real-core-replay-1")
+            .body(Body::from(
+                r#"{"method":"setRelay","params":{"enabled":true}}"#,
+            ))
+            .unwrap()
+    };
+
+    let first = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let first: Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let replay = app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay: Value =
+        serde_json::from_slice(&to_bytes(replay.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(replay, first);
+
+    let conflict = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices/real-core-device/commands")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "real-core-replay-1")
+                .body(Body::from(
+                    r#"{"method":"setRelay","params":{"enabled":false}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(conflict, StatusCode::CONFLICT, "conflict").await;
+    core_server.abort();
 }
 
 #[tokio::test]
