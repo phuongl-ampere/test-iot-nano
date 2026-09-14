@@ -72,8 +72,87 @@ pub use transport::{
 
 pub struct BrokerLifecycleHandle {
     inner: Option<CoreBrokerHandle>,
+    public_accept_gate: PublicMuxAcceptanceGate,
     public_accept_stop: watch::Sender<bool>,
     public_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+pub struct PublicMuxAcceptanceGate {
+    accepting: Arc<Mutex<bool>>,
+    #[cfg(test)]
+    proxy_spawn_barrier: Arc<Mutex<Option<MuxProxySpawnBarrier>>>,
+}
+
+impl Default for PublicMuxAcceptanceGate {
+    fn default() -> Self {
+        Self {
+            accepting: Arc::new(Mutex::new(true)),
+            #[cfg(test)]
+            proxy_spawn_barrier: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl PublicMuxAcceptanceGate {
+    /// Closes admission for new public mux proxies.
+    ///
+    /// The mutex-protected state transition is the linearization point shared
+    /// with `try_admit`: a proxy that observes `true` won before this close.
+    pub fn close(&self) {
+        *self
+            .accepting
+            .lock()
+            .expect("public accept gate is not poisoned") = false;
+    }
+
+    fn try_admit(&self) -> bool {
+        *self
+            .accepting
+            .lock()
+            .expect("public accept gate is not poisoned")
+    }
+
+    #[cfg(test)]
+    fn test_proxy_spawn_barrier(&self) -> MuxProxySpawnBarrier {
+        let barrier = MuxProxySpawnBarrier::default();
+        *self
+            .proxy_spawn_barrier
+            .lock()
+            .expect("public accept gate test barrier is not poisoned") = Some(barrier.clone());
+        barrier
+    }
+
+    #[cfg(test)]
+    async fn wait_before_proxy_spawn(&self) {
+        let barrier = self
+            .proxy_spawn_barrier
+            .lock()
+            .expect("public accept gate test barrier is not poisoned")
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.reached.notify_one();
+            barrier.proceed.notified().await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct MuxProxySpawnBarrier {
+    reached: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl MuxProxySpawnBarrier {
+    async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    fn release(&self) {
+        self.proceed.notify_one();
+    }
 }
 
 pub struct PreboundBackendListeners {
@@ -90,6 +169,7 @@ impl BrokerLifecycleHandle {
     }
 
     pub fn stop_public_accepting(&self) {
+        self.public_accept_gate.close();
         self.public_accept_stop.send_replace(true);
     }
 
@@ -188,13 +268,14 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-plaintext-mux",
             listener,
-            move |listener, accept_stop, force_stop| async move {
-                serve_plaintext_mux_with_shutdowns(
+            move |listener, accept_stop, force_stop, accept_gate| async move {
+                serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
                     listener,
                     backends,
                     settings,
                     accept_stop,
                     force_stop,
+                    accept_gate,
                 )
                 .await
             },
@@ -235,13 +316,14 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-plaintext-mux",
             listener,
-            move |listener, accept_stop, force_stop| async move {
+            move |listener, accept_stop, force_stop, accept_gate| async move {
                 serve_plaintext_mux_with_shutdowns_and_mode(
                     listener,
                     backends,
                     settings,
                     accept_stop,
                     force_stop,
+                    accept_gate,
                     MuxRouteMode::DeviceOnly,
                     connection_counter,
                 )
@@ -260,14 +342,15 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-tls-mux",
             listener,
-            move |listener, accept_stop, force_stop| async move {
-                serve_tls_mux_with_shutdowns(
+            move |listener, accept_stop, force_stop, accept_gate| async move {
+                serve_tls_mux_with_shutdowns_and_acceptance_gate(
                     listener,
                     acceptor,
                     backends,
                     settings,
                     accept_stop,
                     force_stop,
+                    accept_gate,
                 )
                 .await
             },
@@ -314,7 +397,7 @@ impl BrokerLifecycleHandle {
         self.spawn_public_worker(
             "iot-mqttd-tls-mux",
             listener,
-            move |listener, accept_stop, force_stop| async move {
+            move |listener, accept_stop, force_stop, accept_gate| async move {
                 serve_tls_mux_with_shutdowns_and_mode(
                     listener,
                     acceptor,
@@ -322,6 +405,7 @@ impl BrokerLifecycleHandle {
                     settings,
                     accept_stop,
                     force_stop,
+                    accept_gate,
                     MuxRouteMode::DeviceOnly,
                     connection_counter,
                 )
@@ -337,7 +421,12 @@ impl BrokerLifecycleHandle {
         serve: F,
     ) -> Result<(), MqttdError>
     where
-        F: FnOnce(TcpListener, watch::Receiver<bool>, watch::Receiver<bool>) -> Fut
+        F: FnOnce(
+                TcpListener,
+                watch::Receiver<bool>,
+                watch::Receiver<bool>,
+                PublicMuxAcceptanceGate,
+            ) -> Fut
             + Send
             + 'static,
         Fut: std::future::Future<Output = std::io::Result<()>> + Send + 'static,
@@ -347,6 +436,7 @@ impl BrokerLifecycleHandle {
             .map_err(|error| MqttdError::Broker(Box::new(error)))?;
         let accept_stop = self.public_accept_stop.subscribe();
         let force_stop = self.shutdown_receiver();
+        let accept_gate = self.public_accept_gate.clone();
         let worker = thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
@@ -357,7 +447,7 @@ impl BrokerLifecycleHandle {
                     Ok(runtime) => {
                         let result = runtime.block_on(async {
                             let listener = TcpListener::from_std(listener)?;
-                            serve(listener, accept_stop, force_stop).await
+                            serve(listener, accept_stop, force_stop, accept_gate).await
                         });
                         if let Err(error) = result {
                             eprintln!("iot-mqttd public listener stopped: {error}");
@@ -680,16 +770,107 @@ pub async fn serve_plaintext_mux_with_shutdowns(
     accept_shutdown: watch::Receiver<bool>,
     force_shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
+        listener,
+        backends,
+        settings,
+        accept_shutdown,
+        force_shutdown,
+        PublicMuxAcceptanceGate::default(),
+    )
+    .await
+}
+
+pub async fn serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
+    listener: TcpListener,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
+    accept_shutdown: watch::Receiver<bool>,
+    force_shutdown: watch::Receiver<bool>,
+    accept_gate: PublicMuxAcceptanceGate,
+) -> std::io::Result<()> {
     serve_plaintext_mux_with_shutdowns_and_mode(
         listener,
         backends,
         settings,
         accept_shutdown,
         force_shutdown,
+        accept_gate,
         MuxRouteMode::GenericBroker,
         None,
     )
     .await
+}
+
+#[cfg(test)]
+mod mux_shutdown_tests {
+    use super::*;
+    use tokio::{
+        io::AsyncWriteExt,
+        sync::mpsc,
+        time::{Duration, timeout},
+    };
+
+    fn connect_packet() -> Vec<u8> {
+        vec![
+            0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 4, 0x02, 0x00, 0x3c, 0x00, 0x02, b'i',
+            b'd',
+        ]
+    }
+
+    #[tokio::test]
+    async fn lifecycle_accept_gate_rejects_a_connection_stopped_after_accept_before_spawn() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let (backend_accepted, mut backend_connections) = mpsc::unbounded_channel();
+        let backend_task = tokio::spawn(async move {
+            let _ = backend_listener
+                .accept()
+                .await
+                .map(|_| backend_accepted.send(()));
+        });
+
+        let (accept_stop, accept_shutdown) = watch::channel(false);
+        let (_force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let lifecycle = BrokerLifecycleHandle {
+            inner: None,
+            public_accept_gate: gate.clone(),
+            public_accept_stop: accept_stop,
+            public_workers: Mutex::new(Vec::new()),
+        };
+        let barrier = gate.test_proxy_spawn_barrier();
+        let mux_task = tokio::spawn(serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
+            public_listener,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: None,
+                device_v5: None,
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate.clone(),
+        ));
+
+        let mut client = TcpStream::connect(public_address).await.unwrap();
+        client.write_all(&connect_packet()).await.unwrap();
+        barrier.wait_until_reached().await;
+        lifecycle.stop_public_accepting();
+        barrier.release();
+
+        assert!(mux_task.await.unwrap().is_ok());
+        assert!(
+            timeout(Duration::from_millis(100), backend_connections.recv())
+                .await
+                .is_err(),
+            "a connection accepted before stop was proxied after the gate closed"
+        );
+        backend_task.abort();
+    }
 }
 
 fn public_mux_shutdown_requested(
@@ -705,25 +886,39 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
     settings: MuxSettings,
     mut accept_shutdown: watch::Receiver<bool>,
     mut force_shutdown: watch::Receiver<bool>,
+    accept_gate: PublicMuxAcceptanceGate,
     route_mode: MuxRouteMode,
     connection_counter: Option<Arc<AtomicUsize>>,
 ) -> std::io::Result<()> {
     if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+        accept_gate.close();
         return Ok(());
     }
 
     let mut connections = JoinSet::new();
     loop {
         if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+            accept_gate.close();
             break;
         }
 
         tokio::select! {
             biased;
-            _ = force_shutdown.changed() => break,
-            _ = accept_shutdown.changed() => break,
+            _ = force_shutdown.changed() => {
+                accept_gate.close();
+                break;
+            }
+            _ = accept_shutdown.changed() => {
+                accept_gate.close();
+                break;
+            }
             result = listener.accept() => {
                 let (stream, _) = result?;
+                #[cfg(test)]
+                accept_gate.wait_before_proxy_spawn().await;
+                if !accept_gate.try_admit() {
+                    continue;
+                }
                 let mut connection_shutdown = force_shutdown.clone();
                 let connection_counter = connection_counter.clone();
                 connections.spawn(async move {
@@ -798,6 +993,27 @@ pub async fn serve_tls_mux_with_shutdowns(
     accept_shutdown: watch::Receiver<bool>,
     force_shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    serve_tls_mux_with_shutdowns_and_acceptance_gate(
+        listener,
+        acceptor,
+        backends,
+        settings,
+        accept_shutdown,
+        force_shutdown,
+        PublicMuxAcceptanceGate::default(),
+    )
+    .await
+}
+
+pub async fn serve_tls_mux_with_shutdowns_and_acceptance_gate(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
+    accept_shutdown: watch::Receiver<bool>,
+    force_shutdown: watch::Receiver<bool>,
+    accept_gate: PublicMuxAcceptanceGate,
+) -> std::io::Result<()> {
     serve_tls_mux_with_shutdowns_and_mode(
         listener,
         acceptor,
@@ -805,6 +1021,7 @@ pub async fn serve_tls_mux_with_shutdowns(
         settings,
         accept_shutdown,
         force_shutdown,
+        accept_gate,
         MuxRouteMode::GenericBroker,
         None,
     )
@@ -818,25 +1035,39 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
     settings: MuxSettings,
     mut accept_shutdown: watch::Receiver<bool>,
     mut force_shutdown: watch::Receiver<bool>,
+    accept_gate: PublicMuxAcceptanceGate,
     route_mode: MuxRouteMode,
     connection_counter: Option<Arc<AtomicUsize>>,
 ) -> std::io::Result<()> {
     if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+        accept_gate.close();
         return Ok(());
     }
 
     let mut connections = JoinSet::new();
     loop {
         if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+            accept_gate.close();
             break;
         }
 
         tokio::select! {
             biased;
-            _ = force_shutdown.changed() => break,
-            _ = accept_shutdown.changed() => break,
+            _ = force_shutdown.changed() => {
+                accept_gate.close();
+                break;
+            }
+            _ = accept_shutdown.changed() => {
+                accept_gate.close();
+                break;
+            }
             result = listener.accept() => {
                 let (stream, _) = result?;
+                #[cfg(test)]
+                accept_gate.wait_before_proxy_spawn().await;
+                if !accept_gate.try_admit() {
+                    continue;
+                }
                 let acceptor = acceptor.clone();
                 let mut connection_shutdown = force_shutdown.clone();
                 let connection_counter = connection_counter.clone();
@@ -1438,6 +1669,7 @@ async fn start_broker_with_timeout_storage_and_prebound_listeners(
     };
     let handle = BrokerLifecycleHandle {
         inner: Some(inner),
+        public_accept_gate: PublicMuxAcceptanceGate::default(),
         public_accept_stop,
         public_workers: Mutex::new(Vec::new()),
     };

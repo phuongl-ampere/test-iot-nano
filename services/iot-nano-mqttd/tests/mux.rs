@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use iot_nano_mqttd::{ProtocolBackends, serve_plaintext_mux, serve_plaintext_mux_with_shutdowns};
+use iot_nano_mqttd::{
+    ProtocolBackends, load_tls_acceptor, serve_plaintext_mux, serve_plaintext_mux_with_shutdowns,
+    serve_tls_mux_with_shutdowns,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
@@ -174,6 +177,57 @@ async fn pre_signalled_accept_shutdown_does_not_proxy_a_ready_plaintext_client()
         tokio::time::timeout(Duration::from_secs(1), mux_task)
             .await
             .expect("mux did not stop after a pre-signalled accept shutdown")
+            .unwrap()
+            .is_ok()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), backend_listener.accept())
+            .await
+            .is_err()
+    );
+
+    drop(client);
+}
+
+#[tokio::test]
+async fn pre_signalled_force_shutdown_does_not_proxy_a_ready_tls_client() {
+    tokio_rustls::rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let public_address = public_listener.local_addr().unwrap();
+    let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let acceptor =
+        load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
+
+    let mut client = tokio::net::TcpStream::connect(public_address)
+        .await
+        .unwrap();
+    client.write_all(&connect_packet(4)).await.unwrap();
+
+    let (_accept_stop, accept_shutdown) = watch::channel(false);
+    let (force_stop, force_shutdown) = watch::channel(false);
+    force_stop.send_replace(true);
+    let mux_task = tokio::spawn(serve_tls_mux_with_shutdowns(
+        public_listener,
+        acceptor,
+        ProtocolBackends {
+            v311: backend_address,
+            v5: backend_address,
+            device_v311: None,
+            device_v5: None,
+        },
+        Default::default(),
+        accept_shutdown,
+        force_shutdown,
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("mux did not stop after a pre-signalled force shutdown")
             .unwrap()
             .is_ok()
     );
