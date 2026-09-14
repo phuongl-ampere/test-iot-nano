@@ -5,7 +5,7 @@ use crate::protocol::{
 use crate::router::Ack;
 use crate::router::{
     iobufs::{Incoming, Outgoing},
-    Connection, Event, Notification, ShadowRequest,
+    Connection, Event, ManagedLinkState, ManagedRouterLink, Notification, ShadowRequest,
 };
 use crate::ConnectionId;
 use bytes::Bytes;
@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
@@ -34,6 +35,32 @@ pub enum LinkError {
     RecvTimeout(#[from] RecvTimeoutError),
     #[error("Timeout = {0}")]
     Elapsed(#[from] tokio::time::error::Elapsed),
+    #[error("an asynchronous local link requires a managed router link")]
+    ManagedRouterLinkRequired,
+    #[error("a managed router link must use the asynchronous local-link builder")]
+    ManagedRouterLinkRequiresAsync,
+}
+
+struct LinkSetup {
+    router_tx: Sender<(ConnectionId, Event)>,
+    event: Event,
+    link_rx: Receiver<()>,
+    outgoing_data_buffer: Arc<Mutex<VecDeque<Notification>>>,
+    incoming_data_buffer: Arc<Mutex<VecDeque<Packet>>>,
+    managed_cleanup: Option<ManagedLinkCleanup>,
+}
+
+#[derive(Debug)]
+struct ManagedLinkCleanup {
+    link_state: Arc<ManagedLinkState>,
+    cancellation_tx: UnboundedSender<Arc<ManagedLinkState>>,
+}
+
+impl Drop for ManagedLinkCleanup {
+    fn drop(&mut self) {
+        self.link_state.cancel();
+        let _ = self.cancellation_tx.send(self.link_state.clone());
+    }
 }
 
 // used to build LinkTx and LinkRx
@@ -49,6 +76,7 @@ pub struct LinkBuilder<'a> {
     dynamic_filters: bool,
     // default to 0, indicating to not use topic alias
     topic_alias_max: u16,
+    managed_link: Option<ManagedRouterLink>,
 }
 
 impl<'a> LinkBuilder<'a> {
@@ -62,7 +90,16 @@ impl<'a> LinkBuilder<'a> {
             last_will_properties: None,
             dynamic_filters: false,
             topic_alias_max: 0,
+            managed_link: None,
         }
+    }
+
+    /// Builds a local link whose lifecycle is owned by `ManagedRouter`.
+    pub fn new_managed(client_id: &'a str, managed_link: ManagedRouterLink) -> Self {
+        let router_tx = managed_link.router_tx();
+        let mut builder = Self::new(client_id, router_tx);
+        builder.managed_link = Some(managed_link);
+        builder
     }
 
     pub fn tenant_id(mut self, tenant_id: Option<String>) -> Self {
@@ -99,6 +136,61 @@ impl<'a> LinkBuilder<'a> {
     }
 
     pub fn build(self) -> Result<(LinkTx, LinkRx, Notification), LinkError> {
+        if self.managed_link.is_some() {
+            return Err(LinkError::ManagedRouterLinkRequiresAsync);
+        }
+        let LinkSetup {
+            router_tx,
+            event,
+            link_rx,
+            outgoing_data_buffer,
+            incoming_data_buffer,
+            managed_cleanup,
+        } = self.prepare(None);
+        router_tx.send((0, event))?;
+        link_rx.recv()?;
+
+        finish_link(
+            router_tx,
+            link_rx,
+            outgoing_data_buffer,
+            incoming_data_buffer,
+            managed_cleanup,
+        )
+    }
+
+    /// Connects to the router without blocking the caller's Tokio worker.
+    ///
+    /// The returned future is owned by its caller. Its managed cleanup guard
+    /// remains with the returned `LinkRx`, so dropping either the pending
+    /// future or that receiver reports cancellation to the parent router
+    /// without spawning or detaching a task.
+    pub async fn build_async(self) -> Result<(LinkTx, LinkRx, Notification), LinkError> {
+        let managed_link = self
+            .managed_link
+            .clone()
+            .ok_or(LinkError::ManagedRouterLinkRequired)?;
+        let LinkSetup {
+            router_tx,
+            event,
+            link_rx,
+            outgoing_data_buffer,
+            incoming_data_buffer,
+            managed_cleanup,
+        } = self.prepare(Some(&managed_link));
+        router_tx.send_async((0, event)).await?;
+        link_rx.recv_async().await?;
+
+        finish_link(
+            router_tx,
+            link_rx,
+            outgoing_data_buffer,
+            incoming_data_buffer,
+            managed_cleanup,
+        )
+    }
+
+    fn prepare(self, managed_link: Option<&ManagedRouterLink>) -> LinkSetup {
         // Connect to router
         // Local connections to the router shall have access to all subscriptions
         let mut connection = Connection::new(
@@ -116,28 +208,68 @@ impl<'a> LinkBuilder<'a> {
         let outgoing_data_buffer = outgoing.buffer();
         let incoming_data_buffer = incoming.buffer();
 
-        let event = Event::Connect {
-            connection,
-            incoming,
-            outgoing,
+        let (event, managed_cleanup) = match managed_link {
+            Some(managed_link) => {
+                let (link_state, cancellation_tx) = managed_link.new_link_state();
+                (
+                    Event::ManagedConnect {
+                        connection,
+                        incoming,
+                        outgoing,
+                        link_state: link_state.clone(),
+                    },
+                    Some(ManagedLinkCleanup {
+                        link_state,
+                        cancellation_tx,
+                    }),
+                )
+            }
+            None => (
+                Event::Connect {
+                    connection,
+                    incoming,
+                    outgoing,
+                },
+                None,
+            ),
         };
 
-        self.router_tx.send((0, event))?;
-
-        link_rx.recv()?;
-        let notification = outgoing_data_buffer.lock().pop_front().unwrap();
-
-        // Right now link identifies failure with dropped rx in router,
-        // which is probably ok. We need this here to get id assigned by router
-        let id = match notification {
-            Notification::DeviceAck(Ack::ConnAck(id, ..)) => id,
-            _message => return Err(LinkError::NotConnectionAck),
-        };
-
-        let tx = LinkTx::new(id, self.router_tx.clone(), incoming_data_buffer);
-        let rx = LinkRx::new(id, self.router_tx, link_rx, outgoing_data_buffer);
-        Ok((tx, rx, notification))
+        LinkSetup {
+            router_tx: self.router_tx,
+            event,
+            link_rx,
+            outgoing_data_buffer,
+            incoming_data_buffer,
+            managed_cleanup,
+        }
     }
+}
+
+fn finish_link(
+    router_tx: Sender<(ConnectionId, Event)>,
+    link_rx: Receiver<()>,
+    outgoing_data_buffer: Arc<Mutex<VecDeque<Notification>>>,
+    incoming_data_buffer: Arc<Mutex<VecDeque<Packet>>>,
+    managed_cleanup: Option<ManagedLinkCleanup>,
+) -> Result<(LinkTx, LinkRx, Notification), LinkError> {
+    let notification = outgoing_data_buffer.lock().pop_front().unwrap();
+
+    // Right now link identifies failure with dropped rx in router,
+    // which is probably ok. We need this here to get id assigned by router
+    let id = match notification {
+        Notification::DeviceAck(Ack::ConnAck(id, ..)) => id,
+        _message => return Err(LinkError::NotConnectionAck),
+    };
+
+    let tx = LinkTx::new(id, router_tx.clone(), incoming_data_buffer);
+    let rx = LinkRx::new_with_managed_cleanup(
+        id,
+        router_tx,
+        link_rx,
+        outgoing_data_buffer,
+        managed_cleanup,
+    );
+    Ok((tx, rx, notification))
 }
 
 pub struct LinkTx {
@@ -322,6 +454,7 @@ pub struct LinkRx {
     router_rx: Receiver<()>,
     send_buffer: Arc<Mutex<VecDeque<Notification>>>,
     cache: VecDeque<Notification>,
+    _managed_cleanup: Option<ManagedLinkCleanup>,
 }
 
 impl LinkRx {
@@ -331,12 +464,29 @@ impl LinkRx {
         router_rx: Receiver<()>,
         outgoing_data_buffer: Arc<Mutex<VecDeque<Notification>>>,
     ) -> LinkRx {
+        Self::new_with_managed_cleanup(
+            connection_id,
+            router_tx,
+            router_rx,
+            outgoing_data_buffer,
+            None,
+        )
+    }
+
+    fn new_with_managed_cleanup(
+        connection_id: ConnectionId,
+        router_tx: Sender<(ConnectionId, Event)>,
+        router_rx: Receiver<()>,
+        outgoing_data_buffer: Arc<Mutex<VecDeque<Notification>>>,
+        managed_cleanup: Option<ManagedLinkCleanup>,
+    ) -> LinkRx {
         LinkRx {
             connection_id,
             router_tx,
             router_rx,
             send_buffer: outgoing_data_buffer,
             cache: VecDeque::with_capacity(100),
+            _managed_cleanup: managed_cleanup,
         }
     }
 
@@ -418,7 +568,7 @@ impl LinkRx {
 
 #[cfg(test)]
 mod test {
-    use super::LinkTx;
+    use super::{LinkBuilder, LinkError, LinkTx};
     use flume::bounded;
     use parking_lot::Mutex;
     use std::{collections::VecDeque, sync::Arc, thread};
@@ -452,5 +602,17 @@ mod test {
         }
 
         // TODO: Write a similar test to benchmark buffer vs channels
+    }
+
+    #[tokio::test]
+    async fn async_builder_requires_a_managed_router_link() {
+        let (router_tx, _router_rx) = bounded(1);
+
+        assert!(matches!(
+            LinkBuilder::new("not-managed", router_tx)
+                .build_async()
+                .await,
+            Err(LinkError::ManagedRouterLinkRequired)
+        ));
     }
 }

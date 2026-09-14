@@ -1,6 +1,10 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use bytes::Bytes;
@@ -27,7 +31,7 @@ mod waiters;
 
 pub use alertlog::Alert;
 pub use connection::Connection;
-pub use routing::{ManagedRouter, Router, RouterError};
+pub use routing::{ManagedRouter, ManagedRouterLink, Router, RouterError};
 pub use scheduler::Tracker;
 pub use waiters::Waiters;
 
@@ -35,6 +39,44 @@ pub const MAX_SCHEDULE_ITERATIONS: usize = 100;
 pub const MAX_CHANNEL_CAPACITY: usize = 200;
 
 pub(crate) type FilterIdx = usize;
+
+const UNASSIGNED_MANAGED_LINK_CONNECTION_ID: usize = usize::MAX;
+
+/// Shared state that lets a managed local-link future report cancellation to
+/// its parent-owned router task without spawning a watcher.
+#[derive(Debug)]
+pub struct ManagedLinkState {
+    connection_id: AtomicUsize,
+    cancelled: AtomicBool,
+}
+
+impl ManagedLinkState {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            connection_id: AtomicUsize::new(UNASSIGNED_MANAGED_LINK_CONNECTION_ID),
+            cancelled: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_connection_id(&self, connection_id: ConnectionId) {
+        self.connection_id.store(connection_id, Ordering::SeqCst);
+    }
+
+    pub(crate) fn connection_id(&self) -> Option<ConnectionId> {
+        match self.connection_id.load(Ordering::SeqCst) {
+            UNASSIGNED_MANAGED_LINK_CONNECTION_ID => None,
+            connection_id => Some(connection_id),
+        }
+    }
+}
 
 #[derive(Debug)]
 // TODO: Fix this
@@ -45,6 +87,13 @@ pub enum Event {
         connection: connection::Connection,
         incoming: iobufs::Incoming,
         outgoing: iobufs::Outgoing,
+    },
+    /// Local connection whose future is owned by a managed router parent.
+    ManagedConnect {
+        connection: connection::Connection,
+        incoming: iobufs::Incoming,
+        outgoing: iobufs::Outgoing,
+        link_state: Arc<ManagedLinkState>,
     },
     /// New meter link
     NewMeter(flume::Sender<Vec<Meter>>),

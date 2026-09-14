@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::SystemTime;
 use thiserror::Error;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -27,8 +28,8 @@ use super::logs::{AckLog, DataLog};
 use super::scheduler::{ScheduleReason, Scheduler};
 use super::shared_subs::SharedGroup;
 use super::{
-    packetid, Connection, DataRequest, Event, FilterIdx, Meter, Notification, Print, RouterMeter,
-    ShadowRequest, MAX_CHANNEL_CAPACITY, MAX_SCHEDULE_ITERATIONS,
+    packetid, Connection, DataRequest, Event, FilterIdx, ManagedLinkState, Meter, Notification,
+    Print, RouterMeter, ShadowRequest, MAX_CHANNEL_CAPACITY, MAX_SCHEDULE_ITERATIONS,
 };
 use crate::{BrokerStorage, BrokerStorageState, RetentionPolicy, StorageError};
 
@@ -66,8 +67,36 @@ pub enum RouterError {
 /// `JoinHandle`, which preserves router errors, cancellation, and panics.
 pub struct ManagedRouter {
     link: Sender<(ConnectionId, Event)>,
+    managed_link: ManagedRouterLink,
     router: Router,
     cancellation: CancellationToken,
+    managed_link_cancellations: UnboundedReceiver<Arc<ManagedLinkState>>,
+}
+
+/// Sender for local links that are owned by a managed router parent task.
+///
+/// Dropping a local-link future or receiver reports its liveness transition to
+/// that parent through an unbounded control channel. The router itself drains
+/// the control channel; no watcher task is spawned per link.
+#[derive(Clone)]
+pub struct ManagedRouterLink {
+    router_tx: Sender<(ConnectionId, Event)>,
+    cancellation_tx: UnboundedSender<Arc<ManagedLinkState>>,
+}
+
+impl ManagedRouterLink {
+    pub(crate) fn router_tx(&self) -> Sender<(ConnectionId, Event)> {
+        self.router_tx.clone()
+    }
+
+    pub(crate) fn new_link_state(
+        &self,
+    ) -> (
+        Arc<ManagedLinkState>,
+        UnboundedSender<Arc<ManagedLinkState>>,
+    ) {
+        (ManagedLinkState::new(), self.cancellation_tx.clone())
+    }
 }
 
 #[cfg(test)]
@@ -105,8 +134,14 @@ impl ManagedRouter {
         self.link.clone()
     }
 
+    pub fn managed_link(&self) -> ManagedRouterLink {
+        self.managed_link.clone()
+    }
+
     pub async fn run(self) -> Result<(), RouterError> {
-        self.router.run_managed(self.cancellation).await
+        self.router
+            .run_managed(self.cancellation, self.managed_link_cancellations)
+            .await
     }
 }
 
@@ -125,6 +160,8 @@ pub struct Router {
     connections: Slab<Connection>,
     /// Connection map from device id to connection id
     connection_map: HashMap<String, ConnectionId>,
+    /// Managed local-link state keyed by the live connection generation.
+    managed_links: HashMap<ConnectionId, Arc<ManagedLinkState>>,
     /// Subscription map to interested connection ids
     subscription_map: HashMap<Filter, HashSet<ConnectionId>>,
     /// Incoming data grouped by connection
@@ -201,6 +238,7 @@ impl Router {
             alerts,
             connections,
             connection_map: Default::default(),
+            managed_links: Default::default(),
             subscription_map: Default::default(),
             ibufs,
             obufs,
@@ -332,10 +370,16 @@ impl Router {
     #[tracing::instrument(skip_all)]
     pub fn into_managed(self, cancellation: CancellationToken) -> ManagedRouter {
         let link = self.link();
+        let (cancellation_tx, managed_link_cancellations) = unbounded_channel();
         ManagedRouter {
+            managed_link: ManagedRouterLink {
+                router_tx: link.clone(),
+                cancellation_tx,
+            },
             link,
             router: self,
             cancellation,
+            managed_link_cancellations,
         }
     }
 
@@ -348,12 +392,17 @@ impl Router {
     /// Runs the router on a Tokio worker without blocking it while waiting for
     /// new router events.
     #[tracing::instrument(skip_all)]
-    async fn run_managed(mut self, cancellation: CancellationToken) -> Result<(), RouterError> {
+    async fn run_managed(
+        mut self,
+        cancellation: CancellationToken,
+        mut managed_link_cancellations: UnboundedReceiver<Arc<ManagedLinkState>>,
+    ) -> Result<(), RouterError> {
         loop {
             if cancellation.is_cancelled() {
                 return Ok(());
             }
-            self.run_inner_managed(&cancellation).await?;
+            self.run_inner_managed(&cancellation, &mut managed_link_cancellations)
+                .await?;
             tokio::task::yield_now().await;
         }
     }
@@ -413,6 +462,7 @@ impl Router {
     async fn run_inner_managed(
         &mut self,
         cancellation: &CancellationToken,
+        managed_link_cancellations: &mut UnboundedReceiver<Arc<ManagedLinkState>>,
     ) -> Result<(), RouterError> {
         if let Some(storage) = &self.storage {
             let now = now_ms();
@@ -421,13 +471,25 @@ impl Router {
                 self.next_prune_ms = now.saturating_add(self.storage_policy.prune_interval_ms);
             }
         }
+        self.drain_managed_link_cancellations(managed_link_cancellations);
         if self.consume().is_none() {
             let interval =
                 std::time::Duration::from_millis(self.storage_policy.prune_interval_ms.max(1));
-            let (id, data) = tokio::select! {
+            let cancellation_channel_open = !managed_link_cancellations.is_closed();
+            tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
+                link_state = managed_link_cancellations.recv(), if cancellation_channel_open => {
+                    if let Some(link_state) = link_state {
+                        self.handle_managed_link_cancellation(link_state);
+                    }
+                    return Ok(());
+                }
                 event = self.router_rx.recv_async() => match event {
-                    Ok(event) => event,
+                    Ok((id, data)) => {
+                        if !self.events(id, data) {
+                            return Err(RouterError::Shutdown);
+                        }
+                    }
                     Err(_) => return Err(RouterError::Disconnected),
                 },
                 _ = tokio::time::sleep(interval) => {
@@ -436,18 +498,25 @@ impl Router {
                     }
                     return Ok(());
                 }
-            };
-            if !self.events(id, data) {
-                return Err(RouterError::Shutdown);
             }
         }
 
+        self.drain_managed_link_cancellations(managed_link_cancellations);
         self.complete_iteration()?;
         #[cfg(test)]
         if let Some(counter) = &self.managed_iterations {
             counter.record();
         }
         Ok(())
+    }
+
+    fn drain_managed_link_cancellations(
+        &mut self,
+        managed_link_cancellations: &mut UnboundedReceiver<Arc<ManagedLinkState>>,
+    ) {
+        while let Ok(link_state) = managed_link_cancellations.try_recv() {
+            self.handle_managed_link_cancellation(link_state);
+        }
     }
 
     fn complete_iteration(&mut self) -> Result<(), RouterError> {
@@ -495,7 +564,13 @@ impl Router {
                 connection,
                 incoming,
                 outgoing,
-            } => self.handle_new_connection(connection, incoming, outgoing),
+            } => self.handle_new_connection(connection, incoming, outgoing, None),
+            Event::ManagedConnect {
+                connection,
+                incoming,
+                outgoing,
+                link_state,
+            } => self.handle_new_connection(connection, incoming, outgoing, Some(link_state)),
             Event::NewMeter(tx) => self.handle_new_meter(tx),
             Event::NewAlert(tx) => self.handle_new_alert(tx),
             Event::DeviceData => self.handle_device_payload(id),
@@ -526,6 +601,7 @@ impl Router {
         mut connection: Connection,
         incoming: Incoming,
         mut outgoing: Outgoing,
+        managed_link_state: Option<Arc<ManagedLinkState>>,
     ) {
         let client_id = outgoing.client_id.clone();
         if let Err(err) = validate_clientid(&client_id) {
@@ -669,6 +745,9 @@ impl Router {
         }
 
         let connection_id = self.connections.insert(connection);
+        if let Some(link_state) = &managed_link_state {
+            link_state.set_connection_id(connection_id);
+        }
         for entry in &mut restored_inflight {
             if let Some(filter) = &entry.filter {
                 if let Some(request) = tracker
@@ -695,10 +774,14 @@ impl Router {
             .restore_outbound_qos2(restored_outbound_qos2);
 
         self.connection_map.insert(client_id.clone(), connection_id);
+        if let Some(link_state) = &managed_link_state {
+            self.managed_links.insert(connection_id, link_state.clone());
+        }
         info!(connection_id, "Client connection registered");
 
         assert_eq!(self.ackslog.insert(ackslog), connection_id);
         assert_eq!(self.scheduler.add(tracker), connection_id);
+        self.router_meters.total_connections += 1;
 
         // Check if there are multiple data requests on same filter.
         debug_assert!(self
@@ -729,10 +812,25 @@ impl Router {
             ackslog.pubrel(pubrel)
         });
 
+        if managed_link_state.is_some_and(|link_state| link_state.is_cancelled()) {
+            self.handle_disconnection(connection_id, None);
+            return;
+        }
+
         self.scheduler
             .reschedule(connection_id, ScheduleReason::Init);
+    }
 
-        self.router_meters.total_connections += 1;
+    fn handle_managed_link_cancellation(&mut self, link_state: Arc<ManagedLinkState>) {
+        if let Some(connection_id) = link_state.connection_id() {
+            let is_live_link = self
+                .managed_links
+                .get(&connection_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &link_state));
+            if is_live_link {
+                self.handle_disconnection(connection_id, None);
+            }
+        }
     }
 
     fn handle_new_meter(&mut self, tx: Sender<Vec<Meter>>) {
@@ -764,6 +862,8 @@ impl Router {
         // }
 
         info!("Disconnecting connection");
+
+        self.managed_links.remove(&id);
 
         if let Some(reason_code) = reason {
             let outgoing = match self.obufs.get_mut(id) {
@@ -2413,15 +2513,14 @@ mod tests {
 
     async fn build_local_link(
         client_id: &'static str,
-        link: Sender<(ConnectionId, Event)>,
+        link: ManagedRouterLink,
     ) -> (LinkTx, LinkRx, Notification) {
         tokio::time::timeout(
             Duration::from_secs(1),
-            tokio::task::spawn_blocking(move || LinkBuilder::new(client_id, link).build()),
+            LinkBuilder::new_managed(client_id, link).build_async(),
         )
         .await
         .expect("managed router must process the local link")
-        .expect("link builder must not panic")
         .expect("router must accept the local link")
     }
 
@@ -2464,12 +2563,21 @@ mod tests {
         let managed = Router::new(0, router_config())
             .unwrap()
             .into_managed(cancellation.clone());
-        let link = managed.link();
+        let link = managed.managed_link();
 
-        let link_builder = tokio::task::spawn_blocking(move || {
-            LinkBuilder::new("managed-pre-spawn-client", link).build()
-        });
-        tokio::task::yield_now().await;
+        let mut link_builder = std::pin::pin!(LinkBuilder::new_managed(
+            "managed-pre-spawn-client",
+            link
+        )
+        .build_async());
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                link_builder.as_mut().poll(context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
 
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(managed.run());
@@ -2477,9 +2585,193 @@ mod tests {
         let (_, _, notification) = tokio::time::timeout(Duration::from_secs(1), link_builder)
             .await
             .expect("pre-spawn link builder must complete after the parent starts the router")
-            .expect("link builder must not panic")
             .expect("router must accept the pre-spawn link");
         assert!(matches!(notification, Notification::DeviceAck(_)));
+
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("managed router must stop after cancellation"),
+            Some(Ok(Ok(())))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_async_local_link_does_not_leave_a_router_connection() {
+        let cancellation = CancellationToken::new();
+        let mut config = router_config();
+        config.max_connections = 1;
+        let managed = Router::new(0, config)
+            .unwrap()
+            .into_managed(cancellation.clone());
+        let link = managed.managed_link();
+
+        {
+            let mut link_builder = std::pin::pin!(LinkBuilder::new_managed(
+                "cancelled-managed-client",
+                link.clone()
+            )
+            .build_async());
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    link_builder.as_mut().poll(context),
+                    std::task::Poll::Pending
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
+
+        let (replacement_tx, replacement_rx, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            LinkBuilder::new_managed("replacement-managed-client", link).build_async(),
+        )
+        .await
+        .expect("router must remove the cancelled connection before admitting a replacement")
+        .expect("replacement connection must be accepted");
+        drop(replacement_tx);
+        drop(replacement_rx);
+
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("managed router must stop after cancellation"),
+            Some(Ok(Ok(())))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_async_local_link_after_connack_cleans_up_the_router_connection() {
+        let mut router = Router::new(0, router_config()).unwrap();
+        let (cancellation_tx, mut managed_link_cancellations) = unbounded_channel();
+        let managed_link = ManagedRouterLink {
+            router_tx: router.link(),
+            cancellation_tx,
+        };
+        let active = CancellationToken::new();
+
+        {
+            let mut link_builder = std::pin::pin!(LinkBuilder::new_managed(
+                "post-connack-cancelled-client",
+                managed_link
+            )
+            .build_async());
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    link_builder.as_mut().poll(context),
+                    std::task::Poll::Pending
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            router
+                .run_inner_managed(&active, &mut managed_link_cancellations)
+                .await
+                .expect("router must queue ConnAck while the local-link future is pending");
+            assert_eq!(router.connections.len(), 1);
+        }
+
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        router
+            .run_inner_managed(&stopped, &mut managed_link_cancellations)
+            .await
+            .expect("router must drain local-link cancellation before stopping");
+        assert!(router.connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_managed_link_cancellation_cannot_disconnect_a_reused_connection_id() {
+        let mut router = Router::new(0, router_config()).unwrap();
+        let (cancellation_tx, mut managed_link_cancellations) = unbounded_channel();
+        let managed_link = ManagedRouterLink {
+            router_tx: router.link(),
+            cancellation_tx,
+        };
+        let active = CancellationToken::new();
+
+        {
+            let mut first = std::pin::pin!(LinkBuilder::new_managed(
+                "first-managed-client",
+                managed_link.clone()
+            )
+            .build_async());
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    first.as_mut().poll(context),
+                    std::task::Poll::Pending
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+            router
+                .run_inner_managed(&active, &mut managed_link_cancellations)
+                .await
+                .expect("router must accept the first managed connection");
+        }
+
+        router.handle_disconnection(0, None);
+        assert!(router.connections.is_empty());
+
+        let mut replacement =
+            std::pin::pin!(
+                LinkBuilder::new_managed("replacement-managed-client", managed_link).build_async()
+            );
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                replacement.as_mut().poll(context),
+                std::task::Poll::Pending
+            ));
+            std::task::Poll::Ready(())
+        })
+        .await;
+        router
+            .run_inner()
+            .expect("router must reuse the connection slot for the replacement");
+        assert_eq!(router.connections.len(), 1);
+
+        router.drain_managed_link_cancellations(&mut managed_link_cancellations);
+        assert_eq!(router.connections.len(), 1);
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn dropping_managed_local_link_receiver_frees_router_capacity() {
+        let cancellation = CancellationToken::new();
+        let mut config = router_config();
+        config.max_connections = 1;
+        let managed = Router::new(0, config)
+            .unwrap()
+            .into_managed(cancellation.clone());
+        let link = managed.managed_link();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
+
+        let (first_tx, first_rx, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            LinkBuilder::new_managed("first-managed-client", link.clone()).build_async(),
+        )
+        .await
+        .expect("first managed connection must start")
+        .expect("first managed connection must be accepted");
+        drop(first_tx);
+        drop(first_rx);
+
+        let (replacement_tx, replacement_rx, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            LinkBuilder::new_managed("replacement-managed-client", link).build_async(),
+        )
+        .await
+        .expect("dropping the receiver must free capacity for a replacement")
+        .expect("replacement connection must be accepted");
+        drop(replacement_tx);
+        drop(replacement_rx);
 
         cancellation.cancel();
         assert!(matches!(
@@ -2608,7 +2900,7 @@ mod tests {
         let managed = Router::new(0, router_config())
             .unwrap()
             .into_managed(cancellation.clone());
-        let link = managed.link();
+        let link = managed.managed_link();
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(managed.run());
 
@@ -2623,13 +2915,14 @@ mod tests {
             Notification::DeviceAck(Ack::SubAck(_))
         ));
 
-        let (mut publisher_tx, _, _) = build_local_link("managed-publisher", link).await;
+        let (mut publisher_tx, publisher_rx, _) = build_local_link("managed-publisher", link).await;
         publisher_tx.publish("managed/events", "payload").unwrap();
         let (_, notification) = receive_notification(subscriber_rx).await;
         assert!(matches!(
             notification,
             Notification::Forward(Forward { publish, .. }) if publish.payload.as_ref() == b"payload"
         ));
+        drop(publisher_rx);
 
         cancellation.cancel();
         assert!(matches!(
