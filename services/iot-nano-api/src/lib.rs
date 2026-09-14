@@ -25,7 +25,10 @@ pub use core_client::{
     CoreCommandResponseRequest, CoreTelemetryBucket, CoreTelemetryPoint,
 };
 pub use core_facade::{CoreFacade, CoreFacadeError, CoreTelemetryQuery};
-pub use oauth::public_oauth_router;
+pub use oauth::{
+    OAuthBrowserSessionVerifier, public_oauth_router,
+    public_oauth_router_with_browser_session_verifier,
+};
 pub use power_switcher::{
     POWER_SWITCHER_PROFILE_NAME, bootstrap_power_switcher_profile,
     bootstrap_power_switcher_profile_sqlite,

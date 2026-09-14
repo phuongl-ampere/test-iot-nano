@@ -21,34 +21,70 @@ use iot_storage::{
 };
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     application_registry::{ApplicationRegistry, ApplicationRegistryError},
-    auth::AuthContext,
     routes::{ApiState, SqliteApiState},
 };
 
-const AUTHORIZATION_CODE_TTL: Duration = Duration::minutes(10);
+const AUTHORIZATION_CODE_TTL: Duration = Duration::minutes(5);
 const ACCESS_TOKEN_TTL: Duration = Duration::hours(1);
 
 pub fn public_oauth_router<S>(store: Arc<PlatformStore>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    public_oauth_router_with_optional_browser_session_verifier(store, None)
+}
+
+pub fn public_oauth_router_with_browser_session_verifier<S>(
+    store: Arc<PlatformStore>,
+    browser_session_verifier: Arc<dyn OAuthBrowserSessionVerifier>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    public_oauth_router_with_optional_browser_session_verifier(
+        store,
+        Some(browser_session_verifier),
+    )
+}
+
+fn public_oauth_router_with_optional_browser_session_verifier<S>(
+    store: Arc<PlatformStore>,
+    browser_session_verifier: Option<Arc<dyn OAuthBrowserSessionVerifier>>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
         .route("/oauth/authorize", get(public_authorize))
         .route("/oauth/token", post(public_token))
-        .with_state(store)
+        .with_state(PublicOAuthState {
+            store,
+            browser_session_verifier,
+        })
+}
+
+pub trait OAuthBrowserSessionVerifier: Send + Sync {
+    fn authenticated_user_id(&self, headers: &HeaderMap) -> Option<Uuid>;
+}
+
+#[derive(Clone)]
+struct PublicOAuthState {
+    store: Arc<PlatformStore>,
+    browser_session_verifier: Option<Arc<dyn OAuthBrowserSessionVerifier>>,
 }
 
 trait OAuthState {
-    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<AuthContext>;
+    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<Uuid>;
     fn oauth_store(&self) -> Option<Arc<PlatformStore>>;
 }
 
 impl OAuthState for ApiState {
-    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<AuthContext> {
-        ApiState::authenticate_browser_session(self, headers)
+    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<Uuid> {
+        ApiState::authenticate_browser_session(self, headers).map(|session| session.user_id)
     }
 
     fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
@@ -57,12 +93,24 @@ impl OAuthState for ApiState {
 }
 
 impl OAuthState for SqliteApiState {
-    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<AuthContext> {
-        SqliteApiState::authenticate_browser_session(self, headers)
+    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<Uuid> {
+        SqliteApiState::authenticate_browser_session(self, headers).map(|session| session.user_id)
     }
 
     fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
         SqliteApiState::oauth_store(self)
+    }
+}
+
+impl OAuthState for PublicOAuthState {
+    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<Uuid> {
+        self.browser_session_verifier
+            .as_ref()
+            .and_then(|verifier| verifier.authenticated_user_id(headers))
+    }
+
+    fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
+        Some(Arc::clone(&self.store))
     }
 }
 
@@ -197,8 +245,12 @@ pub(crate) async fn sqlite_authorize(
     authorize_response(&state, &headers, request).await
 }
 
-async fn public_authorize() -> Response {
-    OAuthError::AccessDenied.into_response()
+async fn public_authorize(
+    State(state): State<PublicOAuthState>,
+    headers: HeaderMap,
+    Query(request): Query<AuthorizationRequest>,
+) -> Response {
+    authorize_response(&state, &headers, request).await
 }
 
 async fn authorize_response(
@@ -229,26 +281,11 @@ pub(crate) async fn sqlite_token(
 }
 
 async fn public_token(
-    State(store): State<Arc<PlatformStore>>,
+    State(state): State<PublicOAuthState>,
     headers: HeaderMap,
     form: Result<Form<TokenRequest>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let Form(request) = match form {
-        Ok(request) => request,
-        Err(_) => return OAuthError::InvalidRequest.into_response(),
-    };
-    let response = match request.grant_type.as_deref() {
-        Some("client_credentials") => {
-            issue_client_credentials_from_store(store.as_ref(), &headers, request).await
-        }
-        Some("authorization_code") => Err(OAuthError::UnsupportedGrantType),
-        Some(_) => Err(OAuthError::UnsupportedGrantType),
-        None => Err(OAuthError::InvalidRequest),
-    };
-    match response {
-        Ok(response) => response,
-        Err(error) => error.into_response(),
-    }
+    token_response_for_request(&state, &headers, form).await
 }
 
 async fn token_response_for_request(
@@ -298,7 +335,7 @@ async fn authorize_request(
     if request.code_challenge_method.as_deref() != Some("S256") {
         return Err(OAuthError::InvalidRequest);
     }
-    let browser_session = state
+    let user_id = state
         .authenticate_browser_session(headers)
         .ok_or(OAuthError::AccessDenied)?;
     let store = state.oauth_store().ok_or(OAuthError::ServerError)?;
@@ -313,7 +350,7 @@ async fn authorize_request(
         NewOAuthAuthorizationCode {
             code: code.clone(),
             app_id: application.app_id,
-            user_id: browser_session.user_id,
+            user_id,
             redirect_uri: RedirectUri::from_str(redirect_uri)
                 .map_err(|_| OAuthError::InvalidRequest)?,
             code_challenge: code_challenge.to_owned(),
@@ -343,6 +380,13 @@ fn is_s256_challenge(challenge: &str) -> bool {
     URL_SAFE_NO_PAD
         .decode(challenge)
         .is_ok_and(|decoded| decoded.len() == 32)
+}
+
+fn is_pkce_code_verifier(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
 }
 
 fn random_credential() -> Result<String, OAuthError> {
@@ -393,6 +437,9 @@ async fn exchange_authorization_code(
     )
     .map_err(|_| OAuthError::InvalidGrant)?;
     let code_verifier = request.code_verifier.ok_or(OAuthError::InvalidGrant)?;
+    if !is_pkce_code_verifier(&code_verifier) {
+        return Err(OAuthError::InvalidGrant);
+    }
     let access_token = random_credential()?;
     let issued_at = Utc::now();
     let record = OAuthRepository::consume_authorization_code_and_issue_access_token(

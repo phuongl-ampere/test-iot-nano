@@ -3,23 +3,31 @@ use std::sync::Arc;
 use axum::{
     body::{Body, to_bytes},
     http::{
-        Request, StatusCode,
+        HeaderMap, Request, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE, PRAGMA},
     },
 };
-use iot_api::public_oauth_router;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Duration, Utc};
+use iot_api::{
+    OAuthBrowserSessionVerifier, public_oauth_router,
+    public_oauth_router_with_browser_session_verifier,
+};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret, OAuthRepository,
     PlatformStore,
 };
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const APP_ID: &str = "public-oauth-router-app";
 const CLIENT_ID: &str = "public-oauth-router-client";
 const CLIENT_SECRET: &str = "public-oauth-router-client-secret";
+const TRUSTED_SESSION_HEADER: &str = "x-test-oauth-session";
 
-async fn public_oauth_app() -> (tempfile::TempDir, axum::Router) {
+async fn public_oauth_store() -> (tempfile::TempDir, Arc<PlatformStore>) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         PlatformStore::open(&StorageConfiguration {
@@ -55,7 +63,25 @@ async fn public_oauth_app() -> (tempfile::TempDir, axum::Router) {
     .await
     .unwrap();
 
+    (directory, store)
+}
+
+async fn public_oauth_app() -> (tempfile::TempDir, axum::Router) {
+    let (directory, store) = public_oauth_store().await;
     (directory, public_oauth_router::<()>(store))
+}
+
+struct FixedSessionVerifier {
+    user_id: Uuid,
+}
+
+impl OAuthBrowserSessionVerifier for FixedSessionVerifier {
+    fn authenticated_user_id(&self, headers: &HeaderMap) -> Option<Uuid> {
+        headers
+            .get(TRUSTED_SESSION_HEADER)
+            .filter(|value| value.as_bytes() == b"trusted")
+            .map(|_| self.user_id)
+    }
 }
 
 #[tokio::test]
@@ -93,7 +119,10 @@ async fn exported_public_oauth_router_uses_platform_store_and_fails_closed_for_c
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/oauth/authorize")
+                .uri(format!(
+                    "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={}&code_challenge_method=S256",
+                    URL_SAFE_NO_PAD.encode(Sha256::digest(b"missing-session-pkce-verifier-with-at-least-forty-three-characters")),
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -127,5 +156,159 @@ async fn exported_public_oauth_router_uses_platform_store_and_fails_closed_for_c
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(payload["error"], "unsupported_grant_type");
+    assert_eq!(payload["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn exported_public_oauth_router_issues_and_exchanges_pkce_codes_from_a_trusted_session() {
+    let (directory, store) = public_oauth_store().await;
+    let user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class, default_app)
+         VALUES (?, 'oauth-browser-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+    )
+    .bind(user_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let app = public_oauth_router_with_browser_session_verifier::<()>(
+        Arc::clone(&store),
+        Arc::new(FixedSessionVerifier { user_id }),
+    );
+    let verifier = "public-router-pkce-verifier-with-at-least-forty-three-characters";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
+                ))
+                .header(TRUSTED_SESSION_HEADER, "trusted")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(authorize.status(), StatusCode::FOUND);
+    let location = authorize.headers()["location"].to_str().unwrap();
+    let code = location
+        .split_once('?')
+        .unwrap()
+        .1
+        .split('&')
+        .find_map(|part| part.strip_prefix("code="))
+        .unwrap();
+    let (issued_at, expires_at): (String, String) =
+        sqlx::query_as("SELECT issued_at, expires_at FROM oauth_authorization_codes")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    let issued_at = DateTime::parse_from_rfc3339(&issued_at)
+        .unwrap()
+        .with_timezone(&Utc);
+    let expires_at = DateTime::parse_from_rfc3339(&expires_at)
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(expires_at - issued_at, Duration::minutes(5));
+    let exchange = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id={CLIENT_ID}&client_secret={CLIENT_SECRET}&code_verifier={verifier}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exchange.status(), StatusCode::OK);
+
+    let replay = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id={CLIENT_ID}&client_secret={CLIENT_SECRET}&code_verifier={verifier}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(replay.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["error"], "invalid_grant");
+
+    drop(directory);
+}
+
+#[tokio::test]
+async fn exported_public_oauth_router_rejects_a_short_pkce_verifier_even_when_its_hash_matches() {
+    let (directory, store) = public_oauth_store().await;
+    let user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class, default_app)
+         VALUES (?, 'oauth-short-verifier-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+    )
+    .bind(user_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let app = public_oauth_router_with_browser_session_verifier::<()>(
+        store,
+        Arc::new(FixedSessionVerifier { user_id }),
+    );
+    let verifier = "short";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
+                ))
+                .header(TRUSTED_SESSION_HEADER, "trusted")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let code = authorize.headers()["location"]
+        .to_str()
+        .unwrap()
+        .split_once('?')
+        .unwrap()
+        .1
+        .split('&')
+        .find_map(|part| part.strip_prefix("code="))
+        .unwrap();
+
+    let exchange = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id={CLIENT_ID}&client_secret={CLIENT_SECRET}&code_verifier={verifier}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(exchange.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(exchange.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["error"], "invalid_grant");
+
+    drop(directory);
 }
