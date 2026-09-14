@@ -10,19 +10,29 @@ struct Arguments {
     config_check: bool,
     #[arg(long)]
     migrate_only: bool,
+    #[arg(long, conflicts_with_all = ["config_check", "migrate_only"])]
+    bootstrap_admin: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let arguments = Arguments::parse();
-    let configuration = MonolithConfig::from_env()?;
 
-    if arguments.config_check {
+    if arguments.migrate_only {
+        let storage = MonolithConfig::storage_from_env()?;
+        MonolithRuntime::migrate(&storage).await?;
         return Ok(());
     }
 
-    if arguments.migrate_only {
-        MonolithRuntime::migrate(&configuration).await?;
+    if arguments.bootstrap_admin {
+        let storage = MonolithConfig::storage_from_env()?;
+        let (username, password) = bootstrap_admin_credentials()?;
+        MonolithRuntime::bootstrap_admin(&storage, &username, &password).await?;
+        return Ok(());
+    }
+
+    let configuration = MonolithConfig::from_env()?;
+    if arguments.config_check {
         return Ok(());
     }
 
@@ -51,6 +61,18 @@ fn runtime_exit_result(child_failed: bool) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn bootstrap_admin_credentials() -> io::Result<(String, String)> {
+    let username = std::env::var("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME is required"))?;
+    let password = std::env::var("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::other("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD is required"))?;
+    Ok((username, password))
 }
 
 #[cfg(unix)]

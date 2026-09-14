@@ -12,6 +12,7 @@ use std::{
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use fs2::FileExt;
 use iot_api::TokenVault;
+use iot_core::StorageConfiguration;
 use iot_nano_core::{
     CommandTransport, CoreRuntime, CoreRuntimeConfig, EmailSender, IngestMetrics, NotificationError,
 };
@@ -26,8 +27,9 @@ use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    CacheError, ManagementSessionRouter, MonolithConfig, PersistentCache, PlatformCommandResponse,
-    PlatformCommandTransport, PlatformCoreFacade, PlatformDeviceAuthorization, Readiness,
+    BootstrapAdminError, CacheError, ManagementSessionRouter, MonolithConfig, PersistentCache,
+    PlatformCommandResponse, PlatformCommandTransport, PlatformCoreFacade,
+    PlatformDeviceAuthorization, Readiness,
 };
 
 const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
@@ -51,8 +53,19 @@ pub struct MonolithRuntime {
 }
 
 impl MonolithRuntime {
-    pub async fn migrate(config: &MonolithConfig) -> Result<(), StartupError> {
-        let platform = PlatformStore::open(&config.storage)
+    pub async fn bootstrap_admin(
+        storage: &StorageConfiguration,
+        username: &str,
+        password: &str,
+    ) -> Result<(), BootstrapAdminError> {
+        let platform = PlatformStore::open(storage)
+            .await
+            .map_err(BootstrapAdminError::PlatformMigration)?;
+        crate::management::bootstrap_admin(&platform, username, password).await
+    }
+
+    pub async fn migrate(storage: &StorageConfiguration) -> Result<(), StartupError> {
+        let platform = PlatformStore::open(storage)
             .await
             .map_err(StartupError::PlatformMigration)?;
         drop(platform);

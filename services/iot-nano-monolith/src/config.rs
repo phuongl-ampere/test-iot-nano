@@ -78,6 +78,12 @@ impl MonolithConfig {
         Self::from_values(std::env::vars().collect())
     }
 
+    pub fn storage_from_env() -> Result<StorageConfiguration, ConfigError> {
+        let values = std::env::vars().collect::<BTreeMap<_, _>>();
+        validate_retired_environment(&values)?;
+        parse_storage(&values)
+    }
+
     pub fn from_values(values: BTreeMap<String, String>) -> Result<Self, ConfigError> {
         validate_retired_environment(&values)?;
 

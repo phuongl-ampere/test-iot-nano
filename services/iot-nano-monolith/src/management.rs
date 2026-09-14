@@ -16,18 +16,145 @@ use axum::{
     routing::{get, post},
 };
 use iot_api::{
-    AuthError, OAuthBrowserSessionVerifier, authenticate_credentials,
-    authenticate_credentials_sqlite, generate_session_id,
+    AuthError, OAuthBrowserSessionVerifier, POWER_MONITOR_APP, authenticate_credentials,
+    authenticate_credentials_sqlite, generate_session_id, hash_password, validate_password,
 };
-use iot_storage::PlatformStore;
+use iot_storage::{PlatformStore, PlatformStoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use thiserror::Error;
 use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "iot_nano_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: u8 = 5;
+
+#[derive(Debug, Error)]
+pub enum BootstrapAdminError {
+    #[error(
+        "bootstrap admin username must use 3-64 ASCII letters, digits, hyphens, or underscores"
+    )]
+    InvalidUsername,
+    #[error("bootstrap admin password is invalid")]
+    InvalidPassword(#[source] AuthError),
+    #[error("bootstrap admin can run only when the platform has no users")]
+    AlreadyInitialized,
+    #[error("platform store has no selected backend")]
+    NoBackend,
+    #[error("bootstrap admin storage operation failed")]
+    Storage(#[source] sqlx::Error),
+    #[error("bootstrap admin platform migration failed")]
+    PlatformMigration(#[source] PlatformStoreError),
+}
+
+pub async fn bootstrap_admin(
+    store: &PlatformStore,
+    username: &str,
+    password: &str,
+) -> Result<(), BootstrapAdminError> {
+    if !is_bootstrap_username(username) {
+        return Err(BootstrapAdminError::InvalidUsername);
+    }
+    validate_password(password).map_err(BootstrapAdminError::InvalidPassword)?;
+    let password_hash = hash_password(password).map_err(BootstrapAdminError::InvalidPassword)?;
+    let user_id = Uuid::now_v7();
+    if let Some(pool) = store.sqlite_pool() {
+        return bootstrap_admin_sqlite(pool, user_id, username, &password_hash).await;
+    }
+    let pool = store
+        .timescale_pool()
+        .ok_or(BootstrapAdminError::NoBackend)?;
+    bootstrap_admin_timescale(pool, user_id, username, &password_hash).await
+}
+
+async fn bootstrap_admin_sqlite(
+    pool: &sqlx::SqlitePool,
+    user_id: Uuid,
+    username: &str,
+    password_hash: &str,
+) -> Result<(), BootstrapAdminError> {
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(BootstrapAdminError::Storage)?;
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(BootstrapAdminError::Storage)?;
+    if users != 0 {
+        return Err(BootstrapAdminError::AlreadyInitialized);
+    }
+    sqlx::query(
+        "INSERT INTO users (
+            id, username, password_hash, role, account_class, default_app, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'admin', 'admin', '/apps/powermonitor', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
+    .bind(user_id.to_string())
+    .bind(username)
+    .bind(password_hash)
+    .execute(&mut *transaction)
+    .await
+    .map_err(BootstrapAdminError::Storage)?;
+    sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES (?1, ?2)")
+        .bind(user_id.to_string())
+        .bind(POWER_MONITOR_APP)
+        .execute(&mut *transaction)
+        .await
+        .map_err(BootstrapAdminError::Storage)?;
+    transaction
+        .commit()
+        .await
+        .map_err(BootstrapAdminError::Storage)
+}
+
+async fn bootstrap_admin_timescale(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    username: &str,
+    password_hash: &str,
+) -> Result<(), BootstrapAdminError> {
+    let mut transaction = pool.begin().await.map_err(BootstrapAdminError::Storage)?;
+    sqlx::query("LOCK TABLE users IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *transaction)
+        .await
+        .map_err(BootstrapAdminError::Storage)?;
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(BootstrapAdminError::Storage)?;
+    if users != 0 {
+        return Err(BootstrapAdminError::AlreadyInitialized);
+    }
+    sqlx::query(
+        "INSERT INTO users (
+            id, username, password_hash, role, account_class, default_app, created_at, updated_at
+         ) VALUES ($1, $2, $3, 'admin', 'admin', '/apps/powermonitor', now(), now())",
+    )
+    .bind(user_id)
+    .bind(username)
+    .bind(password_hash)
+    .execute(&mut *transaction)
+    .await
+    .map_err(BootstrapAdminError::Storage)?;
+    sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(POWER_MONITOR_APP)
+        .execute(&mut *transaction)
+        .await
+        .map_err(BootstrapAdminError::Storage)?;
+    transaction
+        .commit()
+        .await
+        .map_err(BootstrapAdminError::Storage)
+}
+
+fn is_bootstrap_username(value: &str) -> bool {
+    (3..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
 
 #[derive(Clone)]
 pub struct ManagementSessionRouter {

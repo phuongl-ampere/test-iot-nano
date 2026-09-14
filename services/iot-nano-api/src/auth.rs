@@ -269,7 +269,7 @@ pub fn default_user(username: impl Into<String>, role: Role) -> AuthenticatedUse
     }
 }
 
-pub(crate) fn hash_password(password: &str) -> Result<String, AuthError> {
+pub fn hash_password(password: &str) -> Result<String, AuthError> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)

@@ -295,9 +295,6 @@ fn migrate_only_applies_platform_storage_without_binding_listeners() {
         reserve_address(),
     ];
     let platform_path = root.join("platform.sqlite").display().to_string();
-    let internal_path = root.join("internal").display().to_string();
-    let certificate_path = root.join("server.crt").display().to_string();
-    let key_path = root.join("server.key").display().to_string();
     let public_address = addresses[0].to_string();
     let management_address = addresses[1].to_string();
     let mqtt_tcp_address = addresses[2].to_string();
@@ -305,13 +302,6 @@ fn migrate_only_applies_platform_storage_without_binding_listeners() {
     let configuration = values(&[
         ("IOT_NANO_STORAGE", "sqlite"),
         ("IOT_NANO_SQLITE_PATH", &platform_path),
-        (
-            "IOT_DEVICE_TOKEN_VAULT_KEY",
-            "test-device-token-vault-key-material-0001",
-        ),
-        ("IOT_NANO_INTERNAL_DIR", &internal_path),
-        ("IOT_NANO_TLS_CERT_PATH", &certificate_path),
-        ("IOT_NANO_TLS_KEY_PATH", &key_path),
         ("IOT_NANO_PUBLIC_HTTP_ADDRESS", &public_address),
         ("IOT_NANO_MANAGEMENT_ADDRESS", &management_address),
         ("IOT_NANO_MQTT_TCP_ADDRESS", &mqtt_tcp_address),
@@ -320,6 +310,48 @@ fn migrate_only_applies_platform_storage_without_binding_listeners() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_iot-nano-monolith"))
         .arg("--migrate-only")
+        .env_clear()
+        .envs(configuration)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(root.join("platform.sqlite").exists());
+    assert!(!root.join("internal").exists());
+    for address in addresses {
+        let listener = TcpListener::bind(address).unwrap();
+        drop(listener);
+    }
+}
+
+#[test]
+fn bootstrap_admin_provisions_an_empty_platform_without_binding_listeners() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let addresses = [
+        reserve_address(),
+        reserve_address(),
+        reserve_address(),
+        reserve_address(),
+    ];
+    let platform_path = root.join("platform.sqlite").display().to_string();
+    let public_address = addresses[0].to_string();
+    let management_address = addresses[1].to_string();
+    let mqtt_tcp_address = addresses[2].to_string();
+    let mqtt_tls_address = addresses[3].to_string();
+    let configuration = values(&[
+        ("IOT_NANO_STORAGE", "sqlite"),
+        ("IOT_NANO_SQLITE_PATH", &platform_path),
+        ("IOT_NANO_PUBLIC_HTTP_ADDRESS", &public_address),
+        ("IOT_NANO_MANAGEMENT_ADDRESS", &management_address),
+        ("IOT_NANO_MQTT_TCP_ADDRESS", &mqtt_tcp_address),
+        ("IOT_NANO_MQTT_TLS_ADDRESS", &mqtt_tls_address),
+        ("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME", "initial-admin"),
+        ("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD", "BootstrapAdmin@2026"),
+    ]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_iot-nano-monolith"))
+        .arg("--bootstrap-admin")
         .env_clear()
         .envs(configuration)
         .output()

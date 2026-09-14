@@ -11,7 +11,7 @@ use axum::{
 };
 use iot_api::{OAuthBrowserSessionVerifier, bootstrap_users_sqlite};
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_nano_monolith::ManagementSessionRouter;
+use iot_nano_monolith::{BootstrapAdminError, ManagementSessionRouter, bootstrap_admin};
 use iot_storage::PlatformStore;
 use std::net::SocketAddr;
 use tower::ServiceExt;
@@ -136,6 +136,63 @@ async fn management_login_rate_limits_repeated_invalid_credentials() {
     }
     let response = app.oneshot(invalid_login_request()).await.unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn bootstrap_admin_creates_the_only_initial_user_and_enables_management_login() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        PlatformStore::open(&StorageConfiguration {
+            storage: DatabaseStorage::Sqlite,
+            database_url: None,
+            sqlite_path: Some(directory.path().join("platform.sqlite")),
+            sqlite_busy_timeout_ms: 5_000,
+        })
+        .await
+        .unwrap(),
+    );
+    bootstrap_admin(&store, "initial-admin", "BootstrapAdmin@2026")
+        .await
+        .unwrap();
+    assert!(matches!(
+        bootstrap_admin(&store, "second-admin", "BootstrapAdmin@2026").await,
+        Err(BootstrapAdminError::AlreadyInitialized)
+    ));
+    let grants: Vec<String> = sqlx::query_scalar(
+        "SELECT app_key FROM user_app_grants WHERE user_id = ? ORDER BY app_key",
+    )
+    .bind(
+        sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = 'initial-admin'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+    )
+    .fetch_all(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    assert_eq!(grants, vec!["powermonitor"]);
+
+    let management = ManagementSessionRouter::new(store);
+    let router = management
+        .router
+        .layer(Extension(ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        )))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"initial-admin","password":"BootstrapAdmin@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 fn invalid_login_request() -> Request<Body> {
