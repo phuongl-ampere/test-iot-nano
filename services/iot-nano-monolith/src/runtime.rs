@@ -1,19 +1,32 @@
 use std::{
     fs::File,
+    future::Future,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    pin::Pin,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
+use axum::{Router, extract::State, http::StatusCode, routing::get};
 use fs2::FileExt;
-use iot_nano_mqttd::{BrokerStorage, RetentionPolicy, SqliteStorage};
-use iot_nano_stream::{LocalStream, StreamConfig};
+use iot_nano_core::{
+    CommandTransport, CoreRuntime, CoreRuntimeConfig, EmailSender, IngestMetrics, NotificationError,
+};
+use iot_nano_mqttd::{
+    BrokerStorage, CachePort, CommandResponsePort, DeviceAuthorizationPort, MqttListenerConfig,
+    MqttRuntime, MqttRuntimeConfig, RetentionPolicy, RpcSessionRouter, SqliteStorage,
+};
+use iot_nano_stream::{LocalStream, StreamConfig, StreamPort};
 use iot_storage::{PlatformStore, PlatformStoreError};
 use thiserror::Error;
+use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CacheError, MonolithConfig, PersistentCache, Readiness};
+use crate::{
+    CacheError, MonolithConfig, PersistentCache, PlatformCommandResponse, PlatformCommandTransport,
+    PlatformDeviceAuthorization, Readiness,
+};
 
 const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
 const INTERNAL_DIRECTORY_MARKER_CONTENT: &[u8] = b"iot-nano-monolith-state-v1\n";
@@ -21,10 +34,14 @@ const INTERNAL_DIRECTORY_MARKER_CONTENT: &[u8] = b"iot-nano-monolith-state-v1\n"
 pub struct MonolithRuntime {
     internal_directory: Option<InternalDirectory>,
     instance_lock: Option<InstanceLock>,
-    platform: Option<PlatformStore>,
+    platform: Option<Arc<PlatformStore>>,
     stream: Option<Arc<LocalStream>>,
     mqtt_storage: Option<Arc<SqliteStorage>>,
     cache: Option<Arc<PersistentCache>>,
+    core: Option<CoreRuntime>,
+    mqtt: Option<MqttRuntime>,
+    http_cancellation: CancellationToken,
+    http_tasks: Vec<JoinHandle<io::Result<()>>>,
     readiness: Readiness,
     cancellation: CancellationToken,
 }
@@ -33,9 +50,13 @@ impl MonolithRuntime {
     pub async fn start(config: MonolithConfig) -> Result<Self, StartupError> {
         let internal_directory = prepare_internal_directory(&config.internal_dir)?;
         let instance_lock = InstanceLock::acquire(&internal_directory)?;
-        let platform = PlatformStore::open(&config.storage)
-            .await
-            .map_err(StartupError::PlatformMigration)?;
+        let cancellation = CancellationToken::new();
+        let http_cancellation = CancellationToken::new();
+        let platform = Arc::new(
+            PlatformStore::open(&config.storage)
+                .await
+                .map_err(StartupError::PlatformMigration)?,
+        );
         let stream_path = internal_directory
             .prepare_state_file("stream.sqlite")
             .map_err(StartupError::InternalDirectory)?;
@@ -65,7 +86,83 @@ impl MonolithRuntime {
                 .map_err(StartupError::CacheRecovery)?,
         );
 
+        let device_authorization: Arc<dyn DeviceAuthorizationPort> =
+            Arc::new(PlatformDeviceAuthorization::new(Arc::clone(&platform)));
+        let command_responses: Arc<dyn CommandResponsePort> =
+            Arc::new(PlatformCommandResponse::new(Arc::clone(&platform)));
+        let mqtt_storage_port: Arc<dyn BrokerStorage> = mqtt_storage.clone();
+        let stream_port: Arc<dyn StreamPort> = stream.clone();
+        let cache_port: Arc<dyn CachePort> = cache.clone();
+        let session_router = RpcSessionRouter::default();
+        let command_transport: Arc<dyn CommandTransport> = Arc::new(PlatformCommandTransport::new(
+            session_router.clone(),
+            Arc::clone(&device_authorization),
+        ));
+        let core = CoreRuntime::start(default_core_runtime_config(
+            Arc::clone(&platform),
+            Arc::clone(&stream_port),
+            command_transport,
+            cancellation.clone(),
+        ))
+        .await
+        .map_err(StartupError::CoreRuntime)?;
+        let mut mqtt = match MqttRuntime::start(MqttRuntimeConfig {
+            listeners: MqttListenerConfig {
+                plaintext_address: config.mqtt_tcp,
+                tls_address: config.mqtt_tls,
+                tls_cert_path: config.tls_cert_path.clone(),
+                tls_key_path: config.tls_key_path.clone(),
+                max_connections: 1_024,
+                max_payload_size: 1_048_576,
+                max_inflight_count: 64,
+            },
+            storage: mqtt_storage_port,
+            authorization: device_authorization,
+            stream: stream_port,
+            command_responses,
+            cache: cache_port,
+            session_router,
+            cancellation: cancellation.clone(),
+        })
+        .await
+        {
+            Ok(mqtt) => mqtt,
+            Err(error) => {
+                cancellation.cancel();
+                let _ = core.drain(Instant::now() + config.shutdown_deadline).await;
+                return Err(StartupError::MqttRuntime(error));
+            }
+        };
+
         let readiness = Readiness::default();
+        let public_listener = match TcpListener::bind(config.public_http).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = core.drain(Instant::now() + config.shutdown_deadline).await;
+                let _ = mqtt.drain(Instant::now() + config.shutdown_deadline).await;
+                return Err(StartupError::PublicHttpBind(error));
+            }
+        };
+        let management_listener = match TcpListener::bind(config.management_http).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = core.drain(Instant::now() + config.shutdown_deadline).await;
+                let _ = mqtt.drain(Instant::now() + config.shutdown_deadline).await;
+                return Err(StartupError::ManagementHttpBind(error));
+            }
+        };
+        let http_tasks = vec![
+            spawn_health_server(
+                public_listener,
+                readiness.clone(),
+                http_cancellation.clone(),
+            ),
+            spawn_health_server(
+                management_listener,
+                readiness.clone(),
+                http_cancellation.clone(),
+            ),
+        ];
         readiness.mark_ready();
 
         Ok(Self {
@@ -75,8 +172,12 @@ impl MonolithRuntime {
             stream: Some(stream),
             mqtt_storage: Some(mqtt_storage),
             cache: Some(cache),
+            core: Some(core),
+            mqtt: Some(mqtt),
+            http_cancellation,
+            http_tasks,
             readiness,
-            cancellation: CancellationToken::new(),
+            cancellation,
         })
     }
 
@@ -89,7 +190,7 @@ impl MonolithRuntime {
     }
 
     pub fn platform(&self) -> Option<&PlatformStore> {
-        self.platform.as_ref()
+        self.platform.as_deref()
     }
 
     pub fn stream(&self) -> Option<&Arc<LocalStream>> {
@@ -105,7 +206,25 @@ impl MonolithRuntime {
     }
 
     pub async fn shutdown(&mut self, deadline: Instant) -> Result<(), ShutdownError> {
+        let deadline_was_elapsed = Instant::now() > deadline;
         self.readiness.mark_not_ready();
+        self.http_cancellation.cancel();
+        let mut first_error = join_http_tasks(&mut self.http_tasks, deadline).await.err();
+        if let Some(mqtt) = self.mqtt.as_mut()
+            && let Err(error) = mqtt.stop_accepting().await
+        {
+            first_error.get_or_insert(ShutdownError::MqttRuntime(error));
+        }
+        if let Some(core) = self.core.take()
+            && let Err(error) = core.drain(deadline).await
+        {
+            first_error.get_or_insert(ShutdownError::CoreRuntime(error));
+        }
+        if let Some(mut mqtt) = self.mqtt.take() {
+            if let Err(error) = mqtt.drain(deadline).await {
+                first_error.get_or_insert(ShutdownError::MqttRuntime(error));
+            }
+        }
         self.cancellation.cancel();
         self.cache.take();
         self.mqtt_storage.take();
@@ -113,8 +232,11 @@ impl MonolithRuntime {
         self.platform.take();
         self.instance_lock.take();
         self.internal_directory.take();
-        if Instant::now() > deadline {
+        if deadline_was_elapsed || Instant::now() > deadline {
             return Err(ShutdownError::DeadlineElapsed);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -146,12 +268,123 @@ pub enum StartupError {
     MqttStorageTask(String),
     #[error("cache state recovery failed")]
     CacheRecovery(#[source] CacheError),
+    #[error("MQTT runtime startup failed")]
+    MqttRuntime(#[source] iot_nano_mqttd::MqttRuntimeStartError),
+    #[error("Core runtime startup failed")]
+    CoreRuntime(#[source] iot_nano_core::CoreRuntimeError),
+    #[error("public HTTP listener bind failed")]
+    PublicHttpBind(#[source] io::Error),
+    #[error("management HTTP listener bind failed")]
+    ManagementHttpBind(#[source] io::Error),
 }
 
 #[derive(Debug, Error)]
 pub enum ShutdownError {
     #[error("runtime shutdown deadline elapsed")]
     DeadlineElapsed,
+    #[error("HTTP server task failed: {0}")]
+    HttpServer(String),
+    #[error("MQTT runtime shutdown failed")]
+    MqttRuntime(#[source] iot_nano_mqttd::MqttRuntimeError),
+    #[error("Core runtime shutdown failed")]
+    CoreRuntime(#[source] iot_nano_core::CoreRuntimeError),
+}
+
+fn health_router(readiness: Readiness) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(healthz))
+        .with_state(readiness)
+}
+
+async fn healthz(State(readiness): State<Readiness>) -> StatusCode {
+    if readiness.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+fn spawn_health_server(
+    listener: TcpListener,
+    readiness: Readiness,
+    cancellation: CancellationToken,
+) -> JoinHandle<io::Result<()>> {
+    tokio::spawn(async move {
+        axum::serve(listener, health_router(readiness))
+            .with_graceful_shutdown(async move {
+                cancellation.cancelled().await;
+            })
+            .await
+    })
+}
+
+async fn join_http_tasks(
+    tasks: &mut Vec<JoinHandle<io::Result<()>>>,
+    deadline: Instant,
+) -> Result<(), ShutdownError> {
+    while let Some(mut task) = tasks.pop() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, &mut task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => return Err(ShutdownError::HttpServer(error.to_string())),
+            Ok(Err(error)) => return Err(ShutdownError::HttpServer(error.to_string())),
+            Err(_) => return Err(ShutdownError::DeadlineElapsed),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct UnconfiguredEmailSender;
+
+impl EmailSender for UnconfiguredEmailSender {
+    fn send(
+        &self,
+        _subject: String,
+        _body: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NotificationError>> + Send + '_>> {
+        Box::pin(async {
+            Err(NotificationError::Configuration(
+                "SMTP is not configured for iot-nano-monolith".to_owned(),
+            ))
+        })
+    }
+}
+
+fn default_core_runtime_config(
+    store: Arc<PlatformStore>,
+    stream: Arc<dyn StreamPort>,
+    command_transport: Arc<dyn CommandTransport>,
+    cancellation: CancellationToken,
+) -> CoreRuntimeConfig {
+    CoreRuntimeConfig {
+        store,
+        stream,
+        command_transport,
+        email_sender: Arc::new(UnconfiguredEmailSender),
+        writer_batch_size: 100,
+        alert_batch_size: 100,
+        command_batch_size: 100,
+        notification_batch_size: 100,
+        writer_group: "platform-writer".to_owned(),
+        alert_group: "platform-alerts".to_owned(),
+        writer_member_id: "monolith-writer".to_owned(),
+        alert_member_id: "monolith-alerts".to_owned(),
+        writer_interval: Duration::from_secs(1),
+        event_alert_interval: Duration::from_secs(1),
+        window_alert_interval: Duration::from_secs(1),
+        command_interval: Duration::from_secs(1),
+        notification_interval: Duration::from_secs(1),
+        writer_heartbeat_interval: Duration::from_secs(1),
+        alert_heartbeat_interval: Duration::from_secs(1),
+        notification_send_timeout: Duration::from_secs(15),
+        notification_lease_duration: chrono::Duration::seconds(30),
+        notification_retry_base: chrono::Duration::seconds(1),
+        notification_retry_max: chrono::Duration::seconds(60),
+        cancellation,
+        metrics: Arc::new(IngestMetrics::default()),
+    }
 }
 
 struct InstanceLock {

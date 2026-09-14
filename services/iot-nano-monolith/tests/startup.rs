@@ -22,10 +22,10 @@ impl Fixture {
     async fn sqlite() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let tls_cert_path = root.join("server.crt");
-        let tls_key_path = root.join("server.key");
-        std::fs::write(&tls_cert_path, "certificate").unwrap();
-        std::fs::write(&tls_key_path, "key").unwrap();
+        let mqtt_fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../iot-nano-mqttd/tests/fixtures");
+        let tls_cert_path = mqtt_fixtures.join("server.crt");
+        let tls_key_path = mqtt_fixtures.join("server.key");
 
         Self {
             config: MonolithConfig {
@@ -155,7 +155,6 @@ async fn second_runtime_cannot_acquire_the_same_internal_instance_lock() {
     assert!(fixture.internal_path("mqttd.sqlite").is_file());
     assert!(fixture.internal_path("cache.sqlite").is_file());
     assert!(first.cache().is_some());
-    fixture.assert_configured_addresses_are_unbound().await;
 
     let mut locked_config = fixture.config();
     locked_config.storage.sqlite_path = None;
@@ -164,7 +163,6 @@ async fn second_runtime_cannot_acquire_the_same_internal_instance_lock() {
         Err(error) => error,
     };
     assert!(matches!(error, StartupError::InstanceLocked { .. }));
-    fixture.assert_configured_addresses_are_unbound().await;
 
     first
         .shutdown(Instant::now() + Duration::from_secs(1))
@@ -278,7 +276,10 @@ async fn expired_shutdown_releases_local_state_before_reporting_deadline() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error, ShutdownError::DeadlineElapsed));
+    assert!(
+        matches!(error, ShutdownError::DeadlineElapsed),
+        "unexpected expired shutdown error: {error:?}"
+    );
     assert!(!runtime.readiness().is_ready());
     assert!(cancellation.is_cancelled());
 
