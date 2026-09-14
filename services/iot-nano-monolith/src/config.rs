@@ -59,9 +59,10 @@ const DEFAULT_SHUTDOWN_DEADLINE_SECONDS: u64 = 30;
 const MAX_BUSY_TIMEOUT_MS: u64 = 60_000;
 const MAX_SHUTDOWN_DEADLINE_SECONDS: u64 = 300;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MonolithConfig {
     pub storage: StorageConfiguration,
+    pub device_token_vault_key: String,
     pub internal_dir: PathBuf,
     pub public_http: SocketAddr,
     pub management_http: SocketAddr,
@@ -81,6 +82,7 @@ impl MonolithConfig {
         validate_retired_environment(&values)?;
 
         let storage = parse_storage(&values)?;
+        let device_token_vault_key = device_token_vault_key(&values)?;
         let internal_dir = absolute_path(&values, "IOT_NANO_INTERNAL_DIR")?;
         let tls_cert_path = absolute_path(&values, "IOT_NANO_TLS_CERT_PATH")?;
         let tls_key_path = absolute_path(&values, "IOT_NANO_TLS_KEY_PATH")?;
@@ -114,6 +116,7 @@ impl MonolithConfig {
 
         Ok(Self {
             storage,
+            device_token_vault_key,
             internal_dir,
             public_http,
             management_http,
@@ -124,6 +127,18 @@ impl MonolithConfig {
             shutdown_deadline,
         })
     }
+}
+
+fn device_token_vault_key(values: &BTreeMap<String, String>) -> Result<String, ConfigError> {
+    let value = values
+        .get("IOT_DEVICE_TOKEN_VAULT_KEY")
+        .filter(|value| !value.is_empty())
+        .ok_or(ConfigError::MissingDeviceTokenVaultKey)?;
+    if value.len() < 32 || !value.is_ascii() || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(ConfigError::InvalidDeviceTokenVaultKey);
+    }
+    Ok(value.clone())
 }
 
 pub fn validate_retired_environment(values: &BTreeMap<String, String>) -> Result<(), ConfigError> {
@@ -277,6 +292,10 @@ pub enum ConfigError {
     ContradictoryStorage(String),
     #[error("DATABASE_URL is required when IOT_NANO_STORAGE=timescale")]
     MissingDatabaseUrl,
+    #[error("IOT_DEVICE_TOKEN_VAULT_KEY is required")]
+    MissingDeviceTokenVaultKey,
+    #[error("IOT_DEVICE_TOKEN_VAULT_KEY must be at least 32 ASCII non-whitespace characters")]
+    InvalidDeviceTokenVaultKey,
     #[error("{0} is required")]
     MissingPath(&'static str),
     #[error("TLS certificate and key paths must both be configured")]

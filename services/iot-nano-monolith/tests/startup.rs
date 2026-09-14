@@ -35,6 +35,7 @@ impl Fixture {
                     sqlite_path: Some(root.join("platform.sqlite")),
                     sqlite_busy_timeout_ms: 5_000,
                 },
+                device_token_vault_key: "test-device-token-vault-key-material-0001".to_owned(),
                 internal_dir: root.join("internal"),
                 public_http: reserve_address().await,
                 management_http: reserve_address().await,

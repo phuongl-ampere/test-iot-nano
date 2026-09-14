@@ -304,7 +304,8 @@ impl CoreRuntime {
                 .workers
                 .lock()
                 .expect("runtime worker mutex poisoned")
-                .is_some()
+                .as_ref()
+                .is_some_and(|workers| workers.iter().all(|worker| !worker.is_finished()))
     }
 
     pub fn startup_barrier_count(&self) -> usize {

@@ -17,6 +17,10 @@ fn sqlite_values() -> BTreeMap<String, String> {
     values(&[
         ("IOT_NANO_STORAGE", "sqlite"),
         ("IOT_NANO_SQLITE_PATH", "/var/lib/iot-nano/platform.sqlite"),
+        (
+            "IOT_DEVICE_TOKEN_VAULT_KEY",
+            "test-device-token-vault-key-material-0001",
+        ),
         ("IOT_NANO_INTERNAL_DIR", "/var/lib/iot-nano/internal"),
         ("IOT_NANO_TLS_CERT_PATH", "/run/tls/server.crt"),
         ("IOT_NANO_TLS_KEY_PATH", "/run/tls/server.key"),
@@ -27,6 +31,10 @@ fn timescale_values() -> BTreeMap<String, String> {
     values(&[
         ("IOT_NANO_STORAGE", "timescale"),
         ("DATABASE_URL", "postgres://iot:secret@db.example/iot"),
+        (
+            "IOT_DEVICE_TOKEN_VAULT_KEY",
+            "test-device-token-vault-key-material-0001",
+        ),
         ("IOT_NANO_INTERNAL_DIR", "/var/lib/iot-nano/internal"),
         ("IOT_NANO_TLS_CERT_PATH", "/run/tls/server.crt"),
         ("IOT_NANO_TLS_KEY_PATH", "/run/tls/server.key"),
@@ -48,6 +56,26 @@ fn config_accepts_only_complete_sqlite_or_timescale_storage() {
     assert!(matches!(
         timescale.storage.storage,
         DatabaseStorage::Timescale
+    ));
+}
+
+#[test]
+fn config_requires_a_strong_device_token_vault_key() {
+    let mut missing_key = sqlite_values();
+    missing_key.remove("IOT_DEVICE_TOKEN_VAULT_KEY");
+    assert!(matches!(
+        MonolithConfig::from_values(missing_key),
+        Err(ConfigError::MissingDeviceTokenVaultKey)
+    ));
+
+    let mut short_key = sqlite_values();
+    short_key.insert(
+        "IOT_DEVICE_TOKEN_VAULT_KEY".to_owned(),
+        "too-short".to_owned(),
+    );
+    assert!(matches!(
+        MonolithConfig::from_values(short_key),
+        Err(ConfigError::InvalidDeviceTokenVaultKey)
     ));
 }
 

@@ -813,6 +813,50 @@ async fn fatal_worker_failure_is_returned_by_join_and_cancels_siblings() {
 }
 
 #[tokio::test]
+async fn worker_error_does_not_cancel_the_runtime_parent_token() {
+    let stream = RecordingStream::default();
+    let (_directory, config) = runtime_config(Arc::new(stream.clone())).await;
+    let parent_cancellation = config.cancellation.clone();
+    let runtime = CoreRuntime::start(config).await.unwrap();
+    stream.fail_claim.store(true, Ordering::SeqCst);
+
+    timeout(Duration::from_secs(1), async {
+        while runtime.ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker failure did not stop the Core runtime");
+
+    assert!(!parent_cancellation.is_cancelled());
+    assert!(matches!(
+        runtime.join().await,
+        Err(CoreRuntimeError::Worker(_))
+    ));
+}
+
+#[tokio::test]
+async fn ready_turns_false_when_a_worker_panics_after_startup() {
+    let stream = RecordingStream::default();
+    stream.panic_writer_claims();
+    let (_directory, config) = runtime_config(Arc::new(stream.clone())).await;
+    let runtime = CoreRuntime::start(config).await.unwrap();
+
+    timeout(Duration::from_secs(1), async {
+        while runtime.ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a panicked worker must make the runtime unready");
+
+    assert!(matches!(
+        runtime.join().await,
+        Err(CoreRuntimeError::Worker(_))
+    ));
+}
+
+#[tokio::test]
 async fn join_reports_a_panicked_worker_and_cancels_its_siblings() {
     let stream = RecordingStream::default();
     stream.panic_writer_claims();

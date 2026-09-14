@@ -30,15 +30,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut runtime = MonolithRuntime::start(configuration.clone()).await?;
     let cancellation = runtime.cancellation_token();
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        _ = shutdown_signal() => {}
-        _ = cancellation.cancelled() => {}
-    }
+    let failure = runtime.failure_token();
+    let child_failed = tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            false
+        }
+        _ = shutdown_signal() => false,
+        _ = cancellation.cancelled() => false,
+        _ = failure.cancelled() => true,
+    };
     runtime
         .shutdown(Instant::now() + configuration.shutdown_deadline)
         .await?;
+    runtime_exit_result(child_failed)?;
     Ok(())
+}
+
+fn runtime_exit_result(child_failed: bool) -> io::Result<()> {
+    if child_failed {
+        Err(io::Error::other("a monolith runtime child failed"))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -52,4 +66,15 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     std::future::pending::<()>().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runtime_exit_result;
+
+    #[test]
+    fn child_failure_requires_a_nonzero_process_exit() {
+        assert!(runtime_exit_result(false).is_ok());
+        assert!(runtime_exit_result(true).is_err());
+    }
 }

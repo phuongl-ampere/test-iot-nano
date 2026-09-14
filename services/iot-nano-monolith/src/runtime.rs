@@ -10,6 +10,7 @@ use std::{
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use fs2::FileExt;
+use iot_api::TokenVault;
 use iot_nano_core::{
     CommandTransport, CoreRuntime, CoreRuntimeConfig, EmailSender, IngestMetrics, NotificationError,
 };
@@ -25,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     CacheError, MonolithConfig, PersistentCache, PlatformCommandResponse, PlatformCommandTransport,
-    PlatformDeviceAuthorization, Readiness,
+    PlatformCoreFacade, PlatformDeviceAuthorization, Readiness,
 };
 
 const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
@@ -45,6 +46,7 @@ pub struct MonolithRuntime {
     readiness_monitor: Option<JoinHandle<()>>,
     readiness: Readiness,
     cancellation: CancellationToken,
+    failure_cancellation: CancellationToken,
 }
 
 impl MonolithRuntime {
@@ -52,6 +54,7 @@ impl MonolithRuntime {
         let internal_directory = prepare_internal_directory(&config.internal_dir)?;
         let instance_lock = InstanceLock::acquire(&internal_directory)?;
         let cancellation = CancellationToken::new();
+        let failure_cancellation = CancellationToken::new();
         let http_cancellation = CancellationToken::new();
         let platform = Arc::new(
             PlatformStore::open(&config.storage)
@@ -109,6 +112,7 @@ impl MonolithRuntime {
             .await
             .map_err(StartupError::CoreRuntime)?,
         );
+        let mqtt_cancellation = cancellation.child_token();
         let mut mqtt = match MqttRuntime::start(MqttRuntimeConfig {
             listeners: MqttListenerConfig {
                 plaintext_address: config.mqtt_tcp,
@@ -125,7 +129,7 @@ impl MonolithRuntime {
             command_responses,
             cache: cache_port,
             session_router,
-            cancellation: cancellation.clone(),
+            cancellation: mqtt_cancellation.clone(),
         })
         .await
         {
@@ -138,6 +142,13 @@ impl MonolithRuntime {
         };
 
         let readiness = Readiness::default();
+        let public_router = health_router(readiness.clone())
+            .merge(iot_api::public_v1_router(
+                Arc::clone(&platform),
+                TokenVault::from_key_material(&config.device_token_vault_key),
+                Arc::new(PlatformCoreFacade::new(Arc::clone(&platform))),
+            ))
+            .merge(iot_api::public_oauth_router(Arc::clone(&platform)));
         let public_listener = match TcpListener::bind(config.public_http).await {
             Ok(listener) => listener,
             Err(error) => {
@@ -153,19 +164,20 @@ impl MonolithRuntime {
             }
         };
         let http_tasks = vec![
-            spawn_health_server(
-                public_listener,
-                readiness.clone(),
-                http_cancellation.clone(),
-            ),
-            spawn_health_server(
+            spawn_http_server(public_listener, public_router, http_cancellation.clone()),
+            spawn_http_server(
                 management_listener,
-                readiness.clone(),
+                health_router(readiness.clone()),
                 http_cancellation.clone(),
             ),
         ];
-        let readiness_monitor =
-            spawn_readiness_monitor(readiness.clone(), cancellation.clone(), Arc::clone(&core));
+        let readiness_monitor = spawn_readiness_monitor(
+            readiness.clone(),
+            cancellation.clone(),
+            failure_cancellation.clone(),
+            Arc::clone(&core),
+            mqtt_cancellation,
+        );
         readiness.mark_ready();
 
         Ok(Self {
@@ -182,6 +194,7 @@ impl MonolithRuntime {
             readiness_monitor: Some(readiness_monitor),
             readiness,
             cancellation,
+            failure_cancellation,
         })
     }
 
@@ -191,6 +204,10 @@ impl MonolithRuntime {
 
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    pub fn failure_token(&self) -> CancellationToken {
+        self.failure_cancellation.clone()
     }
 
     pub fn platform(&self) -> Option<&PlatformStore> {
@@ -212,6 +229,7 @@ impl MonolithRuntime {
     pub async fn shutdown(&mut self, deadline: Instant) -> Result<(), ShutdownError> {
         let deadline_was_elapsed = Instant::now() > deadline;
         self.readiness.mark_not_ready();
+        self.stop_readiness_monitor().await;
         self.http_cancellation.cancel();
         let mut first_error = join_http_tasks(&mut self.http_tasks, deadline).await.err();
         if let Some(mqtt) = self.mqtt.as_mut()
@@ -230,9 +248,6 @@ impl MonolithRuntime {
             }
         }
         self.cancellation.cancel();
-        if let Some(monitor) = self.readiness_monitor.take() {
-            let _ = monitor.await;
-        }
         self.cache.take();
         self.mqtt_storage.take();
         self.stream.take();
@@ -246,6 +261,13 @@ impl MonolithRuntime {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn stop_readiness_monitor(&mut self) {
+        if let Some(monitor) = self.readiness_monitor.take() {
+            monitor.abort();
+            let _ = monitor.await;
+        }
     }
 }
 
@@ -312,13 +334,13 @@ async fn healthz(State(readiness): State<Readiness>) -> StatusCode {
     }
 }
 
-fn spawn_health_server(
+fn spawn_http_server(
     listener: TcpListener,
-    readiness: Readiness,
+    router: Router,
     cancellation: CancellationToken,
 ) -> JoinHandle<io::Result<()>> {
     tokio::spawn(async move {
-        axum::serve(listener, health_router(readiness))
+        axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 cancellation.cancelled().await;
             })
@@ -340,7 +362,9 @@ async fn cleanup_started_components(
 fn spawn_readiness_monitor(
     readiness: Readiness,
     cancellation: CancellationToken,
+    failure_cancellation: CancellationToken,
     core: Arc<CoreRuntime>,
+    mqtt_cancellation: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(25));
@@ -350,16 +374,28 @@ fn spawn_readiness_monitor(
                     readiness.mark_not_ready();
                     return;
                 }
+                _ = mqtt_cancellation.cancelled() => {
+                    if !cancellation.is_cancelled() {
+                        request_orderly_shutdown(&readiness, &failure_cancellation);
+                    } else {
+                        readiness.mark_not_ready();
+                    }
+                    return;
+                }
                 _ = interval.tick() => {
                     if !core.ready() {
-                        readiness.mark_not_ready();
-                        cancellation.cancel();
+                        request_orderly_shutdown(&readiness, &failure_cancellation);
                         return;
                     }
                 }
             }
         }
     })
+}
+
+fn request_orderly_shutdown(readiness: &Readiness, failure_cancellation: &CancellationToken) {
+    readiness.mark_not_ready();
+    failure_cancellation.cancel();
 }
 
 async fn join_http_tasks(
@@ -397,7 +433,10 @@ mod unit_tests {
         time::{Duration, timeout},
     };
 
-    use super::{ShutdownError, join_http_tasks};
+    use crate::Readiness;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ShutdownError, join_http_tasks, request_orderly_shutdown};
 
     struct DropSignal(Option<oneshot::Sender<()>>);
 
@@ -428,6 +467,20 @@ mod unit_tests {
             .expect("HTTP task was detached instead of joined")
             .expect("HTTP task drop signal was lost");
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn failure_request_marks_not_ready_without_cancelling_component_parent() {
+        let readiness = Readiness::default();
+        readiness.mark_ready();
+        let component_parent = CancellationToken::new();
+        let failure = CancellationToken::new();
+
+        request_orderly_shutdown(&readiness, &failure);
+
+        assert!(!readiness.is_ready());
+        assert!(failure.is_cancelled());
+        assert!(!component_parent.is_cancelled());
     }
 }
 

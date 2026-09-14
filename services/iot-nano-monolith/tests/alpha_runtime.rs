@@ -32,6 +32,7 @@ impl Fixture {
                     sqlite_path: Some(root.join("platform.sqlite")),
                     sqlite_busy_timeout_ms: 5_000,
                 },
+                device_token_vault_key: "test-device-token-vault-key-material-0001".to_owned(),
                 internal_dir: root.join("internal"),
                 public_http: reserve_address().await,
                 management_http: reserve_address().await,
@@ -101,6 +102,36 @@ async fn alpha_runtime_marks_not_ready_after_parent_cancellation() {
     .expect("runtime shutdown hung after parent cancellation");
 }
 
+#[tokio::test]
+async fn alpha_runtime_mounts_generic_public_api_and_requires_bearer_token() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+
+    assert_http_status(fixture.config.public_http, "/api/v1/assets", 401).await;
+
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn alpha_runtime_mounts_public_oauth_token_endpoint() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+
+    assert_form_post_status(fixture.config.public_http, "/oauth/token", "", 400).await;
+
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
 async fn assert_health(address: SocketAddr) {
     assert_health_status(address, 200).await;
 }
@@ -119,6 +150,51 @@ async fn assert_health_status(address: SocketAddr, status: u16) {
     assert!(
         response.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
         "unexpected health response: {}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+async fn assert_http_status(address: SocketAddr, path: &str, status: u16) {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        response.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
+        "unexpected HTTP response: {}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+async fn assert_form_post_status(address: SocketAddr, path: &str, body: &str, status: u16) {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        response.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
+        "unexpected HTTP response: {}",
         String::from_utf8_lossy(&response)
     );
 }
