@@ -15,7 +15,9 @@ use crate::server::tls::{self, TLSAcceptor};
 use crate::{meters, ConnectionSettings, Meter};
 use flume::{RecvError, SendError, Sender};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -525,6 +527,59 @@ impl ServerAcceptanceGate {
         let shutting_down = shutdown.borrow();
         !*closed && !*shutting_down
     }
+}
+
+#[derive(Clone)]
+pub struct InProcessBrokerControl {
+    acceptance_gate: Arc<ServerAcceptanceGate>,
+    graceful_shutdown: watch::Sender<bool>,
+    force_cancellation: CancellationToken,
+}
+
+impl InProcessBrokerControl {
+    pub fn stop_accepting(&self) {
+        self.acceptance_gate.close();
+        self.graceful_shutdown.send_replace(true);
+    }
+
+    pub fn force_stop(&self) {
+        self.stop_accepting();
+        self.force_cancellation.cancel();
+    }
+}
+
+#[derive(Clone, Debug)]
+enum InProcessTaskId {
+    Router,
+    Server(PreboundListenerSource),
+}
+
+impl std::fmt::Display for InProcessTaskId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Router => formatter.write_str("router"),
+            Self::Server(source) => {
+                write!(formatter, "{} listener {:?}", source.protocol, source.name)
+            }
+        }
+    }
+}
+
+type InProcessTaskFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+
+struct PreparedInProcessTask {
+    id: InProcessTaskId,
+    future: InProcessTaskFuture,
+}
+
+/// A production-oriented broker composition that never creates a native
+/// broker thread or a child Tokio runtime.
+pub struct InProcessBroker {
+    control: InProcessBrokerControl,
+    graceful_state: watch::Receiver<bool>,
+    router_cancellation: CancellationToken,
+    tasks: Vec<PreparedInProcessTask>,
+    server_count: usize,
 }
 
 impl Broker {
@@ -1114,6 +1169,219 @@ impl Broker {
 impl Drop for Broker {
     fn drop(&mut self) {
         let _ = self.shutdown_router();
+    }
+}
+
+impl InProcessBroker {
+    pub fn new_with_prebound_listeners(
+        config: Config,
+        v4_listeners: Vec<NamedListener>,
+        v5_listeners: Vec<NamedListener>,
+    ) -> Result<(Self, InProcessBrokerControl), Error> {
+        if config.v4.is_none() && config.v5.is_none() {
+            return Err(Error::Config(
+                "at least one v4 or v5 listener must be configured for the in-process broker"
+                    .to_owned(),
+            ));
+        }
+        if config.bridge.is_some() {
+            return Err(Error::Config(
+                "bridge configuration is not yet supported by the in-process broker".to_owned(),
+            ));
+        }
+        if config.ws.is_some() {
+            return Err(Error::Config(
+                "websocket configuration is not yet supported by the in-process broker".to_owned(),
+            ));
+        }
+        if config.metrics.is_some() || config.prometheus.is_some() || config.console.is_some() {
+            return Err(Error::Config(
+                "metrics, prometheus, and console workers are not yet supported by the in-process broker"
+                    .to_owned(),
+            ));
+        }
+        if config.cluster.is_some() {
+            return Err(Error::Config(
+                "cluster configuration is not yet supported by the in-process broker".to_owned(),
+            ));
+        }
+
+        let listeners = PreboundListeners::prepare(&config, v4_listeners, v5_listeners)?;
+        let config = Arc::new(config);
+        let router = Router::new_with_storage(
+            config.id,
+            config.router.clone(),
+            config.storage.clone(),
+            config.storage_policy,
+        )?;
+        let router_cancellation = CancellationToken::new();
+        let managed_router = router.into_managed(router_cancellation.clone());
+        let router_tx = managed_router.link();
+        let acceptance_gate = Arc::new(ServerAcceptanceGate::new());
+        let (graceful_shutdown, graceful_state) = watch::channel(false);
+        let force_cancellation = CancellationToken::new();
+        let control = InProcessBrokerControl {
+            acceptance_gate: Arc::clone(&acceptance_gate),
+            graceful_shutdown,
+            force_cancellation: force_cancellation.clone(),
+        };
+        let PreboundListeners { mut v4, mut v5 } = listeners;
+        let mut tasks = Vec::with_capacity(v4.len() + v5.len() + 1);
+
+        if let Some(configured) = &config.v4 {
+            let mut names = v4.keys().cloned().collect::<Vec<_>>();
+            names.sort_unstable();
+            for name in names {
+                let listener = v4
+                    .remove(&name)
+                    .expect("prebound v4 listener names were validated");
+                let settings = configured
+                    .get(&name)
+                    .expect("prebound v4 server names were validated")
+                    .clone();
+                let source = listener_source("v4", &name);
+                let mut server = Server::new(settings, router_tx.clone(), V4);
+                server.set_acceptance_gate(Arc::clone(&acceptance_gate));
+                let managed = server.into_managed_prebound(
+                    listener,
+                    source.clone(),
+                    "v4",
+                    LinkType::Remote,
+                    control.graceful_shutdown.subscribe(),
+                    force_cancellation.clone(),
+                )?;
+                tasks.push(PreparedInProcessTask {
+                    id: InProcessTaskId::Server(source),
+                    future: Box::pin(managed.run()),
+                });
+            }
+        }
+
+        if let Some(configured) = &config.v5 {
+            let mut names = v5.keys().cloned().collect::<Vec<_>>();
+            names.sort_unstable();
+            for name in names {
+                let listener = v5
+                    .remove(&name)
+                    .expect("prebound v5 listener names were validated");
+                let settings = configured
+                    .get(&name)
+                    .expect("prebound v5 server names were validated")
+                    .clone();
+                let source = listener_source("v5", &name);
+                let mut server = Server::new(settings, router_tx.clone(), V5);
+                server.set_acceptance_gate(Arc::clone(&acceptance_gate));
+                let managed = server.into_managed_prebound(
+                    listener,
+                    source.clone(),
+                    "v5",
+                    LinkType::Remote,
+                    control.graceful_shutdown.subscribe(),
+                    force_cancellation.clone(),
+                )?;
+                tasks.push(PreparedInProcessTask {
+                    id: InProcessTaskId::Server(source),
+                    future: Box::pin(managed.run()),
+                });
+            }
+        }
+
+        tasks.push(PreparedInProcessTask {
+            id: InProcessTaskId::Router,
+            future: Box::pin(async move {
+                managed_router
+                    .run()
+                    .await
+                    .map_err(|error| Error::ManagedTask(format!("router: {error}")))
+            }),
+        });
+        let server_count = tasks
+            .iter()
+            .filter(|task| matches!(task.id, InProcessTaskId::Server(_)))
+            .count();
+
+        Ok((
+            Self {
+                control: control.clone(),
+                graceful_state,
+                router_cancellation,
+                tasks,
+                server_count,
+            },
+            control,
+        ))
+    }
+
+    pub async fn run(mut self) -> Result<(), Error> {
+        let mut tasks = JoinSet::new();
+        for PreparedInProcessTask { id, future } in self.tasks.drain(..) {
+            tasks.spawn(async move { (id, future.await) });
+        }
+
+        let mut servers_remaining = self.server_count;
+        let mut router_cancelled = false;
+        let mut force_requested = false;
+        let mut primary_error = None;
+        if servers_remaining == 0 {
+            self.router_cancellation.cancel();
+            router_cancelled = true;
+        }
+
+        while !tasks.is_empty() {
+            tokio::select! {
+                _ = self.control.force_cancellation.cancelled(), if !force_requested => {
+                    force_requested = true;
+                }
+                joined = tasks.join_next() => {
+                    let (id, result) = match joined {
+                        Some(Ok(outcome)) => outcome,
+                        Some(Err(error)) => {
+                            if primary_error.is_none() {
+                                primary_error = Some(Error::ManagedTask(
+                                    format!("in-process broker task join failure: {error}"),
+                                ));
+                            }
+                            force_requested = true;
+                            self.control.force_cancellation.cancel();
+                            self.router_cancellation.cancel();
+                            continue;
+                        }
+                        None => break,
+                    };
+
+                    let graceful_requested = *self.graceful_state.borrow();
+                    let task_error = match result {
+                        Ok(()) => match &id {
+                            InProcessTaskId::Server(_) if !graceful_requested && !force_requested => {
+                                Some(Error::ManagedTask(format!("{id} exited before shutdown")))
+                            }
+                            InProcessTaskId::Router if servers_remaining > 0 && !force_requested => {
+                                Some(Error::ManagedTask("router exited before server tasks".to_owned()))
+                            }
+                            _ => None,
+                        },
+                        Err(error) => Some(Error::ManagedTask(format!("{id}: {error}"))),
+                    };
+                    if let Some(error) = task_error {
+                        if primary_error.is_none() {
+                            primary_error = Some(error);
+                        }
+                        force_requested = true;
+                        self.control.force_cancellation.cancel();
+                    }
+
+                    if matches!(id, InProcessTaskId::Server(_)) {
+                        servers_remaining = servers_remaining.saturating_sub(1);
+                    }
+                    if servers_remaining == 0 && !router_cancelled {
+                        self.router_cancellation.cancel();
+                        router_cancelled = true;
+                    }
+                }
+            }
+        }
+
+        primary_error.map_or(Ok(()), Err)
     }
 }
 
@@ -2015,8 +2283,8 @@ mod tests {
 
     use super::{
         install_managed_remote_spawn_hook, install_post_accept_admission_hook,
-        install_prebound_test_hooks, prebound_test_serial, Broker, BrokerHandle, Error, LinkType,
-        PreboundListenerSource, Server, V4,
+        install_prebound_test_hooks, prebound_test_serial, Broker, BrokerHandle, Error,
+        InProcessBroker, LinkType, PreboundListenerSource, Server, V4,
     };
 
     #[test]
@@ -2429,6 +2697,35 @@ mod tests {
                 .expect("managed server must stop after graceful admission closure"),
             Some(Ok(Ok(())))
         ));
+    }
+
+    #[tokio::test]
+    async fn in_process_broker_owns_prebound_listeners_and_parent_tasks() {
+        let (config, v4_listener, v5_listener) = prebound_test_config();
+        let v4_address = v4_listener.local_addr().unwrap();
+        let v5_address = v5_listener.local_addr().unwrap();
+        let (broker, control) = InProcessBroker::new_with_prebound_listeners(
+            config,
+            vec![("v311".to_owned(), v4_listener)],
+            vec![("v5".to_owned(), v5_listener)],
+        )
+        .expect("in-process broker must validate and retain prebound listeners");
+
+        assert!(TcpListener::bind(v4_address).is_err());
+        assert!(TcpListener::bind(v5_address).is_err());
+
+        let mut tasks = JoinSet::new();
+        tasks.spawn(broker.run());
+        control.stop_accepting();
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("parent must join the in-process broker task"),
+            Some(Ok(Ok(())))
+        ));
+        assert!(TcpListener::bind(v4_address).is_ok());
+        assert!(TcpListener::bind(v5_address).is_ok());
     }
 
     #[test]
