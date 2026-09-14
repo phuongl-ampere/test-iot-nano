@@ -74,7 +74,22 @@ pub struct BrokerLifecycleHandle {
     inner: Option<CoreBrokerHandle>,
     public_accept_gate: PublicMuxAcceptanceGate,
     public_accept_stop: watch::Sender<bool>,
-    public_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    public_workers: Mutex<Vec<PublicWorker>>,
+}
+
+struct PublicWorker {
+    name: String,
+    handle: thread::JoinHandle<Result<(), MqttdError>>,
+}
+
+pub(crate) fn join_public_workers(workers: Vec<PublicWorker>) -> Result<(), MqttdError> {
+    for PublicWorker { name, handle } in workers {
+        match handle.join() {
+            Ok(result) => result?,
+            Err(_) => return Err(MqttdError::PublicWorkerPanic { worker: name }),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -248,7 +263,7 @@ impl BrokerLifecycleHandle {
             .expect("public accept gate is not poisoned")
     }
 
-    pub fn take_public_workers(&self) -> Vec<thread::JoinHandle<()>> {
+    pub(crate) fn take_public_workers(&self) -> Vec<PublicWorker> {
         std::mem::take(
             &mut *self
                 .public_workers
@@ -259,19 +274,20 @@ impl BrokerLifecycleHandle {
 
     pub fn join(mut self) -> Result<(), MqttdError> {
         self.shutdown();
-        for worker in self
-            .public_workers
-            .get_mut()
-            .expect("public worker mutex is not poisoned")
-            .drain(..)
-        {
-            let _ = worker.join();
-        }
-        self.inner
+        let public_result = join_public_workers(
+            self.public_workers
+                .get_mut()
+                .expect("public worker mutex is not poisoned")
+                .drain(..)
+                .collect(),
+        );
+        let broker_result = self
+            .inner
             .take()
             .expect("broker lifecycle handle is available")
             .join()
-            .map_err(|error| MqttdError::Broker(Box::new(error)))
+            .map_err(|error| MqttdError::Broker(Box::new(error)));
+        public_result.and(broker_result)
     }
 
     pub fn shutdown_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -298,39 +314,43 @@ impl BrokerLifecycleHandle {
             .subscribe(rule.source_topic.clone())
             .map_err(MqttdError::LocalLink)?;
         let mut shutdown = self.shutdown_receiver();
+        let name = format!("iot-mqttd-rule-{}", rule.name);
+        let worker_name = name.clone();
         let worker = thread::Builder::new()
-            .name(format!("iot-mqttd-rule-{}", rule.name))
+            .name(name.clone())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build();
-                match runtime {
-                    Ok(runtime) => runtime.block_on(async move {
-                        loop {
-                            tokio::select! {
-                                _ = shutdown.changed() => break,
-                                notification = link_rx.next() => {
-                                    let Ok(Some(rumqttd::Notification::Forward(forward))) = notification else {
-                                        continue;
-                                    };
-                                    if let Err(error) = link_tx.publish(
-                                        rule.target_topic.clone(),
-                                        forward.publish.payload,
-                                    ) {
-                                        eprintln!("iot-mqttd republish rule failed: {error}");
-                                    }
-                                }
+                    .build()
+                    .map_err(|source| MqttdError::PublicWorkerRuntime {
+                        worker: worker_name.clone(),
+                        source,
+                    })?;
+                runtime.block_on(async move {
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.changed() => break,
+                            notification = link_rx.next() => {
+                                let Ok(Some(rumqttd::Notification::Forward(forward))) = notification else {
+                                    continue;
+                                };
+                                link_tx
+                                    .publish(rule.target_topic.clone(), forward.publish.payload)
+                                    .map_err(MqttdError::LocalLink)?;
                             }
                         }
-                    }),
-                    Err(error) => eprintln!("iot-mqttd rule runtime failed: {error}"),
-                }
+                    }
+                    Ok(())
+                })
             })
             .map_err(|error| MqttdError::Broker(Box::new(error)))?;
         self.public_workers
             .lock()
             .expect("public worker mutex is not poisoned")
-            .push(worker);
+            .push(PublicWorker {
+                name,
+                handle: worker,
+            });
         Ok(())
     }
 
@@ -512,30 +532,36 @@ impl BrokerLifecycleHandle {
         let accept_stop = self.public_accept_stop.subscribe();
         let force_stop = self.shutdown_receiver();
         let accept_gate = self.public_accept_gate.clone();
+        let worker_name = name.to_owned();
+        let thread_name = worker_name.clone();
         let worker = thread::Builder::new()
-            .name(name.to_owned())
+            .name(worker_name.clone())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build();
-                match runtime {
-                    Ok(runtime) => {
-                        let result = runtime.block_on(async {
-                            let listener = TcpListener::from_std(listener)?;
-                            serve(listener, accept_stop, force_stop, accept_gate).await
-                        });
-                        if let Err(error) = result {
-                            eprintln!("iot-mqttd public listener stopped: {error}");
-                        }
-                    }
-                    Err(error) => eprintln!("iot-mqttd public runtime failed: {error}"),
-                }
+                    .build()
+                    .map_err(|source| MqttdError::PublicWorkerRuntime {
+                        worker: thread_name.clone(),
+                        source,
+                    })?;
+                runtime
+                    .block_on(async {
+                        let listener = TcpListener::from_std(listener)?;
+                        serve(listener, accept_stop, force_stop, accept_gate).await
+                    })
+                    .map_err(|source| MqttdError::PublicWorkerIo {
+                        worker: thread_name,
+                        source,
+                    })
             })
             .map_err(|error| MqttdError::Broker(Box::new(error)))?;
         self.public_workers
             .lock()
             .expect("public worker mutex is not poisoned")
-            .push(worker);
+            .push(PublicWorker {
+                name: worker_name,
+                handle: worker,
+            });
         Ok(())
     }
 }
@@ -543,14 +569,13 @@ impl BrokerLifecycleHandle {
 impl Drop for BrokerLifecycleHandle {
     fn drop(&mut self) {
         self.shutdown();
-        for worker in self
-            .public_workers
-            .get_mut()
-            .expect("public worker mutex is not poisoned")
-            .drain(..)
-        {
-            let _ = worker.join();
-        }
+        let _ = join_public_workers(
+            self.public_workers
+                .get_mut()
+                .expect("public worker mutex is not poisoned")
+                .drain(..)
+                .collect(),
+        );
         if let Some(inner) = self.inner.take() {
             let _ = inner.join();
         }
@@ -875,6 +900,39 @@ pub async fn serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
         None,
     )
     .await
+}
+
+#[cfg(test)]
+async fn start_broker_for_public_worker_test() -> BrokerLifecycleHandle {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let plaintext_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let tls_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let v311_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let v5_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let plaintext_address = plaintext_listener.local_addr().unwrap();
+    let tls_address = tls_listener.local_addr().unwrap();
+    let v311_backend_address = v311_listener.local_addr().unwrap();
+    let v5_backend_address = v5_listener.local_addr().unwrap();
+    drop((plaintext_listener, tls_listener, v311_listener, v5_listener));
+    start_broker(ListenerConfiguration {
+        plaintext_address,
+        tls_address,
+        v311_backend_address,
+        v5_backend_address,
+        tls_cert_path: fixtures.join("server.crt"),
+        tls_key_path: fixtures.join("server.key"),
+        websocket_address: None,
+        websocket_tls: false,
+        bridge: None,
+        max_connections: 32,
+        max_payload_size: 1024 * 1024,
+        max_inflight_count: 16,
+        token_authenticator: None,
+        auth_handler: None,
+        authorization_handler: None,
+    })
+    .await
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -1426,6 +1484,58 @@ mod mux_shutdown_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         backend_task.abort();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_join_returns_a_fatal_public_listener_io_error() {
+        let broker = start_broker_for_public_worker_test().await;
+        broker
+            .spawn_public_worker(
+                "injected-listener-error",
+                StdTcpListener::bind("127.0.0.1:0").unwrap(),
+                |_listener, _accept_stop, _force_stop, _accept_gate| async {
+                    Err(std::io::Error::other("injected listener failure"))
+                },
+            )
+            .unwrap();
+
+        let error = broker
+            .join()
+            .expect_err("fatal public listener I/O error must reach lifecycle join");
+
+        match error {
+            MqttdError::PublicWorkerIo { worker, source } => {
+                assert_eq!(worker, "injected-listener-error");
+                assert_eq!(source.kind(), std::io::ErrorKind::Other);
+                assert_eq!(source.to_string(), "injected listener failure");
+            }
+            error => panic!("expected public listener I/O error, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_join_returns_a_fatal_public_listener_panic() {
+        let broker = start_broker_for_public_worker_test().await;
+        broker
+            .spawn_public_worker(
+                "injected-listener-panic",
+                StdTcpListener::bind("127.0.0.1:0").unwrap(),
+                |_listener, _accept_stop, _force_stop, _accept_gate| async {
+                    panic!("injected listener panic");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let error = broker
+            .join()
+            .expect_err("fatal public listener panic must reach lifecycle join");
+
+        assert!(matches!(
+            error,
+            MqttdError::PublicWorkerPanic { worker } if worker == "injected-listener-panic"
+        ));
     }
 }
 
@@ -1994,6 +2104,20 @@ pub enum MqttdError {
     Tls(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("IOT_NANO_MQTTD_API_SECRET must use at least 32 ASCII non-whitespace characters")]
     InvalidTransportSecret,
+    #[error("MQTT public listener worker {worker} failed: {source}")]
+    PublicWorkerIo {
+        worker: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("MQTT public listener worker {worker} runtime failed: {source}")]
+    PublicWorkerRuntime {
+        worker: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("MQTT public listener worker {worker} panicked")]
+    PublicWorkerPanic { worker: String },
     #[error("MQTT broker failed to start")]
     Broker(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("broker local link failed")]

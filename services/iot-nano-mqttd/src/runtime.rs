@@ -28,7 +28,8 @@ use crate::{
     CachePort, CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization,
     GatewayAuthorizationRequest, ListenerConfiguration, MqttdDeviceTransport, MqttdError,
     MuxSettings, PreboundBackendListeners, ProtocolBackends, RpcSessionRouter,
-    TransportAuthRequest, load_tls_acceptor, start_broker_with_prebound_listeners,
+    TransportAuthRequest, join_public_workers, load_tls_acceptor,
+    start_broker_with_prebound_listeners,
 };
 
 const AUTHORIZATION_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -392,13 +393,18 @@ impl MqttRuntime {
             .map(|workers| tokio::task::spawn_blocking(move || join_public_workers(workers)));
         let mut drain_result = self.drain_device_workers(deadline).await;
         if drain_result.is_ok() {
-            if let Some(join) = public_join.as_mut() {
-                drain_result = timeout_until(deadline, join)
-                    .await
-                    .map_err(|_| MqttRuntimeError::DeadlineElapsed)
-                    .and_then(|result| {
-                        result.map_err(|error| MqttRuntimeError::Worker(error.to_string()))
-                    });
+            if let Some(mut join) = public_join.take() {
+                match timeout_until(deadline, &mut join).await {
+                    Ok(result) => {
+                        drain_result = result
+                            .map_err(|error| MqttRuntimeError::Worker(error.to_string()))
+                            .and_then(|result| result.map_err(MqttRuntimeError::PublicWorker));
+                    }
+                    Err(()) => {
+                        public_join = Some(join);
+                        drain_result = Err(MqttRuntimeError::DeadlineElapsed);
+                    }
+                }
             }
         }
 
@@ -568,6 +574,8 @@ pub enum MqttRuntimeError {
     DeadlineElapsed,
     #[error("MQTT runtime worker failed: {0}")]
     Worker(String),
+    #[error("MQTT public listener worker failed")]
+    PublicWorker(#[source] MqttdError),
     #[error("MQTT broker shutdown failed")]
     Broker(#[source] MqttdError),
 }
@@ -779,22 +787,17 @@ where
     timeout(remaining, future).await.map_err(|_| ())
 }
 
-fn join_public_workers(workers: Vec<std::thread::JoinHandle<()>>) {
-    for worker in workers {
-        let _ = worker.join();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         future::Future,
+        net::TcpListener as StdTcpListener,
         pin::Pin,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use tokio::{
@@ -804,13 +807,15 @@ mod tests {
     };
 
     use super::{
-        DeviceAdmissionControl, MqttdDeviceTransport, ParentCancellationBarrier,
-        TransportAuthRequest, serve_device_backend, spawn_parent_cancellation_watcher,
+        DeviceAdmissionControl, MqttRuntime, MqttRuntimeError, MqttdDeviceTransport,
+        ParentCancellationBarrier, TransportAuthRequest, serve_device_backend,
+        spawn_parent_cancellation_watcher,
     };
     use crate::{
-        AuthenticatedDevice, BrokerLifecycleHandle, DeviceAuthenticator, TransportError,
-        TransportUplink, UplinkForwarder,
+        AuthenticatedDevice, BrokerLifecycleHandle, CacheEntry, CacheError, CachePort,
+        DeviceAuthenticator, MqttdError, TransportError, TransportUplink, UplinkForwarder,
     };
+    use tokio::{sync::watch, task::JoinHandle};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -839,6 +844,25 @@ mod tests {
 
     struct UnusedUplink;
 
+    struct UnusedCache;
+
+    impl CachePort for UnusedCache {
+        fn get(
+            &self,
+            _key: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, CacheError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn put(
+            &self,
+            _entry: CacheEntry,
+        ) -> Pin<Box<dyn Future<Output = Result<(), CacheError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     impl UplinkForwarder for UnusedUplink {
         fn forward(
             &self,
@@ -851,6 +875,79 @@ mod tests {
 
     fn transport(calls: Arc<AtomicUsize>) -> MqttdDeviceTransport {
         MqttdDeviceTransport::new(CountingAuthenticator { calls }, UnusedUplink)
+    }
+
+    fn runtime_with_broker(broker: BrokerLifecycleHandle) -> MqttRuntime {
+        let (drain_started, _) = watch::channel(false);
+        MqttRuntime {
+            broker: Arc::new(Mutex::new(Some(broker))),
+            device_workers: Vec::<JoinHandle<()>>::new(),
+            session_router: Default::default(),
+            device_admission: DeviceAdmissionControl::new(),
+            force_cancellation: CancellationToken::new(),
+            parent_cancellation_watcher: None,
+            accepting: Arc::new(AtomicBool::new(true)),
+            drain_started,
+            public_connections: Arc::new(AtomicUsize::new(0)),
+            _cache: Arc::new(UnusedCache),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_returns_a_fatal_public_listener_io_error() {
+        let broker = crate::start_broker_for_public_worker_test().await;
+        broker
+            .spawn_public_worker(
+                "injected-runtime-listener-error",
+                StdTcpListener::bind("127.0.0.1:0").unwrap(),
+                |_listener, _accept_stop, _force_stop, _accept_gate| async {
+                    Err(std::io::Error::other("injected runtime listener failure"))
+                },
+            )
+            .unwrap();
+        let mut runtime = runtime_with_broker(broker);
+
+        let error = runtime
+            .drain(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect_err("fatal public listener I/O error must reach runtime drain");
+
+        match error {
+            MqttRuntimeError::PublicWorker(MqttdError::PublicWorkerIo { worker, source }) => {
+                assert_eq!(worker, "injected-runtime-listener-error");
+                assert_eq!(source.kind(), std::io::ErrorKind::Other);
+                assert_eq!(source.to_string(), "injected runtime listener failure");
+            }
+            error => panic!("expected public listener I/O error, got {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_returns_a_fatal_public_listener_panic() {
+        let broker = crate::start_broker_for_public_worker_test().await;
+        broker
+            .spawn_public_worker(
+                "injected-runtime-listener-panic",
+                StdTcpListener::bind("127.0.0.1:0").unwrap(),
+                |_listener, _accept_stop, _force_stop, _accept_gate| async {
+                    panic!("injected runtime listener panic");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let mut runtime = runtime_with_broker(broker);
+
+        let error = runtime
+            .drain(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect_err("fatal public listener panic must reach runtime drain");
+
+        assert!(matches!(
+            error,
+            MqttRuntimeError::PublicWorker(MqttdError::PublicWorkerPanic { worker })
+                if worker == "injected-runtime-listener-panic"
+        ));
     }
 
     fn v311_connect() -> Vec<u8> {
