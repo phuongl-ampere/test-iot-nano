@@ -70,6 +70,36 @@ pub struct ManagedRouter {
     cancellation: CancellationToken,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct ManagedIterationCounter {
+    updates: tokio::sync::watch::Sender<usize>,
+}
+
+#[cfg(test)]
+impl ManagedIterationCounter {
+    fn new() -> Self {
+        let (updates, _) = tokio::sync::watch::channel(0);
+        Self { updates }
+    }
+
+    fn record(&self) {
+        self.updates.send_modify(|iterations| *iterations += 1);
+    }
+
+    async fn wait_for_at_least(&self, minimum: usize) -> usize {
+        let mut updates = self.updates.subscribe();
+        while *updates.borrow_and_update() < minimum {
+            updates
+                .changed()
+                .await
+                .expect("managed iteration counter must retain its sender");
+        }
+        let observed = *updates.borrow_and_update();
+        observed
+    }
+}
+
 impl ManagedRouter {
     pub fn link(&self) -> Sender<(ConnectionId, Event)> {
         self.link.clone()
@@ -133,6 +163,8 @@ pub struct Router {
     pending_inflight: HashMap<ConnectionId, Vec<crate::StoredInflight>>,
     applied_inbound_qos2: HashMap<(String, u16), u64>,
     next_prune_ms: u64,
+    #[cfg(test)]
+    managed_iterations: Option<ManagedIterationCounter>,
 }
 
 impl Router {
@@ -189,6 +221,8 @@ impl Router {
             pending_inflight: HashMap::new(),
             applied_inbound_qos2: HashMap::new(),
             next_prune_ms: 0,
+            #[cfg(test)]
+            managed_iterations: None,
         };
         router.restore_storage()?;
         Ok(router)
@@ -247,8 +281,10 @@ impl Router {
         Ok(())
     }
 
-    /// Gets handle to the router. This is not a public method to ensure that link
-    /// is created only after the router starts
+    /// Gets a handle to the router.
+    ///
+    /// This remains private so startup APIs own readiness semantics. The managed
+    /// path intentionally obtains its link before [`ManagedRouter::run`] is spawned.
     fn link(&self) -> Sender<(ConnectionId, Event)> {
         self.router_tx.clone()
     }
@@ -303,6 +339,12 @@ impl Router {
         }
     }
 
+    #[cfg(test)]
+    fn with_managed_iteration_counter(mut self, counter: ManagedIterationCounter) -> Self {
+        self.managed_iterations = Some(counter);
+        self
+    }
+
     /// Runs the router on a Tokio worker without blocking it while waiting for
     /// new router events.
     #[tracing::instrument(skip_all)]
@@ -312,7 +354,7 @@ impl Router {
                 return Ok(());
             }
             self.run_inner_managed(&cancellation).await?;
-            tokio::time::sleep(std::time::Duration::ZERO).await;
+            tokio::task::yield_now().await;
         }
     }
 
@@ -400,7 +442,12 @@ impl Router {
             }
         }
 
-        self.complete_iteration()
+        self.complete_iteration()?;
+        #[cfg(test)]
+        if let Some(counter) = &self.managed_iterations {
+            counter.record();
+        }
+        Ok(())
     }
 
     fn complete_iteration(&mut self) -> Result<(), RouterError> {
@@ -2445,8 +2492,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn managed_router_yields_to_sibling_cancellation_during_active_workload() {
-        const ACTIVE_CLIENTS: usize = 200;
+        const ACTIVE_CLIENTS: usize = 1_000;
         const PUBLISHES_PER_CLIENT: usize = 198;
+        const MIN_ACTIVE_READY_ITERATIONS: usize = 4;
 
         let cancellation = CancellationToken::new();
         let mut config = router_config();
@@ -2508,12 +2556,18 @@ mod tests {
         router
             .run_inner()
             .expect("router must prepare the active managed workload");
-        let started = std::time::Instant::now();
-        let managed = router.into_managed(cancellation.clone());
+        let active_iterations = ManagedIterationCounter::new();
+        let managed = router
+            .with_managed_iteration_counter(active_iterations.clone())
+            .into_managed(cancellation.clone());
         let cancellation_signal = cancellation.clone();
+        let cancellation_iterations = active_iterations.clone();
         let canceller = tokio::spawn(async move {
-            tokio::task::yield_now().await;
+            let observed = cancellation_iterations
+                .wait_for_at_least(MIN_ACTIVE_READY_ITERATIONS)
+                .await;
             cancellation_signal.cancel();
+            observed
         });
         let feeder_cancellation = cancellation.clone();
         let feeder = tokio::spawn(async move {
@@ -2525,18 +2579,23 @@ mod tests {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(managed.run());
 
-        tokio::time::timeout(Duration::from_millis(20), async {
-            canceller
-                .await
-                .expect("cancellation sibling must not panic");
+        let observed_iterations = tokio::time::timeout(Duration::from_secs(1), canceller)
+            .await
+            .expect("cancellation sibling must be released after sustained ready work")
+            .expect("cancellation sibling must not panic");
+        assert!(
+            observed_iterations >= MIN_ACTIVE_READY_ITERATIONS,
+            "cancellation sibling must wait for sustained active ready iterations"
+        );
+        assert!(
+            observed_iterations < 8,
+            "managed router must yield before Tokio's forced cooperative budget"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
             assert!(matches!(tasks.join_next().await, Some(Ok(Ok(())))));
         })
         .await
         .expect("managed router must yield so sibling cancellation can complete");
-        assert!(
-            started.elapsed() < Duration::from_millis(20),
-            "managed router must yield so sibling cancellation can complete within the bound"
-        );
         assert!(tasks.is_empty());
         feeder.await.expect("workload feeder must not panic");
         drop(publishers);
