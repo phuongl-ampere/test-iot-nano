@@ -18,6 +18,7 @@ iot-nano-stream = { path = "../iot-nano-stream" }
 iot-storage = { path = "../../crates/iot-storage" }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 rusqlite = "0.37.0"
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -27,6 +28,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tower.workspace = true
 
 [lib]
 name = "iot_nano_monolith"

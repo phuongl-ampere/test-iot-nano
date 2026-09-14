@@ -2,6 +2,7 @@ use std::{
     fs::File,
     future::Future,
     io::{self, Read, Write},
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -25,8 +26,8 @@ use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    CacheError, MonolithConfig, PersistentCache, PlatformCommandResponse, PlatformCommandTransport,
-    PlatformCoreFacade, PlatformDeviceAuthorization, Readiness,
+    CacheError, ManagementSessionRouter, MonolithConfig, PersistentCache, PlatformCommandResponse,
+    PlatformCommandTransport, PlatformCoreFacade, PlatformDeviceAuthorization, Readiness,
 };
 
 const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
@@ -150,13 +151,19 @@ impl MonolithRuntime {
         };
 
         let readiness = Readiness::default();
+        let management_sessions = ManagementSessionRouter::new(Arc::clone(&platform));
+        let browser_session_verifier: Arc<dyn iot_api::OAuthBrowserSessionVerifier> =
+            management_sessions.session_verifier.clone();
         let public_router = health_router(readiness.clone())
             .merge(iot_api::public_v1_router(
                 Arc::clone(&platform),
                 TokenVault::from_key_material(&config.device_token_vault_key),
                 Arc::new(PlatformCoreFacade::new(Arc::clone(&platform))),
             ))
-            .merge(iot_api::public_oauth_router(Arc::clone(&platform)));
+            .merge(iot_api::public_oauth_router_with_browser_session_verifier(
+                Arc::clone(&platform),
+                browser_session_verifier,
+            ));
         let public_listener = match TcpListener::bind(config.public_http).await {
             Ok(listener) => listener,
             Err(error) => {
@@ -175,7 +182,7 @@ impl MonolithRuntime {
             spawn_http_server(public_listener, public_router, http_cancellation.clone()),
             spawn_http_server(
                 management_listener,
-                health_router(readiness.clone()),
+                health_router(readiness.clone()).merge(management_sessions.router),
                 http_cancellation.clone(),
             ),
         ];
@@ -348,11 +355,14 @@ fn spawn_http_server(
     cancellation: CancellationToken,
 ) -> JoinHandle<io::Result<()>> {
     tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                cancellation.cancelled().await;
-            })
-            .await
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            cancellation.cancelled().await;
+        })
+        .await
     })
 }
 

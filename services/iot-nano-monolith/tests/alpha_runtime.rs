@@ -4,8 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use iot_api::bootstrap_users_sqlite;
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{MonolithConfig, MonolithRuntime};
+use iot_storage::{ApplicationKind, ApplicationRepository, NewApplication};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -132,6 +134,93 @@ async fn alpha_runtime_mounts_public_oauth_token_endpoint() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn alpha_runtime_mounts_management_login_endpoint() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+
+    assert_json_post_status(
+        fixture.config.management_http,
+        "/api/auth/login",
+        r#"{"username":"missing","password":"wrong"}"#,
+        401,
+    )
+    .await;
+    assert_json_post_status(
+        fixture.config.public_http,
+        "/api/auth/login",
+        r#"{"username":"missing","password":"wrong"}"#,
+        404,
+    )
+    .await;
+
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn alpha_runtime_uses_a_management_session_to_issue_a_public_pkce_code() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+    let store = runtime.platform().unwrap();
+    bootstrap_users_sqlite(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    ApplicationRepository::upsert_application(
+        store,
+        NewApplication {
+            app_id: "alpha-pkce-app".parse().unwrap(),
+            kind: ApplicationKind::FullStack,
+            launch_url: "https://client.example.test".to_owned(),
+            client_id: "alpha-pkce-client".parse().unwrap(),
+            redirect_uris: vec!["https://client.example.test/callback".parse().unwrap()],
+            allowed_scopes: vec!["devices:read".to_owned()],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let login = send_http(
+        fixture.config.management_http,
+        "POST /api/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"username\":\"admin\",\"password\":\"NanoAdmin@1234\"}".to_owned(),
+    )
+    .await;
+    assert!(login.starts_with(b"HTTP/1.1 200"));
+    let cookie = String::from_utf8_lossy(&login)
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: "))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let challenge = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let authorize = send_http(
+        fixture.config.public_http,
+        format!(
+            "GET /oauth/authorize?response_type=code&client_id=alpha-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256 HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        authorize.starts_with(b"HTTP/1.1 302"),
+        "unexpected authorization response: {}",
+        String::from_utf8_lossy(&authorize)
+    );
+
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
 async fn assert_health(address: SocketAddr) {
     assert_health_status(address, 200).await;
 }
@@ -197,6 +286,41 @@ async fn assert_form_post_status(address: SocketAddr, path: &str, body: &str, st
         "unexpected HTTP response: {}",
         String::from_utf8_lossy(&response)
     );
+}
+
+async fn assert_json_post_status(address: SocketAddr, path: &str, body: &str, status: u16) {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        response.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
+        "unexpected HTTP response: {}",
+        String::from_utf8_lossy(&response)
+    );
+}
+
+async fn send_http(address: SocketAddr, request: String) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    response
 }
 
 async fn reserve_address() -> SocketAddr {

@@ -16,9 +16,10 @@ mod system_config;
 mod token_vault;
 
 pub use auth::{
-    AccountClass, AuthError, BearerAccessToken, BearerAccessTokenError, Role, bootstrap_users,
-    bootstrap_users_sqlite, extract_bearer_access_token, validate_bearer_access_token,
-    validate_password,
+    AccountClass, AuthError, AuthenticatedUser, BearerAccessToken, BearerAccessTokenError, Role,
+    authenticate_credentials, authenticate_credentials_sqlite, bootstrap_users,
+    bootstrap_users_sqlite, extract_bearer_access_token, generate_session_id,
+    validate_bearer_access_token, validate_password,
 };
 pub use core_client::{
     CoreClient, CoreClientError, CoreCommandCreateRequest, CoreCommandRecord,

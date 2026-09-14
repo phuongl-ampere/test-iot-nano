@@ -1768,12 +1768,14 @@ dependencies = [
  "iot-storage",
  "rusqlite",
  "rustix",
+ "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+ "tower",
  "uuid",
 ]
 
