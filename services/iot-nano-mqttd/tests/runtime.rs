@@ -400,8 +400,11 @@ async fn parent_cancellation_releases_configured_public_listener_addresses() {
 
     cancellation.cancel();
 
+    runtime
+        .join(Instant::now() + Duration::from_secs(2))
+        .await
+        .expect("parent cancellation did not join all runtime tasks");
     assert_public_addresses_rebindable(plaintext_address, tls_address).await;
-    shutdown(&mut runtime).await;
 }
 
 #[tokio::test]

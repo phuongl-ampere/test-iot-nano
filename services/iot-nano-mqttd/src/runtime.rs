@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     future::Future,
     io,
     net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
@@ -18,8 +19,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
-    sync::watch,
-    task::{JoinHandle, JoinSet},
+    sync::{Mutex as AsyncMutex, watch},
+    task::{Id as TaskId, JoinHandle, JoinSet},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -60,7 +61,8 @@ pub struct MqttRuntimeConfig {
 }
 
 pub struct MqttRuntime {
-    supervisor: RuntimeTaskSupervisor,
+    supervisor: Arc<AsyncMutex<RuntimeTaskSupervisor>>,
+    supervisor_monitor: Option<JoinHandle<Result<(), MqttRuntimeError>>>,
     session_router: RpcSessionRouter,
     shutdown: RuntimeShutdownControl,
     parent_cancellation_watcher: Option<JoinHandle<()>>,
@@ -125,12 +127,14 @@ impl std::fmt::Display for RuntimeTaskName {
 
 struct RuntimeTaskSupervisor {
     tasks: JoinSet<(RuntimeTaskName, Result<(), MqttRuntimeError>)>,
+    task_names: HashMap<TaskId, RuntimeTaskName>,
 }
 
 impl RuntimeTaskSupervisor {
     fn new() -> Self {
         Self {
             tasks: JoinSet::new(),
+            task_names: HashMap::new(),
         }
     }
 
@@ -138,17 +142,22 @@ impl RuntimeTaskSupervisor {
     where
         F: Future<Output = Result<(), MqttRuntimeError>> + Send + 'static,
     {
-        self.tasks.spawn(async move { (name, task.await) });
+        let handle = self.tasks.spawn(async move { (name, task.await) });
+        self.task_names.insert(handle.id(), name);
     }
 
+    #[cfg(test)]
     async fn join_until(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
         while !self.tasks.is_empty() {
-            let joined = timeout_until(deadline, self.tasks.join_next())
+            let joined = timeout_until(deadline, self.tasks.join_next_with_id())
                 .await
                 .map_err(|_| MqttRuntimeError::DeadlineElapsed)?;
             match joined {
-                Some(Ok((_name, Ok(())))) => {}
-                Some(Ok((name, Err(error)))) => {
+                Some(Ok((id, (_name, Ok(()))))) => {
+                    self.task_names.remove(&id);
+                }
+                Some(Ok((id, (name, Err(error))))) => {
+                    let name = self.task_names.remove(&id).unwrap_or(name);
                     return Err(match error {
                         MqttRuntimeError::Worker(message) => {
                             MqttRuntimeError::Worker(format!("{name} task failed: {message}"))
@@ -157,8 +166,12 @@ impl RuntimeTaskSupervisor {
                     });
                 }
                 Some(Err(error)) => {
+                    let name = self
+                        .task_names
+                        .remove(&error.id())
+                        .map_or_else(|| "managed".to_owned(), |name| name.to_string());
                     return Err(MqttRuntimeError::Worker(format!(
-                        "managed task join failure: {error}"
+                        "{name} task join failure: {error}"
                     )));
                 }
                 None => break,
@@ -167,13 +180,99 @@ impl RuntimeTaskSupervisor {
         Ok(())
     }
 
+    async fn run_until_stopped<F>(
+        &mut self,
+        force_cancellation: CancellationToken,
+        accepting: Arc<AtomicBool>,
+        mut on_failure: F,
+    ) -> Result<(), MqttRuntimeError>
+    where
+        F: FnMut(),
+    {
+        let mut failures = Vec::new();
+        let mut force_requested = force_cancellation.is_cancelled();
+        if force_requested {
+            self.abort_all();
+        }
+
+        while !self.tasks.is_empty() {
+            tokio::select! {
+                _ = force_cancellation.cancelled(), if !force_requested => {
+                    force_requested = true;
+                    self.abort_all();
+                }
+                joined = self.tasks.join_next_with_id() => match joined {
+                    Some(Ok((id, (name, Ok(()))))) => {
+                        let name = self.task_names.remove(&id).unwrap_or(name);
+                        if accepting.load(Ordering::Acquire) && !force_requested {
+                            failures.push(format!("{name} task exited before shutdown"));
+                            force_requested = true;
+                            on_failure();
+                            force_cancellation.cancel();
+                            self.abort_all();
+                        }
+                    }
+                    Some(Ok((id, (name, Err(error))))) => {
+                        let name = self.task_names.remove(&id).unwrap_or(name);
+                        failures.push(format!(
+                            "{name} task failed: {}",
+                            task_error_message(error),
+                        ));
+                        if !force_requested {
+                            force_requested = true;
+                            on_failure();
+                            force_cancellation.cancel();
+                            self.abort_all();
+                        }
+                    }
+                    Some(Err(error)) if !error.is_cancelled() => {
+                        let name = self
+                            .task_names
+                            .remove(&error.id())
+                            .map_or_else(|| "managed".to_owned(), |name| name.to_string());
+                        failures.push(format!("{name} task join failure: {error}"));
+                        if !force_requested {
+                            force_requested = true;
+                            on_failure();
+                            force_cancellation.cancel();
+                            self.abort_all();
+                        }
+                    }
+                    Some(Err(_)) | None => {}
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(MqttRuntimeError::Worker(failures.join("; ")))
+        }
+    }
+
     fn abort_all(&mut self) {
         self.tasks.abort_all();
     }
 
     async fn abort_and_join(&mut self) {
         self.abort_all();
-        while self.tasks.join_next().await.is_some() {}
+        while let Some(joined) = self.tasks.join_next_with_id().await {
+            match joined {
+                Ok((id, _)) => {
+                    self.task_names.remove(&id);
+                }
+                Err(error) => {
+                    self.task_names.remove(&error.id());
+                }
+            }
+        }
+    }
+}
+
+fn task_error_message(error: MqttRuntimeError) -> String {
+    match error {
+        MqttRuntimeError::Worker(message) => message,
+        error => error.to_string(),
     }
 }
 
@@ -376,8 +475,7 @@ impl MqttRuntime {
                 v311_admission,
                 v311_force_cancellation,
             )
-            .await;
-            Ok(())
+            .await
         });
         let v5_admission = shutdown.device_admission.clone();
         let v5_force_cancellation = shutdown.force_cancellation.clone();
@@ -389,8 +487,7 @@ impl MqttRuntime {
                 v5_admission,
                 v5_force_cancellation,
             )
-            .await;
-            Ok(())
+            .await
         });
 
         let plaintext_listener = match TcpListener::bind(config.listeners.plaintext_address).await {
@@ -463,12 +560,23 @@ impl MqttRuntime {
             }
         });
 
+        let supervisor = Arc::new(AsyncMutex::new(supervisor));
+        let (supervisor_completed, _) = watch::channel(false);
+        let supervisor_monitor = spawn_task_supervisor(
+            Arc::clone(&supervisor),
+            shutdown.clone(),
+            supervisor_completed.clone(),
+        );
         let (drain_started, _) = watch::channel(false);
-        let parent_cancellation_watcher =
-            spawn_parent_cancellation_watcher(config.cancellation, shutdown.clone());
+        let parent_cancellation_watcher = spawn_parent_cancellation_watcher(
+            config.cancellation,
+            shutdown.clone(),
+            supervisor_completed.subscribe(),
+        );
 
         Ok(Self {
             supervisor,
+            supervisor_monitor: Some(supervisor_monitor),
             session_router: config.session_router,
             shutdown,
             parent_cancellation_watcher: Some(parent_cancellation_watcher),
@@ -504,13 +612,36 @@ impl MqttRuntime {
     pub async fn drain(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
         self.stop_accepting().await?;
         self.drain_started.send_replace(true);
-        let result = self.supervisor.join_until(deadline).await;
+        self.join(deadline).await
+    }
+
+    pub async fn join(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
+        let result = self.join_supervisor_until(deadline).await;
         if result.is_err() {
             self.shutdown.force_stop();
-            self.supervisor.abort_and_join().await;
         };
         self.stop_parent_cancellation_watcher().await;
         result
+    }
+
+    async fn join_supervisor_until(&mut self, deadline: Instant) -> Result<(), MqttRuntimeError> {
+        let Some(mut monitor) = self.supervisor_monitor.take() else {
+            return Ok(());
+        };
+        match timeout_until(deadline, &mut monitor).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(MqttRuntimeError::Worker(format!(
+                "runtime supervisor join failure: {error}"
+            ))),
+            Err(()) => {
+                self.shutdown.force_stop();
+                if let Ok(mut supervisor) = self.supervisor.try_lock() {
+                    supervisor.abort_all();
+                }
+                let _ = monitor.await;
+                Err(MqttRuntimeError::DeadlineElapsed)
+            }
+        }
     }
 
     async fn stop_parent_cancellation_watcher(&mut self) {
@@ -524,11 +655,40 @@ impl MqttRuntime {
 fn spawn_parent_cancellation_watcher(
     parent_cancellation: CancellationToken,
     shutdown: RuntimeShutdownControl,
+    mut supervisor_completed: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         parent_cancellation.cancelled().await;
-        shutdown.stop_accepting();
         shutdown.force_stop();
+        while !*supervisor_completed.borrow() {
+            if supervisor_completed.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_task_supervisor(
+    supervisor: Arc<AsyncMutex<RuntimeTaskSupervisor>>,
+    shutdown: RuntimeShutdownControl,
+    supervisor_completed: watch::Sender<bool>,
+) -> JoinHandle<Result<(), MqttRuntimeError>> {
+    tokio::spawn(async move {
+        let failure_shutdown = shutdown.clone();
+        let result = supervisor
+            .lock()
+            .await
+            .run_until_stopped(
+                shutdown.force_cancellation.clone(),
+                Arc::clone(&shutdown.accepting),
+                move || failure_shutdown.force_stop(),
+            )
+            .await;
+        if result.is_err() {
+            shutdown.force_stop();
+        }
+        supervisor_completed.send_replace(true);
+        result
     })
 }
 
@@ -538,7 +698,9 @@ impl Drop for MqttRuntime {
             watcher.abort();
         }
         self.shutdown.force_stop();
-        self.supervisor.abort_all();
+        if let Ok(mut supervisor) = self.supervisor.try_lock() {
+            supervisor.abort_all();
+        }
     }
 }
 
@@ -714,7 +876,8 @@ async fn serve_device_backend(
     mqtt5: bool,
     device_admission: DeviceAdmissionControl,
     force_cancellation: CancellationToken,
-) {
+) -> Result<(), MqttRuntimeError> {
+    let protocol = if mqtt5 { "MQTT 5" } else { "MQTT 3.1.1" };
     let accept_cancellation = device_admission.accept_cancellation();
     let mut connections = JoinSet::new();
     loop {
@@ -748,23 +911,30 @@ async fn serve_device_backend(
                 }
                 Err(error) => {
                     if !accept_cancellation.is_cancelled() {
-                        eprintln!("iot-mqttd device backend accept error: {error}");
+                        return Err(MqttRuntimeError::Worker(format!(
+                            "device {protocol} backend accept failed: {error}"
+                        )));
                     }
                     break;
                 }
             },
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
-                    eprintln!("iot-mqttd device worker failed: {error}");
+                    return Err(MqttRuntimeError::Worker(format!(
+                        "device {protocol} connection task failed: {error}"
+                    )));
                 }
             }
         }
     }
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
-            eprintln!("iot-mqttd device worker failed: {error}");
+            return Err(MqttRuntimeError::Worker(format!(
+                "device {protocol} connection task failed: {error}"
+            )));
         }
     }
+    Ok(())
 }
 
 async fn timeout_until<T>(deadline: Instant, future: T) -> Result<T::Output, ()>
@@ -782,7 +952,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -824,6 +994,18 @@ mod tests {
                     is_gateway: false,
                 })
             })
+        }
+    }
+
+    struct PanicAuthenticator;
+
+    impl DeviceAuthenticator for PanicAuthenticator {
+        fn authenticate(
+            &self,
+            _request: TransportAuthRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<AuthenticatedDevice, TransportError>> + Send + '_>>
+        {
+            Box::pin(async { panic!("injected device authenticator panic") })
         }
     }
 
@@ -879,6 +1061,74 @@ mod tests {
             "unexpected supervisor error: {error:?}"
         );
         supervisor.abort_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn managed_supervisor_forces_and_joins_siblings_after_a_task_failure() {
+        let mut supervisor = RuntimeTaskSupervisor::new();
+        let force_cancellation = CancellationToken::new();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let shutdown_started = Arc::new(AtomicBool::new(false));
+        let (held_started_tx, held_started_rx) = oneshot::channel();
+        let (held_finished_tx, held_finished_rx) = oneshot::channel();
+
+        supervisor.spawn(RuntimeTaskName::PublicPlaintext, async {
+            Err(MqttRuntimeError::Worker(
+                "injected public plaintext failure".to_owned(),
+            ))
+        });
+        let held_force_cancellation = force_cancellation.clone();
+        supervisor.spawn(RuntimeTaskName::DeviceV311, async move {
+            let _ = held_started_tx.send(());
+            held_force_cancellation.cancelled().await;
+            let _ = held_finished_tx.send(());
+            Ok(())
+        });
+
+        held_started_rx
+            .await
+            .expect("held managed task did not start");
+        let failure_shutdown_started = Arc::clone(&shutdown_started);
+        let error = supervisor
+            .run_until_stopped(
+                force_cancellation.clone(),
+                Arc::clone(&accepting),
+                move || failure_shutdown_started.store(true, Ordering::Release),
+            )
+            .await
+            .expect_err("task failure must reach the supervisor");
+        assert!(force_cancellation.is_cancelled());
+        assert!(shutdown_started.load(Ordering::Acquire));
+        let _ = timeout(Duration::from_secs(1), held_finished_rx)
+            .await
+            .expect("supervisor did not join the force-cancelled sibling");
+        assert!(matches!(
+            error,
+            MqttRuntimeError::Worker(ref message)
+                if message == "public plaintext listener task failed: injected public plaintext failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_supervisor_names_a_panicking_task() {
+        let mut supervisor = RuntimeTaskSupervisor::new();
+        let force_cancellation = CancellationToken::new();
+        let accepting = Arc::new(AtomicBool::new(true));
+        supervisor.spawn(RuntimeTaskName::PublicTls, async {
+            panic!("injected public TLS task panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        let error = supervisor
+            .run_until_stopped(force_cancellation, accepting, || {})
+            .await
+            .expect_err("task panic must reach the supervisor");
+        assert!(matches!(
+            error,
+            MqttRuntimeError::Worker(ref message)
+                if message.contains("public TLS listener task join failure")
+        ));
     }
 
     fn v311_connect() -> Vec<u8> {
@@ -947,8 +1197,34 @@ mod tests {
         timeout(Duration::from_secs(1), worker)
             .await
             .expect("private device worker did not stop after normal admission closure")
+            .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn device_backend_surfaces_a_connection_task_panic() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = tokio::spawn(serve_device_backend(
+            listener,
+            MqttdDeviceTransport::new(PanicAuthenticator, UnusedUplink),
+            false,
+            DeviceAdmissionControl::new(),
+            CancellationToken::new(),
+        ));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&v311_connect()).await.unwrap();
+        let result = timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("device backend did not surface the child task panic")
+            .expect("device backend task panicked");
+        assert!(matches!(
+            result,
+            Err(MqttRuntimeError::Worker(message))
+                if message.contains("device MQTT 3.1.1 connection task failed")
+        ));
     }
 
     #[tokio::test]
@@ -994,6 +1270,7 @@ mod tests {
         timeout(Duration::from_secs(1), worker)
             .await
             .expect("private device worker did not join after force cancellation")
+            .unwrap()
             .unwrap();
     }
 
@@ -1024,6 +1301,7 @@ mod tests {
         timeout(Duration::from_secs(1), worker)
             .await
             .expect("V5 private device worker did not stop after normal admission closure")
+            .unwrap()
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
