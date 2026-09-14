@@ -911,6 +911,28 @@ pub(crate) async fn serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
     .await
 }
 
+pub(crate) async fn serve_public_plaintext_device_only_mux(
+    listener: TcpListener,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
+    accept_shutdown: watch::Receiver<bool>,
+    force_shutdown: watch::Receiver<bool>,
+    accept_gate: PublicMuxAcceptanceGate,
+    connection_counter: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    serve_plaintext_mux_with_shutdowns_and_mode(
+        listener,
+        backends,
+        settings,
+        accept_shutdown,
+        force_shutdown,
+        accept_gate,
+        MuxRouteMode::DeviceOnly,
+        Some(connection_counter),
+    )
+    .await
+}
+
 #[cfg(test)]
 async fn start_broker_for_public_worker_test() -> BrokerLifecycleHandle {
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -963,6 +985,32 @@ mod mux_shutdown_tests {
             0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 4, 0x02, 0x00, 0x3c, 0x00, 0x02, b'i',
             b'd',
         ]
+    }
+
+    fn device_connect_packet() -> Vec<u8> {
+        let username = "iotd_token";
+        let remaining = 10 + 4 + 2 + username.len();
+        let mut packet = vec![
+            0x10,
+            remaining as u8,
+            0x00,
+            0x04,
+            b'M',
+            b'Q',
+            b'T',
+            b'T',
+            4,
+            0x82,
+            0x00,
+            0x3c,
+            0x00,
+            0x02,
+            b'i',
+            b'd',
+        ];
+        packet.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        packet.extend_from_slice(username.as_bytes());
+        packet
     }
 
     #[test]
@@ -1353,6 +1401,118 @@ mod mux_shutdown_tests {
     #[tokio::test]
     async fn lifecycle_accept_stop_after_tls_admission_still_proxies() {
         assert_tls_admitted_before_accept_stop_still_proxies().await;
+    }
+
+    #[tokio::test]
+    async fn managed_plaintext_device_only_mux_is_a_parent_joinset_future() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_release, backend_task) =
+            spawn_backend_that_holds_connection(backend_listener);
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let (accept_stop, accept_shutdown) = watch::channel(false);
+        let (_force_stop, force_shutdown) = watch::channel(false);
+        let connection_counter = Arc::new(AtomicUsize::new(0));
+        let mut muxes = JoinSet::new();
+        muxes.spawn(serve_public_plaintext_device_only_mux(
+            public_listener,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: Some(backend_address),
+                device_v5: Some(backend_address),
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            PublicMuxAcceptanceGate::default(),
+            connection_counter.clone(),
+        ));
+
+        let mut client = TcpStream::connect(public_address).await.unwrap();
+        client.write_all(&device_connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("managed plaintext mux did not establish the device proxy")
+            .expect("managed plaintext backend closed unexpectedly");
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 1);
+
+        accept_stop.send_replace(true);
+        assert!(
+            timeout(Duration::from_millis(100), muxes.join_next())
+                .await
+                .is_err(),
+            "managed plaintext mux cancelled an admitted proxy during accept-stop"
+        );
+
+        backend_release.notify_one();
+        muxes.join_next().await.unwrap().unwrap().unwrap();
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 0);
+        backend_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_tls_device_only_mux_is_a_parent_joinset_future() {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_release, backend_task) =
+            spawn_backend_that_holds_connection(backend_listener);
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let acceptor =
+            load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
+        let (accept_stop, accept_shutdown) = watch::channel(false);
+        let (_force_stop, force_shutdown) = watch::channel(false);
+        let connection_counter = Arc::new(AtomicUsize::new(0));
+        let mut muxes = JoinSet::new();
+        muxes.spawn(serve_public_tls_device_only_mux(
+            public_listener,
+            acceptor,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: Some(backend_address),
+                device_v5: Some(backend_address),
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            PublicMuxAcceptanceGate::default(),
+            connection_counter.clone(),
+        ));
+
+        let client = TcpStream::connect(public_address).await.unwrap();
+        let mut client = timeout(
+            Duration::from_secs(1),
+            tls_connector().connect(ServerName::try_from("localhost").unwrap(), client),
+        )
+        .await
+        .expect("managed TLS mux did not complete the handshake")
+        .unwrap();
+        client.write_all(&device_connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("managed TLS mux did not establish the device proxy")
+            .expect("managed TLS backend closed unexpectedly");
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 1);
+
+        accept_stop.send_replace(true);
+        assert!(
+            timeout(Duration::from_millis(100), muxes.join_next())
+                .await
+                .is_err(),
+            "managed TLS mux cancelled an admitted proxy during accept-stop"
+        );
+
+        backend_release.notify_one();
+        muxes.join_next().await.unwrap().unwrap().unwrap();
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 0);
+        backend_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1809,6 +1969,30 @@ pub(crate) async fn serve_tls_mux_with_shutdowns_and_acceptance_gate(
         accept_gate,
         MuxRouteMode::GenericBroker,
         None,
+    )
+    .await
+}
+
+pub(crate) async fn serve_public_tls_device_only_mux(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    backends: ProtocolBackends,
+    settings: MuxSettings,
+    accept_shutdown: watch::Receiver<bool>,
+    force_shutdown: watch::Receiver<bool>,
+    accept_gate: PublicMuxAcceptanceGate,
+    connection_counter: Arc<AtomicUsize>,
+) -> std::io::Result<()> {
+    serve_tls_mux_with_shutdowns_and_mode(
+        listener,
+        acceptor,
+        backends,
+        settings,
+        accept_shutdown,
+        force_shutdown,
+        accept_gate,
+        MuxRouteMode::DeviceOnly,
+        Some(connection_counter),
     )
     .await
 }
