@@ -7,7 +7,8 @@ mod readiness;
 mod runtime;
 
 pub use adapters::{
-    PlatformCommandResponse, PlatformCommandTransport, PlatformDeviceAuthorization,
+    PlatformCommandResponse, PlatformCommandTransport, PlatformCoreFacade,
+    PlatformDeviceAuthorization,
 };
 pub use cache::{CacheEntry, CacheError, PersistentCache};
 pub use config::{
