@@ -151,7 +151,12 @@ impl PublicMuxAcceptanceGate {
             .clone();
         if let Some(barrier) = barrier {
             barrier.reached.notify_one();
-            barrier.proceed.notified().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                barrier.proceed.notified(),
+            )
+            .await
+            .expect("public mux admission test barrier was not released within one second");
         }
     }
 
@@ -175,7 +180,12 @@ impl PublicMuxAcceptanceGate {
             .clone();
         if let Some(barrier) = barrier {
             barrier.reached.notify_one();
-            barrier.proceed.notified().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                barrier.proceed.notified(),
+            )
+            .await
+            .expect("public mux post-admission test barrier was not released within one second");
         }
     }
 }
@@ -189,8 +199,10 @@ struct MuxAdmissionBarrier {
 
 #[cfg(test)]
 impl MuxAdmissionBarrier {
-    async fn wait_until_reached(&self) {
-        self.reached.notified().await;
+    async fn wait_until_reached(&self, description: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{description} was not reached within one second"));
     }
 
     fn release(&self) {
@@ -871,13 +883,40 @@ mod mux_shutdown_tests {
     ) -> (mpsc::UnboundedReceiver<()>, tokio::task::JoinHandle<()>) {
         let (accepted, connections) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
-            while let Ok((_stream, _)) = listener.accept().await {
+            while let Ok(Ok((_stream, _))) =
+                timeout(Duration::from_secs(5), listener.accept()).await
+            {
                 if accepted.send(()).is_err() {
                     break;
                 }
             }
         });
         (connections, task)
+    }
+
+    fn spawn_backend_that_holds_connections(
+        listener: TcpListener,
+    ) -> (
+        mpsc::UnboundedReceiver<()>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (accepted, connections) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = release.clone();
+        let task = tokio::spawn(async move {
+            while let Ok(Ok((_stream, _))) =
+                timeout(Duration::from_secs(5), listener.accept()).await
+            {
+                if accepted.send(()).is_err() {
+                    break;
+                }
+                timeout(Duration::from_secs(5), task_release.notified())
+                    .await
+                    .expect("held test backend was not released within five seconds");
+            }
+        });
+        (connections, release, task)
     }
 
     #[derive(Clone, Copy)]
@@ -947,7 +986,9 @@ mod mux_shutdown_tests {
 
         let mut client = TcpStream::connect(public_address).await.unwrap();
         client.write_all(&connect_packet()).await.unwrap();
-        barrier.wait_until_reached().await;
+        barrier
+            .wait_until_reached("plaintext mux admission barrier")
+            .await;
         signal_shutdown(signal, &accept_stop, &force_stop);
         barrier.release();
 
@@ -998,7 +1039,9 @@ mod mux_shutdown_tests {
         ));
 
         let client = TcpStream::connect(public_address).await.unwrap();
-        barrier.wait_until_reached().await;
+        barrier
+            .wait_until_reached("TLS mux admission barrier")
+            .await;
         signal_shutdown(signal, &accept_stop, &force_stop);
         barrier.release();
         if let Ok(Ok(mut client)) = timeout(
@@ -1056,9 +1099,9 @@ mod mux_shutdown_tests {
 
         let mut client = TcpStream::connect(public_address).await.unwrap();
         client.write_all(&connect_packet()).await.unwrap();
-        timeout(Duration::from_secs(1), barrier.wait_until_reached())
-            .await
-            .expect("plaintext mux did not reach the post-admission barrier");
+        barrier
+            .wait_until_reached("plaintext mux post-admission barrier")
+            .await;
         lifecycle.stop_public_accepting();
         barrier.release();
         timeout(Duration::from_secs(1), backend_connections.recv())
@@ -1117,15 +1160,18 @@ mod mux_shutdown_tests {
         ));
 
         let client = TcpStream::connect(public_address).await.unwrap();
-        timeout(Duration::from_secs(1), barrier.wait_until_reached())
-            .await
-            .expect("TLS mux did not reach the post-admission barrier");
+        barrier
+            .wait_until_reached("TLS mux post-admission barrier")
+            .await;
         lifecycle.stop_public_accepting();
         barrier.release();
-        let mut client = tls_connector()
-            .connect(ServerName::try_from("localhost").unwrap(), client)
-            .await
-            .unwrap();
+        let mut client = timeout(
+            Duration::from_secs(1),
+            tls_connector().connect(ServerName::try_from("localhost").unwrap(), client),
+        )
+        .await
+        .expect("TLS client did not complete the admitted handshake")
+        .unwrap();
         client.write_all(&connect_packet()).await.unwrap();
         timeout(Duration::from_secs(1), backend_connections.recv())
             .await
@@ -1161,9 +1207,8 @@ mod mux_shutdown_tests {
         let backend_address = backend_listener.local_addr().unwrap();
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_address = public_listener.local_addr().unwrap();
-        let backend_task = tokio::spawn(async move {
-            let _ = backend_listener.accept().await;
-        });
+        let (mut backend_connections, _backend_release, backend_task) =
+            spawn_backend_that_holds_connections(backend_listener);
         let (_accept_stop, accept_shutdown) = watch::channel(false);
         let (force_stop, force_shutdown) = watch::channel(false);
         let gate = PublicMuxAcceptanceGate::default();
@@ -1184,9 +1229,9 @@ mod mux_shutdown_tests {
 
         let mut client = TcpStream::connect(public_address).await.unwrap();
         client.write_all(&connect_packet()).await.unwrap();
-        timeout(Duration::from_secs(1), barrier.wait_until_reached())
-            .await
-            .expect("plaintext mux did not reach the post-admission barrier");
+        barrier
+            .wait_until_reached("plaintext mux post-admission barrier")
+            .await;
         force_stop.send_replace(true);
         barrier.release();
 
@@ -1199,6 +1244,80 @@ mod mux_shutdown_tests {
             .expect("plaintext mux did not stop after force-stop")
             .unwrap()
             .unwrap();
+        assert!(
+            !backend_task.is_finished(),
+            "backend completed without its test Notify being released, so it could have closed the proxy independently"
+        );
+        assert!(
+            !matches!(
+                backend_connections.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "backend notifier disconnected before the test released its held stream"
+        );
+        backend_task.abort();
+    }
+
+    #[tokio::test]
+    async fn force_stop_after_tls_admission_before_spawn_closes_the_client() {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let (mut backend_connections, _backend_release, backend_task) =
+            spawn_backend_that_holds_connections(backend_listener);
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let acceptor =
+            load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
+        let (_accept_stop, accept_shutdown) = watch::channel(false);
+        let (force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let barrier = gate.test_post_admission_barrier();
+        let mux_task = tokio::spawn(serve_tls_mux_with_shutdowns_and_acceptance_gate(
+            public_listener,
+            acceptor,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: None,
+                device_v5: None,
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate,
+        ));
+
+        let mut client = TcpStream::connect(public_address).await.unwrap();
+        barrier
+            .wait_until_reached("TLS mux post-admission barrier")
+            .await;
+        force_stop.send_replace(true);
+        barrier.release();
+
+        let mut response = Vec::new();
+        let _ = timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("force-stop did not close the admitted TLS client before worker spawn");
+        timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("TLS mux did not stop after force-stop")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !backend_task.is_finished(),
+            "backend completed without its test Notify being released, so it could have closed the TLS proxy independently"
+        );
+        assert!(
+            !matches!(
+                backend_connections.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "TLS backend notifier disconnected before the test released its held stream"
+        );
         backend_task.abort();
     }
 
@@ -1258,7 +1377,9 @@ mod mux_shutdown_tests {
 
         let mut client = TcpStream::connect(public_address).await.unwrap();
         client.write_all(&connect_packet()).await.unwrap();
-        barrier.wait_until_reached().await;
+        barrier
+            .wait_until_reached("plaintext mux admission barrier")
+            .await;
         lifecycle.stop_public_accepting();
         barrier.release();
 
