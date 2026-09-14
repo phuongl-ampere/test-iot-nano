@@ -894,7 +894,7 @@ mod mux_shutdown_tests {
         (connections, task)
     }
 
-    fn spawn_backend_that_holds_connections(
+    fn spawn_backend_that_holds_connection(
         listener: TcpListener,
     ) -> (
         mpsc::UnboundedReceiver<()>,
@@ -905,16 +905,17 @@ mod mux_shutdown_tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let task_release = release.clone();
         let task = tokio::spawn(async move {
-            while let Ok(Ok((_stream, _))) =
-                timeout(Duration::from_secs(5), listener.accept()).await
-            {
-                if accepted.send(()).is_err() {
-                    break;
-                }
-                timeout(Duration::from_secs(5), task_release.notified())
-                    .await
-                    .expect("held test backend was not released within five seconds");
-            }
+            let (stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("held test backend did not accept a connection within five seconds")
+                .expect("held test backend listener failed");
+            accepted
+                .send(())
+                .expect("held test backend acceptance receiver was dropped");
+            timeout(Duration::from_secs(5), task_release.notified())
+                .await
+                .expect("held test backend was not released within five seconds");
+            drop(stream);
         });
         (connections, release, task)
     }
@@ -1202,13 +1203,13 @@ mod mux_shutdown_tests {
     }
 
     #[tokio::test]
-    async fn force_stop_after_admission_ends_the_plaintext_proxy() {
+    async fn force_stop_after_plaintext_proxy_establishes_closes_the_client() {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend_listener.local_addr().unwrap();
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_address = public_listener.local_addr().unwrap();
-        let (mut backend_connections, _backend_release, backend_task) =
-            spawn_backend_that_holds_connections(backend_listener);
+        let (mut backend_connections, backend_release, backend_task) =
+            spawn_backend_that_holds_connection(backend_listener);
         let (_accept_stop, accept_shutdown) = watch::channel(false);
         let (force_stop, force_shutdown) = watch::channel(false);
         let gate = PublicMuxAcceptanceGate::default();
@@ -1232,13 +1233,17 @@ mod mux_shutdown_tests {
         barrier
             .wait_until_reached("plaintext mux post-admission barrier")
             .await;
-        force_stop.send_replace(true);
         barrier.release();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("plaintext mux did not establish a backend proxy before force-stop")
+            .expect("plaintext backend notifier closed unexpectedly");
+        force_stop.send_replace(true);
 
         let mut response = Vec::new();
         let _ = timeout(Duration::from_secs(1), client.read_to_end(&mut response))
             .await
-            .expect("force-stop did not close the admitted plaintext proxy");
+            .expect("force-stop did not close the established plaintext proxy");
         timeout(Duration::from_secs(1), mux_task)
             .await
             .expect("plaintext mux did not stop after force-stop")
@@ -1246,20 +1251,17 @@ mod mux_shutdown_tests {
             .unwrap();
         assert!(
             !backend_task.is_finished(),
-            "backend completed without its test Notify being released, so it could have closed the proxy independently"
+            "backend completed while its stream was held, so it could have closed the proxy independently"
         );
-        assert!(
-            !matches!(
-                backend_connections.try_recv(),
-                Err(mpsc::error::TryRecvError::Disconnected)
-            ),
-            "backend notifier disconnected before the test released its held stream"
-        );
-        backend_task.abort();
+        backend_release.notify_one();
+        timeout(Duration::from_secs(1), backend_task)
+            .await
+            .expect("plaintext held backend did not clean up after release")
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn force_stop_after_tls_admission_before_spawn_closes_the_client() {
+    async fn force_stop_after_tls_proxy_establishes_closes_the_client() {
         tokio_rustls::rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
@@ -1267,8 +1269,8 @@ mod mux_shutdown_tests {
         let backend_address = backend_listener.local_addr().unwrap();
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_address = public_listener.local_addr().unwrap();
-        let (mut backend_connections, _backend_release, backend_task) =
-            spawn_backend_that_holds_connections(backend_listener);
+        let (mut backend_connections, backend_release, backend_task) =
+            spawn_backend_that_holds_connection(backend_listener);
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let acceptor =
             load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
@@ -1291,17 +1293,29 @@ mod mux_shutdown_tests {
             gate,
         ));
 
-        let mut client = TcpStream::connect(public_address).await.unwrap();
+        let client = TcpStream::connect(public_address).await.unwrap();
         barrier
             .wait_until_reached("TLS mux post-admission barrier")
             .await;
-        force_stop.send_replace(true);
         barrier.release();
+        let mut client = timeout(
+            Duration::from_secs(1),
+            tls_connector().connect(ServerName::try_from("localhost").unwrap(), client),
+        )
+        .await
+        .expect("TLS client did not complete the admitted handshake")
+        .unwrap();
+        client.write_all(&connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("TLS mux did not establish a backend proxy before force-stop")
+            .expect("TLS backend notifier closed unexpectedly");
+        force_stop.send_replace(true);
 
         let mut response = Vec::new();
         let _ = timeout(Duration::from_secs(1), client.read_to_end(&mut response))
             .await
-            .expect("force-stop did not close the admitted TLS client before worker spawn");
+            .expect("force-stop did not close the established TLS proxy");
         timeout(Duration::from_secs(1), mux_task)
             .await
             .expect("TLS mux did not stop after force-stop")
@@ -1309,16 +1323,13 @@ mod mux_shutdown_tests {
             .unwrap();
         assert!(
             !backend_task.is_finished(),
-            "backend completed without its test Notify being released, so it could have closed the TLS proxy independently"
+            "backend completed while its stream was held, so it could have closed the TLS proxy independently"
         );
-        assert!(
-            !matches!(
-                backend_connections.try_recv(),
-                Err(mpsc::error::TryRecvError::Disconnected)
-            ),
-            "TLS backend notifier disconnected before the test released its held stream"
-        );
-        backend_task.abort();
+        backend_release.notify_one();
+        timeout(Duration::from_secs(1), backend_task)
+            .await
+            .expect("TLS held backend did not clean up after release")
+            .unwrap();
     }
 
     #[tokio::test]
