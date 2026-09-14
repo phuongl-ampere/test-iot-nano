@@ -79,6 +79,21 @@ where
         .layer(Extension(context))
 }
 
+pub fn public_v1_router<S>(
+    store: Arc<PlatformStore>,
+    token_vault: TokenVault,
+    core_facade: Arc<dyn CoreFacade>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router(PublicApiContext::new(
+        Some(store),
+        token_vault,
+        Some(core_facade),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct PublicPageQuery {
     after: Option<String>,

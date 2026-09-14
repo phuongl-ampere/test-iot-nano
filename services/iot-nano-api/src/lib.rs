@@ -29,6 +29,7 @@ pub use power_switcher::{
     POWER_SWITCHER_PROFILE_NAME, bootstrap_power_switcher_profile,
     bootstrap_power_switcher_profile_sqlite,
 };
+pub use public_v1::public_v1_router;
 pub use routes::{
     ApiRouters, ApiState, MqttdDeviceTransportSessionRevocation,
     MqttdDeviceTransportSessionRevoker, MqttdDeviceTransportSessionRevokerError, SqliteApiRouters,
