@@ -16,6 +16,7 @@ use crate::{meters, ConnectionSettings, Meter};
 use flume::{RecvError, SendError, Sender};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -425,6 +426,40 @@ struct ServerAcceptanceGate {
     closed: RwLock<bool>,
 }
 
+const REMOTE_TASKS_RUNNING: u8 = 0;
+const REMOTE_TASKS_DRAIN: u8 = 1;
+const REMOTE_TASKS_ABORT: u8 = 2;
+
+#[derive(Clone)]
+struct RemoteTaskShutdown {
+    mode: Arc<AtomicU8>,
+}
+
+impl RemoteTaskShutdown {
+    fn new() -> Self {
+        Self {
+            mode: Arc::new(AtomicU8::new(REMOTE_TASKS_RUNNING)),
+        }
+    }
+
+    fn request_drain(&self) {
+        let _ = self.mode.compare_exchange(
+            REMOTE_TASKS_RUNNING,
+            REMOTE_TASKS_DRAIN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn abort(&self) {
+        self.mode.store(REMOTE_TASKS_ABORT, Ordering::Release);
+    }
+
+    fn should_drain(&self) -> bool {
+        self.mode.load(Ordering::Acquire) == REMOTE_TASKS_DRAIN
+    }
+}
+
 impl ServerAcceptanceGate {
     fn new() -> Self {
         Self {
@@ -586,9 +621,11 @@ impl Broker {
     ) -> Result<BrokerHandle, Error> {
         let (shutdown, receiver) = watch::channel(false);
         let acceptance_gate = Arc::new(ServerAcceptanceGate::new());
+        let remote_task_shutdown = RemoteTaskShutdown::new();
         let router_tx = self.router_tx.clone();
         let shutdown_for_thread = shutdown.clone();
         let acceptance_gate_for_thread = Arc::clone(&acceptance_gate);
+        let remote_task_shutdown_for_thread = remote_task_shutdown.clone();
         let join = thread::Builder::new()
             .name("iot-mqtt-core-broker".to_owned())
             .spawn(move || {
@@ -596,6 +633,7 @@ impl Broker {
                     receiver,
                     shutdown_for_thread,
                     acceptance_gate_for_thread,
+                    remote_task_shutdown_for_thread,
                     listeners,
                     startup,
                 )
@@ -603,6 +641,7 @@ impl Broker {
         Ok(BrokerHandle {
             shutdown,
             acceptance_gate,
+            remote_task_shutdown,
             join: Some(join),
             router_tx,
         })
@@ -674,17 +713,19 @@ impl Broker {
             receiver,
             shutdown,
             Arc::new(ServerAcceptanceGate::new()),
+            RemoteTaskShutdown::new(),
             None,
             None,
         )
     }
 
-    #[tracing::instrument(skip(self, acceptance_gate, listeners, startup))]
+    #[tracing::instrument(skip(self, acceptance_gate, remote_task_shutdown, listeners, startup))]
     fn start_with_shutdown(
         &mut self,
         shutdown: watch::Receiver<bool>,
         shutdown_sender: watch::Sender<bool>,
         acceptance_gate: Arc<ServerAcceptanceGate>,
+        remote_task_shutdown: RemoteTaskShutdown,
         mut listeners: Option<PreboundListeners>,
         startup: Option<StartupSender>,
     ) -> Result<(), Error> {
@@ -749,6 +790,7 @@ impl Broker {
                     self.shutdown_started_threads(
                         &shutdown_sender,
                         &acceptance_gate,
+                        &remote_task_shutdown,
                         server_thread_handles,
                     );
                     return Err(error.into());
@@ -764,6 +806,7 @@ impl Broker {
                 let server_thread = thread::Builder::new().name(server_name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
                 server.set_acceptance_gate(Arc::clone(&acceptance_gate));
+                server.set_remote_task_shutdown(remote_task_shutdown.clone());
                 let shutdown = shutdown.clone();
                 let listener = listeners.as_mut().map(|listeners| {
                     listeners
@@ -777,6 +820,7 @@ impl Broker {
                     self.shutdown_started_threads(
                         &shutdown_sender,
                         &acceptance_gate,
+                        &remote_task_shutdown,
                         server_thread_handles,
                     );
                     return Err(error.into());
@@ -810,6 +854,7 @@ impl Broker {
                         self.shutdown_started_threads(
                             &shutdown_sender,
                             &acceptance_gate,
+                            &remote_task_shutdown,
                             server_thread_handles,
                         );
                         return Err(error.into());
@@ -825,6 +870,7 @@ impl Broker {
                 let server_thread = thread::Builder::new().name(server_name.clone());
                 let mut server = Server::new(config, self.router_tx.clone(), V5);
                 server.set_acceptance_gate(Arc::clone(&acceptance_gate));
+                server.set_remote_task_shutdown(remote_task_shutdown.clone());
                 let shutdown = shutdown.clone();
                 let listener = listeners.as_mut().map(|listeners| {
                     listeners
@@ -838,6 +884,7 @@ impl Broker {
                     self.shutdown_started_threads(
                         &shutdown_sender,
                         &acceptance_gate,
+                        &remote_task_shutdown,
                         server_thread_handles,
                     );
                     return Err(error.into());
@@ -871,6 +918,7 @@ impl Broker {
                         self.shutdown_started_threads(
                             &shutdown_sender,
                             &acceptance_gate,
+                            &remote_task_shutdown,
                             server_thread_handles,
                         );
                         return Err(error.into());
@@ -894,6 +942,7 @@ impl Broker {
                 //TODO: Add support for V5 procotol with websockets. Registered in config or on ServerSettings
                 let mut server = Server::new(config, self.router_tx.clone(), V4);
                 server.set_acceptance_gate(Arc::clone(&acceptance_gate));
+                server.set_remote_task_shutdown(remote_task_shutdown.clone());
                 let shutdown = shutdown.clone();
                 let handle = match server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
@@ -910,6 +959,7 @@ impl Broker {
                         self.shutdown_started_threads(
                             &shutdown_sender,
                             &acceptance_gate,
+                            &remote_task_shutdown,
                             server_thread_handles,
                         );
                         return Err(error.into());
@@ -991,9 +1041,11 @@ impl Broker {
         &mut self,
         shutdown: &watch::Sender<bool>,
         acceptance_gate: &ServerAcceptanceGate,
+        remote_task_shutdown: &RemoteTaskShutdown,
         server_thread_handles: Vec<thread::JoinHandle<()>>,
     ) {
         acceptance_gate.close();
+        remote_task_shutdown.abort();
         shutdown.send_replace(true);
         for handle in server_thread_handles {
             let _ = handle.join();
@@ -1034,7 +1086,7 @@ fn prebound_listener_sources(listeners: &PreboundListeners) -> Vec<PreboundListe
 }
 
 fn shutdown_prebound_startup(handle: BrokerHandle, error: Error) -> Result<BrokerHandle, Error> {
-    handle.shutdown();
+    handle.shutdown_immediately();
     handle.join()?;
     Err(error)
 }
@@ -1042,6 +1094,7 @@ fn shutdown_prebound_startup(handle: BrokerHandle, error: Error) -> Result<Broke
 pub struct BrokerHandle {
     shutdown: watch::Sender<bool>,
     acceptance_gate: Arc<ServerAcceptanceGate>,
+    remote_task_shutdown: RemoteTaskShutdown,
     join: Option<thread::JoinHandle<Result<(), Error>>>,
     router_tx: Sender<(ConnectionId, Event)>,
 }
@@ -1049,6 +1102,13 @@ pub struct BrokerHandle {
 impl BrokerHandle {
     pub fn shutdown(&self) {
         self.acceptance_gate.close();
+        self.remote_task_shutdown.request_drain();
+        let _ = self.shutdown.send(true);
+    }
+
+    fn shutdown_immediately(&self) {
+        self.acceptance_gate.close();
+        self.remote_task_shutdown.abort();
         let _ = self.shutdown.send(true);
     }
 
@@ -1089,6 +1149,7 @@ pub struct Server<P> {
     router_tx: Sender<(ConnectionId, Event)>,
     protocol: P,
     acceptance_gate: Arc<ServerAcceptanceGate>,
+    remote_task_shutdown: RemoteTaskShutdown,
     awaiting_will_handler: Arc<Mutex<HashMap<String, Sender<AwaitingWill>>>>,
 }
 
@@ -1103,12 +1164,17 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             router_tx,
             protocol,
             acceptance_gate: Arc::new(ServerAcceptanceGate::new()),
+            remote_task_shutdown: RemoteTaskShutdown::new(),
             awaiting_will_handler: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 
     fn set_acceptance_gate(&mut self, acceptance_gate: Arc<ServerAcceptanceGate>) {
         self.acceptance_gate = acceptance_gate;
+    }
+
+    fn set_remote_task_shutdown(&mut self, remote_task_shutdown: RemoteTaskShutdown) {
+        self.remote_task_shutdown = remote_task_shutdown;
     }
 
     // Depending on TLS or not create a new Network
@@ -1275,8 +1341,10 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                 _ = shutdown.changed() => break,
             }
         }
-        for task in &remote_tasks {
-            task.abort();
+        if !self.remote_task_shutdown.should_drain() {
+            for task in &remote_tasks {
+                task.abort();
+            }
         }
         for task in remote_tasks {
             let _ = task.await;
