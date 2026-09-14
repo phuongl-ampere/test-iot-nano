@@ -1,12 +1,14 @@
 use std::{str::FromStr, sync::Arc};
 
 use axum::{
+    Router,
     extract::{Form, Query, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{AUTHORIZATION, CACHE_CONTROL, LOCATION, PRAGMA},
     },
     response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use base64::{
     Engine,
@@ -28,6 +30,16 @@ use crate::{
 
 const AUTHORIZATION_CODE_TTL: Duration = Duration::minutes(10);
 const ACCESS_TOKEN_TTL: Duration = Duration::hours(1);
+
+pub fn public_oauth_router<S>(store: Arc<PlatformStore>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/oauth/authorize", get(public_authorize))
+        .route("/oauth/token", post(public_token))
+        .with_state(store)
+}
 
 trait OAuthState {
     fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<AuthContext>;
@@ -185,6 +197,10 @@ pub(crate) async fn sqlite_authorize(
     authorize_response(&state, &headers, request).await
 }
 
+async fn public_authorize() -> Response {
+    OAuthError::AccessDenied.into_response()
+}
+
 async fn authorize_response(
     state: &impl OAuthState,
     headers: &HeaderMap,
@@ -210,6 +226,29 @@ pub(crate) async fn sqlite_token(
     form: Result<Form<TokenRequest>, axum::extract::rejection::FormRejection>,
 ) -> Response {
     token_response_for_request(&state, &headers, form).await
+}
+
+async fn public_token(
+    State(store): State<Arc<PlatformStore>>,
+    headers: HeaderMap,
+    form: Result<Form<TokenRequest>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let Form(request) = match form {
+        Ok(request) => request,
+        Err(_) => return OAuthError::InvalidRequest.into_response(),
+    };
+    let response = match request.grant_type.as_deref() {
+        Some("client_credentials") => {
+            issue_client_credentials_from_store(store.as_ref(), &headers, request).await
+        }
+        Some("authorization_code") => Err(OAuthError::UnsupportedGrantType),
+        Some(_) => Err(OAuthError::UnsupportedGrantType),
+        None => Err(OAuthError::InvalidRequest),
+    };
+    match response {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn token_response_for_request(
@@ -389,13 +428,21 @@ async fn issue_client_credentials(
     request: TokenRequest,
 ) -> Result<Response, OAuthError> {
     let store = state.oauth_store().ok_or(OAuthError::ServerError)?;
+    issue_client_credentials_from_store(store.as_ref(), headers, request).await
+}
+
+async fn issue_client_credentials_from_store(
+    store: &PlatformStore,
+    headers: &HeaderMap,
+    request: TokenRequest,
+) -> Result<Response, OAuthError> {
     let client = token_client_authentication(headers, &request)?;
     let client_id = ClientId::from_str(&client.client_id).map_err(|_| OAuthError::InvalidClient)?;
     let client_secret = client.client_secret.ok_or(OAuthError::InvalidClient)?;
     let access_token = random_credential()?;
     let issued_at = Utc::now();
     let record = OAuthRepository::issue_client_credentials_access_token(
-        store.as_ref(),
+        store,
         OAuthClientCredentialsToken {
             client_id,
             client_secret,
