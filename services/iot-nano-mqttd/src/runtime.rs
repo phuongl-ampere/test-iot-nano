@@ -61,7 +61,6 @@ pub struct MqttRuntimeConfig {
 }
 
 pub struct MqttRuntime {
-    supervisor: Arc<AsyncMutex<RuntimeTaskSupervisor>>,
     supervisor_monitor: Option<JoinHandle<Result<(), MqttRuntimeError>>>,
     session_router: RpcSessionRouter,
     shutdown: RuntimeShutdownControl,
@@ -191,15 +190,11 @@ impl RuntimeTaskSupervisor {
     {
         let mut failures = Vec::new();
         let mut force_requested = force_cancellation.is_cancelled();
-        if force_requested {
-            self.abort_all();
-        }
 
         while !self.tasks.is_empty() {
             tokio::select! {
                 _ = force_cancellation.cancelled(), if !force_requested => {
                     force_requested = true;
-                    self.abort_all();
                 }
                 joined = self.tasks.join_next_with_id() => match joined {
                     Some(Ok((id, (name, Ok(()))))) => {
@@ -209,7 +204,6 @@ impl RuntimeTaskSupervisor {
                             force_requested = true;
                             on_failure();
                             force_cancellation.cancel();
-                            self.abort_all();
                         }
                     }
                     Some(Ok((id, (name, Err(error))))) => {
@@ -222,7 +216,6 @@ impl RuntimeTaskSupervisor {
                             force_requested = true;
                             on_failure();
                             force_cancellation.cancel();
-                            self.abort_all();
                         }
                     }
                     Some(Err(error)) if !error.is_cancelled() => {
@@ -235,7 +228,6 @@ impl RuntimeTaskSupervisor {
                             force_requested = true;
                             on_failure();
                             force_cancellation.cancel();
-                            self.abort_all();
                         }
                     }
                     Some(Err(_)) | None => {}
@@ -250,10 +242,12 @@ impl RuntimeTaskSupervisor {
         }
     }
 
+    #[cfg(test)]
     fn abort_all(&mut self) {
         self.tasks.abort_all();
     }
 
+    #[cfg(test)]
     async fn abort_and_join(&mut self) {
         self.abort_all();
         while let Some(joined) = self.tasks.join_next_with_id().await {
@@ -575,7 +569,6 @@ impl MqttRuntime {
         );
 
         Ok(Self {
-            supervisor,
             supervisor_monitor: Some(supervisor_monitor),
             session_router: config.session_router,
             shutdown,
@@ -635,11 +628,12 @@ impl MqttRuntime {
             ))),
             Err(()) => {
                 self.shutdown.force_stop();
-                if let Ok(mut supervisor) = self.supervisor.try_lock() {
-                    supervisor.abort_all();
+                match monitor.await {
+                    Ok(_) => Err(MqttRuntimeError::DeadlineElapsed),
+                    Err(error) => Err(MqttRuntimeError::Worker(format!(
+                        "runtime supervisor join failure after deadline: {error}"
+                    ))),
                 }
-                let _ = monitor.await;
-                Err(MqttRuntimeError::DeadlineElapsed)
             }
         }
     }
@@ -698,9 +692,6 @@ impl Drop for MqttRuntime {
             watcher.abort();
         }
         self.shutdown.force_stop();
-        if let Ok(mut supervisor) = self.supervisor.try_lock() {
-            supervisor.abort_all();
-        }
     }
 }
 
@@ -867,7 +858,13 @@ fn authorization_cache_expiration_ms() -> u64 {
 
 async fn cancel_startup(shutdown: &RuntimeShutdownControl, supervisor: &mut RuntimeTaskSupervisor) {
     shutdown.force_stop();
-    supervisor.abort_and_join().await;
+    let _ = supervisor
+        .run_until_stopped(
+            shutdown.force_cancellation.clone(),
+            Arc::clone(&shutdown.accepting),
+            || {},
+        )
+        .await;
 }
 
 async fn serve_device_backend(
@@ -1107,6 +1104,52 @@ mod tests {
             MqttRuntimeError::Worker(ref message)
                 if message == "public plaintext listener task failed: injected public plaintext failure"
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_supervisor_waits_for_a_force_cancelled_sibling_to_drain() {
+        let mut supervisor = RuntimeTaskSupervisor::new();
+        let force_cancellation = CancellationToken::new();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let (force_observed_tx, force_observed_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+
+        supervisor.spawn(RuntimeTaskName::PublicPlaintext, async {
+            Err(MqttRuntimeError::Worker(
+                "injected public plaintext failure".to_owned(),
+            ))
+        });
+        let held_force_cancellation = force_cancellation.clone();
+        supervisor.spawn(RuntimeTaskName::DeviceV311, async move {
+            held_force_cancellation.cancelled().await;
+            let _ = force_observed_tx.send(());
+            let _ = release_rx.await;
+            let _ = finished_tx.send(());
+            Ok(())
+        });
+
+        let mut supervised = tokio::spawn(async move {
+            supervisor
+                .run_until_stopped(force_cancellation, accepting, || {})
+                .await
+        });
+        force_observed_rx
+            .await
+            .expect("sibling did not observe force cancellation");
+        assert!(
+            timeout(Duration::from_millis(100), &mut supervised)
+                .await
+                .is_err(),
+            "supervisor completed before the force-cancelled sibling drained"
+        );
+        release_tx
+            .send(())
+            .expect("force-cancelled sibling was dropped before its drain release");
+        finished_rx
+            .await
+            .expect("force-cancelled sibling did not finish after release");
+        assert!(supervised.await.unwrap().is_err());
     }
 
     #[tokio::test]

@@ -374,10 +374,15 @@ async fn expired_drain_closes_listeners_and_joins_runtime_work() {
         runtime.drain(Instant::now()).await,
         Err(iot_nano_mqttd::MqttRuntimeError::DeadlineElapsed)
     ));
-    drop(stream);
-    drop(runtime);
+    let mut closed = Vec::new();
+    timeout(Duration::from_secs(1), stream.read_to_end(&mut closed))
+        .await
+        .expect("deadline force shutdown did not close the admitted device connection")
+        .expect("admitted device connection did not close after deadline force shutdown");
     assert_bindable(plaintext_address).await;
     assert_bindable(tls_address).await;
+    drop(stream);
+    drop(runtime);
 }
 
 #[tokio::test]
@@ -424,8 +429,8 @@ async fn parent_cancellation_forces_held_public_preambles_during_drain() {
     );
     config.cancellation = cancellation.clone();
     let runtime = MqttRuntime::start(config).await.unwrap();
-    let plaintext = TcpStream::connect(plaintext_address).await.unwrap();
-    let tls = TcpStream::connect(tls_address).await.unwrap();
+    let mut plaintext = TcpStream::connect(plaintext_address).await.unwrap();
+    let mut tls = TcpStream::connect(tls_address).await.unwrap();
     timeout(Duration::from_secs(1), async {
         while runtime.public_connection_count() < 2 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -457,6 +462,19 @@ async fn parent_cancellation_forces_held_public_preambles_during_drain() {
         drain.abort();
         let _ = drain.await;
     }
+    let mut plaintext_closed = Vec::new();
+    timeout(
+        Duration::from_secs(1),
+        plaintext.read_to_end(&mut plaintext_closed),
+    )
+    .await
+    .expect("force shutdown did not close the held plaintext preamble")
+    .expect("held plaintext preamble did not close after force shutdown");
+    let mut tls_closed = Vec::new();
+    timeout(Duration::from_secs(1), tls.read_to_end(&mut tls_closed))
+        .await
+        .expect("force shutdown did not close the held TLS preamble")
+        .expect("held TLS preamble did not close after force shutdown");
     drop((plaintext, tls));
     assert!(matches!(result, Ok(Ok(Ok(())))));
     assert_bindable(plaintext_address).await;
