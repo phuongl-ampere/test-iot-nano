@@ -10,9 +10,9 @@ use axum::{
 use chrono::Utc;
 use iot_core::RpcMode;
 use iot_storage::{
-    AccountClass, AuthorizationRepository, NewPublicAsset, NewPublicResourceGrant, PlatformStore,
-    PublicAlert, PublicApiRepository, PublicAsset, PublicPrincipal, PublicResourceGrant,
-    PublicTelemetry, ResourcePermission,
+    AccountClass, AuthorizationRepository, NewPublicAsset, NewPublicDevice, NewPublicResourceGrant,
+    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicDevice, PublicPrincipal,
+    PublicResourceGrant, PublicTelemetry, ResourcePermission,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,6 +62,11 @@ where
         .route(
             "/api/v1/alerts/{alert_id}/acknowledge",
             axum::routing::post(acknowledge_alert),
+        )
+        .route("/api/v1/devices", axum::routing::post(create_device))
+        .route(
+            "/api/v1/devices/{device_id}",
+            axum::routing::patch(update_device).delete(delete_device),
         )
         .route(
             "/api/v1/devices/{device_id}/commands",
@@ -142,6 +147,33 @@ struct AssetCursor {
     subject_user_id: Option<Uuid>,
     app_id: String,
     asset_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDeviceRequest {
+    device_id: String,
+    display_name: Option<String>,
+    #[serde(default = "default_metadata")]
+    metadata: Value,
+    asset_id: Option<Uuid>,
+    device_profile_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateDeviceRequest {
+    display_name: Option<String>,
+    metadata: Option<Value>,
+    asset_id: Option<Uuid>,
+    device_profile_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceResponse {
+    device_id: String,
+    display_name: Option<String>,
+    metadata: Value,
+    asset_id: Option<Uuid>,
+    device_profile_id: Option<Uuid>,
 }
 
 const DEFAULT_PUBLIC_LIMIT: usize = 50;
@@ -359,6 +391,32 @@ fn validate_name(name: String) -> Result<String, PublicApiError> {
     Ok(name.to_owned())
 }
 
+fn default_metadata() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+fn validate_device_id(device_id: String) -> Result<String, PublicApiError> {
+    let device_id = device_id.trim();
+    if device_id.is_empty() || device_id.len() > 200 {
+        return Err(PublicApiError::BadRequest);
+    }
+    Ok(device_id.to_owned())
+}
+
+fn validate_display_name(display_name: Option<String>) -> Result<Option<String>, PublicApiError> {
+    display_name
+        .map(|display_name| validate_name(display_name))
+        .transpose()
+}
+
+fn validate_metadata(metadata: Value) -> Result<Value, PublicApiError> {
+    if metadata.is_object() {
+        Ok(metadata)
+    } else {
+        Err(PublicApiError::BadRequest)
+    }
+}
+
 fn asset_response(asset: PublicAsset) -> AssetResponse {
     AssetResponse {
         id: asset.id,
@@ -367,6 +425,105 @@ fn asset_response(asset: PublicAsset) -> AssetResponse {
         parent_asset_id: asset.parent_asset_id,
         attributes: asset.metadata.clone(),
         metadata: asset.metadata,
+    }
+}
+
+async fn create_device(
+    Extension(context): Extension<PublicApiContext>,
+    request: Request,
+) -> Result<(axum::http::StatusCode, Json<DeviceResponse>), PublicApiError> {
+    let headers = request.headers().clone();
+    let (store, principal) = authenticate(&context, &headers, "devices:write").await?;
+    let request: CreateDeviceRequest = serde_json::from_slice(
+        &to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .map_err(|_| PublicApiError::BadRequest)?,
+    )
+    .map_err(|_| PublicApiError::BadRequest)?;
+    let device = PublicApiRepository::create_public_device(
+        store.as_ref(),
+        &principal,
+        NewPublicDevice {
+            device_id: validate_device_id(request.device_id)?,
+            display_name: validate_display_name(request.display_name)?,
+            metadata: validate_metadata(request.metadata)?,
+            asset_id: request.asset_id,
+            device_profile_id: request.device_profile_id,
+        },
+    )
+    .await
+    .map_err(|_| PublicApiError::Unavailable)?;
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(device_response(device)),
+    ))
+}
+
+async fn update_device(
+    Extension(context): Extension<PublicApiContext>,
+    Path(device_id): Path<String>,
+    request: Request,
+) -> Result<Json<DeviceResponse>, PublicApiError> {
+    let headers = request.headers().clone();
+    let (store, principal) = authenticate(&context, &headers, "devices:write").await?;
+    if !PublicApiRepository::public_device_permission(store.as_ref(), &principal, &device_id)
+        .await
+        .map_err(|_| PublicApiError::Unavailable)?
+        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
+    {
+        return Err(PublicApiError::Forbidden);
+    }
+    let current = PublicApiRepository::get_public_device(store.as_ref(), &device_id)
+        .await
+        .map_err(|_| PublicApiError::Unavailable)?
+        .ok_or(PublicApiError::Forbidden)?;
+    let request: UpdateDeviceRequest = serde_json::from_slice(
+        &to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .map_err(|_| PublicApiError::BadRequest)?,
+    )
+    .map_err(|_| PublicApiError::BadRequest)?;
+    let device = PublicApiRepository::update_public_device(
+        store.as_ref(),
+        &principal,
+        &device_id,
+        NewPublicDevice {
+            device_id: device_id.clone(),
+            display_name: validate_display_name(request.display_name)?.or(current.display_name),
+            metadata: validate_metadata(request.metadata.unwrap_or(current.metadata))?,
+            asset_id: request.asset_id.or(current.asset_id),
+            device_profile_id: request.device_profile_id.or(current.device_profile_id),
+        },
+    )
+    .await
+    .map_err(|_| PublicApiError::Unavailable)?
+    .ok_or(PublicApiError::Forbidden)?;
+    Ok(Json(device_response(device)))
+}
+
+async fn delete_device(
+    Extension(context): Extension<PublicApiContext>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<axum::http::StatusCode, PublicApiError> {
+    let (store, principal) = authenticate(&context, &headers, "devices:write").await?;
+    if PublicApiRepository::delete_public_device(store.as_ref(), &principal, &device_id)
+        .await
+        .map_err(|_| PublicApiError::Unavailable)?
+    {
+        Ok(axum::http::StatusCode::NO_CONTENT)
+    } else {
+        Err(PublicApiError::Forbidden)
+    }
+}
+
+fn device_response(device: PublicDevice) -> DeviceResponse {
+    DeviceResponse {
+        device_id: device.device_id,
+        display_name: device.display_name,
+        metadata: device.metadata,
+        asset_id: device.asset_id,
+        device_profile_id: device.device_profile_id,
     }
 }
 

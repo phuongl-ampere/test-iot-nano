@@ -18,6 +18,24 @@ pub struct PublicAsset {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PublicDevice {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub metadata: serde_json::Value,
+    pub asset_id: Option<Uuid>,
+    pub device_profile_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewPublicDevice {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub metadata: serde_json::Value,
+    pub asset_id: Option<Uuid>,
+    pub device_profile_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewPublicAsset {
     pub name: String,
     pub asset_profile_id: Option<Uuid>,
@@ -94,6 +112,26 @@ pub trait PublicApiRepository: Send + Sync {
             dyn Future<Output = Result<Option<ResourcePermission>, PlatformStoreError>> + Send + 'a,
         >,
     >;
+    fn get_public_device<'a>(
+        &'a self,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>;
+    fn create_public_device<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        device: NewPublicDevice,
+    ) -> Pin<Box<dyn Future<Output = Result<PublicDevice, PlatformStoreError>> + Send + 'a>>;
+    fn update_public_device<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        device_id: &'a str,
+        device: NewPublicDevice,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>;
+    fn delete_public_device<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
     fn list_public_assets<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
@@ -219,6 +257,40 @@ impl PublicApiRepository for PlatformStore {
         >,
     > {
         Box::pin(async move { public_asset_permission(self, principal, asset_id).await })
+    }
+
+    fn get_public_device<'a>(
+        &'a self,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { get_public_device(self, device_id).await })
+    }
+
+    fn create_public_device<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        device: NewPublicDevice,
+    ) -> Pin<Box<dyn Future<Output = Result<PublicDevice, PlatformStoreError>> + Send + 'a>> {
+        Box::pin(async move { create_public_device(self, principal, device).await })
+    }
+
+    fn update_public_device<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        device_id: &'a str,
+        device: NewPublicDevice,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { update_public_device(self, principal, device_id, device).await })
+    }
+
+    fn delete_public_device<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>> {
+        Box::pin(async move { delete_public_device(self, principal, device_id).await })
     }
 
     fn list_public_assets<'a>(
@@ -459,6 +531,189 @@ async fn public_device_permission(
             Ok(strongest_share_permission(rows))
         }
     }
+}
+
+async fn get_public_device(
+    store: &PlatformStore,
+    device_id: &str,
+) -> Result<Option<PublicDevice>, PlatformStoreError> {
+    match store {
+        PlatformStore::Sqlite(store) => sqlx::query(
+            "SELECT device_id, display_name, metadata, asset_id, device_profile_id
+             FROM devices
+             WHERE device_id = ? AND deleted_at IS NULL",
+        )
+        .bind(device_id)
+        .fetch_optional(store.pool())
+        .await?
+        .map(sqlite_device_record)
+        .transpose(),
+        PlatformStore::Timescale(pool) => sqlx::query(
+            "SELECT device_id, display_name, metadata, asset_id, device_profile_id
+             FROM devices
+             WHERE device_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(device_id)
+        .fetch_optional(pool)
+        .await?
+        .map(timescale_device_record)
+        .transpose(),
+    }
+}
+
+async fn create_public_device(
+    store: &PlatformStore,
+    principal: &PublicPrincipal,
+    device: NewPublicDevice,
+) -> Result<PublicDevice, PlatformStoreError> {
+    let created = match store {
+        PlatformStore::Sqlite(store) => {
+            let row = sqlx::query(
+                "INSERT INTO devices (
+                    device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
+                 )
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+            )
+            .bind(&device.device_id)
+            .bind(&device.display_name)
+            .bind(device.metadata.to_string())
+            .bind(device.asset_id.map(|id| id.to_string()))
+            .bind(device.device_profile_id.map(|id| id.to_string()))
+            .bind(principal.user_id.map(|id| id.to_string()))
+            .fetch_one(store.pool())
+            .await?;
+            sqlite_device_record(row)?
+        }
+        PlatformStore::Timescale(pool) => {
+            let row = sqlx::query(
+                "INSERT INTO devices (
+                    device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
+                 )
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+            )
+            .bind(&device.device_id)
+            .bind(&device.display_name)
+            .bind(sqlx::types::Json(device.metadata))
+            .bind(device.asset_id)
+            .bind(device.device_profile_id)
+            .bind(principal.user_id)
+            .fetch_one(pool)
+            .await?;
+            timescale_device_record(row)?
+        }
+    };
+
+    if principal.user_id.is_none() {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                sqlx::query(
+                    "INSERT INTO resource_grants (
+                        id, resource_type, resource_id, grantee_type, grantee_id, permission
+                     ) VALUES (?, 'device', ?, 'application', ?, 'manager')",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(&created.device_id)
+                .bind(&principal.app_id)
+                .execute(store.pool())
+                .await?;
+            }
+            PlatformStore::Timescale(pool) => {
+                sqlx::query(
+                    "INSERT INTO resource_grants (
+                        id, resource_type, resource_id, grantee_type, grantee_id, permission
+                     ) VALUES ($1, 'device', $2, 'application', $3, 'manager')",
+                )
+                .bind(Uuid::now_v7())
+                .bind(&created.device_id)
+                .bind(&principal.app_id)
+                .execute(pool)
+                .await?;
+            }
+        }
+    }
+    Ok(created)
+}
+
+async fn update_public_device(
+    store: &PlatformStore,
+    principal: &PublicPrincipal,
+    device_id: &str,
+    device: NewPublicDevice,
+) -> Result<Option<PublicDevice>, PlatformStoreError> {
+    if !public_device_permission(store, principal, device_id)
+        .await?
+        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
+    {
+        return Ok(None);
+    }
+    match store {
+        PlatformStore::Sqlite(store) => sqlx::query(
+            "UPDATE devices
+             SET display_name = ?, metadata = ?, asset_id = ?, device_profile_id = ?
+             WHERE device_id = ? AND deleted_at IS NULL
+             RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+        )
+        .bind(&device.display_name)
+        .bind(device.metadata.to_string())
+        .bind(device.asset_id.map(|id| id.to_string()))
+        .bind(device.device_profile_id.map(|id| id.to_string()))
+        .bind(device_id)
+        .fetch_optional(store.pool())
+        .await?
+        .map(sqlite_device_record)
+        .transpose(),
+        PlatformStore::Timescale(pool) => sqlx::query(
+            "UPDATE devices
+             SET display_name = $2, metadata = $3, asset_id = $4, device_profile_id = $5
+             WHERE device_id = $1 AND deleted_at IS NULL
+             RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+        )
+        .bind(device_id)
+        .bind(&device.display_name)
+        .bind(sqlx::types::Json(device.metadata))
+        .bind(device.asset_id)
+        .bind(device.device_profile_id)
+        .fetch_optional(pool)
+        .await?
+        .map(timescale_device_record)
+        .transpose(),
+    }
+}
+
+async fn delete_public_device(
+    store: &PlatformStore,
+    principal: &PublicPrincipal,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    if !public_device_permission(store, principal, device_id)
+        .await?
+        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
+    {
+        return Ok(false);
+    }
+    let affected = match store {
+        PlatformStore::Sqlite(store) => sqlx::query(
+            "UPDATE devices
+             SET deleted_at = CURRENT_TIMESTAMP
+             WHERE device_id = ? AND deleted_at IS NULL",
+        )
+        .bind(device_id)
+        .execute(store.pool())
+        .await?
+        .rows_affected(),
+        PlatformStore::Timescale(pool) => sqlx::query(
+            "UPDATE devices
+             SET deleted_at = now()
+             WHERE device_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(device_id)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+    };
+    Ok(affected == 1)
 }
 
 fn public_cursor_parts(
@@ -1509,6 +1764,49 @@ async fn delete_public_asset(
             .rows_affected(),
     };
     Ok(affected == 1)
+}
+
+fn sqlite_device_record(row: SqliteRow) -> Result<PublicDevice, PlatformStoreError> {
+    let metadata = serde_json::from_str(&row.try_get::<String, _>("metadata")?).map_err(|_| {
+        PlatformStoreError::Database(sqlx::Error::Protocol(
+            "invalid public device metadata".to_owned(),
+        ))
+    })?;
+    let asset_id = row
+        .try_get::<Option<String>, _>("asset_id")?
+        .map(|value| Uuid::parse_str(&value))
+        .transpose()
+        .map_err(|_| {
+            PlatformStoreError::Database(sqlx::Error::Protocol(
+                "invalid public device asset ID".to_owned(),
+            ))
+        })?;
+    let device_profile_id = row
+        .try_get::<Option<String>, _>("device_profile_id")?
+        .map(|value| Uuid::parse_str(&value))
+        .transpose()
+        .map_err(|_| {
+            PlatformStoreError::Database(sqlx::Error::Protocol(
+                "invalid public device profile ID".to_owned(),
+            ))
+        })?;
+    Ok(PublicDevice {
+        device_id: row.try_get("device_id")?,
+        display_name: row.try_get("display_name")?,
+        metadata,
+        asset_id,
+        device_profile_id,
+    })
+}
+
+fn timescale_device_record(row: PgRow) -> Result<PublicDevice, PlatformStoreError> {
+    Ok(PublicDevice {
+        device_id: row.try_get("device_id")?,
+        display_name: row.try_get("display_name")?,
+        metadata: row.try_get::<Json<serde_json::Value>, _>("metadata")?.0,
+        asset_id: row.try_get("asset_id")?,
+        device_profile_id: row.try_get("device_profile_id")?,
+    })
 }
 
 fn sqlite_asset_record(row: SqliteRow) -> Result<PublicAsset, PlatformStoreError> {

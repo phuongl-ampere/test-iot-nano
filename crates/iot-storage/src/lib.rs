@@ -28,8 +28,8 @@ use url::Url;
 const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform.sql");
 
 pub use public_api::{
-    NewPublicAsset, NewPublicResourceGrant, PublicAlert, PublicApiRepository, PublicAsset,
-    PublicPrincipal, PublicResourceGrant, PublicTelemetry,
+    NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,
+    PublicAsset, PublicDevice, PublicPrincipal, PublicResourceGrant, PublicTelemetry,
 };
 
 const SQLITE_SCHEMA: &str = r#"

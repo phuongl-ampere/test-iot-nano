@@ -54,6 +54,8 @@ async fn public_app() -> (tempfile::TempDir, SqliteStore, axum::Router) {
             allowed_scopes: vec![
                 "assets:read".to_owned(),
                 "assets:write".to_owned(),
+                "devices:read".to_owned(),
+                "devices:write".to_owned(),
                 "telemetry:read".to_owned(),
                 "alerts:read".to_owned(),
                 "alerts:write".to_owned(),
@@ -329,6 +331,9 @@ async fn public_router_mounts_every_remaining_contract_resource() {
             "/api/v1/resource-grants/00000000-0000-0000-0000-000000000001",
         ),
         ("POST", "/api/v1/devices/device-001/commands"),
+        ("POST", "/api/v1/devices"),
+        ("PATCH", "/api/v1/devices/device-001"),
+        ("DELETE", "/api/v1/devices/device-001"),
     ];
 
     for (method, uri) in routes {
@@ -350,6 +355,163 @@ async fn public_router_mounts_every_remaining_contract_resource() {
         );
         assert_public_error(response, StatusCode::UNAUTHORIZED, "unauthorized").await;
     }
+}
+
+#[tokio::test]
+async fn public_device_mutations_create_update_and_soft_delete_through_generic_repository() {
+    let (_directory, store, app) = public_app().await;
+    let write_token = oauth_bearer_token(&app, "devices:write").await;
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices")
+                .header(AUTHORIZATION, format!("Bearer {write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"device_id":"public-mutation-device","display_name":"Created","metadata":{"room":"lab"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let created: Value =
+        serde_json::from_slice(&to_bytes(create.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(created["device_id"], "public-mutation-device");
+    assert_eq!(created["display_name"], "Created");
+    assert_eq!(created["metadata"]["room"], "lab");
+
+    let update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/devices/public-mutation-device")
+                .header(AUTHORIZATION, format!("Bearer {write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"display_name":"Updated","metadata":{"room":"office"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+    let updated: Value =
+        serde_json::from_slice(&to_bytes(update.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(updated["display_name"], "Updated");
+    assert_eq!(updated["metadata"]["room"], "office");
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/devices/public-mutation-device")
+                .header(AUTHORIZATION, format!("Bearer {write_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT deleted_at FROM devices WHERE device_id = ?",
+        )
+        .bind("public-mutation-device")
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .is_some()
+    );
+
+    let read_token = oauth_bearer_token(&app, "devices:read").await;
+    let hidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/public-mutation-device")
+                .header(AUTHORIZATION, format!("Bearer {read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(hidden, StatusCode::FORBIDDEN, "forbidden").await;
+}
+
+#[tokio::test]
+async fn public_device_mutations_deny_unknown_and_inaccessible_targets_without_disclosure() {
+    let (_directory, store, app) = public_app().await;
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, owner_user_id)
+         VALUES ('public-inaccessible-mutation-device', 'Hidden', ?)",
+    )
+    .bind(admin_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let token = oauth_bearer_token(&app, "devices:write").await;
+
+    for device_id in [
+        "public-inaccessible-mutation-device",
+        "public-unknown-mutation-device",
+    ] {
+        let update = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/devices/{device_id}"))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"must not update"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_public_error(update, StatusCode::FORBIDDEN, "forbidden").await;
+
+        let delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/devices/{device_id}"))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_public_error(delete, StatusCode::FORBIDDEN, "forbidden").await;
+    }
+}
+
+#[tokio::test]
+async fn public_device_mutation_scope_is_checked_before_target_or_body() {
+    let (_directory, _store, app) = public_app().await;
+    let token = oauth_bearer_token(&app, "devices:read").await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/devices/unknown-device")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{not-json}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(response, StatusCode::FORBIDDEN, "forbidden").await;
 }
 
 #[tokio::test]
