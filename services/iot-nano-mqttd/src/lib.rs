@@ -692,6 +692,13 @@ pub async fn serve_plaintext_mux_with_shutdowns(
     .await
 }
 
+fn public_mux_shutdown_requested(
+    accept_shutdown: &watch::Receiver<bool>,
+    force_shutdown: &watch::Receiver<bool>,
+) -> bool {
+    *force_shutdown.borrow() || *accept_shutdown.borrow()
+}
+
 async fn serve_plaintext_mux_with_shutdowns_and_mode(
     listener: TcpListener,
     backends: ProtocolBackends,
@@ -701,9 +708,20 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
     route_mode: MuxRouteMode,
     connection_counter: Option<Arc<AtomicUsize>>,
 ) -> std::io::Result<()> {
+    if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+        return Ok(());
+    }
+
     let mut connections = JoinSet::new();
     loop {
+        if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+            break;
+        }
+
         tokio::select! {
+            biased;
+            _ = force_shutdown.changed() => break,
+            _ = accept_shutdown.changed() => break,
             result = listener.accept() => {
                 let (stream, _) = result?;
                 let mut connection_shutdown = force_shutdown.clone();
@@ -720,8 +738,6 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
                     }
                 });
             }
-            _ = accept_shutdown.changed() => break,
-            _ = force_shutdown.changed() => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
@@ -805,9 +821,20 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
     route_mode: MuxRouteMode,
     connection_counter: Option<Arc<AtomicUsize>>,
 ) -> std::io::Result<()> {
+    if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+        return Ok(());
+    }
+
     let mut connections = JoinSet::new();
     loop {
+        if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
+            break;
+        }
+
         tokio::select! {
+            biased;
+            _ = force_shutdown.changed() => break,
+            _ = accept_shutdown.changed() => break,
             result = listener.accept() => {
                 let (stream, _) = result?;
                 let acceptor = acceptor.clone();
@@ -831,8 +858,6 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
                     }
                 });
             }
-            _ = accept_shutdown.changed() => break,
-            _ = force_shutdown.changed() => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }

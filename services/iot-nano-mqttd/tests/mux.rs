@@ -142,6 +142,51 @@ async fn accept_shutdown_stops_new_plaintext_connections_without_cancelling_acti
 }
 
 #[tokio::test]
+async fn pre_signalled_accept_shutdown_does_not_proxy_a_ready_plaintext_client() {
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_address = backend_listener.local_addr().unwrap();
+    let public_address = public_listener.local_addr().unwrap();
+
+    let mut client = tokio::net::TcpStream::connect(public_address)
+        .await
+        .unwrap();
+    client.write_all(&connect_packet(4)).await.unwrap();
+
+    let (accept_stop, _) = watch::channel(false);
+    let (_force_stop, force_shutdown) = watch::channel(false);
+    accept_stop.send_replace(true);
+    let accept_shutdown = accept_stop.subscribe();
+    let mux_task = tokio::spawn(serve_plaintext_mux_with_shutdowns(
+        public_listener,
+        ProtocolBackends {
+            v311: backend_address,
+            v5: backend_address,
+            device_v311: None,
+            device_v5: None,
+        },
+        Default::default(),
+        accept_shutdown,
+        force_shutdown,
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("mux did not stop after a pre-signalled accept shutdown")
+            .unwrap()
+            .is_ok()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), backend_listener.accept())
+            .await
+            .is_err()
+    );
+
+    drop(client);
+}
+
+#[tokio::test]
 async fn plaintext_mux_routes_v311_and_v5_to_distinct_internal_backends() {
     let v311_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let v5_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
