@@ -13,6 +13,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 use reqwest::StatusCode;
 use rumqttd::{
     AuthHandler, AuthorizationHandler, BridgeConfig as CoreBridgeConfig, Broker,
@@ -28,6 +31,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+use tokio_util::sync::CancellationToken;
 
 mod config;
 mod management;
@@ -105,6 +109,8 @@ pub(crate) struct PublicMuxAcceptanceGate {
     admission_barrier: Arc<Mutex<Option<MuxAdmissionBarrier>>>,
     #[cfg(test)]
     post_admission_barrier: Arc<Mutex<Option<MuxAdmissionBarrier>>>,
+    #[cfg(test)]
+    fail_next_accept: Arc<AtomicBool>,
 }
 
 impl Default for PublicMuxAcceptanceGate {
@@ -115,6 +121,8 @@ impl Default for PublicMuxAcceptanceGate {
             admission_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             post_admission_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_next_accept: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -208,6 +216,18 @@ impl PublicMuxAcceptanceGate {
             .await
             .expect("public mux post-admission test barrier was not released within one second");
         }
+    }
+
+    #[cfg(test)]
+    fn test_fail_next_accept(&self) {
+        self.fail_next_accept.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn take_test_accept_failure(&self) -> Option<std::io::Error> {
+        self.fail_next_accept
+            .swap(false, Ordering::AcqRel)
+            .then(|| std::io::Error::other("injected public mux accept failure"))
     }
 }
 
@@ -1513,6 +1533,131 @@ mod mux_shutdown_tests {
     }
 
     #[tokio::test]
+    async fn plaintext_accept_failure_drains_an_admitted_proxy_before_returning() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_release, backend_task) =
+            spawn_backend_that_holds_connection(backend_listener);
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let (_accept_stop, accept_shutdown) = watch::channel(false);
+        let (_force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let connection_counter = Arc::new(AtomicUsize::new(0));
+        let mux_task = tokio::spawn(serve_public_plaintext_device_only_mux(
+            public_listener,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: Some(backend_address),
+                device_v5: Some(backend_address),
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate.clone(),
+            Arc::clone(&connection_counter),
+        ));
+
+        let mut client = TcpStream::connect(public_address).await.unwrap();
+        client.write_all(&device_connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("plaintext mux did not establish the admitted device proxy")
+            .expect("held backend closed before the proxy established");
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 1);
+
+        gate.test_fail_next_accept();
+        let trigger = TcpStream::connect(public_address).await.unwrap();
+        drop(trigger);
+
+        let error = timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("plaintext mux did not complete the fatal accept drain")
+            .unwrap()
+            .expect_err("injected accept failure must reach the mux caller");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 0);
+        let mut closed = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut closed))
+            .await
+            .expect("fatal accept drain did not close the admitted proxy")
+            .expect("admitted proxy did not close after fatal accept drain");
+
+        backend_release.notify_one();
+        backend_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_accept_failure_drains_an_admitted_proxy_before_returning() {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_release, backend_task) =
+            spawn_backend_that_holds_connection(backend_listener);
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let acceptor =
+            load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
+        let (_accept_stop, accept_shutdown) = watch::channel(false);
+        let (_force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let connection_counter = Arc::new(AtomicUsize::new(0));
+        let mux_task = tokio::spawn(serve_public_tls_device_only_mux(
+            public_listener,
+            acceptor,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: Some(backend_address),
+                device_v5: Some(backend_address),
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate.clone(),
+            Arc::clone(&connection_counter),
+        ));
+
+        let client = TcpStream::connect(public_address).await.unwrap();
+        let mut client = timeout(
+            Duration::from_secs(1),
+            tls_connector().connect(ServerName::try_from("localhost").unwrap(), client),
+        )
+        .await
+        .expect("TLS mux did not complete the admitted client handshake")
+        .unwrap();
+        client.write_all(&device_connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("TLS mux did not establish the admitted device proxy")
+            .expect("held backend closed before the TLS proxy established");
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 1);
+
+        gate.test_fail_next_accept();
+        let trigger = TcpStream::connect(public_address).await.unwrap();
+        drop(trigger);
+
+        let error = timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("TLS mux did not complete the fatal accept drain")
+            .unwrap()
+            .expect_err("injected accept failure must reach the TLS mux caller");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(connection_counter.load(Ordering::Relaxed), 0);
+        let mut closed = Vec::new();
+        let _ = timeout(Duration::from_secs(1), client.read_to_end(&mut closed))
+            .await
+            .expect("fatal accept drain did not close the admitted TLS proxy");
+
+        backend_release.notify_one();
+        backend_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn force_stop_after_tls_proxy_establishes_closes_the_client() {
         tokio_rustls::rustls::crypto::ring::default_provider()
             .install_default()
@@ -1778,6 +1923,8 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
     }
 
     let mut connections = JoinSet::new();
+    let local_force = CancellationToken::new();
+    let mut terminal_error = None;
     loop {
         if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
             accept_gate.close();
@@ -1795,13 +1942,29 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
                 break;
             }
             result = listener.accept() => {
-                let (stream, _) = result?;
+                let (stream, _) = match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        accept_gate.close();
+                        local_force.cancel();
+                        terminal_error = Some(error);
+                        break;
+                    }
+                };
+                #[cfg(test)]
+                if let Some(error) = accept_gate.take_test_accept_failure() {
+                    accept_gate.close();
+                    local_force.cancel();
+                    terminal_error = Some(error);
+                    break;
+                }
                 #[cfg(test)]
                 accept_gate.wait_before_admission().await;
                 if !accept_gate.try_admit_with_shutdowns(&mut accept_shutdown, &mut force_shutdown) {
                     continue;
                 }
                 let mut connection_shutdown = force_shutdown.clone();
+                let connection_force = local_force.clone();
                 #[cfg(test)]
                 accept_gate.wait_after_admission().await;
                 let connection_counter = connection_counter.clone();
@@ -1814,6 +1977,7 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
                             }
                         }
                         _ = connection_shutdown.changed() => {}
+                        _ = connection_force.cancelled() => {}
                     }
                 });
             }
@@ -1821,7 +1985,7 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
         }
     }
     while connections.join_next().await.is_some() {}
-    Ok(())
+    terminal_error.map_or(Ok(()), Err)
 }
 
 async fn proxy_plaintext_connection(
@@ -1953,6 +2117,8 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
     }
 
     let mut connections = JoinSet::new();
+    let local_force = CancellationToken::new();
+    let mut terminal_error = None;
     loop {
         if public_mux_shutdown_requested(&accept_shutdown, &force_shutdown) {
             accept_gate.close();
@@ -1970,7 +2136,22 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
                 break;
             }
             result = listener.accept() => {
-                let (stream, _) = result?;
+                let (stream, _) = match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        accept_gate.close();
+                        local_force.cancel();
+                        terminal_error = Some(error);
+                        break;
+                    }
+                };
+                #[cfg(test)]
+                if let Some(error) = accept_gate.take_test_accept_failure() {
+                    accept_gate.close();
+                    local_force.cancel();
+                    terminal_error = Some(error);
+                    break;
+                }
                 #[cfg(test)]
                 accept_gate.wait_before_admission().await;
                 if !accept_gate.try_admit_with_shutdowns(&mut accept_shutdown, &mut force_shutdown) {
@@ -1978,6 +2159,7 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
                 }
                 let acceptor = acceptor.clone();
                 let mut connection_shutdown = force_shutdown.clone();
+                let connection_force = local_force.clone();
                 #[cfg(test)]
                 accept_gate.wait_after_admission().await;
                 let connection_counter = connection_counter.clone();
@@ -1985,6 +2167,7 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
                     let _connection = ActiveMuxConnection::new(connection_counter);
                     tokio::select! {
                         _ = connection_shutdown.changed() => {}
+                        _ = connection_force.cancelled() => {}
                         _ = async {
                             match tokio::time::timeout(settings.preamble_timeout, acceptor.accept(stream)).await {
                                 Ok(Ok(stream)) => {
@@ -2003,7 +2186,7 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
         }
     }
     while connections.join_next().await.is_some() {}
-    Ok(())
+    terminal_error.map_or(Ok(()), Err)
 }
 
 pub fn load_tls_acceptor(

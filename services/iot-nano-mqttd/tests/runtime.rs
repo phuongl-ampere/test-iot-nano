@@ -386,6 +386,44 @@ async fn expired_drain_closes_listeners_and_joins_runtime_work() {
 }
 
 #[tokio::test]
+async fn dropping_runtime_force_closes_admitted_connections_and_releases_listeners() {
+    let directory = tempfile::tempdir().unwrap();
+    let plaintext_address = reserve_address().await;
+    let tls_address = reserve_address().await;
+    let runtime = start_runtime(
+        directory.path(),
+        plaintext_address,
+        tls_address,
+        Arc::new(MemoryStorage::new()),
+        Arc::new(TestAuthorization::allowing()),
+    )
+    .await
+    .unwrap();
+    let mut stream = TcpStream::connect(plaintext_address).await.unwrap();
+    stream
+        .write_all(&v311_connect(
+            "meter-a",
+            DEVICE_TOKEN_USERNAME,
+            "valid-token",
+        ))
+        .await
+        .unwrap();
+    let mut connack = [0_u8; 4];
+    stream.read_exact(&mut connack).await.unwrap();
+    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+    drop(runtime);
+
+    let mut closed = Vec::new();
+    timeout(Duration::from_secs(1), stream.read_to_end(&mut closed))
+        .await
+        .expect("runtime drop did not close the admitted device connection")
+        .expect("admitted device connection did not close after runtime drop");
+    assert_bindable(plaintext_address).await;
+    assert_bindable(tls_address).await;
+}
+
+#[tokio::test]
 async fn parent_cancellation_releases_configured_public_listener_addresses() {
     let directory = tempfile::tempdir().unwrap();
     let plaintext_address = reserve_address().await;

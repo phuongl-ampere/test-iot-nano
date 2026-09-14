@@ -276,6 +276,8 @@ struct DeviceAdmissionControl {
     accept_cancellation: CancellationToken,
     #[cfg(test)]
     admission_barrier: Arc<Mutex<Option<DeviceAdmissionBarrier>>>,
+    #[cfg(test)]
+    fail_next_accept: Arc<AtomicBool>,
 }
 
 impl DeviceAdmissionControl {
@@ -285,6 +287,8 @@ impl DeviceAdmissionControl {
             accept_cancellation: CancellationToken::new(),
             #[cfg(test)]
             admission_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_next_accept: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -332,6 +336,16 @@ impl DeviceAdmissionControl {
                 .await
                 .expect("device admission test barrier was not released within one second");
         }
+    }
+
+    #[cfg(test)]
+    fn test_fail_next_accept(&self) {
+        self.fail_next_accept.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn take_test_accept_failure(&self) -> bool {
+        self.fail_next_accept.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -691,6 +705,8 @@ impl Drop for MqttRuntime {
         if let Some(watcher) = self.parent_cancellation_watcher.take() {
             watcher.abort();
         }
+        // Drop cannot await the monitor; callers that own process lifecycle
+        // must use `drain` or `join` before releasing dependent resources.
         self.shutdown.force_stop();
     }
 }
@@ -877,11 +893,21 @@ async fn serve_device_backend(
     let protocol = if mqtt5 { "MQTT 5" } else { "MQTT 3.1.1" };
     let accept_cancellation = device_admission.accept_cancellation();
     let mut connections = JoinSet::new();
+    let local_force = CancellationToken::new();
+    let mut terminal_error = None;
     loop {
         tokio::select! {
             _ = accept_cancellation.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    #[cfg(test)]
+                    if device_admission.take_test_accept_failure() {
+                        terminal_error = Some(MqttRuntimeError::Worker(format!(
+                            "device {protocol} backend accept failed: injected accept failure"
+                        )));
+                        local_force.cancel();
+                        break;
+                    }
                     #[cfg(test)]
                     device_admission.wait_before_admission().await;
                     if !device_admission.try_admit() {
@@ -889,6 +915,7 @@ async fn serve_device_backend(
                     }
                     let transport = transport.clone();
                     let force_cancellation = force_cancellation.clone();
+                    let connection_force = local_force.clone();
                     connections.spawn(async move {
                         tokio::select! {
                             result = async {
@@ -903,35 +930,41 @@ async fn serve_device_backend(
                                 }
                             }
                             _ = force_cancellation.cancelled() => {}
+                            _ = connection_force.cancelled() => {}
                         }
                     });
                 }
                 Err(error) => {
                     if !accept_cancellation.is_cancelled() {
-                        return Err(MqttRuntimeError::Worker(format!(
+                        terminal_error = Some(MqttRuntimeError::Worker(format!(
                             "device {protocol} backend accept failed: {error}"
                         )));
+                        local_force.cancel();
                     }
                     break;
                 }
             },
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
-                    return Err(MqttRuntimeError::Worker(format!(
+                    terminal_error = Some(MqttRuntimeError::Worker(format!(
                         "device {protocol} connection task failed: {error}"
                     )));
+                    local_force.cancel();
+                    break;
                 }
             }
         }
     }
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {
-            return Err(MqttRuntimeError::Worker(format!(
-                "device {protocol} connection task failed: {error}"
-            )));
+            terminal_error.get_or_insert_with(|| {
+                MqttRuntimeError::Worker(format!(
+                    "device {protocol} connection task failed: {error}"
+                ))
+            });
         }
     }
-    Ok(())
+    terminal_error.map_or(Ok(()), Err)
 }
 
 async fn timeout_until<T>(deadline: Instant, future: T) -> Result<T::Output, ()>
@@ -1268,6 +1301,45 @@ mod tests {
             Err(MqttRuntimeError::Worker(message))
                 if message.contains("device MQTT 3.1.1 connection task failed")
         ));
+    }
+
+    #[tokio::test]
+    async fn device_accept_failure_drains_an_admitted_connection_before_returning() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = DeviceAdmissionControl::new();
+        let worker = tokio::spawn(serve_device_backend(
+            listener,
+            transport(Arc::new(AtomicUsize::new(0))),
+            false,
+            admission.clone(),
+            CancellationToken::new(),
+        ));
+
+        let mut admitted = TcpStream::connect(address).await.unwrap();
+        admitted.write_all(&v311_connect()).await.unwrap();
+        let mut connack = [0_u8; 4];
+        admitted.read_exact(&mut connack).await.unwrap();
+        assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+
+        admission.test_fail_next_accept();
+        let trigger = TcpStream::connect(address).await.unwrap();
+        drop(trigger);
+
+        let result = timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("device backend did not complete the fatal accept drain")
+            .expect("device backend task panicked");
+        assert!(matches!(
+            result,
+            Err(MqttRuntimeError::Worker(message))
+                if message.contains("device MQTT 3.1.1 backend accept failed")
+        ));
+        let mut closed = Vec::new();
+        timeout(Duration::from_secs(1), admitted.read_to_end(&mut closed))
+            .await
+            .expect("fatal accept drain did not close the admitted device connection")
+            .expect("admitted device connection did not close after fatal accept drain");
     }
 
     #[tokio::test]
