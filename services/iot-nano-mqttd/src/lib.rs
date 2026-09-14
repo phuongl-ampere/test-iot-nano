@@ -82,6 +82,8 @@ pub struct PublicMuxAcceptanceGate {
     accepting: Arc<Mutex<bool>>,
     #[cfg(test)]
     admission_barrier: Arc<Mutex<Option<MuxAdmissionBarrier>>>,
+    #[cfg(test)]
+    post_admission_barrier: Arc<Mutex<Option<MuxAdmissionBarrier>>>,
 }
 
 impl Default for PublicMuxAcceptanceGate {
@@ -90,6 +92,8 @@ impl Default for PublicMuxAcceptanceGate {
             accepting: Arc::new(Mutex::new(true)),
             #[cfg(test)]
             admission_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            post_admission_barrier: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -144,6 +148,30 @@ impl PublicMuxAcceptanceGate {
             .admission_barrier
             .lock()
             .expect("public mux admission test barrier is not poisoned")
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.reached.notify_one();
+            barrier.proceed.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn test_post_admission_barrier(&self) -> MuxAdmissionBarrier {
+        let barrier = MuxAdmissionBarrier::default();
+        *self
+            .post_admission_barrier
+            .lock()
+            .expect("public mux post-admission test barrier is not poisoned") =
+            Some(barrier.clone());
+        barrier
+    }
+
+    #[cfg(test)]
+    async fn wait_after_admission(&self) {
+        let barrier = self
+            .post_admission_barrier
+            .lock()
+            .expect("public mux post-admission test barrier is not poisoned")
             .clone();
         if let Some(barrier) = barrier {
             barrier.reached.notify_one();
@@ -822,7 +850,7 @@ mod mux_shutdown_tests {
     use super::*;
     use std::{fs::File, io::BufReader, path::PathBuf};
     use tokio::{
-        io::AsyncWriteExt,
+        io::{AsyncReadExt, AsyncWriteExt},
         sync::mpsc,
         time::{Duration, timeout},
     };
@@ -836,6 +864,20 @@ mod mux_shutdown_tests {
             0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 4, 0x02, 0x00, 0x3c, 0x00, 0x02, b'i',
             b'd',
         ]
+    }
+
+    fn spawn_backend_notifier(
+        listener: TcpListener,
+    ) -> (mpsc::UnboundedReceiver<()>, tokio::task::JoinHandle<()>) {
+        let (accepted, connections) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                if accepted.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        (connections, task)
     }
 
     #[derive(Clone, Copy)]
@@ -882,6 +924,7 @@ mod mux_shutdown_tests {
     ) {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_task) = spawn_backend_notifier(backend_listener);
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_address = public_listener.local_addr().unwrap();
         let (accept_stop, accept_shutdown) = watch::channel(false);
@@ -908,12 +951,6 @@ mod mux_shutdown_tests {
         signal_shutdown(signal, &accept_stop, &force_stop);
         barrier.release();
 
-        assert!(
-            timeout(Duration::from_millis(100), backend_listener.accept())
-                .await
-                .is_err(),
-            "an unowned-gate plaintext mux proxied after shutdown won admission"
-        );
         drop(client);
         assert!(
             timeout(Duration::from_secs(1), mux_task)
@@ -922,6 +959,11 @@ mod mux_shutdown_tests {
                 .unwrap()
                 .is_ok()
         );
+        assert!(matches!(
+            backend_connections.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        backend_task.abort();
     }
 
     async fn assert_tls_unowned_gate_rejects_shutdown_before_admission(signal: ShutdownSignal) {
@@ -930,6 +972,7 @@ mod mux_shutdown_tests {
             .ok();
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_task) = spawn_backend_notifier(backend_listener);
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_address = public_listener.local_addr().unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -968,18 +1011,195 @@ mod mux_shutdown_tests {
         }
 
         assert!(
-            timeout(Duration::from_millis(100), backend_listener.accept())
-                .await
-                .is_err(),
-            "an unowned-gate TLS mux proxied after shutdown won admission"
-        );
-        assert!(
             timeout(Duration::from_secs(1), mux_task)
                 .await
                 .unwrap()
                 .unwrap()
                 .is_ok()
         );
+        assert!(matches!(
+            backend_connections.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        backend_task.abort();
+    }
+
+    async fn assert_plaintext_admitted_before_accept_stop_still_proxies() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_task) = spawn_backend_notifier(backend_listener);
+        let (accept_stop, accept_shutdown) = watch::channel(false);
+        let (_force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let lifecycle = BrokerLifecycleHandle {
+            inner: None,
+            public_accept_gate: gate.clone(),
+            public_accept_stop: accept_stop,
+            public_workers: Mutex::new(Vec::new()),
+        };
+        let barrier = gate.test_post_admission_barrier();
+        let mux_task = tokio::spawn(serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
+            public_listener,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: None,
+                device_v5: None,
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate,
+        ));
+
+        let mut client = TcpStream::connect(public_address).await.unwrap();
+        client.write_all(&connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), barrier.wait_until_reached())
+            .await
+            .expect("plaintext mux did not reach the post-admission barrier");
+        lifecycle.stop_public_accepting();
+        barrier.release();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("plaintext mux did not proxy the admitted connection")
+            .expect("plaintext backend notifier closed unexpectedly");
+        drop(client);
+
+        timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("plaintext mux did not stop after graceful accept-stop")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            backend_connections.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        backend_task.abort();
+    }
+
+    async fn assert_tls_admitted_before_accept_stop_still_proxies() {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let (mut backend_connections, backend_task) = spawn_backend_notifier(backend_listener);
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let acceptor =
+            load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
+        let (accept_stop, accept_shutdown) = watch::channel(false);
+        let (_force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let lifecycle = BrokerLifecycleHandle {
+            inner: None,
+            public_accept_gate: gate.clone(),
+            public_accept_stop: accept_stop,
+            public_workers: Mutex::new(Vec::new()),
+        };
+        let barrier = gate.test_post_admission_barrier();
+        let mux_task = tokio::spawn(serve_tls_mux_with_shutdowns_and_acceptance_gate(
+            public_listener,
+            acceptor,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: None,
+                device_v5: None,
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate,
+        ));
+
+        let client = TcpStream::connect(public_address).await.unwrap();
+        timeout(Duration::from_secs(1), barrier.wait_until_reached())
+            .await
+            .expect("TLS mux did not reach the post-admission barrier");
+        lifecycle.stop_public_accepting();
+        barrier.release();
+        let mut client = tls_connector()
+            .connect(ServerName::try_from("localhost").unwrap(), client)
+            .await
+            .unwrap();
+        client.write_all(&connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), backend_connections.recv())
+            .await
+            .expect("TLS mux did not proxy the admitted connection")
+            .expect("TLS backend notifier closed unexpectedly");
+        drop(client);
+
+        timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("TLS mux did not stop after graceful accept-stop")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            backend_connections.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        backend_task.abort();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_accept_stop_after_plaintext_admission_still_proxies() {
+        assert_plaintext_admitted_before_accept_stop_still_proxies().await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_accept_stop_after_tls_admission_still_proxies() {
+        assert_tls_admitted_before_accept_stop_still_proxies().await;
+    }
+
+    #[tokio::test]
+    async fn force_stop_after_admission_ends_the_plaintext_proxy() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let _ = backend_listener.accept().await;
+        });
+        let (_accept_stop, accept_shutdown) = watch::channel(false);
+        let (force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let barrier = gate.test_post_admission_barrier();
+        let mux_task = tokio::spawn(serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
+            public_listener,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: None,
+                device_v5: None,
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate,
+        ));
+
+        let mut client = TcpStream::connect(public_address).await.unwrap();
+        client.write_all(&connect_packet()).await.unwrap();
+        timeout(Duration::from_secs(1), barrier.wait_until_reached())
+            .await
+            .expect("plaintext mux did not reach the post-admission barrier");
+        force_stop.send_replace(true);
+        barrier.release();
+
+        let mut response = Vec::new();
+        let _ = timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("force-stop did not close the admitted plaintext proxy");
+        timeout(Duration::from_secs(1), mux_task)
+            .await
+            .expect("plaintext mux did not stop after force-stop")
+            .unwrap()
+            .unwrap();
+        backend_task.abort();
     }
 
     #[tokio::test]
@@ -1010,13 +1230,7 @@ mod mux_shutdown_tests {
         let backend_address = backend_listener.local_addr().unwrap();
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_address = public_listener.local_addr().unwrap();
-        let (backend_accepted, mut backend_connections) = mpsc::unbounded_channel();
-        let backend_task = tokio::spawn(async move {
-            let _ = backend_listener
-                .accept()
-                .await
-                .map(|_| backend_accepted.send(()));
-        });
+        let (mut backend_connections, backend_task) = spawn_backend_notifier(backend_listener);
 
         let (accept_stop, accept_shutdown) = watch::channel(false);
         let (_force_stop, force_shutdown) = watch::channel(false);
@@ -1048,13 +1262,17 @@ mod mux_shutdown_tests {
         lifecycle.stop_public_accepting();
         barrier.release();
 
-        assert!(mux_task.await.unwrap().is_ok());
         assert!(
-            timeout(Duration::from_millis(100), backend_connections.recv())
+            timeout(Duration::from_secs(1), mux_task)
                 .await
-                .is_err(),
-            "a connection accepted before stop was proxied after the gate closed"
+                .unwrap()
+                .unwrap()
+                .is_ok()
         );
+        assert!(matches!(
+            backend_connections.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         backend_task.abort();
     }
 }
@@ -1106,6 +1324,8 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
                     continue;
                 }
                 let mut connection_shutdown = force_shutdown.clone();
+                #[cfg(test)]
+                accept_gate.wait_after_admission().await;
                 let connection_counter = connection_counter.clone();
                 connections.spawn(async move {
                     let _connection = ActiveMuxConnection::new(connection_counter);
@@ -1256,6 +1476,8 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
                 }
                 let acceptor = acceptor.clone();
                 let mut connection_shutdown = force_shutdown.clone();
+                #[cfg(test)]
+                accept_gate.wait_after_admission().await;
                 let connection_counter = connection_counter.clone();
                 connections.spawn(async move {
                     let _connection = ActiveMuxConnection::new(connection_counter);

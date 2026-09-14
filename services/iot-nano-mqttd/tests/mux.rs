@@ -5,7 +5,7 @@ use iot_nano_mqttd::{
     serve_tls_mux_with_shutdowns,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 fn connect_packet(protocol_level: u8) -> Vec<u8> {
     let mut packet = vec![
@@ -31,6 +31,20 @@ fn connect_packet(protocol_level: u8) -> Vec<u8> {
         packet.insert(12, 0x00);
     }
     packet
+}
+
+fn spawn_backend_notifier(
+    listener: tokio::net::TcpListener,
+) -> (mpsc::UnboundedReceiver<()>, tokio::task::JoinHandle<()>) {
+    let (accepted, connections) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            if accepted.send(()).is_err() {
+                break;
+            }
+        }
+    });
+    (connections, task)
 }
 
 fn token_connect_packet() -> Vec<u8> {
@@ -131,15 +145,14 @@ async fn accept_shutdown_stops_new_plaintext_connections_without_cancelling_acti
         .await
         .unwrap();
     late.write_all(&connect_packet(4)).await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), backend_connections.recv())
-            .await
-            .is_err()
-    );
 
     drop(late);
     drop(active);
     assert!(mux_task.await.unwrap().is_ok());
+    assert!(matches!(
+        backend_connections.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
     backend_task.abort();
     drop(force_stop);
 }
@@ -150,6 +163,7 @@ async fn pre_signalled_accept_shutdown_does_not_proxy_a_ready_plaintext_client()
     let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_address = backend_listener.local_addr().unwrap();
     let public_address = public_listener.local_addr().unwrap();
+    let (mut backend_connections, backend_task) = spawn_backend_notifier(backend_listener);
 
     let mut client = tokio::net::TcpStream::connect(public_address)
         .await
@@ -180,11 +194,11 @@ async fn pre_signalled_accept_shutdown_does_not_proxy_a_ready_plaintext_client()
             .unwrap()
             .is_ok()
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), backend_listener.accept())
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        backend_connections.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    backend_task.abort();
 
     drop(client);
 }
@@ -198,6 +212,7 @@ async fn pre_signalled_force_shutdown_does_not_proxy_a_ready_tls_client() {
     let public_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_address = backend_listener.local_addr().unwrap();
     let public_address = public_listener.local_addr().unwrap();
+    let (mut backend_connections, backend_task) = spawn_backend_notifier(backend_listener);
     let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let acceptor =
         load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
@@ -231,11 +246,11 @@ async fn pre_signalled_force_shutdown_does_not_proxy_a_ready_tls_client() {
             .unwrap()
             .is_ok()
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), backend_listener.accept())
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        backend_connections.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    backend_task.abort();
 
     drop(client);
 }
