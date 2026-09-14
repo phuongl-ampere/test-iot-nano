@@ -1,122 +1,33 @@
 services:
-  timescaledb:
-    image: timescale/timescaledb:latest-pg17
+  iot-nano-monolith:
+    build:
+      context: ..
+      dockerfile: infra/docker/Dockerfile
     environment:
-      POSTGRES_DB: iot
-      POSTGRES_PASSWORD: iot
-      POSTGRES_USER: iot
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U iot -d iot"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      IOT_NANO_STORAGE: sqlite
+      IOT_NANO_SQLITE_PATH: /var/lib/iot-nano/platform/platform.sqlite
+      IOT_NANO_INTERNAL_DIR: /var/lib/iot-nano/internal
+      IOT_NANO_TLS_CERT_PATH: /run/tls/mqtt-cert.pem
+      IOT_NANO_TLS_KEY_PATH: /run/tls/mqtt-key.pem
+      IOT_NANO_PUBLIC_HTTP_ADDRESS: 0.0.0.0:8080
+      IOT_NANO_MANAGEMENT_ADDRESS: 127.0.0.1:8081
+      IOT_NANO_MQTT_TCP_ADDRESS: 0.0.0.0:1883
+      IOT_NANO_MQTT_TLS_ADDRESS: 0.0.0.0:8883
+      IOT_DEVICE_TOKEN_VAULT_KEY: ${IOT_DEVICE_TOKEN_VAULT_KEY:?IOT_DEVICE_TOKEN_VAULT_KEY is required}
     ports:
-      - "54329:5432"
-    volumes:
-      - timescaledb-data:/var/lib/postgresql/data
-
-  iot-nano-stream:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["/opt/rush-iot-nano/iot-nano-stream"]
-    environment:
-      IOT_NANO_STREAM_ADDRESS: 0.0.0.0:8090
-      IOT_NANO_STREAM_DIR: /var/lib/iot-nano-stream
-      IOT_NANO_MQTTD_STREAM_SECRET: development-mqttd-stream-secret-must-have-32-bytes
-      IOT_NANO_CORE_STREAM_SECRET: development-core-stream-secret-must-have-32-bytes
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8090/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-    volumes:
-      - stream-data:/var/lib/iot-nano-stream
-
-  iot-nano-core:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["/opt/rush-iot-nano/iot-nano-core", "--health-address", "0.0.0.0:8081"]
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      iot-nano-stream:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://iot:iot@timescaledb:5432/iot
-      IOT_NANO_STREAM_URL: http://iot-nano-stream:8090
-      IOT_NANO_CORE_STREAM_SECRET: development-core-stream-secret-must-have-32-bytes
-      IOT_NANO_API_CORE_SECRET: development-api-core-secret-must-have-32-bytes
-      IOT_NANO_MQTTD_INTERNAL_URL: http://iot-nano-mqttd:8083
-      IOT_NANO_CORE_MQTTD_SECRET: development-core-mqttd-secret-must-have-32-bytes
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8081/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-
-  iot-nano-api:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["/opt/rush-iot-nano/iot-nano-api", "--address", "0.0.0.0:8080"]
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-      iot-nano-core:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://iot:iot@timescaledb:5432/iot
-      IOT_NANO_MQTTD_API_SECRET: development-mqttd-api-secret-must-have-32-bytes
-      IOT_NANO_API_MQTTD_SECRET: development-api-mqttd-secret-must-have-32-bytes
-      IOT_NANO_MQTTD_INTERNAL_URL: http://iot-nano-mqttd:8083
-      IOT_NANO_CORE_URL: http://iot-nano-core:8081
-      IOT_NANO_API_CORE_SECRET: development-api-core-secret-must-have-32-bytes
+      - "8080:8080"
+      - "1883:1883"
+      - "8883:8883"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/healthz"]
       interval: 5s
       timeout: 3s
       retries: 20
-
-  iot-nano-mqttd:
-    build:
-      context: ..
-      dockerfile: infra/docker/Dockerfile
-    command: ["/opt/rush-iot-nano/iot-nano-mqttd"]
-    depends_on:
-      iot-nano-stream:
-        condition: service_healthy
-      iot-nano-core:
-        condition: service_healthy
-      iot-nano-api:
-        condition: service_healthy
-    environment:
-      IOT_MQTTD_PLAIN_ADDRESS: 0.0.0.0:1883
-      IOT_MQTTD_TLS_ADDRESS: 0.0.0.0:8883
-      IOT_MQTTD_MANAGEMENT_ADDRESS: 0.0.0.0:8082
-      IOT_MQTTD_TRANSPORT_INTERNAL_ADDRESS: 0.0.0.0:8083
-      IOT_MQTTD_TLS_CERT_PATH: /run/tls/mqtt-cert.pem
-      IOT_MQTTD_TLS_KEY_PATH: /run/tls/mqtt-key.pem
-      IOT_MQTTD_API_BASE_URL: http://iot-nano-api:8080
-      IOT_NANO_MQTTD_API_SECRET: development-mqttd-api-secret-must-have-32-bytes
-      IOT_NANO_API_MQTTD_SECRET: development-api-mqttd-secret-must-have-32-bytes
-      IOT_NANO_CORE_MQTTD_SECRET: development-core-mqttd-secret-must-have-32-bytes
-      IOT_NANO_STREAM_URL: http://iot-nano-stream:8090
-      IOT_NANO_MQTTD_STREAM_SECRET: development-mqttd-stream-secret-must-have-32-bytes
-    ports:
-      - "1883:1883"
-      - "8883:8883"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8082/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
     volumes:
-      - mqttd-data:/var/lib/iot-nano-mqttd
+      - platform-data:/var/lib/iot-nano/platform
+      - internal-data:/var/lib/iot-nano/internal
       - ./tls:/run/tls:ro
 
 volumes:
-  timescaledb-data:
-  stream-data:
-  mqttd-data:
+  platform-data:
+  internal-data:

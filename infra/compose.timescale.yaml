@@ -1,0 +1,29 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      POSTGRES_DB: iot
+      POSTGRES_PASSWORD: ${TIMESCALE_POSTGRES_PASSWORD:?TIMESCALE_POSTGRES_PASSWORD is required}
+      POSTGRES_USER: ${TIMESCALE_POSTGRES_USER:-iot}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TIMESCALE_POSTGRES_USER:-iot} -d iot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+
+  iot-nano-monolith:
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      IOT_NANO_STORAGE: timescale
+      IOT_NANO_SQLITE_PATH: null
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+    volumes: !reset
+      - internal-data:/var/lib/iot-nano/internal
+      - ./tls:/run/tls:ro
+
+volumes:
+  timescaledb-data:
