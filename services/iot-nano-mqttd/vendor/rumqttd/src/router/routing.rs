@@ -2664,14 +2664,10 @@ mod tests {
     #[tokio::test]
     async fn managed_router_parent_task_propagates_storage_failures() {
         let storage = Arc::new(FailingPruneStorage::default());
-        let managed = Router::new_with_storage(
-            0,
-            router_config(),
-            Some(storage),
-            RetentionPolicy::default(),
-        )
-        .unwrap()
-        .into_managed(CancellationToken::new());
+        let managed =
+            Router::new_with_storage(0, router_config(), Some(storage), test_retention_policy())
+                .unwrap()
+                .into_managed(CancellationToken::new());
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(managed.run());
 
@@ -2687,14 +2683,10 @@ mod tests {
     #[tokio::test]
     async fn managed_router_parent_task_propagates_router_panics() {
         let storage = Arc::new(FailingPruneStorage::panicking());
-        let managed = Router::new_with_storage(
-            0,
-            router_config(),
-            Some(storage),
-            RetentionPolicy::default(),
-        )
-        .unwrap()
-        .into_managed(CancellationToken::new());
+        let managed =
+            Router::new_with_storage(0, router_config(), Some(storage), test_retention_policy())
+                .unwrap()
+                .into_managed(CancellationToken::new());
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(managed.run());
 
@@ -2714,6 +2706,13 @@ mod tests {
         link.send((0, Event::Shutdown)).unwrap();
 
         assert!(matches!(join.join(), Ok(Err(RouterError::Shutdown))));
+    }
+
+    fn test_retention_policy() -> RetentionPolicy {
+        RetentionPolicy {
+            prune_interval_ms: 0,
+            ..RetentionPolicy::default()
+        }
     }
 
     #[derive(Debug)]
