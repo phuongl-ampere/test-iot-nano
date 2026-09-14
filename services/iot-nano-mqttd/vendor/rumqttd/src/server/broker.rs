@@ -45,7 +45,12 @@ use crate::{Config, ConnectionId, ServerSettings};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::error::Elapsed;
-use tokio::{sync::watch, task, time};
+use tokio::{
+    sync::watch,
+    task::{self, JoinError, JoinSet},
+    time,
+};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
 #[error("Acceptor error")]
@@ -111,6 +116,8 @@ pub enum Error {
         timeout: Duration,
         pending: Vec<PreboundListenerSource>,
     },
+    #[error("managed server child task failed: {0}")]
+    ManagedTask(String),
 }
 
 pub type NamedListener = (String, StdTcpListener);
@@ -138,11 +145,15 @@ type PreboundStartupStatusHook = Arc<dyn Fn(&PreboundListenerSource) -> bool + S
 type PostAcceptAdmissionHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[cfg(test)]
+type ManagedRemoteSpawnHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Default)]
 struct PreboundTestHooks {
     server_spawn: Option<PreboundServerSpawnHook>,
     suppress_startup_status: Option<PreboundStartupStatusHook>,
     post_accept_admission: Option<PostAcceptAdmissionHook>,
+    managed_remote_spawn: Option<ManagedRemoteSpawnHook>,
     withheld_startup_senders: Vec<StartupSender>,
 }
 
@@ -177,6 +188,7 @@ fn install_prebound_test_hooks(
         server_spawn,
         suppress_startup_status,
         post_accept_admission: None,
+        managed_remote_spawn: None,
         withheld_startup_senders: Vec::new(),
     };
     PreboundTestHooksGuard
@@ -193,12 +205,35 @@ fn install_post_accept_admission_hook(hook: PostAcceptAdmissionHook) -> Prebound
 }
 
 #[cfg(test)]
+fn install_managed_remote_spawn_hook(hook: ManagedRemoteSpawnHook) -> PreboundTestHooksGuard {
+    PREBOUND_TEST_HOOKS
+        .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+        .lock()
+        .expect("prebound test hook mutex is not poisoned")
+        .managed_remote_spawn = Some(hook);
+    PreboundTestHooksGuard
+}
+
+#[cfg(test)]
 fn before_accept_admission(server_name: &str) {
     let hook = PREBOUND_TEST_HOOKS
         .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
         .lock()
         .expect("prebound test hook mutex is not poisoned")
         .post_accept_admission
+        .clone();
+    if let Some(hook) = hook {
+        hook(server_name);
+    }
+}
+
+#[cfg(test)]
+fn after_managed_remote_spawn(server_name: &str) {
+    let hook = PREBOUND_TEST_HOOKS
+        .get_or_init(|| Mutex::new(PreboundTestHooks::default()))
+        .lock()
+        .expect("prebound test hook mutex is not poisoned")
+        .managed_remote_spawn
         .clone();
     if let Some(hook) = hook {
         hook(server_name);
@@ -1153,6 +1188,16 @@ pub struct Server<P> {
     awaiting_will_handler: Arc<Mutex<HashMap<String, Sender<AwaitingWill>>>>,
 }
 
+/// A prebound server future whose parent owns both listener and remote-link
+/// task lifetimes.
+pub struct ManagedServer<P> {
+    server: Server<P>,
+    listener: Option<TcpListener>,
+    link_type: LinkType,
+    graceful_shutdown: watch::Receiver<bool>,
+    force_cancellation: CancellationToken,
+}
+
 impl<P: Protocol + Clone + Send + 'static> Server<P> {
     pub fn new(
         config: ServerSettings,
@@ -1175,6 +1220,52 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
 
     fn set_remote_task_shutdown(&mut self, remote_task_shutdown: RemoteTaskShutdown) {
         self.remote_task_shutdown = remote_task_shutdown;
+    }
+
+    /// Converts a validated prebound listener before the parent registers the
+    /// managed server task as ready.
+    pub fn into_managed_prebound(
+        self,
+        listener: StdTcpListener,
+        source: PreboundListenerSource,
+        link_type: LinkType,
+        graceful_shutdown: watch::Receiver<bool>,
+        force_cancellation: CancellationToken,
+    ) -> Result<ManagedServer<P>, Error> {
+        let actual = listener
+            .local_addr()
+            .map_err(|io_error| Error::PreboundListenerIo {
+                listener: source.clone(),
+                operation: "local_addr",
+                source: io_error,
+            })?;
+        if actual != self.config.listen {
+            return Err(Error::PreboundListenerAddress {
+                listener: source,
+                expected: self.config.listen,
+                actual,
+            });
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|io_error| Error::PreboundListenerIo {
+                listener: source.clone(),
+                operation: "set_nonblocking",
+                source: io_error,
+            })?;
+        Ok(ManagedServer {
+            server: self,
+            listener: Some(TcpListener::from_std(listener).map_err(|io_error| {
+                Error::PreboundListenerIo {
+                    listener: source,
+                    operation: "from_std",
+                    source: io_error,
+                }
+            })?),
+            link_type,
+            graceful_shutdown,
+            force_cancellation,
+        })
     }
 
     // Depending on TLS or not create a new Network
@@ -1350,6 +1441,346 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             let _ = task.await;
         }
         Ok(())
+    }
+}
+
+impl<P: Protocol + Clone + Send + 'static> ManagedServer<P> {
+    pub fn local_addr(&self) -> Result<SocketAddr, Error> {
+        let listener = self
+            .listener
+            .as_ref()
+            .ok_or_else(|| Error::Config("managed listener is closed".to_owned()))?;
+        Ok(listener.local_addr()?)
+    }
+
+    /// Runs the server in its parent Tokio runtime.
+    ///
+    /// Graceful shutdown closes admission but leaves established remote links
+    /// running. Force cancellation signals those links, aborts any remaining
+    /// work, and joins every child before returning.
+    pub async fn run(mut self) -> Result<(), Error> {
+        let delay = Duration::from_millis(self.server.config.next_connection_delay_ms);
+        let config = Arc::new(self.server.config.connections.clone());
+        let (force_shutdown, _) = watch::channel(false);
+        let mut remote_tasks = JoinSet::new();
+        let mut graceful_closed = *self.graceful_shutdown.borrow();
+        if graceful_closed {
+            self.server.acceptance_gate.close();
+            self.listener.take();
+        }
+
+        info!(
+            config = self.server.config.name,
+            listen_addr = self.server.config.listen.to_string(),
+            "Listening for managed remote connections",
+        );
+
+        'server: loop {
+            if let Err(error) = Self::reap_finished_remote_tasks(&mut remote_tasks) {
+                return Self::stop_after_remote_failure(
+                    &mut self.listener,
+                    &self.server,
+                    &force_shutdown,
+                    &mut remote_tasks,
+                    error,
+                )
+                .await;
+            }
+            if self.force_cancellation.is_cancelled() {
+                return Self::force_stop(
+                    &mut self.listener,
+                    &self.server,
+                    &force_shutdown,
+                    &mut remote_tasks,
+                )
+                .await;
+            }
+            if graceful_closed {
+                if remote_tasks.is_empty() {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = self.force_cancellation.cancelled() => {
+                        return Self::force_stop(
+                            &mut self.listener,
+                            &self.server,
+                            &force_shutdown,
+                            &mut remote_tasks,
+                        ).await;
+                    }
+                    result = remote_tasks.join_next() => {
+                        if let Err(error) = Self::handle_remote_result(result) {
+                            return Self::stop_after_remote_failure(
+                                &mut self.listener,
+                                &self.server,
+                                &force_shutdown,
+                                &mut remote_tasks,
+                                error,
+                            ).await;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            tokio::select! {
+                _ = self.force_cancellation.cancelled() => {
+                    return Self::force_stop(
+                        &mut self.listener,
+                        &self.server,
+                        &force_shutdown,
+                        &mut remote_tasks,
+                    ).await;
+                }
+                changed = self.graceful_shutdown.changed() => {
+                    let _ = changed;
+                    self.server.acceptance_gate.close();
+                    self.listener.take();
+                    graceful_closed = true;
+                }
+                result = remote_tasks.join_next(), if !remote_tasks.is_empty() => {
+                    if let Err(error) = Self::handle_remote_result(result) {
+                        return Self::stop_after_remote_failure(
+                            &mut self.listener,
+                            &self.server,
+                            &force_shutdown,
+                            &mut remote_tasks,
+                            error,
+                        ).await;
+                    }
+                }
+                accepted = self.listener.as_ref().expect("managed listener is open while accepting").accept() => {
+                    let (stream, addr) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            error!(?error, "Unable to accept managed socket.");
+                            continue;
+                        }
+                    };
+
+                    #[cfg(test)]
+                    before_accept_admission(&self.server.config.name);
+
+                    if !self.server.acceptance_gate.admit(&self.graceful_shutdown) {
+                        continue;
+                    }
+
+                    let tls_accept = self.server.tls_accept(stream);
+                    tokio::pin!(tls_accept);
+                    let (network, tenant_id) = loop {
+                        tokio::select! {
+                            result = &mut tls_accept => match result {
+                                Ok(network) => break network,
+                                Err(error) => {
+                                    error!(?error, "Managed TLS accept error");
+                                    continue 'server;
+                                }
+                            },
+                            result = remote_tasks.join_next(), if !remote_tasks.is_empty() => {
+                                if let Err(error) = Self::handle_remote_result(result) {
+                                    return Self::stop_after_remote_failure(
+                                        &mut self.listener,
+                                        &self.server,
+                                        &force_shutdown,
+                                        &mut remote_tasks,
+                                        error,
+                                    ).await;
+                                }
+                            }
+                            changed = self.graceful_shutdown.changed(), if !graceful_closed => {
+                                let _ = changed;
+                                self.server.acceptance_gate.close();
+                                self.listener.take();
+                                graceful_closed = true;
+                            }
+                            _ = self.force_cancellation.cancelled() => {
+                                return Self::force_stop(
+                                    &mut self.listener,
+                                    &self.server,
+                                    &force_shutdown,
+                                    &mut remote_tasks,
+                                ).await;
+                            }
+                        }
+                    };
+
+                    info!(
+                        name = ?self.server.config.name,
+                        ?addr,
+                        tenant = ?tenant_id,
+                        "managed accept"
+                    );
+
+                    let remote_config = Arc::clone(&config);
+                    let router_tx = self.server.router_tx.clone();
+                    let protocol = self.server.protocol.clone();
+                    let will_handlers = Arc::clone(&self.server.awaiting_will_handler);
+                    let remote_shutdown = force_shutdown.subscribe();
+                    match self.link_type {
+                        #[cfg(feature = "websocket")]
+                        LinkType::Websocket => {
+                            let websocket_accept = accept_hdr_async(network, WSCallback);
+                            tokio::pin!(websocket_accept);
+                            let stream = loop {
+                                tokio::select! {
+                                    result = &mut websocket_accept => match result {
+                                        Ok(stream) => break Box::new(WsStream::new(stream)),
+                                        Err(error) => {
+                                            error!(?error, "Managed websocket handshake failed");
+                                            continue 'server;
+                                        }
+                                    },
+                                    result = remote_tasks.join_next(), if !remote_tasks.is_empty() => {
+                                        if let Err(error) = Self::handle_remote_result(result) {
+                                            return Self::stop_after_remote_failure(
+                                                &mut self.listener,
+                                                &self.server,
+                                                &force_shutdown,
+                                                &mut remote_tasks,
+                                                error,
+                                            ).await;
+                                        }
+                                    }
+                                    changed = self.graceful_shutdown.changed(), if !graceful_closed => {
+                                        let _ = changed;
+                                        self.server.acceptance_gate.close();
+                                        self.listener.take();
+                                        graceful_closed = true;
+                                    }
+                                    _ = self.force_cancellation.cancelled() => {
+                                        return Self::force_stop(
+                                            &mut self.listener,
+                                            &self.server,
+                                            &force_shutdown,
+                                            &mut remote_tasks,
+                                        ).await;
+                                    }
+                                }
+                            };
+                            remote_tasks.spawn(
+                                remote(
+                                    remote_config,
+                                    tenant_id.clone(),
+                                    router_tx,
+                                    stream,
+                                    protocol,
+                                    will_handlers,
+                                    remote_shutdown,
+                                )
+                                .instrument(tracing::info_span!(
+                                    "managed_websocket_link",
+                                    client_id = field::Empty,
+                                    connection_id = field::Empty
+                                )),
+                            );
+                        }
+                        LinkType::Remote => {
+                            remote_tasks.spawn(
+                                remote(
+                                    remote_config,
+                                    tenant_id.clone(),
+                                    router_tx,
+                                    network,
+                                    protocol,
+                                    will_handlers,
+                                    remote_shutdown,
+                                )
+                                .instrument(tracing::error_span!(
+                                    "managed_remote_link",
+                                    ?tenant_id,
+                                    client_id = field::Empty,
+                                    connection_id = field::Empty,
+                                )),
+                            );
+                        }
+                    }
+
+                    #[cfg(test)]
+                    after_managed_remote_spawn(&self.server.config.name);
+
+                    let next_connection_delay = time::sleep(delay);
+                    tokio::pin!(next_connection_delay);
+                    loop {
+                        tokio::select! {
+                            _ = &mut next_connection_delay => break,
+                            result = remote_tasks.join_next(), if !remote_tasks.is_empty() => {
+                                if let Err(error) = Self::handle_remote_result(result) {
+                                    return Self::stop_after_remote_failure(
+                                        &mut self.listener,
+                                        &self.server,
+                                        &force_shutdown,
+                                        &mut remote_tasks,
+                                        error,
+                                    ).await;
+                                }
+                            }
+                            _ = self.force_cancellation.cancelled() => {
+                                return Self::force_stop(
+                                    &mut self.listener,
+                                    &self.server,
+                                    &force_shutdown,
+                                    &mut remote_tasks,
+                                ).await;
+                            }
+                            changed = self.graceful_shutdown.changed() => {
+                                let _ = changed;
+                                self.server.acceptance_gate.close();
+                                self.listener.take();
+                                graceful_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn reap_finished_remote_tasks(remote_tasks: &mut JoinSet<()>) -> Result<(), Error> {
+        while let Some(result) = remote_tasks.try_join_next() {
+            Self::handle_remote_result(Some(result))?;
+        }
+        Ok(())
+    }
+
+    fn handle_remote_result(result: Option<Result<(), JoinError>>) -> Result<(), Error> {
+        match result {
+            Some(Ok(())) | None => Ok(()),
+            Some(Err(error)) => Err(Error::ManagedTask(error.to_string())),
+        }
+    }
+
+    async fn force_stop(
+        listener: &mut Option<TcpListener>,
+        server: &Server<P>,
+        force_shutdown: &watch::Sender<bool>,
+        remote_tasks: &mut JoinSet<()>,
+    ) -> Result<(), Error> {
+        listener.take();
+        server.acceptance_gate.close();
+        force_shutdown.send_replace(true);
+        remote_tasks.abort_all();
+
+        let mut first_error = None;
+        while let Some(result) = remote_tasks.join_next().await {
+            if let Err(error) = result {
+                if !error.is_cancelled() && first_error.is_none() {
+                    first_error = Some(Error::ManagedTask(error.to_string()));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn stop_after_remote_failure(
+        listener: &mut Option<TcpListener>,
+        server: &Server<P>,
+        force_shutdown: &watch::Sender<bool>,
+        remote_tasks: &mut JoinSet<()>,
+        error: Error,
+    ) -> Result<(), Error> {
+        let _ = Self::force_stop(listener, server, force_shutdown, remote_tasks).await;
+        Err(error)
     }
 }
 
@@ -1553,11 +1984,16 @@ mod tests {
     use crate::{
         BridgeConfig, Config, ConnectionSettings, PrometheusSetting, ServerSettings, Transport,
     };
-    use tokio::sync::watch;
+    use tokio::{
+        io::AsyncReadExt, net::TcpStream as TokioTcpStream, sync::watch, task::JoinSet,
+        time::timeout,
+    };
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        install_post_accept_admission_hook, install_prebound_test_hooks, prebound_test_serial,
-        Broker, BrokerHandle, Error, PreboundListenerSource,
+        install_managed_remote_spawn_hook, install_post_accept_admission_hook,
+        install_prebound_test_hooks, prebound_test_serial, Broker, BrokerHandle, Error, LinkType,
+        PreboundListenerSource, Server, V4,
     };
 
     #[test]
@@ -1939,6 +2375,186 @@ mod tests {
         assert!(!gate.admit(&receiver));
     }
 
+    #[tokio::test]
+    async fn managed_prebound_server_converts_listener_before_parent_run() {
+        let (config, v4_listener, _v5_listener) = prebound_test_config();
+        let address = v4_listener.local_addr().unwrap();
+        let settings = config.v4.as_ref().unwrap()["v311"].clone();
+        let (router_tx, _router_rx) = flume::bounded(1);
+        let server = Server::new(settings, router_tx, V4);
+        let (graceful_shutdown, graceful_receiver) = watch::channel(false);
+        let force = CancellationToken::new();
+
+        let managed = server
+            .into_managed_prebound(
+                v4_listener,
+                v4_prebound_source(),
+                LinkType::Remote,
+                graceful_receiver,
+                force,
+            )
+            .expect("prebound listener must convert before the parent spawns the task");
+        assert_eq!(managed.local_addr().unwrap(), address);
+
+        graceful_shutdown.send(true).unwrap();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(managed.run());
+        assert!(matches!(
+            timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("managed server must stop after graceful admission closure"),
+            Some(Ok(Ok(())))
+        ));
+    }
+
+    #[test]
+    fn managed_prebound_server_rejects_an_address_mismatch_before_parent_run() {
+        let (config, _v4_listener, _v5_listener) = prebound_test_config();
+        let settings = config.v4.as_ref().unwrap()["v311"].clone();
+        let mismatched = TcpListener::bind("127.0.0.1:0").unwrap();
+        let actual = mismatched.local_addr().unwrap();
+        let (router_tx, _router_rx) = flume::bounded(1);
+        let server = Server::new(settings.clone(), router_tx, V4);
+        let (_graceful_shutdown, graceful_receiver) = watch::channel(false);
+
+        assert!(matches!(
+            server.into_managed_prebound(
+                mismatched,
+                v4_prebound_source(),
+                LinkType::Remote,
+                graceful_receiver,
+                CancellationToken::new(),
+            ),
+            Err(Error::PreboundListenerAddress {
+                listener,
+                expected,
+                actual: error_actual,
+            }) if listener == v4_prebound_source()
+                && expected == settings.listen
+                && error_actual == actual
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_prebound_server_force_cancels_and_joins_a_remote_task() {
+        let _serial = prebound_test_serial()
+            .lock()
+            .expect("prebound test serial mutex is not poisoned");
+        let (config, v4_listener, _v5_listener) = prebound_test_config();
+        let settings = config.v4.as_ref().unwrap()["v311"].clone();
+        let (router_tx, _router_rx) = flume::bounded(1);
+        let server = Server::new(settings, router_tx, V4);
+        let (graceful_shutdown, graceful_receiver) = watch::channel(false);
+        let force = CancellationToken::new();
+        let force_signal = force.clone();
+        let (spawned_tx, spawned_rx) = mpsc::sync_channel(1);
+        let _hooks = install_managed_remote_spawn_hook(Arc::new(move |_| {
+            spawned_tx.send(()).unwrap();
+        }));
+        let managed = server
+            .into_managed_prebound(
+                v4_listener,
+                v4_prebound_source(),
+                LinkType::Remote,
+                graceful_receiver,
+                force,
+            )
+            .unwrap();
+        let address = managed.local_addr().unwrap();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(managed.run());
+
+        let mut client = TokioTcpStream::connect(address).await.unwrap();
+        tokio::task::spawn_blocking(move || spawned_rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("spawned-task waiter must not panic")
+            .expect("managed server must spawn the remote task");
+
+        force_signal.cancel();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("force cancellation must join the managed server"),
+            Some(Ok(Ok(())))
+        ));
+
+        let mut byte = [0_u8; 1];
+        assert!(matches!(
+            timeout(Duration::from_secs(1), client.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        ));
+        drop(graceful_shutdown);
+    }
+
+    #[tokio::test]
+    async fn managed_prebound_server_graceful_shutdown_keeps_an_admitted_remote_task_alive() {
+        let _serial = prebound_test_serial()
+            .lock()
+            .expect("prebound test serial mutex is not poisoned");
+        let (config, v4_listener, _v5_listener) = prebound_test_config();
+        let settings = config.v4.as_ref().unwrap()["v311"].clone();
+        let (router_tx, _router_rx) = flume::bounded(1);
+        let server = Server::new(settings, router_tx, V4);
+        let (graceful_shutdown, graceful_receiver) = watch::channel(false);
+        let force = CancellationToken::new();
+        let force_signal = force.clone();
+        let (spawned_tx, spawned_rx) = mpsc::sync_channel(1);
+        let _hooks = install_managed_remote_spawn_hook(Arc::new(move |_| {
+            spawned_tx.send(()).unwrap();
+        }));
+        let managed = server
+            .into_managed_prebound(
+                v4_listener,
+                v4_prebound_source(),
+                LinkType::Remote,
+                graceful_receiver,
+                force,
+            )
+            .unwrap();
+        let address = managed.local_addr().unwrap();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(managed.run());
+
+        let mut client = TokioTcpStream::connect(address).await.unwrap();
+        tokio::task::spawn_blocking(move || spawned_rx.recv_timeout(Duration::from_secs(1)))
+            .await
+            .expect("spawned-task waiter must not panic")
+            .expect("managed server must spawn the remote task");
+
+        graceful_shutdown.send(true).unwrap();
+        let rebound = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match TcpListener::bind(address) {
+                    Ok(listener) => return listener,
+                    Err(error) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(5));
+                        let _ = error;
+                    }
+                    Err(error) => panic!("graceful shutdown did not release {address}: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("listener rebind waiter must not panic");
+        drop(rebound);
+        assert!(timeout(Duration::from_millis(100), tasks.join_next())
+            .await
+            .is_err());
+        let mut byte = [0_u8; 1];
+        assert!(timeout(Duration::from_millis(100), client.read(&mut byte))
+            .await
+            .is_err());
+
+        force_signal.cancel();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("force cancellation must join the managed server"),
+            Some(Ok(Ok(())))
+        ));
+    }
+
     #[test]
     fn dropping_an_unspawned_broker_stops_the_router() {
         let broker = Broker::new(Config::default()).unwrap();
@@ -1951,6 +2567,13 @@ mod tests {
 
     fn prebound_test_config() -> (Config, TcpListener, TcpListener) {
         prebound_test_config_named("v311", "v5")
+    }
+
+    fn v4_prebound_source() -> PreboundListenerSource {
+        PreboundListenerSource {
+            protocol: "v4",
+            name: "v311".to_owned(),
+        }
     }
 
     fn shutdown_rejects_prebound_connection_accepted_before_admission(protocol: &str) {
