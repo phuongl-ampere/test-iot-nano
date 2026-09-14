@@ -66,7 +66,7 @@ where
         .route("/api/v1/devices", axum::routing::post(create_device))
         .route(
             "/api/v1/devices/{device_id}",
-            axum::routing::patch(update_device).delete(delete_device),
+            get(get_device).patch(update_device).delete(delete_device),
         )
         .route(
             "/api/v1/devices/{device_id}/commands",
@@ -457,6 +457,26 @@ async fn create_device(
         axum::http::StatusCode::CREATED,
         Json(device_response(device)),
     ))
+}
+
+async fn get_device(
+    Extension(context): Extension<PublicApiContext>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<Json<DeviceResponse>, PublicApiError> {
+    let (store, principal) = authenticate(&context, &headers, "devices:read").await?;
+    if !PublicApiRepository::public_device_permission(store.as_ref(), &principal, &device_id)
+        .await
+        .map_err(|_| PublicApiError::Unavailable)?
+        .is_some_and(|permission| permission.allows(ResourcePermission::Viewer))
+    {
+        return Err(PublicApiError::Forbidden);
+    }
+    let device = PublicApiRepository::get_public_device(store.as_ref(), &device_id)
+        .await
+        .map_err(|_| PublicApiError::Unavailable)?
+        .ok_or(PublicApiError::Forbidden)?;
+    Ok(Json(device_response(device)))
 }
 
 async fn update_device(
