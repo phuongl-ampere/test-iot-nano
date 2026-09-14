@@ -4556,8 +4556,6 @@ fn command_payload_matches(
         && existing.method == command.method
         && existing.params == command.params
         && existing.mode == command.mode
-        && existing.expires_at == command.expires_at
-        && existing.next_attempt_at == command.next_attempt_at
 }
 
 fn canonical_postgres_timestamp(timestamp: DateTime<Utc>) -> DateTime<Utc> {

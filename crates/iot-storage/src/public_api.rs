@@ -386,19 +386,21 @@ async fn public_device_permission(
     principal: &PublicPrincipal,
     device_id: &str,
 ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
-    if principal.account_class == AccountClass::Admin {
-        return Ok(Some(ResourcePermission::Owner));
-    }
     match store {
         PlatformStore::Sqlite(store) => {
-            let owner = sqlx::query_scalar::<_, Option<String>>(
+            let Some(owner) = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT owner_user_id FROM devices
                  WHERE device_id = ? AND deleted_at IS NULL",
             )
             .bind(device_id)
             .fetch_optional(store.pool())
             .await?
-            .flatten();
+            else {
+                return Ok(None);
+            };
+            if principal.account_class == AccountClass::Admin {
+                return Ok(Some(ResourcePermission::Owner));
+            }
             if principal.user_id.map(|id| id.to_string()) == owner {
                 return Ok(Some(ResourcePermission::Owner));
             }
@@ -423,14 +425,19 @@ async fn public_device_permission(
             Ok(strongest_share_permission(rows))
         }
         PlatformStore::Timescale(pool) => {
-            let owner = sqlx::query_scalar::<_, Option<Uuid>>(
+            let Some(owner) = sqlx::query_scalar::<_, Option<Uuid>>(
                 "SELECT owner_user_id FROM devices
                  WHERE device_id = $1 AND deleted_at IS NULL",
             )
             .bind(device_id)
             .fetch_optional(pool)
             .await?
-            .flatten();
+            else {
+                return Ok(None);
+            };
+            if principal.account_class == AccountClass::Admin {
+                return Ok(Some(ResourcePermission::Owner));
+            }
             if principal.user_id == owner {
                 return Ok(Some(ResourcePermission::Owner));
             }

@@ -527,6 +527,37 @@ async fn platform_store_rejects_a_conflicting_sqlite_command_retry() {
 }
 
 #[tokio::test]
+async fn platform_store_replays_sqlite_command_when_only_handler_timestamps_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let command_id = uuid::Uuid::now_v7().to_string();
+    TopologyRepository::register_device(&store, "platform-command-device")
+        .await
+        .unwrap();
+
+    let original = command("platform-command-device", &command_id, r#"{"target":"on"}"#);
+    let mut retry = original.clone();
+    retry.next_attempt_at += Duration::seconds(1);
+    retry.expires_at += Duration::seconds(1);
+
+    let created = CommandRepository::enqueue_command(&store, original)
+        .await
+        .unwrap();
+    let replayed = CommandRepository::enqueue_command(&store, retry)
+        .await
+        .unwrap();
+
+    assert_eq!(replayed, created);
+}
+
+#[tokio::test]
 async fn platform_store_canonicalizes_sqlite_command_values() {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {

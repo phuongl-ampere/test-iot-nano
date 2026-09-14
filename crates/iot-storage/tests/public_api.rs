@@ -88,6 +88,68 @@ async fn sqlite_public_repository_filters_assets_and_persists_grants() {
 }
 
 #[tokio::test]
+async fn sqlite_public_device_permission_denies_active_shares_and_grants_for_deleted_devices() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let user_id = Uuid::now_v7();
+    let owner_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, 'public-deleted-device-user', 'unused', 'viewer', 'user'),
+                (?, 'public-deleted-device-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .bind(owner_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, owner_user_id, deleted_at)
+         VALUES ('public-deleted-device', ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(owner_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_shares
+            (id, resource_type, resource_id, target_user_id, permission,
+             inherit_children, state, created_by_user_id)
+         VALUES ('public-deleted-device-share', 'device', ?, ?, 'manager', 0, 'active', ?)",
+    )
+    .bind("public-deleted-device")
+    .bind(user_id.to_string())
+    .bind(owner_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_grants
+            (id, resource_type, resource_id, grantee_type, grantee_id, permission,
+             created_by_user_id)
+         VALUES (?, 'device', 'public-deleted-device', 'user', ?, 'controller', ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(user_id.to_string())
+    .bind(owner_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let principal = PublicPrincipal {
+        user_id: Some(user_id),
+        app_id: "public-deleted-device-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    assert_eq!(
+        PublicApiRepository::public_device_permission(&store, &principal, "public-deleted-device",)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_public_repository_creates_and_reads_an_asset() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
