@@ -757,6 +757,7 @@ fn public_router(state: ApiState) -> Router {
         .route("/oauth/authorize", get(crate::oauth::authorize))
         .route("/oauth/token", post(crate::oauth::token))
         .route("/api/v1/devices", get(public_list_devices))
+        .route("/api/v1/devices/{device_id}", get(public_get_device))
         .with_state(state)
 }
 
@@ -862,6 +863,27 @@ async fn public_list_devices(
         .map(Json)
 }
 
+async fn public_get_device(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<Json<DeviceSummary>, PublicApiError> {
+    extract_bearer_access_token(&headers).map_err(PublicApiError::from)?;
+    let oauth_store = state.oauth_store().ok_or(PublicApiError::Unavailable)?;
+    let token = validate_bearer_access_token(oauth_store.as_ref(), &headers, Utc::now()).await?;
+    if !token.allows_scope("devices:read") {
+        return Err(PublicApiError::Forbidden);
+    }
+    let subject = public_authorization_subject(oauth_store.as_ref(), token.user_id).await?;
+    let device =
+        AuthorizationRepository::authorized_device(oauth_store.as_ref(), &subject, &device_id)
+            .await
+            .map_err(|_| PublicApiError::Unavailable)?
+            .ok_or(PublicApiError::Forbidden)?;
+    let online_threshold = Utc::now() - Duration::minutes(5);
+    Ok(Json(public_device_summary(device, &online_threshold)))
+}
+
 async fn sqlite_public_list_devices(
     State(state): State<SqliteApiState>,
     headers: HeaderMap,
@@ -892,6 +914,27 @@ async fn sqlite_public_list_devices(
     public_device_page(&state.token_vault, &subject, rows, limit)
         .await
         .map(Json)
+}
+
+async fn sqlite_public_get_device(
+    State(state): State<SqliteApiState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<Json<DeviceSummary>, PublicApiError> {
+    extract_bearer_access_token(&headers).map_err(PublicApiError::from)?;
+    let oauth_store = state.oauth_store().ok_or(PublicApiError::Unavailable)?;
+    let token = validate_bearer_access_token(oauth_store.as_ref(), &headers, Utc::now()).await?;
+    if !token.allows_scope("devices:read") {
+        return Err(PublicApiError::Forbidden);
+    }
+    let subject = public_authorization_subject(oauth_store.as_ref(), token.user_id).await?;
+    let device =
+        AuthorizationRepository::authorized_device(oauth_store.as_ref(), &subject, &device_id)
+            .await
+            .map_err(|_| PublicApiError::Unavailable)?
+            .ok_or(PublicApiError::Forbidden)?;
+    let online_threshold = Utc::now() - Duration::minutes(5);
+    Ok(Json(public_device_summary(device, &online_threshold)))
 }
 
 fn public_device_list_limit(limit: Option<usize>) -> Result<usize, PublicApiError> {
@@ -966,14 +1009,7 @@ async fn public_device_page(
     rows.truncate(limit);
     let items = rows
         .into_iter()
-        .map(|row| DeviceSummary {
-            device_id: row.device_id,
-            display_name: row.display_name,
-            online: row
-                .last_seen_at
-                .is_some_and(|last_seen_at| last_seen_at >= online_threshold),
-            last_seen_at: row.last_seen_at,
-        })
+        .map(|row| public_device_summary(row, &online_threshold))
         .collect::<Vec<_>>();
     let next_cursor = if has_more {
         items
@@ -988,6 +1024,20 @@ async fn public_device_page(
         next_cursor,
         has_more,
     })
+}
+
+fn public_device_summary(
+    row: AuthorizedDeviceSummary,
+    online_threshold: &DateTime<Utc>,
+) -> DeviceSummary {
+    DeviceSummary {
+        device_id: row.device_id,
+        display_name: row.display_name,
+        online: row
+            .last_seen_at
+            .is_some_and(|last_seen_at| last_seen_at >= online_threshold.clone()),
+        last_seen_at: row.last_seen_at,
+    }
 }
 
 fn management_router(state: ApiState) -> Router {
@@ -1150,6 +1200,7 @@ fn sqlite_public_router(state: SqliteApiState) -> Router {
         .route("/oauth/authorize", get(crate::oauth::sqlite_authorize))
         .route("/oauth/token", post(crate::oauth::sqlite_token))
         .route("/api/v1/devices", get(sqlite_public_list_devices))
+        .route("/api/v1/devices/{device_id}", get(sqlite_public_get_device))
         .with_state(state)
 }
 

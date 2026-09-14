@@ -244,6 +244,44 @@ async fn assert_approved_authorization_contract(
             .collect::<Vec<_>>(),
         [DEVICE_ASSET_ID, DEVICE_DIRECT_ID]
     );
+    assert_eq!(
+        store
+            .authorized_device(&user, DEVICE_ASSET_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .device_id,
+        DEVICE_ASSET_ID
+    );
+    assert_eq!(
+        AuthorizationRepository::authorized_device(store, &user, DEVICE_DIRECT_ID)
+            .await
+            .unwrap()
+            .unwrap()
+            .device_id,
+        DEVICE_DIRECT_ID
+    );
+    assert!(
+        store
+            .authorized_device(&user, DEVICE_UNSHARED_ID)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .authorized_device(&user, DEVICE_DELETED_ID)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .authorized_device(&user, "missing-device")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

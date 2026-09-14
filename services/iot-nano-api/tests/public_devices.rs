@@ -219,6 +219,111 @@ async fn public_device_list_requires_the_exact_devices_read_scope() {
 }
 
 #[tokio::test]
+async fn public_device_detail_returns_the_authorized_public_representation() {
+    let (_directory, store, app) = public_device_app().await;
+    seed_visible_devices(&store).await;
+    let token = oauth_bearer_token(&app, "viewer", "NanoView@1234", "devices:read").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/device-002-shared")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["device_id"], "device-002-shared");
+    assert_eq!(payload["display_name"], "Shared device");
+    assert_eq!(payload["online"], false);
+    assert_eq!(payload["last_seen_at"], Value::Null);
+    let fields = payload.as_object().unwrap();
+    assert_eq!(fields.len(), 4);
+    for field in ["device_id", "display_name", "online", "last_seen_at"] {
+        assert!(fields.contains_key(field));
+    }
+}
+
+#[tokio::test]
+async fn public_device_detail_requires_the_exact_devices_read_scope() {
+    let (_directory, store, app) = public_device_app().await;
+    seed_visible_devices(&store).await;
+    let token = oauth_bearer_token(&app, "viewer", "NanoView@1234", "assets:read").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/device-001-owned")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_public_error(response, StatusCode::FORBIDDEN, "forbidden").await;
+}
+
+#[tokio::test]
+async fn public_device_detail_denies_a_cross_user_device_without_revealing_data() {
+    let (_directory, store, app) = public_device_app().await;
+    seed_visible_devices(&store).await;
+    let token = oauth_bearer_token(&app, "viewer", "NanoView@1234", "devices:read").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/device-003-hidden")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_public_error(response, StatusCode::FORBIDDEN, "forbidden").await;
+}
+
+#[tokio::test]
+async fn public_device_detail_denies_unknown_and_deleted_devices_without_revealing_data() {
+    let (_directory, store, app) = public_device_app().await;
+    let viewer_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'viewer'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, owner_user_id, deleted_at)
+         VALUES ('device-deleted', 'Deleted device', ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(viewer_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let token = oauth_bearer_token(&app, "viewer", "NanoView@1234", "devices:read").await;
+
+    for device_id in ["missing-device", "device-deleted"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/devices/{device_id}"))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_public_error(response, StatusCode::FORBIDDEN, "forbidden").await;
+    }
+}
+
+#[tokio::test]
 async fn public_device_list_filters_to_the_token_subjects_owned_and_granted_devices() {
     let (_directory, store, app) = public_device_app().await;
     seed_visible_devices(&store).await;
@@ -359,6 +464,7 @@ async fn public_device_list_is_exposed_only_from_the_public_router() {
 
     let public = routers
         .public
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/devices")
@@ -371,6 +477,7 @@ async fn public_device_list_is_exposed_only_from_the_public_router() {
 
     let management = routers
         .management
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/v1/devices")
@@ -380,4 +487,28 @@ async fn public_device_list_is_exposed_only_from_the_public_router() {
         .await
         .unwrap();
     assert_eq!(management.status(), StatusCode::NOT_FOUND);
+
+    let public_detail = routers
+        .public
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/device-001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(public_detail.status(), StatusCode::UNAUTHORIZED);
+
+    let management_detail = routers
+        .management
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices/device-001")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(management_detail.status(), StatusCode::NOT_FOUND);
 }
