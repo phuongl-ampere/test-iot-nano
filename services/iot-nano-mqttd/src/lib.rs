@@ -99,7 +99,7 @@ pub(crate) fn join_public_workers(workers: Vec<PublicWorker>) -> Result<(), Mqtt
 }
 
 #[derive(Clone)]
-pub struct PublicMuxAcceptanceGate {
+pub(crate) struct PublicMuxAcceptanceGate {
     accepting: Arc<Mutex<bool>>,
     #[cfg(test)]
     admission_barrier: Arc<Mutex<Option<MuxAdmissionBarrier>>>,
@@ -125,7 +125,7 @@ impl PublicMuxAcceptanceGate {
     /// The mutex-protected state transition is the linearization point shared
     /// with `try_admit_with_shutdowns`: a proxy that observes `true` won
     /// before this close.
-    pub fn close(&self) {
+    fn close(&self) {
         *self
             .accepting
             .lock()
@@ -890,7 +890,7 @@ pub async fn serve_plaintext_mux_with_shutdowns(
     .await
 }
 
-pub async fn serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
+pub(crate) async fn serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
     listener: TcpListener,
     backends: ProtocolBackends,
     settings: MuxSettings,
@@ -1155,6 +1155,7 @@ mod mux_shutdown_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         backend_task.abort();
+        let _ = backend_task.await;
     }
 
     async fn assert_tls_unowned_gate_rejects_shutdown_before_admission(signal: ShutdownSignal) {
@@ -1215,6 +1216,7 @@ mod mux_shutdown_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         backend_task.abort();
+        let _ = backend_task.await;
     }
 
     async fn assert_plaintext_admitted_before_accept_stop_still_proxies() {
@@ -1270,6 +1272,7 @@ mod mux_shutdown_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         backend_task.abort();
+        let _ = backend_task.await;
     }
 
     async fn assert_tls_admitted_before_accept_stop_still_proxies() {
@@ -1339,6 +1342,7 @@ mod mux_shutdown_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         backend_task.abort();
+        let _ = backend_task.await;
     }
 
     #[tokio::test]
@@ -1555,6 +1559,7 @@ mod mux_shutdown_tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
         backend_task.abort();
+        let _ = backend_task.await;
     }
 
     #[tokio::test]
@@ -1785,7 +1790,7 @@ pub async fn serve_tls_mux_with_shutdowns(
     .await
 }
 
-pub async fn serve_tls_mux_with_shutdowns_and_acceptance_gate(
+pub(crate) async fn serve_tls_mux_with_shutdowns_and_acceptance_gate(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     backends: ProtocolBackends,

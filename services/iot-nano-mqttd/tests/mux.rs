@@ -154,6 +154,7 @@ async fn accept_shutdown_stops_new_plaintext_connections_without_cancelling_acti
         Err(mpsc::error::TryRecvError::Empty)
     ));
     backend_task.abort();
+    let _ = backend_task.await;
     drop(force_stop);
 }
 
@@ -199,6 +200,7 @@ async fn pre_signalled_accept_shutdown_does_not_proxy_a_ready_plaintext_client()
         Err(mpsc::error::TryRecvError::Empty)
     ));
     backend_task.abort();
+    let _ = backend_task.await;
 
     drop(client);
 }
@@ -251,6 +253,7 @@ async fn pre_signalled_force_shutdown_does_not_proxy_a_ready_tls_client() {
         Err(mpsc::error::TryRecvError::Empty)
     ));
     backend_task.abort();
+    let _ = backend_task.await;
 
     drop(client);
 }
