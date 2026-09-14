@@ -81,7 +81,7 @@ pub struct BrokerLifecycleHandle {
 pub struct PublicMuxAcceptanceGate {
     accepting: Arc<Mutex<bool>>,
     #[cfg(test)]
-    proxy_spawn_barrier: Arc<Mutex<Option<MuxProxySpawnBarrier>>>,
+    admission_barrier: Arc<Mutex<Option<MuxAdmissionBarrier>>>,
 }
 
 impl Default for PublicMuxAcceptanceGate {
@@ -89,7 +89,7 @@ impl Default for PublicMuxAcceptanceGate {
         Self {
             accepting: Arc::new(Mutex::new(true)),
             #[cfg(test)]
-            proxy_spawn_barrier: Arc::new(Mutex::new(None)),
+            admission_barrier: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -98,7 +98,8 @@ impl PublicMuxAcceptanceGate {
     /// Closes admission for new public mux proxies.
     ///
     /// The mutex-protected state transition is the linearization point shared
-    /// with `try_admit`: a proxy that observes `true` won before this close.
+    /// with `try_admit_with_shutdowns`: a proxy that observes `true` won
+    /// before this close.
     pub fn close(&self) {
         *self
             .accepting
@@ -106,29 +107,43 @@ impl PublicMuxAcceptanceGate {
             .expect("public accept gate is not poisoned") = false;
     }
 
-    fn try_admit(&self) -> bool {
-        *self
+    fn try_admit_with_shutdowns(
+        &self,
+        accept_shutdown: &mut watch::Receiver<bool>,
+        force_shutdown: &mut watch::Receiver<bool>,
+    ) -> bool {
+        // This acquisition order defines free-API admission: gate, force
+        // watch, then accept watch. A completed send before either borrow is
+        // observed as stopped; a send blocked by these borrows follows this
+        // admission, even if the proxy task has not started yet.
+        let accepting = self
             .accepting
             .lock()
-            .expect("public accept gate is not poisoned")
+            .expect("public accept gate is not poisoned");
+        if !*accepting {
+            return false;
+        }
+        let force_stopped = force_shutdown.borrow_and_update();
+        let accept_stopped = accept_shutdown.borrow_and_update();
+        !*force_stopped && !*accept_stopped
     }
 
     #[cfg(test)]
-    fn test_proxy_spawn_barrier(&self) -> MuxProxySpawnBarrier {
-        let barrier = MuxProxySpawnBarrier::default();
+    fn test_admission_barrier(&self) -> MuxAdmissionBarrier {
+        let barrier = MuxAdmissionBarrier::default();
         *self
-            .proxy_spawn_barrier
+            .admission_barrier
             .lock()
-            .expect("public accept gate test barrier is not poisoned") = Some(barrier.clone());
+            .expect("public mux admission test barrier is not poisoned") = Some(barrier.clone());
         barrier
     }
 
     #[cfg(test)]
-    async fn wait_before_proxy_spawn(&self) {
+    async fn wait_before_admission(&self) {
         let barrier = self
-            .proxy_spawn_barrier
+            .admission_barrier
             .lock()
-            .expect("public accept gate test barrier is not poisoned")
+            .expect("public mux admission test barrier is not poisoned")
             .clone();
         if let Some(barrier) = barrier {
             barrier.reached.notify_one();
@@ -139,13 +154,13 @@ impl PublicMuxAcceptanceGate {
 
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct MuxProxySpawnBarrier {
+struct MuxAdmissionBarrier {
     reached: Arc<tokio::sync::Notify>,
     proceed: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(test)]
-impl MuxProxySpawnBarrier {
+impl MuxAdmissionBarrier {
     async fn wait_until_reached(&self) {
         self.reached.notified().await;
     }
@@ -805,10 +820,15 @@ pub async fn serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
 #[cfg(test)]
 mod mux_shutdown_tests {
     use super::*;
+    use std::{fs::File, io::BufReader, path::PathBuf};
     use tokio::{
         io::AsyncWriteExt,
         sync::mpsc,
         time::{Duration, timeout},
+    };
+    use tokio_rustls::{
+        TlsConnector,
+        rustls::{ClientConfig, RootCertStore, pki_types::ServerName},
     };
 
     fn connect_packet() -> Vec<u8> {
@@ -816,6 +836,172 @@ mod mux_shutdown_tests {
             0x10, 0x0e, 0x00, 0x04, b'M', b'Q', b'T', b'T', 4, 0x02, 0x00, 0x3c, 0x00, 0x02, b'i',
             b'd',
         ]
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShutdownSignal {
+        Accept,
+        Force,
+    }
+
+    fn signal_shutdown(
+        signal: ShutdownSignal,
+        accept_stop: &watch::Sender<bool>,
+        force_stop: &watch::Sender<bool>,
+    ) {
+        match signal {
+            ShutdownSignal::Accept => accept_stop.send_replace(true),
+            ShutdownSignal::Force => force_stop.send_replace(true),
+        };
+    }
+
+    fn tls_connector() -> TlsConnector {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut certificate = BufReader::new(File::open(fixtures.join("server.crt")).unwrap());
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(
+                rustls_pemfile::certs(&mut certificate)
+                    .next()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+        TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ))
+    }
+
+    async fn assert_plaintext_unowned_gate_rejects_shutdown_before_admission(
+        signal: ShutdownSignal,
+    ) {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let (accept_stop, accept_shutdown) = watch::channel(false);
+        let (force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let barrier = gate.test_admission_barrier();
+        let mux_task = tokio::spawn(serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
+            public_listener,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: None,
+                device_v5: None,
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate,
+        ));
+
+        let mut client = TcpStream::connect(public_address).await.unwrap();
+        client.write_all(&connect_packet()).await.unwrap();
+        barrier.wait_until_reached().await;
+        signal_shutdown(signal, &accept_stop, &force_stop);
+        barrier.release();
+
+        assert!(
+            timeout(Duration::from_millis(100), backend_listener.accept())
+                .await
+                .is_err(),
+            "an unowned-gate plaintext mux proxied after shutdown won admission"
+        );
+        drop(client);
+        assert!(
+            timeout(Duration::from_secs(1), mux_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    async fn assert_tls_unowned_gate_rejects_shutdown_before_admission(signal: ShutdownSignal) {
+        tokio_rustls::rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let acceptor =
+            load_tls_acceptor(&fixtures.join("server.crt"), &fixtures.join("server.key")).unwrap();
+        let (accept_stop, accept_shutdown) = watch::channel(false);
+        let (force_stop, force_shutdown) = watch::channel(false);
+        let gate = PublicMuxAcceptanceGate::default();
+        let barrier = gate.test_admission_barrier();
+        let mux_task = tokio::spawn(serve_tls_mux_with_shutdowns_and_acceptance_gate(
+            public_listener,
+            acceptor,
+            ProtocolBackends {
+                v311: backend_address,
+                v5: backend_address,
+                device_v311: None,
+                device_v5: None,
+            },
+            MuxSettings::default(),
+            accept_shutdown,
+            force_shutdown,
+            gate,
+        ));
+
+        let client = TcpStream::connect(public_address).await.unwrap();
+        barrier.wait_until_reached().await;
+        signal_shutdown(signal, &accept_stop, &force_stop);
+        barrier.release();
+        if let Ok(Ok(mut client)) = timeout(
+            Duration::from_secs(1),
+            tls_connector().connect(ServerName::try_from("localhost").unwrap(), client),
+        )
+        .await
+        {
+            client.write_all(&connect_packet()).await.unwrap();
+        }
+
+        assert!(
+            timeout(Duration::from_millis(100), backend_listener.accept())
+                .await
+                .is_err(),
+            "an unowned-gate TLS mux proxied after shutdown won admission"
+        );
+        assert!(
+            timeout(Duration::from_secs(1), mux_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_gate_rejects_plaintext_proxy_when_accept_shutdown_precedes_admission() {
+        assert_plaintext_unowned_gate_rejects_shutdown_before_admission(ShutdownSignal::Accept)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unowned_gate_rejects_plaintext_proxy_when_force_shutdown_precedes_admission() {
+        assert_plaintext_unowned_gate_rejects_shutdown_before_admission(ShutdownSignal::Force)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unowned_gate_rejects_tls_proxy_when_accept_shutdown_precedes_admission() {
+        assert_tls_unowned_gate_rejects_shutdown_before_admission(ShutdownSignal::Accept).await;
+    }
+
+    #[tokio::test]
+    async fn unowned_gate_rejects_tls_proxy_when_force_shutdown_precedes_admission() {
+        assert_tls_unowned_gate_rejects_shutdown_before_admission(ShutdownSignal::Force).await;
     }
 
     #[tokio::test]
@@ -841,7 +1027,7 @@ mod mux_shutdown_tests {
             public_accept_stop: accept_stop,
             public_workers: Mutex::new(Vec::new()),
         };
-        let barrier = gate.test_proxy_spawn_barrier();
+        let barrier = gate.test_admission_barrier();
         let mux_task = tokio::spawn(serve_plaintext_mux_with_shutdowns_and_acceptance_gate(
             public_listener,
             ProtocolBackends {
@@ -915,8 +1101,8 @@ async fn serve_plaintext_mux_with_shutdowns_and_mode(
             result = listener.accept() => {
                 let (stream, _) = result?;
                 #[cfg(test)]
-                accept_gate.wait_before_proxy_spawn().await;
-                if !accept_gate.try_admit() {
+                accept_gate.wait_before_admission().await;
+                if !accept_gate.try_admit_with_shutdowns(&mut accept_shutdown, &mut force_shutdown) {
                     continue;
                 }
                 let mut connection_shutdown = force_shutdown.clone();
@@ -1064,8 +1250,8 @@ async fn serve_tls_mux_with_shutdowns_and_mode(
             result = listener.accept() => {
                 let (stream, _) = result?;
                 #[cfg(test)]
-                accept_gate.wait_before_proxy_spawn().await;
-                if !accept_gate.try_admit() {
+                accept_gate.wait_before_admission().await;
+                if !accept_gate.try_admit_with_shutdowns(&mut accept_shutdown, &mut force_shutdown) {
                     continue;
                 }
                 let acceptor = acceptor.clone();
