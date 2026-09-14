@@ -38,10 +38,11 @@ pub struct MonolithRuntime {
     stream: Option<Arc<LocalStream>>,
     mqtt_storage: Option<Arc<SqliteStorage>>,
     cache: Option<Arc<PersistentCache>>,
-    core: Option<CoreRuntime>,
+    core: Option<Arc<CoreRuntime>>,
     mqtt: Option<MqttRuntime>,
     http_cancellation: CancellationToken,
     http_tasks: Vec<JoinHandle<io::Result<()>>>,
+    readiness_monitor: Option<JoinHandle<()>>,
     readiness: Readiness,
     cancellation: CancellationToken,
 }
@@ -98,14 +99,16 @@ impl MonolithRuntime {
             session_router.clone(),
             Arc::clone(&device_authorization),
         ));
-        let core = CoreRuntime::start(default_core_runtime_config(
-            Arc::clone(&platform),
-            Arc::clone(&stream_port),
-            command_transport,
-            cancellation.clone(),
-        ))
-        .await
-        .map_err(StartupError::CoreRuntime)?;
+        let core = Arc::new(
+            CoreRuntime::start(default_core_runtime_config(
+                Arc::clone(&platform),
+                Arc::clone(&stream_port),
+                command_transport,
+                cancellation.clone(),
+            ))
+            .await
+            .map_err(StartupError::CoreRuntime)?,
+        );
         let mut mqtt = match MqttRuntime::start(MqttRuntimeConfig {
             listeners: MqttListenerConfig {
                 plaintext_address: config.mqtt_tcp,
@@ -138,16 +141,14 @@ impl MonolithRuntime {
         let public_listener = match TcpListener::bind(config.public_http).await {
             Ok(listener) => listener,
             Err(error) => {
-                let _ = core.drain(Instant::now() + config.shutdown_deadline).await;
-                let _ = mqtt.drain(Instant::now() + config.shutdown_deadline).await;
+                cleanup_started_components(&core, &mut mqtt, config.shutdown_deadline).await;
                 return Err(StartupError::PublicHttpBind(error));
             }
         };
         let management_listener = match TcpListener::bind(config.management_http).await {
             Ok(listener) => listener,
             Err(error) => {
-                let _ = core.drain(Instant::now() + config.shutdown_deadline).await;
-                let _ = mqtt.drain(Instant::now() + config.shutdown_deadline).await;
+                cleanup_started_components(&core, &mut mqtt, config.shutdown_deadline).await;
                 return Err(StartupError::ManagementHttpBind(error));
             }
         };
@@ -163,6 +164,8 @@ impl MonolithRuntime {
                 http_cancellation.clone(),
             ),
         ];
+        let readiness_monitor =
+            spawn_readiness_monitor(readiness.clone(), cancellation.clone(), Arc::clone(&core));
         readiness.mark_ready();
 
         Ok(Self {
@@ -176,6 +179,7 @@ impl MonolithRuntime {
             mqtt: Some(mqtt),
             http_cancellation,
             http_tasks,
+            readiness_monitor: Some(readiness_monitor),
             readiness,
             cancellation,
         })
@@ -226,6 +230,9 @@ impl MonolithRuntime {
             }
         }
         self.cancellation.cancel();
+        if let Some(monitor) = self.readiness_monitor.take() {
+            let _ = monitor.await;
+        }
         self.cache.take();
         self.mqtt_storage.take();
         self.stream.take();
@@ -319,20 +326,109 @@ fn spawn_health_server(
     })
 }
 
+async fn cleanup_started_components(
+    core: &CoreRuntime,
+    mqtt: &mut MqttRuntime,
+    deadline: Duration,
+) {
+    let deadline = Instant::now() + deadline;
+    let _ = mqtt.stop_accepting().await;
+    let _ = core.drain(deadline).await;
+    let _ = mqtt.drain(deadline).await;
+}
+
+fn spawn_readiness_monitor(
+    readiness: Readiness,
+    cancellation: CancellationToken,
+    core: Arc<CoreRuntime>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(25));
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    readiness.mark_not_ready();
+                    return;
+                }
+                _ = interval.tick() => {
+                    if !core.ready() {
+                        readiness.mark_not_ready();
+                        cancellation.cancel();
+                        return;
+                    }
+                }
+            }
+        }
+    })
+}
+
 async fn join_http_tasks(
     tasks: &mut Vec<JoinHandle<io::Result<()>>>,
     deadline: Instant,
 ) -> Result<(), ShutdownError> {
+    let mut first_error = None;
     while let Some(mut task) = tasks.pop() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, &mut task).await {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => return Err(ShutdownError::HttpServer(error.to_string())),
-            Ok(Err(error)) => return Err(ShutdownError::HttpServer(error.to_string())),
-            Err(_) => return Err(ShutdownError::DeadlineElapsed),
+            Ok(Ok(Err(error))) => {
+                first_error.get_or_insert(ShutdownError::HttpServer(error.to_string()));
+            }
+            Ok(Err(error)) => {
+                first_error.get_or_insert(ShutdownError::HttpServer(error.to_string()));
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                first_error.get_or_insert(ShutdownError::DeadlineElapsed);
+            }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use std::{future::pending, io, time::Instant};
+
+    use tokio::{
+        sync::oneshot,
+        task::JoinHandle,
+        time::{Duration, timeout},
+    };
+
+    use super::{ShutdownError, join_http_tasks};
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_http_shutdown_aborts_and_joins_every_server_task() {
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let task: JoinHandle<io::Result<()>> = tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped_tx));
+            pending::<io::Result<()>>().await
+        });
+        let mut tasks = vec![task];
+
+        let error = join_http_tasks(&mut tasks, Instant::now())
+            .await
+            .expect_err("an expired deadline must be reported");
+
+        assert!(matches!(error, ShutdownError::DeadlineElapsed));
+        timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("HTTP task was detached instead of joined")
+            .expect("HTTP task drop signal was lost");
+        assert!(tasks.is_empty());
+    }
 }
 
 #[derive(Clone)]

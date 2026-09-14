@@ -76,7 +76,36 @@ async fn alpha_runtime_binds_health_and_mqtt_after_recovery() {
     }
 }
 
+#[tokio::test]
+async fn alpha_runtime_marks_not_ready_after_parent_cancellation() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+    runtime.cancellation_token().cancel();
+
+    timeout(Duration::from_secs(1), async {
+        while runtime.readiness().is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime readiness remained healthy after parent cancellation");
+    assert_health_status(fixture.config.public_http, 503).await;
+
+    let _ = timeout(
+        Duration::from_secs(3),
+        runtime.shutdown(Instant::now() + Duration::from_secs(2)),
+    )
+    .await
+    .expect("runtime shutdown hung after parent cancellation");
+}
+
 async fn assert_health(address: SocketAddr) {
+    assert_health_status(address, 200).await;
+}
+
+async fn assert_health_status(address: SocketAddr, status: u16) {
     let mut stream = TcpStream::connect(address).await.unwrap();
     stream
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -88,7 +117,7 @@ async fn assert_health(address: SocketAddr) {
         .unwrap()
         .unwrap();
     assert!(
-        response.starts_with(b"HTTP/1.1 200"),
+        response.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
         "unexpected health response: {}",
         String::from_utf8_lossy(&response)
     );

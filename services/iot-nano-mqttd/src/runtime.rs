@@ -73,6 +73,7 @@ pub struct MqttRuntime {
 #[derive(Clone)]
 struct RuntimeShutdownControl {
     broker: InProcessBrokerControl,
+    failure_cancellation: CancellationToken,
     device_admission: DeviceAdmissionControl,
     force_cancellation: CancellationToken,
     public_accept_gate: PublicMuxAcceptanceGate,
@@ -438,6 +439,7 @@ impl MqttRuntime {
         let accepting = Arc::new(AtomicBool::new(true));
         let shutdown = RuntimeShutdownControl {
             broker: broker_control,
+            failure_cancellation: config.cancellation.clone(),
             device_admission: device_admission.clone(),
             force_cancellation: force_cancellation.clone(),
             public_accept_gate: public_accept_gate.clone(),
@@ -689,7 +691,10 @@ fn spawn_task_supervisor(
             .run_until_stopped(
                 shutdown.force_cancellation.clone(),
                 Arc::clone(&shutdown.accepting),
-                move || failure_shutdown.force_stop(),
+                move || {
+                    failure_shutdown.force_stop();
+                    failure_shutdown.failure_cancellation.cancel();
+                },
             )
             .await;
         if result.is_err() {

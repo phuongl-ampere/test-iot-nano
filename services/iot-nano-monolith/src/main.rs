@@ -29,9 +29,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let mut runtime = MonolithRuntime::start(configuration.clone()).await?;
+    let cancellation = runtime.cancellation_token();
     tokio::select! {
         result = tokio::signal::ctrl_c() => result?,
         _ = shutdown_signal() => {}
+        _ = cancellation.cancelled() => {}
     }
     runtime
         .shutdown(Instant::now() + configuration.shutdown_deadline)
