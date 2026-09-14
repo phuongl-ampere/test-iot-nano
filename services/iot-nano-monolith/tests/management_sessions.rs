@@ -195,6 +195,73 @@ async fn bootstrap_admin_creates_the_only_initial_user_and_enables_management_lo
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn management_admin_can_register_an_oauth_application() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        PlatformStore::open(&StorageConfiguration {
+            storage: DatabaseStorage::Sqlite,
+            database_url: None,
+            sqlite_path: Some(directory.path().join("platform.sqlite")),
+            sqlite_busy_timeout_ms: 5_000,
+        })
+        .await
+        .unwrap(),
+    );
+    bootstrap_admin(&store, "initial-admin", "BootstrapAdmin@2026")
+        .await
+        .unwrap();
+    let management = ManagementSessionRouter::new(Arc::clone(&store));
+    let router = management
+        .router
+        .layer(Extension(ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        )))));
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"initial-admin","password":"BootstrapAdmin@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/applications")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(
+                    r#"{"app_id":"alpha-client-app","kind":"full_stack","launch_url":"https://client.example.test","client_id":"alpha-client","redirect_uris":["https://client.example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true,"client_secret":"alpha-client-secret"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let applications: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM applications WHERE app_id = 'alpha-client-app'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(applications, 1);
+}
+
 fn invalid_login_request() -> Request<Body> {
     Request::builder()
         .method("POST")

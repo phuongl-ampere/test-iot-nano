@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
+    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -16,10 +17,13 @@ use axum::{
     routing::{get, post},
 };
 use iot_api::{
-    AuthError, OAuthBrowserSessionVerifier, POWER_MONITOR_APP, authenticate_credentials,
+    AuthError, OAuthBrowserSessionVerifier, POWER_MONITOR_APP, Role, authenticate_credentials,
     authenticate_credentials_sqlite, generate_session_id, hash_password, validate_password,
 };
-use iot_storage::{PlatformStore, PlatformStoreError};
+use iot_storage::{
+    ApplicationKind, ApplicationRepository, ClientId, NewApplication, NewOAuthClientSecret,
+    OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -174,6 +178,7 @@ impl ManagementSessionRouter {
             .route("/api/auth/login", post(login))
             .route("/api/auth/logout", post(logout))
             .route("/api/auth/me", get(current_session))
+            .route("/api/management/applications", post(create_application))
             .with_state(state);
         Self {
             router,
@@ -188,7 +193,7 @@ pub struct ManagementSessionVerifier {
 }
 
 impl ManagementSessionVerifier {
-    fn issue(&self, user_id: Uuid) -> String {
+    fn issue(&self, user_id: Uuid, role: Role) -> String {
         let mut sessions = self
             .sessions
             .lock()
@@ -201,6 +206,7 @@ impl ManagementSessionVerifier {
                     session_id.clone(),
                     Session {
                         user_id,
+                        role,
                         expires_at: Instant::now() + SESSION_TTL,
                     },
                 );
@@ -217,6 +223,20 @@ impl ManagementSessionVerifier {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(session_id);
+    }
+
+    fn is_admin(&self, headers: &HeaderMap) -> bool {
+        let Some(session_id) = session_id(headers) else {
+            return false;
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        sessions
+            .get(session_id)
+            .is_some_and(|session| session.role == Role::Admin)
     }
 }
 
@@ -241,6 +261,7 @@ struct ManagementState {
 
 struct Session {
     user_id: Uuid,
+    role: Role,
     expires_at: Instant,
 }
 
@@ -315,6 +336,24 @@ struct SessionResponse {
     user_id: Uuid,
 }
 
+#[derive(Deserialize)]
+struct CreateApplicationRequest {
+    app_id: String,
+    kind: String,
+    launch_url: String,
+    client_id: String,
+    redirect_uris: Vec<String>,
+    allowed_scopes: Vec<String>,
+    enabled: bool,
+    client_secret: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ApplicationResponse {
+    app_id: String,
+    client_id: String,
+}
+
 async fn login(
     State(state): State<ManagementState>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
@@ -355,7 +394,7 @@ async fn login(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .record_success(address);
-    let session_id = state.session_verifier.issue(user.user_id);
+    let session_id = state.session_verifier.issue(user.user_id, user.role);
     Ok((
         session_cookie_headers(&session_id),
         Json(SessionResponse {
@@ -381,6 +420,67 @@ async fn current_session(
         .authenticated_user_id(&headers)
         .ok_or(ManagementSessionError::Unauthorized)?;
     Ok(Json(SessionResponse { user_id }))
+}
+
+async fn create_application(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateApplicationRequest>,
+) -> Result<(StatusCode, Json<ApplicationResponse>), ManagementSessionError> {
+    if !state.session_verifier.is_admin(&headers) {
+        return Err(ManagementSessionError::Forbidden);
+    }
+    let app_id = request
+        .app_id
+        .parse()
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    let kind =
+        ApplicationKind::from_str(&request.kind).map_err(|_| ManagementSessionError::BadRequest)?;
+    let client_id =
+        ClientId::from_str(&request.client_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let redirect_uris = request
+        .redirect_uris
+        .into_iter()
+        .map(|value| RedirectUri::from_str(&value).map_err(|_| ManagementSessionError::BadRequest))
+        .collect::<Result<Vec<_>, _>>()?;
+    if request.launch_url.is_empty() || request.allowed_scopes.is_empty() {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let application = ApplicationRepository::upsert_application(
+        state.store.as_ref(),
+        NewApplication {
+            app_id,
+            kind,
+            launch_url: request.launch_url,
+            client_id,
+            redirect_uris,
+            allowed_scopes: request.allowed_scopes,
+            enabled: request.enabled,
+        },
+    )
+    .await
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    if let Some(client_secret) = request.client_secret {
+        if client_secret.is_empty() {
+            return Err(ManagementSessionError::BadRequest);
+        }
+        OAuthRepository::register_client_secret(
+            state.store.as_ref(),
+            NewOAuthClientSecret {
+                app_id: application.app_id.clone(),
+                client_secret,
+            },
+        )
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(ApplicationResponse {
+            app_id: application.app_id.as_str().to_owned(),
+            client_id: application.client_id.as_str().to_owned(),
+        }),
+    ))
 }
 
 async fn authenticate(
@@ -438,6 +538,8 @@ fn expired_session_cookie_headers() -> HeaderMap {
 enum ManagementSessionError {
     Unauthorized,
     TooManyRequests,
+    Forbidden,
+    BadRequest,
     Unavailable,
 }
 
@@ -446,6 +548,8 @@ impl IntoResponse for ManagementSessionError {
         let (status, code) = match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::BadRequest => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         };
         (status, Json(json!({ "error": code }))).into_response()
