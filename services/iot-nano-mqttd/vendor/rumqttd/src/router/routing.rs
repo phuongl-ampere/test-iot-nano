@@ -59,18 +59,15 @@ pub enum RouterError {
     Storage(#[from] StorageError),
 }
 
-#[derive(Error, Debug)]
-pub enum RouterTaskError {
-    #[error(transparent)]
-    Router(#[from] RouterError),
-    #[error("router task failed: {0}")]
-    Task(#[from] tokio::task::JoinError),
-}
-
-/// Owns a Tokio task that runs a router and aborts it if left unjoined.
+/// A router task body prepared for its parent to spawn and own.
+///
+/// `ManagedRouter` never spawns, aborts, or detaches a Tokio task. Callers obtain
+/// the link before passing [`ManagedRouter::run`] to their `JoinSet` or
+/// `JoinHandle`, which preserves router errors, cancellation, and panics.
 pub struct ManagedRouter {
     link: Sender<(ConnectionId, Event)>,
-    join: Option<tokio::task::JoinHandle<Result<(), RouterError>>>,
+    router: Router,
+    cancellation: CancellationToken,
 }
 
 impl ManagedRouter {
@@ -78,20 +75,8 @@ impl ManagedRouter {
         self.link.clone()
     }
 
-    pub async fn join(mut self) -> Result<(), RouterTaskError> {
-        self.join
-            .take()
-            .expect("managed router join handle must be present")
-            .await??;
-        Ok(())
-    }
-}
-
-impl Drop for ManagedRouter {
-    fn drop(&mut self) {
-        if let Some(join) = &self.join {
-            join.abort();
-        }
+    pub async fn run(self) -> Result<(), RouterError> {
+        self.router.run_managed(self.cancellation).await
     }
 }
 
@@ -303,23 +288,25 @@ impl Router {
         (link, join)
     }
 
-    /// Starts the router on the current Tokio runtime. Cancellation completes
-    /// this managed path successfully; router errors and task panics are
-    /// returned by [`ManagedRouter::join`].
+    /// Prepares the router task for a parent runtime to spawn and own.
+    ///
+    /// The returned link is ready before [`ManagedRouter::run`] is spawned.
+    /// The parent must retain the task's `JoinHandle` or `JoinSet` entry to
+    /// observe router errors, cancellation, and panics.
     #[tracing::instrument(skip_all)]
-    pub fn spawn_managed(self, cancellation: CancellationToken) -> ManagedRouter {
+    pub fn into_managed(self, cancellation: CancellationToken) -> ManagedRouter {
         let link = self.link();
-        let join = tokio::spawn(async move { self.run_managed(cancellation).await });
         ManagedRouter {
             link,
-            join: Some(join),
+            router: self,
+            cancellation,
         }
     }
 
     /// Runs the router on a Tokio worker without blocking it while waiting for
     /// new router events.
     #[tracing::instrument(skip_all)]
-    pub async fn run_managed(mut self, cancellation: CancellationToken) -> Result<(), RouterError> {
+    async fn run_managed(mut self, cancellation: CancellationToken) -> Result<(), RouterError> {
         loop {
             if cancellation.is_cancelled() {
                 return Ok(());
@@ -2358,7 +2345,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::link::local::LinkBuilder;
+    use crate::link::local::{LinkBuilder, LinkRx, LinkTx};
+    use crate::router::Ack;
     use crate::{
         InboundQos2CommitResult, InboundQos2CompletionResult, InboundQos2PrepareResult,
         MemoryStorage, RouterConfig, StoredPublish, StoredSession,
@@ -2374,53 +2362,97 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn managed_router_processes_a_local_link() {
-        let cancellation = CancellationToken::new();
-        let router = Router::new(0, router_config()).unwrap();
-        let managed = router.spawn_managed(cancellation.clone());
-        let link = managed.link();
-
-        let notification = tokio::time::timeout(
+    async fn build_local_link(
+        client_id: &'static str,
+        link: Sender<(ConnectionId, Event)>,
+    ) -> (LinkTx, LinkRx, Notification) {
+        tokio::time::timeout(
             Duration::from_secs(1),
-            tokio::task::spawn_blocking(move || LinkBuilder::new("managed-client", link).build()),
+            tokio::task::spawn_blocking(move || LinkBuilder::new(client_id, link).build()),
         )
         .await
         .expect("managed router must process the local link")
         .expect("link builder must not panic")
         .expect("router must accept the local link")
-        .2;
+    }
 
-        assert!(matches!(notification, Notification::DeviceAck(_)));
-
-        cancellation.cancel();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), managed.join())
-                .await
-                .expect("managed router must stop after cancellation"),
-            Ok(())
-        ));
+    async fn receive_notification(mut receiver: LinkRx) -> (LinkRx, Notification) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(notification) = receiver
+                    .next()
+                    .await
+                    .expect("local link must receive a router notification")
+                {
+                    return (receiver, notification);
+                }
+            }
+        })
+        .await
+        .expect("managed router must notify the local link")
     }
 
     #[tokio::test]
-    async fn managed_router_cancellation_completes_cleanly() {
+    async fn managed_router_parent_task_processes_active_pub_sub() {
         let cancellation = CancellationToken::new();
         let managed = Router::new(0, router_config())
             .unwrap()
-            .spawn_managed(cancellation.clone());
+            .into_managed(cancellation.clone());
+        let link = managed.link();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
+
+        let (mut subscriber_tx, subscriber_rx, notification) =
+            build_local_link("managed-subscriber", link.clone()).await;
+
+        assert!(matches!(notification, Notification::DeviceAck(_)));
+        subscriber_tx.subscribe("managed/events").unwrap();
+        let (subscriber_rx, notification) = receive_notification(subscriber_rx).await;
+        assert!(matches!(
+            notification,
+            Notification::DeviceAck(Ack::SubAck(_))
+        ));
+
+        let (mut publisher_tx, _, _) = build_local_link("managed-publisher", link).await;
+        publisher_tx.publish("managed/events", "payload").unwrap();
+        let (_, notification) = receive_notification(subscriber_rx).await;
+        assert!(matches!(
+            notification,
+            Notification::Forward(Forward { publish, .. }) if publish.payload.as_ref() == b"payload"
+        ));
+
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+                .await
+                .expect("managed router must stop after cancellation"),
+            Some(Ok(Ok(())))
+        ));
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_router_cancellation_completes_in_parent_without_a_detached_task() {
+        let cancellation = CancellationToken::new();
+        let managed = Router::new(0, router_config())
+            .unwrap()
+            .into_managed(cancellation.clone());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
 
         cancellation.cancel();
 
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), managed.join())
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
                 .await
                 .expect("managed router must stop after cancellation"),
-            Ok(())
+            Some(Ok(Ok(())))
         ));
+        assert!(tasks.is_empty());
     }
 
     #[tokio::test]
-    async fn managed_router_propagates_router_failures() {
+    async fn managed_router_parent_task_propagates_storage_failures() {
         let storage = Arc::new(FailingPruneStorage::default());
         let managed = Router::new_with_storage(
             0,
@@ -2429,15 +2461,40 @@ mod tests {
             RetentionPolicy::default(),
         )
         .unwrap()
-        .spawn_managed(CancellationToken::new());
+        .into_managed(CancellationToken::new());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
 
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), managed.join())
+            tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
                 .await
                 .expect("managed router must report its storage failure"),
-            Err(RouterTaskError::Router(RouterError::Storage(error)))
+            Some(Ok(Err(RouterError::Storage(error))))
                 if error.message == "injected prune failure"
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_router_parent_task_propagates_router_panics() {
+        let storage = Arc::new(FailingPruneStorage::panicking());
+        let managed = Router::new_with_storage(
+            0,
+            router_config(),
+            Some(storage),
+            RetentionPolicy::default(),
+        )
+        .unwrap()
+        .into_managed(CancellationToken::new());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(managed.run());
+
+        let join_error = tokio::time::timeout(Duration::from_secs(1), tasks.join_next())
+            .await
+            .expect("managed router panic must reach its parent")
+            .expect("managed router task must complete")
+            .expect_err("router panic must be surfaced as a join error");
+
+        assert!(join_error.is_panic());
     }
 
     #[test]
@@ -2449,10 +2506,36 @@ mod tests {
         assert!(matches!(join.join(), Ok(Err(RouterError::Shutdown))));
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct FailingPruneStorage {
         inner: MemoryStorage,
         prune_calls: AtomicUsize,
+        failure: PruneFailure,
+    }
+
+    #[derive(Debug)]
+    enum PruneFailure {
+        Error,
+        Panic,
+    }
+
+    impl Default for FailingPruneStorage {
+        fn default() -> Self {
+            Self {
+                inner: MemoryStorage::default(),
+                prune_calls: AtomicUsize::default(),
+                failure: PruneFailure::Error,
+            }
+        }
+    }
+
+    impl FailingPruneStorage {
+        fn panicking() -> Self {
+            Self {
+                failure: PruneFailure::Panic,
+                ..Self::default()
+            }
+        }
     }
 
     impl BrokerStorage for FailingPruneStorage {
@@ -2556,7 +2639,10 @@ mod tests {
             if self.prune_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.inner.prune(now_ms, policy)
             } else {
-                Err(StorageError::new("injected prune failure"))
+                match self.failure {
+                    PruneFailure::Error => Err(StorageError::new("injected prune failure")),
+                    PruneFailure::Panic => panic!("injected router storage panic"),
+                }
             }
         }
     }

@@ -23,7 +23,7 @@ pub use link::local;
 pub use link::meters;
 pub use router::{
     Alert, ConnectionEvents, Forward, IncomingMeter, ManagedRouter, Meter, Notification,
-    OutgoingMeter, Router, RouterError, RouterTaskError, Tracker,
+    OutgoingMeter, Router, RouterError, Tracker,
 };
 use segments::Storage;
 pub use server::{Broker, BrokerHandle, LinkType, Server};
