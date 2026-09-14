@@ -92,6 +92,14 @@ pub enum Error {
         provided: &'static str,
     },
     #[error(
+        "prebound {protocol} listener source {actual:?} does not match configured server {expected:?}"
+    )]
+    PreboundListenerName {
+        protocol: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error(
         "prebound listener {listener:?} has address {actual}, but configuration requires {expected}"
     )]
     PreboundListenerAddress {
@@ -1228,10 +1236,25 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
         self,
         listener: StdTcpListener,
         source: PreboundListenerSource,
+        expected_protocol: &'static str,
         link_type: LinkType,
         graceful_shutdown: watch::Receiver<bool>,
         force_cancellation: CancellationToken,
     ) -> Result<ManagedServer<P>, Error> {
+        if source.protocol != expected_protocol {
+            return Err(Error::PreboundListenerProtocol {
+                name: source.name,
+                expected: expected_protocol,
+                provided: source.protocol,
+            });
+        }
+        if source.name != self.config.name {
+            return Err(Error::PreboundListenerName {
+                protocol: expected_protocol,
+                expected: self.config.name.clone(),
+                actual: source.name,
+            });
+        }
         let actual = listener
             .local_addr()
             .map_err(|io_error| Error::PreboundListenerIo {
@@ -2389,6 +2412,7 @@ mod tests {
             .into_managed_prebound(
                 v4_listener,
                 v4_prebound_source(),
+                "v4",
                 LinkType::Remote,
                 graceful_receiver,
                 force,
@@ -2421,6 +2445,7 @@ mod tests {
             server.into_managed_prebound(
                 mismatched,
                 v4_prebound_source(),
+                "v4",
                 LinkType::Remote,
                 graceful_receiver,
                 CancellationToken::new(),
@@ -2432,6 +2457,56 @@ mod tests {
             }) if listener == v4_prebound_source()
                 && expected == settings.listen
                 && error_actual == actual
+        ));
+    }
+
+    #[test]
+    fn managed_prebound_server_rejects_mismatched_source_metadata_before_parent_run() {
+        let (config, v4_listener, _v5_listener) = prebound_test_config();
+        let settings = config.v4.as_ref().unwrap()["v311"].clone();
+        let (_graceful_shutdown, graceful_receiver) = watch::channel(false);
+        let (router_tx, _router_rx) = flume::bounded(1);
+        let server = Server::new(settings.clone(), router_tx, V4);
+
+        assert!(matches!(
+            server.into_managed_prebound(
+                v4_listener.try_clone().unwrap(),
+                PreboundListenerSource {
+                    protocol: "v5",
+                    name: "v311".to_owned(),
+                },
+                "v4",
+                LinkType::Remote,
+                graceful_receiver,
+                CancellationToken::new(),
+            ),
+            Err(Error::PreboundListenerProtocol {
+                name,
+                expected: "v4",
+                provided: "v5",
+            }) if name == "v311"
+        ));
+
+        let (_graceful_shutdown, graceful_receiver) = watch::channel(false);
+        let (router_tx, _router_rx) = flume::bounded(1);
+        let server = Server::new(settings, router_tx, V4);
+        assert!(matches!(
+            server.into_managed_prebound(
+                v4_listener,
+                PreboundListenerSource {
+                    protocol: "v4",
+                    name: "wrong-name".to_owned(),
+                },
+                "v4",
+                LinkType::Remote,
+                graceful_receiver,
+                CancellationToken::new(),
+            ),
+            Err(Error::PreboundListenerName {
+                protocol: "v4",
+                expected,
+                actual,
+            }) if expected == "v311" && actual == "wrong-name"
         ));
     }
 
@@ -2455,6 +2530,7 @@ mod tests {
             .into_managed_prebound(
                 v4_listener,
                 v4_prebound_source(),
+                "v4",
                 LinkType::Remote,
                 graceful_receiver,
                 force,
@@ -2506,6 +2582,7 @@ mod tests {
             .into_managed_prebound(
                 v4_listener,
                 v4_prebound_source(),
+                "v4",
                 LinkType::Remote,
                 graceful_receiver,
                 force,
@@ -2574,6 +2651,13 @@ mod tests {
             protocol: "v4",
             name: "v311".to_owned(),
         }
+    }
+
+    #[test]
+    fn managed_server_api_reexports_prebound_listener_source() {
+        let source: crate::PreboundListenerSource = v4_prebound_source();
+        assert_eq!(source.protocol, "v4");
+        assert_eq!(source.name, "v311");
     }
 
     fn shutdown_rejects_prebound_connection_accepted_before_admission(protocol: &str) {

@@ -26,7 +26,7 @@ pub use router::{
     Notification, OutgoingMeter, Router, RouterError, Tracker,
 };
 use segments::Storage;
-pub use server::{Broker, BrokerHandle, LinkType, ManagedServer, Server};
+pub use server::{Broker, BrokerHandle, LinkType, ManagedServer, PreboundListenerSource, Server};
 
 pub use self::router::shared_subs::Strategy;
 pub use self::storage::{
