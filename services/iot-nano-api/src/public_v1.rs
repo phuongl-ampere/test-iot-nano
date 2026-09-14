@@ -63,7 +63,7 @@ where
             "/api/v1/alerts/{alert_id}/acknowledge",
             axum::routing::post(acknowledge_alert),
         )
-        .route("/api/v1/devices", axum::routing::post(create_device))
+        .route("/api/v1/devices", get(list_devices).post(create_device))
         .route(
             "/api/v1/devices/{device_id}",
             get(get_device).patch(update_device).delete(delete_device),
@@ -457,6 +457,51 @@ async fn create_device(
         axum::http::StatusCode::CREATED,
         Json(device_response(device)),
     ))
+}
+
+async fn list_devices(
+    Extension(context): Extension<PublicApiContext>,
+    headers: HeaderMap,
+    Query(query): Query<PublicPageQuery>,
+) -> Result<Json<PublicPage<DeviceResponse>>, PublicApiError> {
+    let (store, principal) = authenticate(&context, &headers, "devices:read").await?;
+    let limit = limit(query.limit)?;
+    let after = decode_cursor(
+        &context.token_vault,
+        &principal,
+        "device",
+        query.after.as_deref(),
+    )?;
+    let mut devices = PublicApiRepository::list_public_devices(
+        store.as_ref(),
+        &principal,
+        after.as_deref(),
+        u32::try_from(limit.saturating_add(1)).map_err(|_| PublicApiError::BadRequest)?,
+    )
+    .await
+    .map_err(|_| PublicApiError::Unavailable)?;
+    let has_more = devices.len() > limit;
+    devices.truncate(limit);
+    let next_cursor = if has_more {
+        devices
+            .last()
+            .map(|device| {
+                encode_cursor(
+                    &context.token_vault,
+                    &principal,
+                    "device",
+                    device.device_id.clone(),
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Json(PublicPage {
+        items: devices.into_iter().map(device_response).collect(),
+        next_cursor,
+        has_more,
+    }))
 }
 
 async fn get_device(

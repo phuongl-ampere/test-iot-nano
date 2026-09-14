@@ -112,6 +112,7 @@ async fn alpha_runtime_mounts_generic_public_api_and_requires_bearer_token() {
         .unwrap();
 
     assert_http_status(fixture.config.public_http, "/api/v1/assets", 401).await;
+    assert_http_status(fixture.config.public_http, "/api/v1/devices", 401).await;
     assert_http_status(
         fixture.config.public_http,
         "/api/v1/devices/missing-device",

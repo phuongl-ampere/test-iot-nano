@@ -383,6 +383,23 @@ async fn public_device_mutations_create_update_and_soft_delete_through_generic_r
     assert_eq!(created["display_name"], "Created");
     assert_eq!(created["metadata"]["room"], "lab");
 
+    let read_token = oauth_bearer_token(&app, "devices:read").await;
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header(AUTHORIZATION, format!("Bearer {read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(listed["items"][0]["device_id"], "public-mutation-device");
+
     let update = app
         .clone()
         .oneshot(
@@ -428,7 +445,6 @@ async fn public_device_mutations_create_update_and_soft_delete_through_generic_r
         .is_some()
     );
 
-    let read_token = oauth_bearer_token(&app, "devices:read").await;
     let hidden = app
         .clone()
         .oneshot(

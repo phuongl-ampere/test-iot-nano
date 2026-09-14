@@ -773,8 +773,6 @@ fn public_router(state: ApiState) -> Router {
         .route("/healthz", get(healthz))
         .route("/oauth/authorize", get(crate::oauth::authorize))
         .route("/oauth/token", post(crate::oauth::token))
-        .route("/api/v1/devices", get(public_list_devices))
-        .route("/api/v1/devices/{device_id}", get(public_get_device))
         .merge(crate::public_v1::router(state.public_api_context()))
         .with_state(state)
 }
@@ -1223,8 +1221,6 @@ fn sqlite_public_router(state: SqliteApiState) -> Router {
         .route("/healthz", get(healthz))
         .route("/oauth/authorize", get(crate::oauth::sqlite_authorize))
         .route("/oauth/token", post(crate::oauth::sqlite_token))
-        .route("/api/v1/devices", get(sqlite_public_list_devices))
-        .route("/api/v1/devices/{device_id}", get(sqlite_public_get_device))
         .merge(crate::public_v1::router(state.public_api_context()))
         .with_state(state)
 }

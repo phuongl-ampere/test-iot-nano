@@ -116,6 +116,12 @@ pub trait PublicApiRepository: Send + Sync {
         &'a self,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>;
+    fn list_public_devices<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        after: Option<&'a str>,
+        limit: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PublicDevice>, PlatformStoreError>> + Send + 'a>>;
     fn create_public_device<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
@@ -265,6 +271,16 @@ impl PublicApiRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move { get_public_device(self, device_id).await })
+    }
+
+    fn list_public_devices<'a>(
+        &'a self,
+        principal: &'a PublicPrincipal,
+        after: Option<&'a str>,
+        limit: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PublicDevice>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { list_public_devices(self, principal, after, limit).await })
     }
 
     fn create_public_device<'a>(
@@ -558,6 +574,85 @@ async fn get_public_device(
         .await?
         .map(timescale_device_record)
         .transpose(),
+    }
+}
+
+async fn list_public_devices(
+    store: &PlatformStore,
+    principal: &PublicPrincipal,
+    after: Option<&str>,
+    limit: u32,
+) -> Result<Vec<PublicDevice>, PlatformStoreError> {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let user_id = principal.user_id.map(|id| id.to_string());
+            sqlx::query(
+                "SELECT d.device_id, d.display_name, d.metadata, d.asset_id, d.device_profile_id
+                 FROM devices d
+                 WHERE d.deleted_at IS NULL
+                   AND (?1 IS NULL OR d.device_id > ?1)
+                   AND (
+                     ?2
+                     OR d.owner_user_id = ?3
+                     OR EXISTS (
+                       SELECT 1 FROM resource_shares s
+                       WHERE s.resource_type = 'device' AND s.resource_id = d.device_id
+                         AND s.target_user_id = ?3 AND s.state = 'active'
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM resource_grants g
+                       WHERE g.resource_type = 'device' AND g.resource_id = d.device_id
+                         AND ((g.grantee_type = 'user' AND g.grantee_id = ?3)
+                              OR (g.grantee_type = 'application' AND g.grantee_id = ?4))
+                     )
+                   )
+                 ORDER BY d.device_id
+                 LIMIT ?5",
+            )
+            .bind(after)
+            .bind(principal.account_class == AccountClass::Admin)
+            .bind(user_id)
+            .bind(&principal.app_id)
+            .bind(i64::from(limit))
+            .fetch_all(store.pool())
+            .await?
+            .into_iter()
+            .map(sqlite_device_record)
+            .collect()
+        }
+        PlatformStore::Timescale(pool) => sqlx::query(
+            "SELECT d.device_id, d.display_name, d.metadata, d.asset_id, d.device_profile_id
+                 FROM devices d
+                 WHERE d.deleted_at IS NULL
+                   AND ($1::text IS NULL OR d.device_id > $1)
+                   AND (
+                     $2
+                     OR d.owner_user_id = $3
+                     OR EXISTS (
+                       SELECT 1 FROM resource_shares s
+                       WHERE s.resource_type = 'device' AND s.resource_id = d.device_id
+                         AND s.target_user_id = $3 AND s.state = 'active'
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM resource_grants g
+                       WHERE g.resource_type = 'device' AND g.resource_id = d.device_id
+                         AND ((g.grantee_type = 'user' AND g.grantee_id = $3::text)
+                              OR (g.grantee_type = 'application' AND g.grantee_id = $4))
+                     )
+                   )
+                 ORDER BY d.device_id
+                 LIMIT $5",
+        )
+        .bind(after)
+        .bind(principal.account_class == AccountClass::Admin)
+        .bind(principal.user_id)
+        .bind(&principal.app_id)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(timescale_device_record)
+        .collect(),
     }
 }
 
