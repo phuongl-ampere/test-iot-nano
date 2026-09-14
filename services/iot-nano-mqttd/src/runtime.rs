@@ -60,13 +60,106 @@ pub struct MqttRuntime {
     broker: Arc<Mutex<Option<BrokerLifecycleHandle>>>,
     device_workers: Vec<JoinHandle<()>>,
     session_router: RpcSessionRouter,
-    accept_cancellation: CancellationToken,
+    device_admission: DeviceAdmissionControl,
     force_cancellation: CancellationToken,
     parent_cancellation_watcher: Option<JoinHandle<()>>,
     accepting: Arc<AtomicBool>,
     drain_started: watch::Sender<bool>,
     public_connections: Arc<AtomicUsize>,
     _cache: Arc<dyn CachePort>,
+}
+
+#[derive(Clone)]
+struct DeviceAdmissionControl {
+    accepting: Arc<Mutex<bool>>,
+    accept_cancellation: CancellationToken,
+    #[cfg(test)]
+    admission_barrier: Arc<Mutex<Option<DeviceAdmissionBarrier>>>,
+}
+
+impl DeviceAdmissionControl {
+    fn new() -> Self {
+        Self {
+            accepting: Arc::new(Mutex::new(true)),
+            accept_cancellation: CancellationToken::new(),
+            #[cfg(test)]
+            admission_barrier: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Closes private admission before waking listener workers so the mutex is
+    /// the linearization point for sockets accepted during shutdown.
+    fn stop(&self) {
+        *self
+            .accepting
+            .lock()
+            .expect("device admission gate is not poisoned") = false;
+        self.accept_cancellation.cancel();
+    }
+
+    fn try_admit(&self) -> bool {
+        *self
+            .accepting
+            .lock()
+            .expect("device admission gate is not poisoned")
+    }
+
+    fn accept_cancellation(&self) -> CancellationToken {
+        self.accept_cancellation.clone()
+    }
+
+    #[cfg(test)]
+    fn is_accepting(&self) -> bool {
+        *self
+            .accepting
+            .lock()
+            .expect("device admission gate is not poisoned")
+    }
+
+    #[cfg(test)]
+    fn test_admission_barrier(&self) -> DeviceAdmissionBarrier {
+        let barrier = DeviceAdmissionBarrier::default();
+        *self
+            .admission_barrier
+            .lock()
+            .expect("device admission test barrier is not poisoned") = Some(barrier.clone());
+        barrier
+    }
+
+    #[cfg(test)]
+    async fn wait_before_admission(&self) {
+        let barrier = self
+            .admission_barrier
+            .lock()
+            .expect("device admission test barrier is not poisoned")
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.reached.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), barrier.proceed.notified())
+                .await
+                .expect("device admission test barrier was not released within one second");
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct DeviceAdmissionBarrier {
+    reached: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl DeviceAdmissionBarrier {
+    async fn wait_until_reached(&self, description: &str) {
+        tokio::time::timeout(Duration::from_secs(1), self.reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{description} was not reached within one second"));
+    }
+
+    fn release(&self) {
+        self.proceed.notify_one();
+    }
 }
 
 impl MqttRuntime {
@@ -131,8 +224,8 @@ impl MqttRuntime {
         .await
         .map_err(MqttRuntimeStartError::Broker)?;
 
-        let force_cancellation = config.cancellation.child_token();
-        let accept_cancellation = CancellationToken::new();
+        let force_cancellation = CancellationToken::new();
+        let device_admission = DeviceAdmissionControl::new();
         let public_connections = Arc::new(AtomicUsize::new(0));
         let authorization: Arc<dyn DeviceAuthorizationPort> = Arc::new(
             CachedDeviceAuthorization::new(config.authorization, Arc::clone(&config.cache)),
@@ -148,14 +241,14 @@ impl MqttRuntime {
                 device_v311_listener,
                 transport.clone(),
                 false,
-                accept_cancellation.clone(),
+                device_admission.clone(),
                 force_cancellation.clone(),
             )),
             tokio::spawn(serve_device_backend(
                 device_v5_listener,
                 transport,
                 true,
-                accept_cancellation.clone(),
+                device_admission.clone(),
                 force_cancellation.clone(),
             )),
         ];
@@ -205,7 +298,7 @@ impl MqttRuntime {
         let (drain_started, _) = watch::channel(false);
         let parent_cancellation_watcher = spawn_parent_cancellation_watcher(
             config.cancellation,
-            accept_cancellation.clone(),
+            device_admission.clone(),
             force_cancellation.clone(),
             Arc::clone(&broker),
             Arc::clone(&accepting),
@@ -215,7 +308,7 @@ impl MqttRuntime {
             broker,
             device_workers,
             session_router: config.session_router,
-            accept_cancellation,
+            device_admission,
             force_cancellation,
             parent_cancellation_watcher: Some(parent_cancellation_watcher),
             accepting,
@@ -245,7 +338,6 @@ impl MqttRuntime {
 
     pub async fn stop_accepting(&mut self) -> Result<(), MqttRuntimeError> {
         if self.accepting.swap(false, Ordering::AcqRel) {
-            self.accept_cancellation.cancel();
             let broker = self
                 .broker
                 .lock()
@@ -253,6 +345,7 @@ impl MqttRuntime {
             if let Some(broker) = broker.as_ref() {
                 broker.stop_public_accepting();
             }
+            self.device_admission.stop();
         }
         Ok(())
     }
@@ -372,7 +465,7 @@ impl MqttRuntime {
 
 fn spawn_parent_cancellation_watcher(
     parent_cancellation: CancellationToken,
-    accept_cancellation: CancellationToken,
+    device_admission: DeviceAdmissionControl,
     force_cancellation: CancellationToken,
     broker: Arc<Mutex<Option<BrokerLifecycleHandle>>>,
     accepting: Arc<AtomicBool>,
@@ -380,7 +473,14 @@ fn spawn_parent_cancellation_watcher(
     tokio::spawn(async move {
         parent_cancellation.cancelled().await;
         accepting.store(false, Ordering::Release);
-        accept_cancellation.cancel();
+        let broker_handle = broker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(broker) = broker_handle.as_ref() {
+            broker.stop_public_accepting();
+        }
+        drop(broker_handle);
+        device_admission.stop();
         force_cancellation.cancel();
         let broker = broker
             .lock()
@@ -396,7 +496,7 @@ impl Drop for MqttRuntime {
         if let Some(watcher) = self.parent_cancellation_watcher.take() {
             watcher.abort();
         }
-        self.accept_cancellation.cancel();
+        self.device_admission.stop();
         self.force_cancellation.cancel();
         for worker in &self.device_workers {
             worker.abort();
@@ -581,15 +681,21 @@ async fn serve_device_backend(
     listener: TcpListener,
     transport: MqttdDeviceTransport,
     mqtt5: bool,
-    accept_cancellation: CancellationToken,
+    device_admission: DeviceAdmissionControl,
     force_cancellation: CancellationToken,
 ) {
+    let accept_cancellation = device_admission.accept_cancellation();
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             _ = accept_cancellation.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    #[cfg(test)]
+                    device_admission.wait_before_admission().await;
+                    if !device_admission.try_admit() {
+                        continue;
+                    }
                     let transport = transport.clone();
                     let force_cancellation = force_cancellation.clone();
                     connections.spawn(async move {
@@ -641,5 +747,233 @@ where
 fn join_public_workers(workers: Vec<std::thread::JoinHandle<()>>) {
     for worker in workers {
         let _ = worker.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        time::timeout,
+    };
+
+    use super::{
+        DeviceAdmissionControl, MqttdDeviceTransport, TransportAuthRequest, serve_device_backend,
+        spawn_parent_cancellation_watcher,
+    };
+    use crate::{
+        AuthenticatedDevice, DeviceAuthenticator, TransportError, TransportUplink, UplinkForwarder,
+    };
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    #[derive(Clone)]
+    struct CountingAuthenticator {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DeviceAuthenticator for CountingAuthenticator {
+        fn authenticate(
+            &self,
+            _request: TransportAuthRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<AuthenticatedDevice, TransportError>> + Send + '_>>
+        {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(AuthenticatedDevice {
+                    token_id: Uuid::nil(),
+                    device_id: "meter-a".to_owned(),
+                    is_gateway: false,
+                })
+            })
+        }
+    }
+
+    struct UnusedUplink;
+
+    impl UplinkForwarder for UnusedUplink {
+        fn forward(
+            &self,
+            _token: &str,
+            _message: TransportUplink,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn transport(calls: Arc<AtomicUsize>) -> MqttdDeviceTransport {
+        MqttdDeviceTransport::new(CountingAuthenticator { calls }, UnusedUplink)
+    }
+
+    fn v311_connect() -> Vec<u8> {
+        let client_id = "meter-a";
+        let username = "iotd_device_token";
+        let password = "valid-token";
+        let remaining = 10 + 2 + client_id.len() + 2 + username.len() + 2 + password.len();
+        let mut packet = vec![
+            0x10,
+            remaining as u8,
+            0x00,
+            0x04,
+            b'M',
+            b'Q',
+            b'T',
+            b'T',
+            4,
+            0xc2,
+            0x00,
+            0x3c,
+            0x00,
+            client_id.len() as u8,
+        ];
+        packet.extend_from_slice(client_id.as_bytes());
+        packet.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        packet.extend_from_slice(username.as_bytes());
+        packet.extend_from_slice(&(password.len() as u16).to_be_bytes());
+        packet.extend_from_slice(password.as_bytes());
+        packet
+    }
+
+    async fn wait_for_authentication(calls: &AtomicUsize) {
+        timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("device transport did not authenticate the admitted connection");
+    }
+
+    #[tokio::test]
+    async fn normal_stop_rejects_private_connection_after_accept_before_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = DeviceAdmissionControl::new();
+        let barrier = admission.test_admission_barrier();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let force_cancellation = CancellationToken::new();
+        let worker = tokio::spawn(serve_device_backend(
+            listener,
+            transport(Arc::clone(&calls)),
+            false,
+            admission.clone(),
+            force_cancellation,
+        ));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        barrier
+            .wait_until_reached("private device admission barrier")
+            .await;
+        admission.stop();
+        barrier.release();
+        client.write_all(&v311_connect()).await.unwrap();
+
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("private device worker did not stop after normal admission closure")
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_stop_preserves_admitted_private_transport_until_force() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = DeviceAdmissionControl::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let force_cancellation = CancellationToken::new();
+        let worker = tokio::spawn(serve_device_backend(
+            listener,
+            transport(Arc::clone(&calls)),
+            false,
+            admission.clone(),
+            force_cancellation.clone(),
+        ));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&v311_connect()).await.unwrap();
+        let mut connack = [0_u8; 4];
+        client.read_exact(&mut connack).await.unwrap();
+        assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+        wait_for_authentication(&calls).await;
+
+        admission.stop();
+        let mut byte = [0_u8; 1];
+        assert!(
+            timeout(Duration::from_millis(50), client.read(&mut byte))
+                .await
+                .is_err()
+        );
+
+        force_cancellation.cancel();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("force cancellation did not close the admitted private transport")
+            .unwrap();
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("private device worker did not join after force cancellation")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_closes_private_admission_before_forcing_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let parent_cancellation = CancellationToken::new();
+        let admission = DeviceAdmissionControl::new();
+        let force_cancellation = CancellationToken::new();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let watcher = spawn_parent_cancellation_watcher(
+            parent_cancellation.clone(),
+            admission.clone(),
+            force_cancellation.clone(),
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&accepting),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = tokio::spawn(serve_device_backend(
+            listener,
+            transport(Arc::clone(&calls)),
+            false,
+            admission.clone(),
+            force_cancellation.clone(),
+        ));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&v311_connect()).await.unwrap();
+        let mut connack = [0_u8; 4];
+        client.read_exact(&mut connack).await.unwrap();
+        wait_for_authentication(&calls).await;
+
+        parent_cancellation.cancel();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("parent cancellation did not force the admitted private transport")
+            .unwrap();
+        timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("private device worker did not join after parent cancellation")
+            .unwrap();
+        watcher.await.unwrap();
+
+        assert!(!accepting.load(Ordering::Acquire));
+        assert!(!admission.is_accepting());
+        assert!(admission.accept_cancellation().is_cancelled());
+        assert!(force_cancellation.is_cancelled());
     }
 }
