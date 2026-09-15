@@ -372,6 +372,10 @@ run_standalone_installer() {
 : >"$fake_command_log"
 run_standalone_installer
 
+assert_log_contains "fake-sudo fake-groupadd --system iot" "$fake_command_log"
+assert_log_contains "fake-groupadd --system iot" "$fake_command_log"
+assert_log_contains "fake-sudo fake-useradd --system --gid iot --home-dir $state_path --shell /usr/sbin/nologin iot" "$fake_command_log"
+assert_log_contains "fake-useradd --system --gid iot --home-dir $state_path --shell /usr/sbin/nologin iot" "$fake_command_log"
 if ! cmp -s "$template_path" "$config_path"; then
   printf 'standalone installer did not create config from the template\n' >&2
   exit 1
