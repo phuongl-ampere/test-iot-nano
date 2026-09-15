@@ -397,6 +397,74 @@ async fn sqlite_management_asset_repository_maps_root_name_conflicts_to_domain_e
     ));
 }
 
+#[tokio::test]
+async fn sqlite_management_asset_delete_rejects_child_root_name_collisions_before_mutating() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let existing_root = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Promoted child", None, None),
+    )
+    .await
+    .unwrap();
+    let parent = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Delete conflict parent", None, None),
+    )
+    .await
+    .unwrap();
+    let child = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation(&existing_root.name, None, Some(parent.id)),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, asset_id)
+         VALUES ('delete-conflict-device', 'Delete conflict device', ?)",
+    )
+    .bind(parent.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let error = ManagementAssetRepository::delete_management_asset(&store, parent.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: None,
+        } if name == "Promoted child"
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE id = ?")
+            .bind(parent.id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>("SELECT parent_asset_id FROM assets WHERE id = ?")
+            .bind(child.id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        Some(parent.id.to_string())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT asset_id FROM devices WHERE device_id = 'delete-conflict-device'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        Some(parent.id.to_string())
+    );
+}
+
 struct TimescaleTestLock {
     _connection: PgConnection,
 }
@@ -735,6 +803,75 @@ async fn timescale_management_asset_repository_maps_root_name_conflicts_to_domai
             parent_asset_id: None,
         } if name == "Duplicate Timescale root"
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_management_asset_delete_rejects_child_root_name_collisions_before_mutating() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let existing_root = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Promoted Timescale child", None, None),
+    )
+    .await
+    .unwrap();
+    let parent = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Timescale delete conflict parent", None, None),
+    )
+    .await
+    .unwrap();
+    let child = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation(&existing_root.name, None, Some(parent.id)),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, asset_id)
+         VALUES ('timescale-delete-conflict-device', 'Delete conflict device', $1)",
+    )
+    .bind(parent.id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let error = ManagementAssetRepository::delete_management_asset(&store, parent.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: None,
+        } if name == "Promoted Timescale child"
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets WHERE id = $1")
+            .bind(parent.id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT parent_asset_id FROM assets WHERE id = $1")
+            .bind(child.id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        Some(parent.id)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT asset_id FROM devices WHERE device_id = 'timescale-delete-conflict-device'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        Some(parent.id)
+    );
 }
 
 async fn waiting_asset_update_barrier_count(pool: &PgPool) -> i64 {

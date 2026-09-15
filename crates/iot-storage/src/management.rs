@@ -682,6 +682,14 @@ async fn delete_management_asset(
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
             sqlite_require_management_asset(&mut transaction, asset_id).await?;
+            if let Some(name) =
+                sqlite_promoted_asset_root_name_conflict(&mut transaction, asset_id).await?
+            {
+                return Err(ManagementAssetError::SiblingNameConflict {
+                    name,
+                    parent_asset_id: None,
+                });
+            }
             sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = ?")
                 .bind(asset_id.to_string())
                 .execute(&mut *transaction)
@@ -697,6 +705,14 @@ async fn delete_management_asset(
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
             timescale_require_management_asset(&mut transaction, asset_id).await?;
+            if let Some(name) =
+                timescale_promoted_asset_root_name_conflict(&mut transaction, asset_id).await?
+            {
+                return Err(ManagementAssetError::SiblingNameConflict {
+                    name,
+                    parent_asset_id: None,
+                });
+            }
             sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = $1")
                 .bind(asset_id)
                 .execute(&mut *transaction)
@@ -715,6 +731,49 @@ async fn delete_management_asset(
     } else {
         Ok(())
     }
+}
+
+async fn sqlite_promoted_asset_root_name_conflict(
+    transaction: &mut Transaction<'_, Sqlite>,
+    asset_id: Uuid,
+) -> Result<Option<String>, ManagementAssetError> {
+    sqlx::query_scalar(
+        "SELECT child.name
+         FROM assets AS child
+         JOIN assets AS root
+           ON root.name = child.name
+          AND root.parent_asset_id IS NULL
+          AND root.id <> ?
+         WHERE child.parent_asset_id = ?
+         ORDER BY child.name, child.id
+         LIMIT 1",
+    )
+    .bind(asset_id.to_string())
+    .bind(asset_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(ManagementAssetError::from)
+}
+
+async fn timescale_promoted_asset_root_name_conflict(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+) -> Result<Option<String>, ManagementAssetError> {
+    sqlx::query_scalar(
+        "SELECT child.name
+         FROM assets AS child
+         JOIN assets AS root
+           ON root.name = child.name
+          AND root.parent_asset_id IS NULL
+          AND root.id <> $1
+         WHERE child.parent_asset_id = $1
+         ORDER BY child.name, child.id
+         LIMIT 1",
+    )
+    .bind(asset_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(ManagementAssetError::from)
 }
 
 async fn management_asset(

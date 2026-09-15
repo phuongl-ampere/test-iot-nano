@@ -1,6 +1,6 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::PlatformStore;
-use sqlx::{Connection, Row, SqliteConnection};
+use sqlx::{Connection, PgConnection, Row, SqliteConnection};
 
 #[test]
 fn platform_store_owns_its_postgres_migration_source() {
@@ -174,6 +174,75 @@ async fn sqlite_migration_rejects_duplicate_root_asset_names_without_mutating_da
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM assets
              WHERE parent_asset_id IS NULL AND name = 'Duplicate root'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        2
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_migration_rejects_duplicate_root_asset_names_without_mutating_data() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("CREATE SCHEMA iot_nano")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("SET search_path TO iot_nano, public")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE assets (
+             id UUID PRIMARY KEY,
+             name TEXT NOT NULL,
+             parent_asset_id UUID
+         );
+         INSERT INTO assets (id, name) VALUES
+             ('00000000-0000-0000-0000-000000000001', 'Duplicate Timescale root'),
+             ('00000000-0000-0000-0000-000000000002', 'Duplicate Timescale root');",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    let error = match PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    {
+        Ok(_) => panic!("migration accepted duplicate root asset names"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate root asset name \"Duplicate Timescale root\""),
+        "unexpected migration error: {error}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM assets
+             WHERE parent_asset_id IS NULL AND name = 'Duplicate Timescale root'",
         )
         .fetch_one(&mut connection)
         .await
