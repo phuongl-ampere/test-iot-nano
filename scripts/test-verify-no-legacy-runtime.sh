@@ -29,6 +29,10 @@ expected_files=(
 )
 
 retired_paths=(
+  infra/dev/api.env
+  infra/dev/iot-nano-core.env
+  infra/dev/iot-nano-mqttd.env
+  infra/dev/iot-nano-stream.env
   infra/systemd/iot-nano-api.service
   infra/systemd/iot-nano-core.service
   infra/systemd/iot-nano-mqttd.service
@@ -80,6 +84,11 @@ for retired_path in "${retired_paths[@]}"; do
   assert_failure_contains 'retired legacy deployment asset remains'
   rm "$fixture/$retired_path"
 done
+
+printf '%s\n' 'source "$root/infra/dev/api.env"' \
+  >>"$fixture/scripts/e2e-local.sh"
+assert_failure_contains 'retired four-service development environment reference found'
+populate_fixture
 
 printf '%s\n' 'exec "$root/scripts/install-mqttd-standalone.sh"' \
   >>"$fixture/scripts/e2e-local.sh"

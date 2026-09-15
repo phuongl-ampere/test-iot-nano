@@ -44,6 +44,10 @@ deployment_paths=(
 source_paths=("$root/services/iot-nano-monolith/src")
 
 retired_paths=(
+  "$root/infra/dev/api.env"
+  "$root/infra/dev/iot-nano-core.env"
+  "$root/infra/dev/iot-nano-mqttd.env"
+  "$root/infra/dev/iot-nano-stream.env"
   "$root/infra/systemd/iot-nano-api.service"
   "$root/infra/systemd/iot-nano-core.service"
   "$root/infra/systemd/iot-nano-mqttd.service"
@@ -91,6 +95,12 @@ check_for_matches() {
 check_for_matches \
   'legacy runtime references found in production/deployment paths' \
   "$legacy_deployment_pattern" \
+  "${deployment_paths[@]}"
+
+retired_environment_reference_pattern='infra/dev/(api|iot-nano-core|iot-nano-mqttd|iot-nano-stream)\.env'
+check_for_matches \
+  'retired four-service development environment reference found' \
+  "$retired_environment_reference_pattern" \
   "${deployment_paths[@]}"
 
 check_for_matches \
