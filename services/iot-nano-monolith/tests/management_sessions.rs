@@ -955,19 +955,34 @@ async fn management_mutation_reports_unavailable_when_the_store_closes_after_log
         .to_owned();
     store.sqlite_pool().unwrap().close().await;
 
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/management/devices")
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, cookie)
-                .body(Body::from(r#"{"display_name":"Unavailable"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    for request in [
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/applications")
+            .header(CONTENT_TYPE, "application/json")
+            .header(COOKIE, &cookie)
+            .body(Body::from(
+                r#"{"app_id":"unavailable-app","kind":"frontend","launch_url":"https://example.test","client_id":"unavailable-client","redirect_uris":["https://example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true}"#,
+            ))
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/devices")
+            .header(CONTENT_TYPE, "application/json")
+            .header(COOKIE, &cookie)
+            .body(Body::from(r#"{"display_name":"Unavailable"}"#))
+            .unwrap(),
+        Request::builder()
+            .method("PUT")
+            .uri("/api/management/devices/unavailable-device")
+            .header(CONTENT_TYPE, "application/json")
+            .header(COOKIE, &cookie)
+            .body(Body::from(r#"{"display_name":"Unavailable"}"#))
+            .unwrap(),
+    ] {
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 #[tokio::test]
