@@ -14,7 +14,7 @@ use axum::{
         header::{COOKIE, SET_COOKIE},
     },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use iot_api::{
     AuthError, DeviceTokenResponse, OAuthBrowserSessionVerifier, POWER_MONITOR_APP, Role,
@@ -23,11 +23,13 @@ use iot_api::{
     provision_platform_device_token, validate_password,
 };
 use iot_storage::{
-    ApplicationKind, ApplicationRepository, ClientId, NewApplication, NewOAuthClientSecret,
-    OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri,
+    ApplicationKind, ApplicationRepository, ClientId, ManagementChildStatus,
+    ManagementDevice as StorageManagementDevice, ManagementDeviceError, ManagementDeviceRepository,
+    ManagementDeviceTopology, ManagementGatewayStatus, NewApplication, NewOAuthClientSecret,
+    OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri, UpdateManagementDevice,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -182,7 +184,14 @@ impl ManagementSessionRouter {
             .route("/api/auth/logout", post(logout))
             .route("/api/auth/me", get(current_session))
             .route("/api/management/applications", post(create_application))
-            .route("/api/management/devices", post(provision_device))
+            .route(
+                "/api/management/devices",
+                get(list_management_devices).post(provision_device),
+            )
+            .route(
+                "/api/management/devices/{device_id}",
+                put(update_management_device).delete(delete_management_device),
+            )
             .route(
                 "/api/management/devices/{device_id}/tokens",
                 post(create_device_token),
@@ -368,6 +377,41 @@ struct ProvisionDeviceRequest {
     display_name: String,
 }
 
+#[derive(Deserialize)]
+struct UpdateManagementDeviceRequest {
+    display_name: String,
+    #[serde(default)]
+    asset_id: Option<Uuid>,
+    #[serde(default)]
+    device_profile_id: Option<Uuid>,
+    #[serde(default)]
+    attributes: Option<Value>,
+    #[serde(default)]
+    topology: Option<ManagementTopologyRequest>,
+}
+
+#[derive(Deserialize)]
+struct ManagementTopologyRequest {
+    is_gateway: bool,
+    #[serde(default)]
+    gateway_device_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ManagementDeviceResponse {
+    device_id: String,
+    display_name: Option<String>,
+    asset_id: Option<Uuid>,
+    device_profile_id: Option<Uuid>,
+    attributes: Value,
+    online: bool,
+    last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    is_gateway: bool,
+    gateway_device_id: Option<String>,
+    gateway_status: Option<String>,
+    child_status: Option<String>,
+}
+
 async fn login(
     State(state): State<ManagementState>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
@@ -515,6 +559,110 @@ async fn provision_device(
     Ok((StatusCode::CREATED, Json(token)))
 }
 
+async fn list_management_devices(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementDeviceResponse>>, ManagementSessionError> {
+    if !state.session_verifier.is_admin(&headers) {
+        return Err(ManagementSessionError::Forbidden);
+    }
+    ManagementDeviceRepository::list_management_devices(state.store.as_ref())
+        .await
+        .map(|devices| {
+            Json(
+                devices
+                    .into_iter()
+                    .map(management_device_response)
+                    .collect(),
+            )
+        })
+        .map_err(management_device_error)
+}
+
+async fn update_management_device(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+    Json(request): Json<UpdateManagementDeviceRequest>,
+) -> Result<Json<ManagementDeviceResponse>, ManagementSessionError> {
+    if !state.session_verifier.is_admin(&headers) {
+        return Err(ManagementSessionError::Forbidden);
+    }
+    let device = ManagementDeviceRepository::update_management_device(
+        state.store.as_ref(),
+        &device_id,
+        UpdateManagementDevice {
+            display_name: request.display_name,
+            asset_id: request.asset_id,
+            device_profile_id: request.device_profile_id,
+            attributes: request.attributes,
+            topology: request.topology.map(|topology| ManagementDeviceTopology {
+                is_gateway: topology.is_gateway,
+                gateway_device_id: topology.gateway_device_id,
+            }),
+        },
+    )
+    .await
+    .map_err(management_device_error)?;
+    Ok(Json(management_device_response(device)))
+}
+
+async fn delete_management_device(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    if !state.session_verifier.is_admin(&headers) {
+        return Err(ManagementSessionError::Forbidden);
+    }
+    ManagementDeviceRepository::delete_management_device(state.store.as_ref(), &device_id)
+        .await
+        .map_err(management_device_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn management_device_response(device: StorageManagementDevice) -> ManagementDeviceResponse {
+    ManagementDeviceResponse {
+        device_id: device.device_id,
+        display_name: device.display_name,
+        asset_id: device.asset_id,
+        device_profile_id: device.device_profile_id,
+        attributes: device.attributes,
+        online: device.health.online,
+        last_seen_at: device.health.last_seen_at,
+        is_gateway: device.topology.is_gateway,
+        gateway_device_id: device.topology.gateway_device_id,
+        gateway_status: device.health.gateway_status.map(|status| match status {
+            ManagementGatewayStatus::Online => "online".to_owned(),
+            ManagementGatewayStatus::Offline => "offline".to_owned(),
+        }),
+        child_status: device.health.child_status.map(|status| match status {
+            ManagementChildStatus::Fresh => "fresh".to_owned(),
+            ManagementChildStatus::Stale => "stale".to_owned(),
+            ManagementChildStatus::Unavailable => "unavailable".to_owned(),
+        }),
+    }
+}
+
+fn management_device_error(error: ManagementDeviceError) -> ManagementSessionError {
+    match error {
+        ManagementDeviceError::InvalidDeviceId(_)
+        | ManagementDeviceError::InvalidDisplayName
+        | ManagementDeviceError::AttributesMustBeObject => ManagementSessionError::BadRequest,
+        ManagementDeviceError::DeviceNotFound => ManagementSessionError::NotFound,
+        ManagementDeviceError::GatewayCannotHaveParent
+        | ManagementDeviceError::DeviceCannotBeOwnGateway
+        | ManagementDeviceError::GatewayHasChildren
+        | ManagementDeviceError::GatewayUnavailable
+        | ManagementDeviceError::GatewayIsNotGateway
+        | ManagementDeviceError::AssetUnavailable(_)
+        | ManagementDeviceError::DeviceProfileUnavailable(_) => ManagementSessionError::Conflict,
+        ManagementDeviceError::InvalidStoredAttributes
+        | ManagementDeviceError::InvalidStoredTimestamp
+        | ManagementDeviceError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
 async fn create_device_token(
     State(state): State<ManagementState>,
     headers: HeaderMap,
@@ -586,6 +734,8 @@ enum ManagementSessionError {
     TooManyRequests,
     Forbidden,
     BadRequest,
+    NotFound,
+    Conflict,
     Unavailable,
 }
 
@@ -596,6 +746,8 @@ impl IntoResponse for ManagementSessionError {
             Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Self::BadRequest => (StatusCode::BAD_REQUEST, "invalid_request"),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            Self::Conflict => (StatusCode::CONFLICT, "conflict"),
             Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         };
         (status, Json(json!({ "error": code }))).into_response()

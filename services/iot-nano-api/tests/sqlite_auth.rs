@@ -1780,6 +1780,63 @@ async fn sqlite_token_mutations_revoke_only_the_prior_transport_session() {
 }
 
 #[tokio::test]
+async fn sqlite_device_token_history_never_discloses_raw_tokens() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("rush.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    };
+    let store = SqliteStore::open(&configuration).await.unwrap();
+    bootstrap_users_sqlite(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO devices (device_id, display_name) VALUES ('token-history', 'Device')")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let app = sqlite_router(SqliteApiState::new(store));
+    let session_id = sqlite_session_id(&app, "admin", "NanoAdmin@1234").await;
+
+    let issued = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/devices/token-history/tokens")
+                .header("authorization", format!("Session {session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued: serde_json::Value =
+        serde_json::from_slice(&to_bytes(issued.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let raw_token = issued["token"].as_str().unwrap().to_owned();
+    let token_prefix = issued["token_prefix"].as_str().unwrap().to_owned();
+
+    let history = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/devices/token-history/tokens")
+                .header("authorization", format!("Session {session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.status(), StatusCode::OK);
+    let history: serde_json::Value =
+        serde_json::from_slice(&to_bytes(history.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["token_prefix"], token_prefix);
+    assert!(history[0].get("token").is_none() || history[0]["token"].is_null());
+    assert_ne!(history[0]["token"], raw_token);
+    assert!(history[0]["revoked_at"].is_null());
+}
+
+#[tokio::test]
 async fn sqlite_failed_session_revocation_returns_503_without_restoring_the_token() {
     let directory = tempfile::tempdir().unwrap();
     let configuration = StorageConfiguration {

@@ -319,6 +319,36 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
 }
 
 #[tokio::test]
+async fn sqlite_management_device_health_uses_the_five_minute_online_window() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let recently_seen = (Utc::now() - Duration::minutes(3)).to_rfc3339();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, last_seen_at)
+         VALUES ('management-recent', 'Recently seen', ?)",
+    )
+    .bind(recently_seen)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let device = ManagementDeviceRepository::list_management_devices(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|device| device.device_id == "management-recent")
+        .unwrap();
+    assert!(device.health.online);
+}
+
+#[test]
+fn timescale_management_reference_validation_uses_boolean_exists_queries() {
+    let source = include_str!("../src/management.rs");
+    assert!(source.contains("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1)"));
+    assert!(source.contains("SELECT EXISTS(SELECT 1 FROM device_profiles WHERE id = $1)"));
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_device_repository_matches_sqlite_contract() {
     let (_lock, store) = timescale_store().await;
@@ -343,6 +373,7 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
              ('management-gateway', 'Gateway', TRUE),
              ('management-child', 'Child', FALSE),
              ('management-direct', 'Direct', FALSE),
+             ('management-recent', 'Recently seen', FALSE),
              ('management-deleted', 'Deleted', FALSE)",
     )
     .execute(pool)
@@ -360,7 +391,8 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
         "INSERT INTO device_runtime_state (device_id, last_seen_at, gateway_last_read_at)
          VALUES ('management-gateway', now(), NULL),
                 ('management-child', now(), now()),
-                ('management-direct', now() - interval '10 minutes', NULL)",
+                ('management-direct', now() - interval '10 minutes', NULL),
+                ('management-recent', now() - interval '3 minutes', NULL)",
     )
     .execute(pool)
     .await
@@ -373,7 +405,7 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
     let listed = ManagementDeviceRepository::list_management_devices(&store)
         .await
         .unwrap();
-    assert_eq!(listed.len(), 3);
+    assert_eq!(listed.len(), 4);
     assert_eq!(
         listed
             .iter()
@@ -382,6 +414,14 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
             .health
             .child_status,
         Some(ManagementChildStatus::Fresh)
+    );
+    assert!(
+        listed
+            .iter()
+            .find(|device| device.device_id == "management-recent")
+            .unwrap()
+            .health
+            .online
     );
 
     let updated = ManagementDeviceRepository::update_management_device(

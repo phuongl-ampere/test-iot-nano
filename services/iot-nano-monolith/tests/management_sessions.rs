@@ -13,6 +13,7 @@ use iot_api::{OAuthBrowserSessionVerifier, TokenVault, bootstrap_users_sqlite};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{BootstrapAdminError, ManagementSessionRouter, bootstrap_admin};
 use iot_storage::PlatformStore;
+use serde_json::json;
 use std::net::SocketAddr;
 use tower::ServiceExt;
 
@@ -383,6 +384,202 @@ async fn management_admin_can_rotate_an_existing_device_token() {
             .as_str()
             .is_some_and(|token| token != first_token)
     );
+}
+
+#[tokio::test]
+async fn management_admin_manages_devices_through_the_typed_storage_port() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let gateway = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"display_name":"Gateway"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let gateway: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(gateway.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let gateway_id = gateway["device_id"].as_str().unwrap().to_owned();
+
+    let child = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"display_name":"Child"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let child: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(child.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let child_id = child["device_id"].as_str().unwrap().to_owned();
+
+    let listed = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/devices")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+
+    let gateway_topology = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/devices/{gateway_id}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Gateway",
+                        "topology": { "is_gateway": true },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gateway_topology.status(), StatusCode::OK);
+
+    for request in [
+        json!({
+            "display_name": "Child",
+            "asset_id": uuid::Uuid::now_v7(),
+        }),
+        json!({
+            "display_name": "Child",
+            "device_profile_id": uuid::Uuid::now_v7(),
+        }),
+        json!({
+            "display_name": "Child",
+            "topology": { "is_gateway": false, "gateway_device_id": "missing-gateway" },
+        }),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/management/devices/{child_id}"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(COOKIE, &cookie)
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    let assigned = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/devices/{child_id}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Child",
+                        "topology": { "is_gateway": false, "gateway_device_id": gateway_id.clone() },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assigned.status(), StatusCode::OK);
+
+    let gateway_delete = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/management/devices/{gateway_id}"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gateway_delete.status(), StatusCode::CONFLICT);
+
+    let child_delete = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/management/devices/{child_id}"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(child_delete.status(), StatusCode::NO_CONTENT);
+
+    let gateway_delete = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/management/devices/{gateway_id}"))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gateway_delete.status(), StatusCode::NO_CONTENT);
 }
 
 fn invalid_login_request() -> Request<Body> {

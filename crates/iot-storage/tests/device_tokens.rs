@@ -1,8 +1,8 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken,
-    PlatformStore,
+    DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken, PlatformStore,
 };
+use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
@@ -16,6 +16,46 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     .await
     .unwrap();
     (directory, store)
+}
+
+struct TimescaleTestLock {
+    _connection: PgConnection,
+}
+
+async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:device-token-repository-test'))")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    (
+        TimescaleTestLock {
+            _connection: connection,
+        },
+        store,
+    )
 }
 
 fn token(prefix: &str) -> NewDeviceToken {
@@ -57,7 +97,6 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
     .await
     .unwrap();
     assert_eq!(provisioned.token_prefix, "provisioned-token");
-    assert_eq!(provisioned.token_ciphertext, "provisioned-token-ciphertext");
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT display_name FROM devices WHERE device_id = ?",
@@ -163,4 +202,110 @@ async fn sqlite_device_token_repository_reports_prefix_conflicts_without_revokin
     );
 }
 
-fn _assert_record_is_typed(_: DeviceTokenRecord) {}
+#[tokio::test]
+async fn sqlite_device_token_repository_lists_rotates_and_revokes_opaque_history() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query("INSERT INTO devices (device_id) VALUES ('token-history')")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let first = DeviceTokenRepository::create_device_token(
+        &store,
+        "token-history",
+        token("history-token-one"),
+    )
+    .await
+    .unwrap();
+    let initial_history = DeviceTokenRepository::list_device_tokens(&store, "token-history")
+        .await
+        .unwrap();
+    assert_eq!(initial_history.len(), 1);
+    assert_eq!(initial_history[0].id, first.id);
+    assert_eq!(initial_history[0].token_prefix, "history-token-one");
+    assert!(initial_history[0].revoked_at.is_none());
+    assert_eq!(
+        DeviceTokenRepository::active_device_token(&store, first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .device_id,
+        "token-history"
+    );
+
+    let rotated =
+        DeviceTokenRepository::rotate_device_token(&store, first.id, token("history-token-two"))
+            .await
+            .unwrap();
+    assert_eq!(rotated.token_prefix, "history-token-two");
+    assert!(
+        DeviceTokenRepository::active_device_token(&store, first.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let history = DeviceTokenRepository::list_device_tokens(&store, "token-history")
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].id, rotated.id);
+    assert!(history[0].revoked_at.is_none());
+    assert_eq!(history[1].id, first.id);
+    assert!(history[1].revoked_at.is_some());
+
+    DeviceTokenRepository::revoke_device_token(&store, rotated.id)
+        .await
+        .unwrap();
+    assert!(
+        DeviceTokenRepository::active_device_token(&store, rotated.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    sqlx::query("INSERT INTO devices (device_id) VALUES ('token-history')")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let first = DeviceTokenRepository::create_device_token(
+        &store,
+        "token-history",
+        token("timescale-history-token-one"),
+    )
+    .await
+    .unwrap();
+    let rotated = DeviceTokenRepository::rotate_device_token(
+        &store,
+        first.id,
+        token("timescale-history-token-two"),
+    )
+    .await
+    .unwrap();
+    let history = DeviceTokenRepository::list_device_tokens(&store, "token-history")
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].id, rotated.id);
+    assert!(history[0].revoked_at.is_none());
+    assert_eq!(history[1].id, first.id);
+    assert!(history[1].revoked_at.is_some());
+
+    DeviceTokenRepository::revoke_device_token(&store, rotated.id)
+        .await
+        .unwrap();
+    assert!(
+        DeviceTokenRepository::active_device_token(&store, rotated.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
