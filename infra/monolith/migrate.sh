@@ -7,14 +7,62 @@ if [[ "${IOT_NANO_TIMESCALE_COMPOSE:-0}" == "1" ]]; then
   compose_args+=(--file "$root/infra/compose.timescale.yaml")
 fi
 
-backup_root="${IOT_NANO_MONOLITH_BACKUP_DIR:-$root/backups/monolith}"
-case "$backup_root" in
-  /*) ;;
-  *)
-    printf 'IOT_NANO_MONOLITH_BACKUP_DIR must be an absolute path\n' >&2
-    exit 1
-    ;;
-esac
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+validate_volume_path() {
+  local name="$1"
+  local path="$2"
+  local component
+  local -a components
+
+  [[ "$path" == /* && "$path" != / ]] ||
+    fail "$name must be a non-root absolute path"
+  case "$path" in
+    *:* | *$'\n'* | *$'\r'* | *'//'*) fail "$name contains an unsafe Docker volume path" ;;
+  esac
+  IFS=/ read -r -a components <<< "${path#/}"
+  for component in "${components[@]}"; do
+    [[ "$component" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+      fail "$name contains an unsafe path component"
+  done
+}
+
+ensure_safe_directory_path() {
+  local name="$1"
+  local path="$2"
+  local create_missing="$3"
+  local component
+  local current
+  local -a components
+
+  validate_volume_path "$name" "$path"
+  IFS=/ read -r -a components <<< "${path#/}"
+  current=""
+  for component in "${components[@]}"; do
+    current="$current/$component"
+    if [[ -L "$current" ]]; then
+      fail "$name must not traverse symbolic links"
+    fi
+    if [[ -e "$current" ]]; then
+      [[ -d "$current" ]] || fail "$name contains a non-directory path component"
+    elif [[ "$create_missing" == "1" ]]; then
+      mkdir -m 0700 "$current" ||
+        fail "$name could not create a missing path component"
+    else
+      fail "$name must name an existing directory"
+    fi
+  done
+  [[ -d "$path" && ! -L "$path" && -O "$path" ]] ||
+    fail "$name must name an owner-controlled non-symlink directory"
+  chmod 0700 "$path" || fail "$name must be owner-only"
+}
+
+prepare_backup_root() {
+  ensure_safe_directory_path IOT_NANO_MONOLITH_BACKUP_DIR "$1" 1
+}
 
 verify_archive() {
   local archive="$1"
@@ -47,15 +95,21 @@ verify_restore_point() {
   fi
 }
 
-docker compose "${compose_args[@]}" stop iot-nano-monolith
+if [[ "${IOT_NANO_MONOLITH_TEST_LIB:-0}" == 1 ]]; then
+  return 0
+fi
 
 umask 077
-mkdir -p "$backup_root"
-chmod 0700 "$backup_root"
+backup_root="${IOT_NANO_MONOLITH_BACKUP_DIR:-$root/backups/monolith}"
+prepare_backup_root "$backup_root"
 backup_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 backup_dir="$backup_root/$backup_id"
 mkdir -m 0700 "$backup_dir"
+[[ -d "$backup_dir" && ! -L "$backup_dir" && -O "$backup_dir" ]] ||
+  fail 'backup directory must be owner-controlled and non-symlinked'
 backup_owner="$(id -u):$(id -g)"
+
+docker compose "${compose_args[@]}" stop iot-nano-monolith
 
 if [[ "${IOT_NANO_TIMESCALE_COMPOSE:-0}" == "1" ]]; then
   if [[ -z "${TIMESCALE_BACKUP_COMMAND:-}" || ! -x "$TIMESCALE_BACKUP_COMMAND" ||

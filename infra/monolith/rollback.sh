@@ -12,6 +12,46 @@ fail() {
   exit 1
 }
 
+validate_volume_path() {
+  local name="$1"
+  local path="$2"
+  local component
+  local -a components
+
+  [[ "$path" == /* && "$path" != / ]] ||
+    fail "$name must be a non-root absolute path"
+  case "$path" in
+    *:* | *$'\n'* | *$'\r'* | *'//'*) fail "$name contains an unsafe Docker volume path" ;;
+  esac
+  IFS=/ read -r -a components <<< "${path#/}"
+  for component in "${components[@]}"; do
+    [[ "$component" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+      fail "$name contains an unsafe path component"
+  done
+}
+
+verify_backup_directory() {
+  local path="$1"
+  local component
+  local current
+  local -a components
+
+  validate_volume_path ROLLBACK_BACKUP_DIR "$path"
+  IFS=/ read -r -a components <<< "${path#/}"
+  current=""
+  for component in "${components[@]}"; do
+    current="$current/$component"
+    if [[ -L "$current" ]]; then
+      fail 'ROLLBACK_BACKUP_DIR must not traverse symbolic links'
+    fi
+    [[ -d "$current" ]] ||
+      fail 'ROLLBACK_BACKUP_DIR contains a missing or non-directory path component'
+  done
+  [[ ! -L "$path" && -O "$path" ]] ||
+    fail 'ROLLBACK_BACKUP_DIR must name an owner-controlled non-symlink directory'
+  chmod 0700 "$path" || fail 'ROLLBACK_BACKUP_DIR must be owner-only'
+}
+
 verify_archive() {
   local archive="$1"
   [[ -f "$archive" && ! -L "$archive" && -s "$archive" ]] ||
@@ -34,14 +74,45 @@ restore_archives() {
     -c "$restore_command"
 }
 
+stage_internal_archive() {
+  restore_archives '
+    set -eu
+    stage="$(mktemp -d)"
+    trap "rm -rf \"$stage\"" EXIT
+    tar -xzf /rollback/internal-state.tar.gz -C "$stage"
+    tar -C "$stage" -cf - . | tar -tf - >/dev/null'
+}
+
+swap_staged_internal_archive() {
+  restore_archives '
+    set -eu
+    umask 077
+    stage="$(mktemp -d)"
+    previous="$(mktemp -d)"
+    trap "rm -rf \"$stage\" \"$previous\"" EXIT
+    target=/var/lib/iot-nano/internal
+    tar -xzf /rollback/internal-state.tar.gz -C "$stage"
+    tar -C "$target" -cf "$previous/live-state.tar" .
+    replace_internal_state() {
+      find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+      tar -C "$stage" -cf - . | tar -C "$target" -xf -
+      find "$target" -type d -exec chmod 0700 {} +
+      find "$target" -type f -exec chmod 0600 {} +
+    }
+    if ! replace_internal_state; then
+      find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+      tar -xpf "$previous/live-state.tar" -C "$target"
+      exit 1
+    fi'
+}
+
+if [[ "${IOT_NANO_MONOLITH_TEST_LIB:-0}" == 1 ]]; then
+  return 0
+fi
+
 backup_dir="${ROLLBACK_BACKUP_DIR:-}"
 [[ -n "$backup_dir" ]] || fail 'rollback requires ROLLBACK_BACKUP_DIR'
-case "$backup_dir" in
-  /*) ;;
-  *) fail 'ROLLBACK_BACKUP_DIR must be an absolute path' ;;
-esac
-[[ -d "$backup_dir" && ! -L "$backup_dir" ]] ||
-  fail 'ROLLBACK_BACKUP_DIR must name a non-symlink directory'
+verify_backup_directory "$backup_dir"
 
 backup_id="$(basename "$backup_dir")"
 manifest="$backup_dir/manifest"
@@ -77,17 +148,9 @@ if [[ "${IOT_NANO_TIMESCALE_COMPOSE:-0}" == "1" ]]; then
   fi
 
   docker compose "${compose_args[@]}" stop iot-nano-monolith
-  restore_archives '
-    set -eu
-    umask 077
-    stage="$(mktemp -d)"
-    tar -xzf /rollback/internal-state.tar.gz -C "$stage"
-    find /var/lib/iot-nano/internal -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-    tar -C "$stage" -cf - . | tar -C /var/lib/iot-nano/internal -xf -
-    find /var/lib/iot-nano/internal -type d -exec chmod 0700 {} +
-    find /var/lib/iot-nano/internal -type f -exec chmod 0600 {} +
-    rm -rf "$stage"'
+  stage_internal_archive
   "$TIMESCALE_RESTORE_COMMAND" "$restore_point" >/dev/null
+  swap_staged_internal_archive
   docker compose "${compose_args[@]}" up --detach iot-nano-monolith
   exit 0
 fi

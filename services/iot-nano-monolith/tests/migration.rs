@@ -2,7 +2,8 @@ use std::{
     fs::File,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
-    process::Command,
+    process::{Child, Command},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -106,6 +107,16 @@ impl Fixture {
             drop(listener);
         }
     }
+
+    fn remove_platform_state(&self) {
+        let path = self.config.storage.sqlite_path.as_ref().unwrap();
+        for suffix in ["", "-shm", "-wal"] {
+            let path = PathBuf::from(format!("{}{}", path.display(), suffix));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
 }
 
 fn reserve_address() -> SocketAddr {
@@ -116,7 +127,7 @@ fn reserve_address() -> SocketAddr {
 }
 
 #[tokio::test]
-async fn migrate_only_loses_to_an_existing_internal_instance_lock_without_binding_listeners() {
+async fn migrate_only_waits_for_the_internal_instance_lock_before_migrating_or_binding() {
     let fixture = Fixture::new();
     let mut runtime = MonolithRuntime::start(fixture.config.clone())
         .await
@@ -125,6 +136,7 @@ async fn migrate_only_loses_to_an_existing_internal_instance_lock_without_bindin
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
+    fixture.remove_platform_state();
 
     let lock_path = fixture.config.internal_dir.join("instance.lock");
     let lock = File::options()
@@ -134,17 +146,48 @@ async fn migrate_only_loses_to_an_existing_internal_instance_lock_without_bindin
         .unwrap();
     lock.try_lock_exclusive().unwrap();
 
-    let output = fixture.migration_command().output().unwrap();
+    let mut child = fixture.migration_command().spawn().unwrap();
+    wait_until_blocked(&mut child);
 
     assert!(
-        !output.status.success(),
-        "migrate-only unexpectedly succeeded while instance.lock was held: {output:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .to_ascii_lowercase()
-            .contains("instancelocked"),
-        "migrate-only did not report the instance lock: {output:?}"
+        !fixture
+            .config
+            .storage
+            .sqlite_path
+            .as_ref()
+            .unwrap()
+            .exists(),
+        "migrate-only changed platform state while the internal instance lock was held"
     );
     fixture.assert_configured_addresses_are_unbound();
+
+    drop(lock);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "migrate-only did not complete after the internal instance lock was released: {output:?}"
+    );
+    assert!(
+        fixture
+            .config
+            .storage
+            .sqlite_path
+            .as_ref()
+            .unwrap()
+            .exists()
+    );
+    fixture.assert_configured_addresses_are_unbound();
+}
+
+fn wait_until_blocked(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(status) => {
+                panic!("migrate-only exited while the internal instance lock was held: {status}")
+            }
+            None if Instant::now() >= deadline => return,
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }

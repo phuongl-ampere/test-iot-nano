@@ -64,16 +64,10 @@ impl MonolithRuntime {
         crate::management::bootstrap_admin(&platform, username, password).await
     }
 
-    pub async fn migrate(
-        storage: &StorageConfiguration,
-        internal_dir: Option<&Path>,
-    ) -> Result<(), StartupError> {
-        let internal_directory = internal_dir.map(prepare_internal_directory).transpose()?;
-        let instance_lock = internal_directory
-            .as_ref()
-            .map(InstanceLock::acquire)
-            .transpose()?;
-        let platform = PlatformStore::open(storage)
+    pub async fn migrate(config: &MonolithConfig) -> Result<(), StartupError> {
+        let internal_directory = prepare_internal_directory(&config.internal_dir)?;
+        let instance_lock = InstanceLock::acquire_blocking(&internal_directory)?;
+        let platform = PlatformStore::open(&config.storage)
             .await
             .map_err(StartupError::PlatformMigration)?;
         drop(platform);
@@ -585,13 +579,7 @@ struct InstanceLock {
 
 impl InstanceLock {
     fn acquire(directory: &InternalDirectory) -> Result<Self, StartupError> {
-        let path = directory.path.join("instance.lock");
-        let file = directory
-            .open_state_file("instance.lock")
-            .map_err(|source| StartupError::InstanceLock {
-                path: path.clone(),
-                source,
-            })?;
+        let (path, file) = Self::open(directory)?;
 
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Self { file }),
@@ -600,6 +588,24 @@ impl InstanceLock {
             }
             Err(source) => Err(StartupError::InstanceLock { path, source }),
         }
+    }
+
+    fn acquire_blocking(directory: &InternalDirectory) -> Result<Self, StartupError> {
+        let (path, file) = Self::open(directory)?;
+        file.lock_exclusive()
+            .map_err(|source| StartupError::InstanceLock { path, source })?;
+        Ok(Self { file })
+    }
+
+    fn open(directory: &InternalDirectory) -> Result<(PathBuf, File), StartupError> {
+        let path = directory.path.join("instance.lock");
+        let file = directory
+            .open_state_file("instance.lock")
+            .map_err(|source| StartupError::InstanceLock {
+                path: path.clone(),
+                source,
+            })?;
+        Ok((path, file))
     }
 }
 
