@@ -94,6 +94,27 @@ CREATE TABLE IF NOT EXISTS assets (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (parent_asset_id, name)
 );
+DO $$
+DECLARE
+    duplicate_root_asset_name TEXT;
+BEGIN
+    SELECT name INTO duplicate_root_asset_name
+    FROM assets
+    WHERE parent_asset_id IS NULL
+    GROUP BY name
+    HAVING COUNT(*) > 1
+    ORDER BY name
+    LIMIT 1;
+    IF duplicate_root_asset_name IS NOT NULL THEN
+        RAISE EXCEPTION
+            'duplicate root asset name "%"; resolve duplicate root assets before migration',
+            duplicate_root_asset_name;
+    END IF;
+END
+$$;
+CREATE UNIQUE INDEX IF NOT EXISTS assets_root_name_unique_index
+    ON assets (name)
+    WHERE parent_asset_id IS NULL;
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY, display_name TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,

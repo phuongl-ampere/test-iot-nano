@@ -1,6 +1,6 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::PlatformStore;
-use sqlx::Row;
+use sqlx::{Connection, Row, SqliteConnection};
 
 #[test]
 fn platform_store_owns_its_postgres_migration_source() {
@@ -130,4 +130,54 @@ async fn sqlite_backup_is_a_coherent_snapshot_during_an_atomic_write() {
             .unwrap();
     assert_eq!(primary_display_name.as_deref(), Some("after"));
     assert_eq!(primary_command_count, 1);
+}
+
+#[tokio::test]
+async fn sqlite_migration_rejects_duplicate_root_asset_names_without_mutating_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("duplicate-root-assets.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE assets (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             asset_profile_id TEXT,
+             parent_asset_id TEXT,
+             owner_user_id TEXT,
+             metadata TEXT NOT NULL DEFAULT '{}',
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             UNIQUE (parent_asset_id, name)
+         );
+         INSERT INTO assets (id, name) VALUES
+             ('duplicate-root-one', 'Duplicate root'),
+             ('duplicate-root-two', 'Duplicate root');",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    let error = match PlatformStore::open(&sqlite_configuration(path)).await {
+        Ok(_) => panic!("migration accepted duplicate root asset names"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate root asset name \"Duplicate root\""),
+        "unexpected migration error: {error}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM assets
+             WHERE parent_asset_id IS NULL AND name = 'Duplicate root'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        2
+    );
 }

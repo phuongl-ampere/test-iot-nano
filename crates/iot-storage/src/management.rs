@@ -842,13 +842,19 @@ fn is_management_asset_sibling_name_unique_violation(
     match database_error.code().as_deref() {
         Some("23505") => {
             database_error.constraint() == Some("assets_parent_asset_id_name_key")
+                || database_error.constraint() == Some("assets_root_name_unique_index")
                 || database_error
                     .message()
                     .contains("assets_parent_asset_id_name_key")
+                || database_error
+                    .message()
+                    .contains("assets_root_name_unique_index")
         }
-        Some("19") | Some("2067") => database_error
-            .message()
-            .contains("UNIQUE constraint failed: assets.parent_asset_id, assets.name"),
+        Some("19") | Some("2067") => {
+            let message = database_error.message();
+            message.contains("UNIQUE constraint failed: assets.parent_asset_id, assets.name")
+                || message.contains("UNIQUE constraint failed: assets.name")
+        }
         _ => false,
     }
 }

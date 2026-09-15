@@ -351,6 +351,52 @@ async fn sqlite_management_asset_repository_maps_sibling_name_conflicts_to_domai
     ));
 }
 
+#[tokio::test]
+async fn sqlite_management_asset_repository_maps_root_name_conflicts_to_domain_errors() {
+    let (_directory, store) = sqlite_store().await;
+    let first = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Duplicate root", None, None),
+    )
+    .await
+    .unwrap();
+    let second = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Other root", None, None),
+    )
+    .await
+    .unwrap();
+
+    let create_conflict = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation(&first.name, None, None),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        create_conflict,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: None,
+        } if name == "Duplicate root"
+    ));
+
+    let update_conflict = ManagementAssetRepository::update_management_asset(
+        &store,
+        second.id,
+        asset_update(&second, &first.name, None),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        update_conflict,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: None,
+        } if name == "Duplicate root"
+    ));
+}
+
 struct TimescaleTestLock {
     _connection: PgConnection,
 }
@@ -641,6 +687,53 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::delete_management_asset(&store, Uuid::now_v7()).await,
         Err(ManagementAssetError::AssetNotFound)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_management_asset_repository_maps_root_name_conflicts_to_domain_errors() {
+    let (_lock, store) = timescale_store().await;
+    let first = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Duplicate Timescale root", None, None),
+    )
+    .await
+    .unwrap();
+    let second = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Other Timescale root", None, None),
+    )
+    .await
+    .unwrap();
+
+    let create_conflict = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation(&first.name, None, None),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        create_conflict,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: None,
+        } if name == "Duplicate Timescale root"
+    ));
+
+    let update_conflict = ManagementAssetRepository::update_management_asset(
+        &store,
+        second.id,
+        asset_update(&second, &first.name, None),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        update_conflict,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: None,
+        } if name == "Duplicate Timescale root"
     ));
 }
 

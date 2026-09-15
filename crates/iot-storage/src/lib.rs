@@ -7079,6 +7079,7 @@ impl SqliteStore {
             .execute(&pool)
             .await?;
         sqlx::raw_sql(SQLITE_SCHEMA).execute(&pool).await?;
+        migrate_root_asset_name_uniqueness(&pool).await?;
         migrate_command_outbox_schema(&pool).await?;
         migrate_resource_authorization_schema(&pool).await?;
         Ok(Self {
@@ -7866,6 +7867,33 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), sqlx::Er
     .await?;
     transaction.commit().await?;
     refresh_command_outbox_expiring_index(pool).await
+}
+
+async fn migrate_root_asset_name_uniqueness(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let duplicate_name = sqlx::query_scalar::<_, String>(
+        "SELECT name
+         FROM assets
+         WHERE parent_asset_id IS NULL
+         GROUP BY name
+         HAVING COUNT(*) > 1
+         ORDER BY name
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if let Some(name) = duplicate_name {
+        return Err(sqlx::Error::Protocol(format!(
+            "duplicate root asset name {name:?}; resolve duplicate root assets before migration"
+        )));
+    }
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS assets_root_name_unique_index
+         ON assets (name)
+         WHERE parent_asset_id IS NULL",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn migrate_resource_authorization_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
