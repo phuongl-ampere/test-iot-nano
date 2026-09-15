@@ -1394,7 +1394,7 @@ fn validated_test_database_url(value: &str) -> Result<String, String> {
     }
     if test_database_name(value).is_none() {
         return Err(format!(
-            "IOT_NANO_TIMESCALE_TEST_URL must name a disposable {TEST_DATABASE_PREFIX}* database"
+            "IOT_NANO_TIMESCALE_TEST_URL must name a disposable {TEST_DATABASE_PREFIX}<uuid> database"
         ));
     }
     Ok(value.to_owned())
@@ -1405,7 +1405,7 @@ fn test_database_name(database_url: &str) -> Option<String> {
     let database = options.get_database()?;
     database
         .strip_prefix(TEST_DATABASE_PREFIX)
-        .filter(|suffix| !suffix.is_empty())
+        .filter(|suffix| Uuid::parse_str(suffix).is_ok())
         .map(|_| database.to_owned())
 }
 
@@ -1419,7 +1419,7 @@ fn timescale_test_url_must_name_an_isolated_test_database() {
     );
     assert_eq!(
         test_database_name("postgres://iot:secret@localhost/iot_nano_test_local"),
-        Some("iot_nano_test_local".to_owned())
+        None
     );
     assert_eq!(
         test_database_name("postgres://iot:secret@localhost/iot"),
@@ -1436,12 +1436,53 @@ fn timescale_test_url_requires_an_explicit_opt_in_value() {
     assert!(validated_test_database_url("").is_err());
 }
 
-#[test]
-fn migration_lock_query_matches_signed_hashtext_keys() {
-    assert!(
-        migration_lock_query()
-            .contains("((waiting.classid::integer::bigint << 32) + waiting.objid::bigint)")
-    );
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL naming an unused disposable test database"]
+async fn migration_lock_query_detects_waiting_signed_hashtext_lock() -> E2eResult {
+    let database_url =
+        validated_test_database_url(&env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap_or_default())
+            .map_err(test_error)?;
+    let mut lock_holder = PgConnection::connect(&database_url).await?;
+    let hash: i32 = sqlx::query_scalar("SELECT hashtext('iot_nano:migrate')")
+        .fetch_one(&mut lock_holder)
+        .await?;
+    if hash >= 0 {
+        return Err(test_error(format!(
+            "expected hashtext('iot_nano:migrate') to be negative, found {hash}"
+        )));
+    }
+    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:migrate'))")
+        .execute(&mut lock_holder)
+        .await?;
+
+    let application_name = format!("iot-nano-e2e-lock-{}", Uuid::now_v7());
+    let waiting_database_url = migration_database_url(&database_url, &application_name);
+    let mut waiter = PgConnection::connect(&waiting_database_url).await?;
+    let waiter = tokio::spawn(async move {
+        sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:migrate'))")
+            .execute(&mut waiter)
+            .await
+            .map(|_| ())
+    });
+
+    let observation = wait_for_migration_lock(&database_url, &application_name).await;
+    let unlock = sqlx::query("SELECT pg_advisory_unlock(hashtext('iot_nano:migrate'))")
+        .execute(&mut lock_holder)
+        .await
+        .map(|_| ())
+        .map_err(Into::into);
+    let waiter = match timeout(Duration::from_secs(30), waiter).await {
+        Ok(Ok(result)) => result.map_err(Into::into),
+        Ok(Err(error)) => Err(test_error(format!("waiting lock task failed: {error}"))),
+        Err(error) => Err(error.into()),
+    };
+
+    combine_outcomes(
+        "migration lock observation",
+        observation,
+        "advisory lock cleanup",
+        combine_outcomes("advisory unlock", unlock, "waiting lock completion", waiter),
+    )
 }
 
 #[test]
