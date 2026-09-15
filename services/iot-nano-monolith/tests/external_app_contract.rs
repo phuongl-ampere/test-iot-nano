@@ -2,9 +2,12 @@ use std::{
     collections::BTreeSet,
     env,
     error::Error,
-    fs, io,
+    fs,
+    future::Future,
+    io,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     time::Duration,
 };
@@ -27,6 +30,7 @@ const ADMIN_PASSWORD: &str = "ExternalContractAdmin@2026";
 const CLIENT_SECRET: &str = "ExternalContractClientSecret@2026";
 const INVALID_CLIENT_SECRET: &str = "InvalidExternalContractClientSecret@2026";
 const SESSION_SECRET: &str = "external-contract-session-secret-material-0001";
+const START_ATTEMPTS: usize = 5;
 
 struct Fixture {
     _directory: TempDir,
@@ -37,28 +41,31 @@ struct Fixture {
     management_address: SocketAddr,
     mqtt_tcp_address: SocketAddr,
     mqtt_tls_address: SocketAddr,
+    reserved_monolith_addresses: Option<Vec<TcpListener>>,
     tls_cert_path: PathBuf,
     tls_key_path: PathBuf,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    async fn new() -> Result<Self, Box<dyn Error>> {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let tls_fixtures =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../iot-nano-mqttd/tests/fixtures");
-        Self {
+        let (addresses, reserved_monolith_addresses) = reserve_monolith_addresses().await?;
+        Ok(Self {
             root: root.clone(),
             platform_path: root.join("platform.sqlite"),
             internal_dir: root.join("internal"),
-            public_address: reserve_address().await,
-            management_address: reserve_address().await,
-            mqtt_tcp_address: reserve_address().await,
-            mqtt_tls_address: reserve_address().await,
+            public_address: addresses[0],
+            management_address: addresses[1],
+            mqtt_tcp_address: addresses[2],
+            mqtt_tls_address: addresses[3],
+            reserved_monolith_addresses: Some(reserved_monolith_addresses),
             tls_cert_path: tls_fixtures.join("server.crt"),
             tls_key_path: tls_fixtures.join("server.key"),
             _directory: directory,
-        }
+        })
     }
 
     fn configure_monolith(&self, command: &mut Command) {
@@ -95,6 +102,20 @@ impl Fixture {
     fn public_url(&self) -> String {
         format!("http://{}", self.public_address)
     }
+
+    fn release_monolith_addresses(&mut self) {
+        self.reserved_monolith_addresses.take();
+    }
+
+    async fn rebind_monolith_addresses(&mut self) -> Result<(), Box<dyn Error>> {
+        let (addresses, listeners) = reserve_monolith_addresses().await?;
+        self.public_address = addresses[0];
+        self.management_address = addresses[1];
+        self.mqtt_tcp_address = addresses[2];
+        self.mqtt_tls_address = addresses[3];
+        self.reserved_monolith_addresses = Some(listeners);
+        Ok(())
+    }
 }
 
 struct CapturedChild {
@@ -105,21 +126,99 @@ struct CapturedChild {
 
 impl CapturedChild {
     async fn stop(mut self) -> Result<String, Box<dyn Error>> {
-        if self.child.try_wait()?.is_none() {
-            #[cfg(unix)]
-            if let Some(pid) = self
-                .child
-                .id()
-                .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
-            {
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            }
-            self.child.start_kill()?;
+        let mut errors = Vec::new();
+        record_cleanup_result(
+            &mut errors,
+            "PowerMonitor process",
+            terminate_process_group(&mut self.child).await,
+        );
+
+        let mut output = Vec::new();
+        match self.stdout.await {
+            Ok(Ok(value)) => output.extend(value),
+            Ok(Err(error)) => errors.push(format!("PowerMonitor stdout capture failed: {error}")),
+            Err(error) => errors.push(format!("PowerMonitor stdout task failed: {error}")),
         }
-        let _ = self.child.wait().await?;
-        let mut output = self.stdout.await??;
-        output.extend(self.stderr.await??);
-        Ok(String::from_utf8_lossy(&output).into_owned())
+        match self.stderr.await {
+            Ok(Ok(value)) => output.extend(value),
+            Ok(Err(error)) => errors.push(format!("PowerMonitor stderr capture failed: {error}")),
+            Err(error) => errors.push(format!("PowerMonitor stderr task failed: {error}")),
+        }
+
+        if errors.is_empty() {
+            Ok(String::from_utf8_lossy(&output).into_owned())
+        } else {
+            Err(io::Error::other(errors.join("; ")).into())
+        }
+    }
+}
+
+struct ManagedPowerMonitor {
+    child: CapturedChild,
+    secrets: Vec<&'static str>,
+}
+
+#[derive(Default)]
+struct FixtureProcesses {
+    monolith: Option<Child>,
+    powermonitors: Vec<ManagedPowerMonitor>,
+}
+
+type CleanupFuture = Pin<Box<dyn Future<Output = Result<(), String>>>>;
+
+impl FixtureProcesses {
+    fn register_monolith(&mut self, child: Child) {
+        self.monolith = Some(child);
+    }
+
+    fn register_powermonitor(&mut self, child: CapturedChild, secrets: Vec<&'static str>) {
+        self.powermonitors
+            .push(ManagedPowerMonitor { child, secrets });
+    }
+
+    async fn cleanup(mut self) -> Result<(), Box<dyn Error>> {
+        let mut actions: Vec<CleanupFuture> = Vec::new();
+        for power_monitor in self.powermonitors.drain(..) {
+            actions.push(Box::pin(async move {
+                let output = power_monitor
+                    .child
+                    .stop()
+                    .await
+                    .map_err(|error| format!("PowerMonitor cleanup failed: {error}"))?;
+                if power_monitor
+                    .secrets
+                    .iter()
+                    .any(|secret| output.contains(secret))
+                {
+                    return Err(
+                        "PowerMonitor stdout/stderr exposed a confidential client secret"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            }));
+        }
+        if let Some(mut monolith) = self.monolith.take() {
+            actions.push(Box::pin(async move {
+                terminate_process_group(&mut monolith)
+                    .await
+                    .map_err(|error| format!("monolith cleanup failed: {error}"))
+            }));
+        }
+        cleanup_all(actions).await
+    }
+}
+
+impl Drop for FixtureProcesses {
+    fn drop(&mut self) {
+        for power_monitor in &mut self.powermonitors {
+            kill_process_group(&mut power_monitor.child.child);
+            let _ = power_monitor.child.child.start_kill();
+        }
+        if let Some(monolith) = &mut self.monolith {
+            kill_process_group(monolith);
+            let _ = monolith.start_kill();
+        }
     }
 }
 
@@ -140,7 +239,8 @@ async fn powermonitor_bff_uses_only_public_oauth_and_v1_platform_contracts() {
 }
 
 async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await?;
+    let prepared_powermonitor = prepare_powermonitor(&fixture, npm).await?;
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -164,25 +264,18 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         "monolith bootstrap failed: {bootstrap_output:?}"
     );
 
-    let mut monolith_command = Command::new(binary);
-    fixture.configure_monolith(&mut monolith_command);
-    let mut monolith = monolith_command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut powermonitor = None;
-    let mut invalid_powermonitor = None;
-    let prepared_powermonitor = prepare_powermonitor(&fixture, npm).await?;
+    let mut processes = FixtureProcesses::default();
 
     let result = async {
-        wait_ready(&client, &fixture.public_url()).await?;
+        processes
+            .register_monolith(start_monolith_with_retry(&mut fixture, binary, &client).await?);
         let management_cookie = management_login(&client, fixture.management_address).await?;
         let (child, powermonitor_address) =
             start_powermonitor_with_retry(&fixture, &prepared_powermonitor, &client, CLIENT_SECRET)
                 .await?;
         let powermonitor_url = format!("http://{powermonitor_address}");
+        processes.register_powermonitor(child, vec![CLIENT_SECRET]);
         assert_powermonitor_environment(&prepared_powermonitor.audit_path)?;
-        powermonitor = Some(child);
         register_application(
             &client,
             fixture.management_address,
@@ -241,7 +334,14 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
             .header(COOKIE, state_cookie)
             .send()
             .await?;
-        assert_eq!(callback.status(), StatusCode::TEMPORARY_REDIRECT);
+        if callback.status() != StatusCode::TEMPORARY_REDIRECT {
+            return Err(io::Error::other(format!(
+                "PowerMonitor callback returned {}: {}",
+                callback.status(),
+                callback.text().await?
+            ))
+            .into());
+        }
         let session_cookie = cookie(&callback, "powermonitor_session")?;
         assert_response_hides_client_secrets(callback, &[CLIENT_SECRET]).await?;
 
@@ -272,6 +372,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         )
         .await?;
         let invalid_powermonitor_url = format!("http://{invalid_powermonitor_address}");
+        processes.register_powermonitor(invalid_child, vec![CLIENT_SECRET, INVALID_CLIENT_SECRET]);
         register_application(
             &client,
             fixture.management_address,
@@ -333,7 +434,6 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
             &[CLIENT_SECRET, INVALID_CLIENT_SECRET],
         )
         .await?;
-        invalid_powermonitor = Some(invalid_child);
 
         let confidential_token = client
             .post(format!("{}/oauth/token", fixture.public_url()))
@@ -398,22 +498,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
     }
     .await;
 
-    if let Some(child) = powermonitor {
-        let output = child.stop().await?;
-        assert!(
-            !output.contains(CLIENT_SECRET),
-            "PowerMonitor stdout/stderr exposed the confidential client secret"
-        );
-    }
-    if let Some(child) = invalid_powermonitor {
-        let output = child.stop().await?;
-        assert!(
-            !output.contains(CLIENT_SECRET) && !output.contains(INVALID_CLIENT_SECRET),
-            "PowerMonitor stdout/stderr exposed a confidential client secret"
-        );
-    }
-    stop(&mut monolith).await;
-    result
+    combine_result_and_cleanup(result, processes.cleanup().await)
 }
 
 async fn management_login(
@@ -533,6 +618,60 @@ async fn run_npm(
     Ok(())
 }
 
+async fn start_monolith_with_retry(
+    fixture: &mut Fixture,
+    binary: &str,
+    client: &Client,
+) -> Result<Child, Box<dyn Error>> {
+    let mut failures = Vec::new();
+    for attempt in 1..=START_ATTEMPTS {
+        fixture.release_monolith_addresses();
+        let mut command = Command::new(binary);
+        fixture.configure_monolith(&mut command);
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                failures.push(format!(
+                    "attempt {attempt}: failed to spawn monolith: {error}"
+                ));
+                if attempt < START_ATTEMPTS {
+                    fixture.rebind_monolith_addresses().await?;
+                    continue;
+                }
+                break;
+            }
+        };
+        match wait_ready(client, &fixture.public_url()).await {
+            Ok(()) => return Ok(child),
+            Err(error) => {
+                let cleanup = terminate_process_group(&mut child).await;
+                failures.push(format!(
+                    "attempt {attempt}: monolith did not become ready: {error}; cleanup: {}",
+                    cleanup.err().unwrap_or_else(|| "completed".to_owned())
+                ));
+                if attempt < START_ATTEMPTS {
+                    fixture.rebind_monolith_addresses().await?;
+                }
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "monolith could not bind ready test ports after {START_ATTEMPTS} attempts: {}",
+            failures.join("\n")
+        ),
+    )
+    .into())
+}
+
 async fn start_powermonitor(
     fixture: &Fixture,
     prepared: &PreparedPowerMonitor,
@@ -569,7 +708,8 @@ async fn start_powermonitor(
         .env("NEXT_TELEMETRY_DISABLED", "1")
         .env("NODE_ENV", "production")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn()?;
@@ -589,19 +729,23 @@ async fn start_powermonitor_with_retry(
     client_secret: &str,
 ) -> Result<(CapturedChild, SocketAddr), Box<dyn Error>> {
     let mut failures = Vec::new();
-    for _ in 0..5 {
-        let address = reserve_address().await;
+    for attempt in 1..=START_ATTEMPTS {
+        let (address, listener) = reserve_address().await?;
+        drop(listener);
         let child = start_powermonitor(fixture, prepared, address, client_secret).await?;
         let url = format!("http://{address}");
         if wait_powermonitor(client, &url).await.is_ok() {
             return Ok((child, address));
         }
-        failures.push(child.stop().await?);
+        match child.stop().await {
+            Ok(output) => failures.push(format!("attempt {attempt}: {output}")),
+            Err(error) => failures.push(format!("attempt {attempt} cleanup failed: {error}")),
+        }
     }
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
         format!(
-            "PowerMonitor could not bind a ready test port after five attempts: {}",
+            "PowerMonitor could not bind a ready test port after {START_ATTEMPTS} attempts: {}",
             failures.join("\n")
         ),
     )
@@ -827,16 +971,116 @@ fn cookie(response: &Response, name: &str) -> Result<String, Box<dyn std::error:
         .ok_or_else(|| format!("response did not set {name}").into())
 }
 
-async fn stop(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+async fn terminate_process_group(child: &mut Child) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let should_stop = match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(error) => {
+            errors.push(format!("could not inspect process state: {error}"));
+            true
+        }
+    };
+    if should_stop {
+        kill_process_group(child);
+        if let Err(error) = child.start_kill() {
+            errors.push(format!("could not kill process: {error}"));
+        }
+    }
+    if let Err(error) = child.wait().await {
+        errors.push(format!("could not reap process: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
-async fn reserve_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    address
+fn kill_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child
+        .id()
+        .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+}
+
+async fn reserve_address() -> io::Result<(SocketAddr, TcpListener)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    Ok((address, listener))
+}
+
+async fn reserve_monolith_addresses() -> io::Result<([SocketAddr; 4], Vec<TcpListener>)> {
+    let mut addresses = Vec::with_capacity(4);
+    let mut listeners = Vec::with_capacity(4);
+    for _ in 0..4 {
+        let (address, listener) = reserve_address().await?;
+        addresses.push(address);
+        listeners.push(listener);
+    }
+    let addresses = addresses
+        .try_into()
+        .expect("four reserved monolith addresses");
+    Ok((addresses, listeners))
+}
+
+async fn cleanup_all(actions: Vec<CleanupFuture>) -> Result<(), Box<dyn Error>> {
+    let mut errors = Vec::new();
+    for action in actions {
+        if let Err(error) = action.await {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(errors.join("; ")).into())
+    }
+}
+
+fn record_cleanup_result(errors: &mut Vec<String>, context: &str, result: Result<(), String>) {
+    if let Err(error) = result {
+        errors.push(format!("{context}: {error}"));
+    }
+}
+
+fn combine_result_and_cleanup(
+    result: Result<(), Box<dyn Error>>,
+    cleanup: Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(result), Err(cleanup)) => Err(io::Error::other(format!(
+            "external app contract failed: {result}; fixture cleanup also failed: {cleanup}"
+        ))
+        .into()),
+    }
+}
+
+#[tokio::test]
+async fn cleanup_failure_does_not_prevent_later_actions() {
+    use std::{cell::RefCell, rc::Rc};
+
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let first = Rc::clone(&actions);
+    let second = Rc::clone(&actions);
+    let error = cleanup_all(vec![
+        Box::pin(async move {
+            first.borrow_mut().push("first");
+            Err("first cleanup failed".to_owned())
+        }),
+        Box::pin(async move {
+            second.borrow_mut().push("second");
+            Ok(())
+        }),
+    ])
+    .await
+    .expect_err("the first cleanup action must fail");
+
+    assert_eq!(actions.borrow().as_slice(), ["first", "second"]);
+    assert!(error.to_string().contains("first cleanup failed"));
 }
