@@ -5,20 +5,26 @@ devices.
 
 ## Runtime
 
-The target runtime has four Rust services:
+The production target is one Rust binary, `iot-nano-monolith`, with API, Core,
+Stream, MQTTD, cache, and command delivery composed in one Tokio runtime:
 
 ```text
-device -> iot-nano-mqttd -> iot-nano-stream -> iot-nano-core -> storage
-browser -> iot-nano-api -> iot-nano-core
+device -> iot-nano-monolith -> stream.sqlite -> platform storage
+browser -> iot-nano-monolith -> platform storage
 ```
 
-- `iot-nano-mqttd` owns MQTT, token authentication, device sessions, and RPC.
-- `iot-nano-stream` owns durable event append and consumer groups.
-- `iot-nano-core` owns telemetry, alerts, notifications, and command state.
-- `iot-nano-api` owns users, sessions, devices, assets, profiles, and tokens.
+- The public listener serves HTTP, MQTT TCP, and MQTT TLS.
+- Management and administrative routes bind to
+  `IOT_NANO_MANAGEMENT_ADDRESS`, which defaults to loopback
+  (`127.0.0.1:8081`).
+- API, Core, Stream, and MQTTD are library packages in monolith mode, not
+  child processes or deployment services.
 
-Retired broker and ingress processes, compatibility modes, and shared API/Core
-databases are not supported target-runtime components.
+The monolith deployment is for a fresh environment. It must not be pointed at,
+or used to directly convert or reuse, state owned by the former API, Core,
+Stream, or MQTTD services. See
+[docs/operations-monolith.md](docs/operations-monolith.md) for storage,
+secrets, startup, and rollback procedures.
 
 ## Device MQTT
 
@@ -38,8 +44,8 @@ only from that session, at the matching response topic and command ID.
 ## Development
 
 Development state is disposable. Architecture or schema changes do not migrate
-old data: stop the stack, reset API/Core database state, Stream state, and
-MQTTD broker state, then bootstrap the current schema.
+old data: stop the monolith, reset its platform and internal state, then
+bootstrap the current schema.
 
 ```bash
 cargo fmt --all -- --check
@@ -53,13 +59,15 @@ cargo test -p iot-nano-api -- --test-threads=1
 ## Repository Layout
 
 ```text
-services/   four deployable Rust services
-contracts/  versioned service contracts
-infra/      Compose, systemd, and development environment templates
+services/   Rust libraries plus the deployable monolith binary
+crates/     storage and core platform crates
+contracts/  versioned public and device data contracts
+infra/      Compose, systemd, and monolith environment templates
+docs/       architecture, plans, and operations guidance
 web/        Next.js application
 firmware/   ESP32 firmware
 ```
 
-The authoritative architecture, delivery plan, reset rules, and acceptance
-gates are in [docs/iot-nano-four-service-architecture.md](docs/iot-nano-four-service-architecture.md).
-Operational guidance is in [docs/operations.md](docs/operations.md).
+The production design and delivery plan are in
+`docs/superpowers/specs/` and `docs/superpowers/plans/`. Operational guidance
+is in [docs/operations-monolith.md](docs/operations-monolith.md).
