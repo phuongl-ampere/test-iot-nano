@@ -7,6 +7,7 @@ timescale_compose="$root/infra/compose.timescale.yaml"
 dockerfile="$root/infra/docker/Dockerfile"
 migrate_script="$root/infra/monolith/migrate.sh"
 rollback_script="$root/infra/monolith/rollback.sh"
+rollback_copy_failure_fixture="$root/scripts/fixtures/verify-rollback-timescale-copy-failure.sh"
 monolith_main="$root/services/iot-nano-monolith/src/main.rs"
 monolith_runtime="$root/services/iot-nano-monolith/src/runtime.rs"
 
@@ -63,6 +64,8 @@ rg -q 'IOT_NANO_STORAGE: timescale' "$timescale_compose"
 rg -q 'DATABASE_URL:' "$timescale_compose"
 test -x "$migrate_script"
 test -x "$rollback_script"
+test -x "$rollback_copy_failure_fixture"
+bash -n "$migrate_script" "$rollback_script" "$rollback_copy_failure_fixture"
 
 migrate_only_block="$(awk '
   /if arguments\.migrate_only/ { capture = 1 }
@@ -107,18 +110,4 @@ expect_unsafe_path_rejected "$rollback_script" verify_backup_directory "$path_te
 expect_unsafe_path_rejected "$rollback_script" verify_backup_directory "relative/backup-root"
 expect_unsafe_path_rejected "$rollback_script" verify_backup_directory "$path_test_root/symlink-root"
 
-timescale_stage_line="$(nl -ba "$rollback_script" | rg '^[[:space:]]*[0-9]+[[:space:]]+  stage_internal_archive$' | awk '{ print $1 }')"
-timescale_restore_line="$(nl -ba "$rollback_script" | rg 'TIMESCALE_RESTORE_COMMAND.*restore_point' | awk '{ print $1 }')"
-timescale_swap_line="$(nl -ba "$rollback_script" | rg '^[[:space:]]*[0-9]+[[:space:]]+  swap_staged_internal_archive$' | awk '{ print $1 }')"
-[[ -n "$timescale_stage_line" && -n "$timescale_restore_line" && -n "$timescale_swap_line" &&
-  "$timescale_stage_line" -lt "$timescale_restore_line" &&
-  "$timescale_restore_line" -lt "$timescale_swap_line" ]] || {
-  printf 'Timescale rollback must stage, externally restore, then swap internal state\n' >&2
-  exit 1
-}
-
-if awk '/^stage_internal_archive\(\)/,/^}/' "$rollback_script" |
-  rg -q '/var/lib/iot-nano/internal'; then
-  printf 'Timescale staging must not mutate live internal state\n' >&2
-  exit 1
-fi
+"$rollback_copy_failure_fixture" "$rollback_script"

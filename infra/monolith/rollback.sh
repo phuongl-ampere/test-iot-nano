@@ -87,23 +87,65 @@ swap_staged_internal_archive() {
   restore_archives '
     set -eu
     umask 077
-    stage="$(mktemp -d)"
-    previous="$(mktemp -d)"
-    trap "rm -rf \"$stage\" \"$previous\"" EXIT
     target=/var/lib/iot-nano/internal
-    tar -xzf /rollback/internal-state.tar.gz -C "$stage"
-    tar -C "$target" -cf "$previous/live-state.tar" .
-    replace_internal_state() {
-      find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-      tar -C "$stage" -cf - . | tar -C "$target" -xf -
-      find "$target" -type d -exec chmod 0700 {} +
-      find "$target" -type f -exec chmod 0600 {} +
+    stage="$(mktemp -d "$target/.rollback-internal-stage.XXXXXX")"
+    candidate="$(mktemp -d "$target/.rollback-internal-candidate.XXXXXX")"
+    previous="$(mktemp -d "$target/.rollback-internal-previous.XXXXXX")"
+    replacement_started=0
+    replacement_complete=0
+
+    move_state() {
+      source="$1"
+      destination="$2"
+      find "$source" -mindepth 1 -maxdepth 1 -exec mv -- {} "$destination" \; ||
+        return 1
     }
-    if ! replace_internal_state; then
-      find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-      tar -xpf "$previous/live-state.tar" -C "$target"
-      exit 1
-    fi'
+
+    move_live_state() {
+      find "$target" -mindepth 1 -maxdepth 1 \
+        ! -path "$stage" ! -path "$candidate" ! -path "$previous" \
+        -exec mv -- {} "$previous" \; || return 1
+    }
+
+    clear_replaced_state() {
+      find "$target" -mindepth 1 -maxdepth 1 \
+        ! -path "$stage" ! -path "$candidate" ! -path "$previous" \
+        -exec rm -rf -- {} + || return 1
+    }
+
+    restore_original_internal_state() {
+      if [ "$replacement_started" -eq 1 ]; then
+        clear_replaced_state || return 1
+        move_state "$previous" "$target" || return 1
+      fi
+    }
+
+    cleanup_failed_replacement() {
+      status=$?
+      trap - EXIT
+      if [ "$replacement_complete" -eq 0 ]; then
+        restore_original_internal_state || {
+          printf "%s\n" "could not restore the original internal state" >&2
+          status=1
+        }
+      fi
+      rm -rf "$stage" "$candidate" "$previous" || status=1
+      exit "$status"
+    }
+
+    trap cleanup_failed_replacement EXIT
+
+    tar -xzf /rollback/internal-state.tar.gz -C "$stage"
+    replace_internal_state() {
+      cp -a "$stage/." "$candidate/" || return 1
+      find "$candidate" -type d -exec chmod 0700 {} + || return 1
+      find "$candidate" -type f -exec chmod 0600 {} + || return 1
+      replacement_started=1
+      move_live_state || return 1
+      move_state "$candidate" "$target" || return 1
+      replacement_complete=1
+    }
+    replace_internal_state'
 }
 
 if [[ "${IOT_NANO_MONOLITH_TEST_LIB:-0}" == 1 ]]; then
