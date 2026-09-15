@@ -120,6 +120,7 @@ impl Fixture {
 
 struct CapturedChild {
     child: Child,
+    pgid: Option<u32>,
     stdout: JoinHandle<io::Result<Vec<u8>>>,
     stderr: JoinHandle<io::Result<Vec<u8>>>,
 }
@@ -130,7 +131,7 @@ impl CapturedChild {
         record_cleanup_result(
             &mut errors,
             "PowerMonitor process",
-            terminate_process_group(&mut self.child).await,
+            terminate_process_group(&mut self.child, self.pgid).await,
         );
 
         let mut output = Vec::new();
@@ -153,6 +154,11 @@ impl CapturedChild {
     }
 }
 
+struct MonolithChild {
+    child: Child,
+    pgid: Option<u32>,
+}
+
 struct ManagedPowerMonitor {
     child: CapturedChild,
     secrets: Vec<&'static str>,
@@ -160,14 +166,14 @@ struct ManagedPowerMonitor {
 
 #[derive(Default)]
 struct FixtureProcesses {
-    monolith: Option<Child>,
+    monolith: Option<MonolithChild>,
     powermonitors: Vec<ManagedPowerMonitor>,
 }
 
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<(), String>>>>;
 
 impl FixtureProcesses {
-    fn register_monolith(&mut self, child: Child) {
+    fn register_monolith(&mut self, child: MonolithChild) {
         self.monolith = Some(child);
     }
 
@@ -200,7 +206,7 @@ impl FixtureProcesses {
         }
         if let Some(mut monolith) = self.monolith.take() {
             actions.push(Box::pin(async move {
-                terminate_process_group(&mut monolith)
+                terminate_process_group(&mut monolith.child, monolith.pgid)
                     .await
                     .map_err(|error| format!("monolith cleanup failed: {error}"))
             }));
@@ -212,12 +218,12 @@ impl FixtureProcesses {
 impl Drop for FixtureProcesses {
     fn drop(&mut self) {
         for power_monitor in &mut self.powermonitors {
-            kill_process_group(&mut power_monitor.child.child);
+            let _ = kill_process_group(power_monitor.child.pgid);
             let _ = power_monitor.child.child.start_kill();
         }
         if let Some(monolith) = &mut self.monolith {
-            kill_process_group(monolith);
-            let _ = monolith.start_kill();
+            let _ = kill_process_group(monolith.pgid);
+            let _ = monolith.child.start_kill();
         }
     }
 }
@@ -622,7 +628,7 @@ async fn start_monolith_with_retry(
     fixture: &mut Fixture,
     binary: &str,
     client: &Client,
-) -> Result<Child, Box<dyn Error>> {
+) -> Result<MonolithChild, Box<dyn Error>> {
     let mut failures = Vec::new();
     for attempt in 1..=START_ATTEMPTS {
         fixture.release_monolith_addresses();
@@ -648,13 +654,18 @@ async fn start_monolith_with_retry(
                 break;
             }
         };
+        let pgid = child.id();
         match wait_ready(client, &fixture.public_url()).await {
-            Ok(()) => return Ok(child),
+            Ok(()) => return Ok(MonolithChild { child, pgid }),
             Err(error) => {
-                let cleanup = terminate_process_group(&mut child).await;
+                if let Err(cleanup_error) = terminate_process_group(&mut child, pgid).await {
+                    return Err(io::Error::other(format!(
+                        "attempt {attempt}: monolith did not become ready: {error}; cleanup failed: {cleanup_error}"
+                    ))
+                    .into());
+                }
                 failures.push(format!(
-                    "attempt {attempt}: monolith did not become ready: {error}; cleanup: {}",
-                    cleanup.err().unwrap_or_else(|| "completed".to_owned())
+                    "attempt {attempt}: monolith did not become ready: {error}"
                 ));
                 if attempt < START_ATTEMPTS {
                     fixture.rebind_monolith_addresses().await?;
@@ -713,10 +724,12 @@ async fn start_powermonitor(
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn()?;
+    let pgid = child.id();
     let stdout = capture_output(child.stdout.take().expect("PowerMonitor stdout"));
     let stderr = capture_stderr(child.stderr.take().expect("PowerMonitor stderr"));
     Ok(CapturedChild {
         child,
+        pgid,
         stdout,
         stderr,
     })
@@ -737,10 +750,12 @@ async fn start_powermonitor_with_retry(
         if wait_powermonitor(client, &url).await.is_ok() {
             return Ok((child, address));
         }
-        match child.stop().await {
-            Ok(output) => failures.push(format!("attempt {attempt}: {output}")),
-            Err(error) => failures.push(format!("attempt {attempt} cleanup failed: {error}")),
-        }
+        let output = child.stop().await.map_err(|error| {
+            io::Error::other(format!(
+                "attempt {attempt}: PowerMonitor cleanup failed: {error}"
+            ))
+        })?;
+        failures.push(format!("attempt {attempt}: {output}"));
     }
     Err(io::Error::new(
         io::ErrorKind::AddrInUse,
@@ -971,7 +986,7 @@ fn cookie(response: &Response, name: &str) -> Result<String, Box<dyn std::error:
         .ok_or_else(|| format!("response did not set {name}").into())
 }
 
-async fn terminate_process_group(child: &mut Child) -> Result<(), String> {
+async fn terminate_process_group(child: &mut Child, pgid: Option<u32>) -> Result<(), String> {
     let mut errors = Vec::new();
     let should_stop = match child.try_wait() {
         Ok(None) => true,
@@ -981,8 +996,10 @@ async fn terminate_process_group(child: &mut Child) -> Result<(), String> {
             true
         }
     };
+    if let Err(error) = kill_process_group(pgid) {
+        errors.push(format!("could not kill process group: {error}"));
+    }
     if should_stop {
-        kill_process_group(child);
         if let Err(error) = child.start_kill() {
             errors.push(format!("could not kill process: {error}"));
         }
@@ -997,14 +1014,23 @@ async fn terminate_process_group(child: &mut Child) -> Result<(), String> {
     }
 }
 
-fn kill_process_group(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child
-        .id()
-        .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+fn kill_process_group(pgid: Option<u32>) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = test_hooks::intercept_kill_process_group(pgid) {
+        return result;
     }
+
+    #[cfg(unix)]
+    if let Some(raw_pgid) = pgid {
+        let Some(pgid) = rustix::process::Pid::from_raw(raw_pgid as i32) else {
+            return Err(format!("invalid process group id {raw_pgid}"));
+        };
+        return match rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+    }
+    Ok(())
 }
 
 async fn reserve_address() -> io::Result<(SocketAddr, TcpListener)> {
@@ -1083,4 +1109,125 @@ async fn cleanup_failure_does_not_prevent_later_actions() {
 
     assert_eq!(actions.borrow().as_slice(), ["first", "second"]);
     assert!(error.to_string().contains("first cleanup failed"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_group_cleanup_reports_errors_and_kills_saved_group_after_leader_exit() {
+    let mut failed_child = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let failed_pgid = failed_child.id();
+    failed_child.wait().await.unwrap();
+
+    let recorded =
+        test_hooks::install_kill_process_group_hook(Some("injected cleanup failure"), true);
+    let cleanup_error = terminate_process_group(&mut failed_child, failed_pgid)
+        .await
+        .expect_err("a non-ESRCH group-kill error must fail cleanup");
+    test_hooks::clear_kill_process_group_hook();
+    assert!(cleanup_error.contains("injected cleanup failure"));
+    assert_eq!(
+        recorded.lock().unwrap().as_slice(),
+        &[failed_pgid],
+        "cleanup must use the PGID captured before the leader exited"
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let descendant_path = directory.path().join("descendant.pid");
+    let script = format!(
+        "sleep 30 & echo $! > {} ; wait",
+        shell_quote(&descendant_path)
+    );
+    let mut leader = Command::new("sh")
+        .args(["-c", &script])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let saved_pgid = leader.id().expect("group leader must have a PID");
+    let descendant_pid = loop {
+        if let Some(pid) = fs::read_to_string(&descendant_path)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    leader.start_kill().unwrap();
+    leader.wait().await.unwrap();
+
+    let recorded = test_hooks::install_kill_process_group_hook(None, false);
+    terminate_process_group(&mut leader, Some(saved_pgid))
+        .await
+        .expect("ESRCH from a group that disappeared should be suppressed");
+    test_hooks::clear_kill_process_group_hook();
+    assert_eq!(
+        recorded.lock().unwrap().as_slice(),
+        &[Some(saved_pgid)],
+        "an exited leader must still trigger termination of its saved group"
+    );
+
+    let descendant = rustix::process::Pid::from_raw(descendant_pid as i32).unwrap();
+    for _ in 0..100 {
+        if rustix::process::test_kill_process(descendant).is_err() {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("process-group descendant remained alive after saved-group cleanup");
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    struct KillProcessGroupHook {
+        error: Option<String>,
+        intercept: bool,
+        recorded: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    static KILL_PROCESS_GROUP_HOOK: OnceLock<Mutex<Option<KillProcessGroupHook>>> = OnceLock::new();
+
+    pub(super) fn install_kill_process_group_hook(
+        error: Option<&str>,
+        intercept: bool,
+    ) -> Arc<Mutex<Vec<Option<u32>>>> {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        *KILL_PROCESS_GROUP_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(KillProcessGroupHook {
+            error: error.map(str::to_owned),
+            intercept,
+            recorded: Arc::clone(&recorded),
+        });
+        recorded
+    }
+
+    pub(super) fn clear_kill_process_group_hook() {
+        *KILL_PROCESS_GROUP_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = None;
+    }
+
+    pub(super) fn intercept_kill_process_group(pgid: Option<u32>) -> Option<Result<(), String>> {
+        let hook = KILL_PROCESS_GROUP_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        let hook = hook.as_ref()?;
+        hook.recorded.lock().unwrap().push(pgid);
+        if !hook.intercept {
+            return None;
+        }
+        Some(match &hook.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        })
+    }
 }
