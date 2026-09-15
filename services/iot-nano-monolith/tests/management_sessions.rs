@@ -675,6 +675,8 @@ async fn management_admin_manages_assets_through_the_typed_storage_port() {
     .unwrap();
     assert_eq!(listed[0]["id"], asset_id);
     assert_eq!(listed[0]["name"], "Operations Campus");
+    assert!(listed[0]["asset_profile_id"].is_null());
+    assert!(listed[0]["parent_asset_id"].is_null());
     assert_eq!(listed[0]["metadata"], json!({ "region": "north" }));
     assert_eq!(listed[0]["attributes"], json!({ "region": "north" }));
 
@@ -737,6 +739,20 @@ async fn management_admin_manages_assets_through_the_typed_storage_port() {
         .await
         .unwrap();
     assert_eq!(invalid_id.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_delete_id = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/management/assets/not-a-uuid")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_delete_id.status(), StatusCode::BAD_REQUEST);
 
     let duplicate = router
         .clone()
