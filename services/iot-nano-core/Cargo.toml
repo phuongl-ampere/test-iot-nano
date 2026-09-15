@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 axum.workspace = true
 chrono.workspace = true
-clap.workspace = true
 iot-core = { path = "../../crates/iot-core" }
 iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
 iot-storage = { path = "../../crates/iot-storage" }
