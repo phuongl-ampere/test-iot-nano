@@ -1,7 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    CreateManagementUser, ManagementUserError, ManagementUserRepository, ManagementUserRole,
-    PlatformStore, UpdateManagementUser,
+    AccountClass, CreateManagementUser, ManagementUserError, ManagementUserRepository,
+    ManagementUserRole, PlatformStore, UpdateManagementUser,
 };
 use sqlx::{Connection, PgConnection};
 
@@ -118,6 +118,63 @@ async fn sqlite_management_user_repository_updates_a_username_and_replaces_grant
     .await
     .unwrap();
     assert_eq!(grants, ["fleet", "reports"]);
+}
+
+#[tokio::test]
+async fn sqlite_management_user_role_changes_update_account_class_atomically() {
+    let (_directory, store) = sqlite_store().await;
+    ManagementUserRepository::create_management_user(&store, user_creation("alice"))
+        .await
+        .unwrap();
+    ManagementUserRepository::create_management_user(&store, user_creation("bob"))
+        .await
+        .unwrap();
+
+    let alice = ManagementUserRepository::update_management_user(
+        &store,
+        "alice",
+        UpdateManagementUser {
+            default_app: "/apps/powermonitor".to_owned(),
+            granted_apps: vec!["powermonitor".to_owned()],
+            role: Some(ManagementUserRole::Admin),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(alice.role, ManagementUserRole::Admin);
+    assert_eq!(alice.account_class, AccountClass::Admin);
+
+    ManagementUserRepository::update_management_user(
+        &store,
+        "bob",
+        UpdateManagementUser {
+            default_app: "/apps/powermonitor".to_owned(),
+            granted_apps: vec!["powermonitor".to_owned()],
+            role: Some(ManagementUserRole::Admin),
+        },
+    )
+    .await
+    .unwrap();
+    let alice = ManagementUserRepository::update_management_user(
+        &store,
+        "alice",
+        UpdateManagementUser {
+            default_app: "/apps/fleet".to_owned(),
+            granted_apps: vec!["fleet".to_owned()],
+            role: Some(ManagementUserRole::Viewer),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(alice.role, ManagementUserRole::Viewer);
+    assert_eq!(alice.account_class, AccountClass::User);
+
+    let stored: (String, String) =
+        sqlx::query_as("SELECT role, account_class FROM users WHERE username = 'alice'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(stored, ("viewer".to_owned(), "user".to_owned()));
 }
 
 #[tokio::test]
@@ -352,8 +409,37 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
     .await
     .unwrap();
     assert_eq!(updated.role, ManagementUserRole::Admin);
+    assert_eq!(updated.account_class, AccountClass::Admin);
     assert_eq!(updated.default_app, "/apps/fleet");
     assert_eq!(updated.granted_apps, ["fleet", "reports"]);
+
+    ManagementUserRepository::create_management_user(&store, user_creation("bob"))
+        .await
+        .unwrap();
+    let bob = ManagementUserRepository::update_management_user(
+        &store,
+        "bob",
+        UpdateManagementUser {
+            default_app: "/apps/powermonitor".to_owned(),
+            granted_apps: vec!["powermonitor".to_owned()],
+            role: Some(ManagementUserRole::Admin),
+        },
+    )
+    .await
+    .unwrap();
+    let demoted = ManagementUserRepository::update_management_user(
+        &store,
+        "alice",
+        UpdateManagementUser {
+            default_app: "/apps/fleet".to_owned(),
+            granted_apps: vec!["fleet".to_owned(), "reports".to_owned()],
+            role: Some(ManagementUserRole::Viewer),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(demoted.role, ManagementUserRole::Viewer);
+    assert_eq!(demoted.account_class, AccountClass::User);
 
     let duplicate_apps = ManagementUserRepository::update_management_user(
         &store,
@@ -375,6 +461,6 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
         ManagementUserRepository::list_management_users(&store)
             .await
             .unwrap(),
-        [updated]
+        [demoted, bob,]
     );
 }

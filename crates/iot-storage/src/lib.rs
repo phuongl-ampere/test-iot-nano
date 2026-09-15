@@ -29,12 +29,16 @@ use url::Url;
 const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform.sql");
 
 pub use management::{
-    CreateManagementAsset, CreateManagementUser, DeviceTokenRecord, DeviceTokenRepository,
-    DeviceTokenRepositoryError, ManagementAsset, ManagementAssetError, ManagementAssetRepository,
-    ManagementChildStatus, ManagementDevice, ManagementDeviceError, ManagementDeviceHealth,
-    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
-    ManagementUserError, ManagementUserRepository, ManagementUserRole, NewDeviceToken,
-    NewOwnedDeviceToken, UpdateManagementAsset, UpdateManagementDevice, UpdateManagementUser,
+    CreateManagementAsset, CreateManagementAssetProfile, CreateManagementDeviceProfile,
+    CreateManagementUser, DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError,
+    ManagementAsset, ManagementAssetError, ManagementAssetProfile, ManagementAssetProfileError,
+    ManagementAssetProfileRepository, ManagementAssetRepository, ManagementChildStatus,
+    ManagementDevice, ManagementDeviceError, ManagementDeviceHealth, ManagementDeviceProfile,
+    ManagementDeviceProfileError, ManagementDeviceProfileRepository, ManagementDeviceRepository,
+    ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser, ManagementUserError,
+    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOwnedDeviceToken,
+    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
+    UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,
