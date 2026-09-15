@@ -24,6 +24,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+utoipa-swagger-ui.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

@@ -1776,6 +1776,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "utoipa-swagger-ui",
  "uuid",
 ]
 

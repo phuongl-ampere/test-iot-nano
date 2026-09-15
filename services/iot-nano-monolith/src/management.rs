@@ -36,8 +36,9 @@ use iot_storage::{
     UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
+use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use tokio::sync::Notify;
@@ -245,12 +246,1051 @@ impl ManagementSessionRouter {
                 "/api/management/devices/{device_id}/tokens",
                 post(create_device_token),
             )
-            .with_state(state);
+            .with_state(state)
+            .merge(
+                SwaggerUi::new("/docs/")
+                    .external_url_unchecked("/api-docs/openapi.json", management_openapi()),
+            );
         Self {
             router,
             session_verifier,
         }
     }
+}
+
+fn management_openapi() -> Value {
+    let mut paths = Map::new();
+
+    documented_path(
+        &mut paths,
+        "/oauth/authorize",
+        vec![(
+            "get",
+            documented_operation(
+                "Authorize an OAuth client with the active management browser session",
+                Some("managementSession"),
+                None,
+                ("302", "Authorization redirect", None),
+                &[
+                    ("400", "Invalid authorization request"),
+                    ("401", "No active browser session"),
+                ],
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/oauth/token",
+        vec![(
+            "post",
+            documented_operation(
+                "Exchange an OAuth authorization code or client credentials for an access token",
+                None,
+                Some(("application/x-www-form-urlencoded", "OAuthTokenRequest")),
+                ("200", "Access token issued", Some("AccessToken")),
+                &[
+                    ("400", "Invalid token request"),
+                    ("401", "Client authentication failed"),
+                ],
+            ),
+        )],
+    );
+
+    documented_path(
+        &mut paths,
+        "/api/v1/assets",
+        vec![
+            (
+                "get",
+                public_operation("List assets", None, "200", "AssetPage"),
+            ),
+            (
+                "post",
+                public_operation(
+                    "Create an asset",
+                    Some("PublicAssetRequest"),
+                    "201",
+                    "PublicAsset",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/assets/{asset_id}",
+        vec![
+            (
+                "get",
+                public_operation("Get an asset", None, "200", "PublicAsset"),
+            ),
+            (
+                "patch",
+                public_operation(
+                    "Update an asset",
+                    Some("PublicAssetRequest"),
+                    "200",
+                    "PublicAsset",
+                ),
+            ),
+            ("delete", public_no_content_operation("Delete an asset")),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/telemetry",
+        vec![(
+            "get",
+            public_operation("List telemetry", None, "200", "TelemetryPage"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/telemetry/{device_id}",
+        vec![(
+            "get",
+            public_operation("Get device telemetry", None, "200", "TelemetryPage"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/alerts",
+        vec![(
+            "get",
+            public_operation("List alerts", None, "200", "AlertPage"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/alerts/{alert_id}",
+        vec![(
+            "get",
+            public_operation("Get an alert", None, "200", "PublicAlert"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/alerts/{alert_id}/acknowledge",
+        vec![(
+            "post",
+            public_operation("Acknowledge an alert", None, "200", "PublicAlert"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/devices",
+        vec![
+            (
+                "get",
+                public_operation("List devices", None, "200", "DevicePage"),
+            ),
+            (
+                "post",
+                public_operation(
+                    "Create a device",
+                    Some("PublicDeviceRequest"),
+                    "201",
+                    "PublicDevice",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/devices/{device_id}",
+        vec![
+            (
+                "get",
+                public_operation("Get a device", None, "200", "PublicDevice"),
+            ),
+            (
+                "patch",
+                public_operation(
+                    "Update a device",
+                    Some("PublicDeviceRequest"),
+                    "200",
+                    "PublicDevice",
+                ),
+            ),
+            ("delete", public_no_content_operation("Delete a device")),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/devices/{device_id}/commands",
+        vec![(
+            "post",
+            public_operation(
+                "Create a device command",
+                Some("CommandRequest"),
+                "202",
+                "Command",
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/commands/{command_id}",
+        vec![(
+            "get",
+            public_operation("Get a device command", None, "200", "Command"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/resource-grants",
+        vec![
+            (
+                "get",
+                public_operation("List resource grants", None, "200", "GrantPage"),
+            ),
+            (
+                "post",
+                public_operation(
+                    "Create a resource grant",
+                    Some("ResourceGrantRequest"),
+                    "201",
+                    "ResourceGrant",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/resource-grants/{grant_id}",
+        vec![
+            (
+                "get",
+                public_operation("Get a resource grant", None, "200", "ResourceGrant"),
+            ),
+            (
+                "patch",
+                public_operation(
+                    "Update a resource grant",
+                    Some("ResourceGrantRequest"),
+                    "200",
+                    "ResourceGrant",
+                ),
+            ),
+            (
+                "delete",
+                public_no_content_operation("Delete a resource grant"),
+            ),
+        ],
+    );
+
+    documented_path(
+        &mut paths,
+        "/api/auth/login",
+        vec![(
+            "post",
+            documented_operation(
+                "Start a management session",
+                None,
+                Some(("application/json", "LoginRequest")),
+                ("200", "Management session started", Some("SessionResponse")),
+                &[
+                    ("401", "Invalid credentials"),
+                    ("429", "Too many attempts"),
+                    ("503", "Service unavailable"),
+                ],
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/auth/logout",
+        vec![(
+            "post",
+            documented_operation(
+                "End the current management session",
+                Some("managementSession"),
+                None,
+                ("204", "Management session ended", None),
+                &[],
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/auth/me",
+        vec![(
+            "get",
+            documented_operation(
+                "Get the current management session",
+                Some("managementSession"),
+                None,
+                ("200", "Current session", Some("SessionResponse")),
+                &[("401", "No active management session")],
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/applications",
+        vec![(
+            "post",
+            management_operation(
+                "Create or update an OAuth application",
+                "ApplicationRequest",
+                "201",
+                "ApplicationResponse",
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/users",
+        vec![
+            (
+                "get",
+                management_list_operation("List management users", "ManagementUserList"),
+            ),
+            (
+                "post",
+                management_operation(
+                    "Create a management user",
+                    "ManagementUserCreateRequest",
+                    "201",
+                    "ManagementUser",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/users/{username}",
+        vec![(
+            "put",
+            management_operation(
+                "Update a management user",
+                "ManagementUserUpdateRequest",
+                "200",
+                "ManagementUser",
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/profiles/device-profiles",
+        vec![
+            (
+                "get",
+                management_list_operation("List device profiles", "DeviceProfileList"),
+            ),
+            (
+                "post",
+                management_operation(
+                    "Create a device profile",
+                    "DeviceProfileRequest",
+                    "201",
+                    "DeviceProfile",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/profiles/device-profiles/{profile_id}",
+        vec![
+            (
+                "put",
+                management_operation(
+                    "Update a device profile",
+                    "DeviceProfileRequest",
+                    "200",
+                    "DeviceProfile",
+                ),
+            ),
+            (
+                "delete",
+                management_no_content_operation("Delete a device profile"),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/profiles/asset-profiles",
+        vec![
+            (
+                "get",
+                management_list_operation("List asset profiles", "AssetProfileList"),
+            ),
+            (
+                "post",
+                management_operation(
+                    "Create an asset profile",
+                    "AssetProfileRequest",
+                    "201",
+                    "AssetProfile",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/profiles/asset-profiles/{profile_id}",
+        vec![
+            (
+                "put",
+                management_operation(
+                    "Update an asset profile",
+                    "AssetProfileRequest",
+                    "200",
+                    "AssetProfile",
+                ),
+            ),
+            (
+                "delete",
+                management_no_content_operation("Delete an asset profile"),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/devices",
+        vec![
+            (
+                "get",
+                management_list_operation("List management devices", "ManagementDeviceList"),
+            ),
+            (
+                "post",
+                management_operation(
+                    "Provision a device",
+                    "DeviceProvisionRequest",
+                    "201",
+                    "DeviceToken",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/devices/{device_id}",
+        vec![
+            (
+                "put",
+                management_operation(
+                    "Update a management device",
+                    "ManagementDeviceUpdateRequest",
+                    "200",
+                    "ManagementDevice",
+                ),
+            ),
+            (
+                "delete",
+                management_no_content_operation("Delete a management device"),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/devices/{device_id}/tokens",
+        vec![(
+            "post",
+            documented_operation(
+                "Issue a device token",
+                Some("managementSession"),
+                None,
+                ("201", "Device token issued", Some("DeviceToken")),
+                &[
+                    ("400", "Invalid device identifier"),
+                    ("401", "No active management session"),
+                    ("403", "Administrator role required"),
+                    ("404", "Device not found"),
+                    ("503", "Service unavailable"),
+                ],
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/assets",
+        vec![
+            (
+                "get",
+                management_list_operation("List management assets", "ManagementAssetList"),
+            ),
+            (
+                "post",
+                management_operation(
+                    "Create a management asset",
+                    "ManagementAssetRequest",
+                    "201",
+                    "ManagementAsset",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/assets/{asset_id}",
+        vec![
+            (
+                "put",
+                management_operation(
+                    "Update a management asset",
+                    "ManagementAssetRequest",
+                    "200",
+                    "ManagementAsset",
+                ),
+            ),
+            (
+                "delete",
+                management_no_content_operation("Delete a management asset"),
+            ),
+        ],
+    );
+
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "IoT Nano operator API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "Public OAuth and API v1 operations, plus management administration operations."
+        },
+        "paths": paths,
+        "components": {
+            "securitySchemes": {
+                "managementSession": {
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": SESSION_COOKIE
+                },
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "OAuth 2.0 access token"
+                },
+                "oauth2": {
+                    "type": "oauth2",
+                    "flows": {
+                        "authorizationCode": {
+                            "authorizationUrl": "/oauth/authorize",
+                            "tokenUrl": "/oauth/token",
+                            "scopes": {}
+                        },
+                        "clientCredentials": {
+                            "tokenUrl": "/oauth/token",
+                            "scopes": {}
+                        }
+                    }
+                }
+            },
+            "schemas": management_openapi_schemas()
+        }
+    })
+}
+
+fn documented_path(paths: &mut Map<String, Value>, path: &str, operations: Vec<(&str, Value)>) {
+    let mut item = Map::new();
+    for (method, operation) in operations {
+        item.insert(method.to_owned(), operation);
+    }
+    let parameters = path_parameters(path);
+    if !parameters.is_empty() {
+        item.insert("parameters".to_owned(), Value::Array(parameters));
+    }
+    paths.insert(path.to_owned(), Value::Object(item));
+}
+
+fn path_parameters(path: &str) -> Vec<Value> {
+    path.split('/')
+        .filter_map(|segment| {
+            segment
+                .strip_prefix('{')
+                .and_then(|segment| segment.strip_suffix('}'))
+        })
+        .map(|name| {
+            json!({
+                "name": name,
+                "in": "path",
+                "required": true,
+                "schema": {"type": "string"}
+            })
+        })
+        .collect()
+}
+
+fn public_operation(
+    summary: &str,
+    request_schema: Option<&str>,
+    success_status: &str,
+    response_schema: &str,
+) -> Value {
+    documented_operation(
+        summary,
+        Some("bearerAuth"),
+        request_schema.map(|schema| ("application/json", schema)),
+        (success_status, "Request completed", Some(response_schema)),
+        &[
+            ("400", "Invalid request"),
+            ("401", "Bearer token required"),
+            ("403", "Insufficient scope"),
+            ("404", "Resource not found"),
+            ("409", "Conflicting request"),
+            ("503", "Service unavailable"),
+        ],
+    )
+}
+
+fn public_no_content_operation(summary: &str) -> Value {
+    documented_operation(
+        summary,
+        Some("bearerAuth"),
+        None,
+        ("204", "Request completed", None),
+        &[
+            ("401", "Bearer token required"),
+            ("403", "Insufficient scope"),
+            ("404", "Resource not found"),
+            ("503", "Service unavailable"),
+        ],
+    )
+}
+
+fn management_operation(
+    summary: &str,
+    request_schema: &str,
+    success_status: &str,
+    response_schema: &str,
+) -> Value {
+    documented_operation(
+        summary,
+        Some("managementSession"),
+        Some(("application/json", request_schema)),
+        (success_status, "Request completed", Some(response_schema)),
+        &management_errors(),
+    )
+}
+
+fn management_list_operation(summary: &str, response_schema: &str) -> Value {
+    documented_operation(
+        summary,
+        Some("managementSession"),
+        None,
+        ("200", "Request completed", Some(response_schema)),
+        &management_errors(),
+    )
+}
+
+fn management_no_content_operation(summary: &str) -> Value {
+    documented_operation(
+        summary,
+        Some("managementSession"),
+        None,
+        ("204", "Request completed", None),
+        &management_errors(),
+    )
+}
+
+fn management_errors() -> [(&'static str, &'static str); 6] {
+    [
+        ("400", "Invalid request"),
+        ("401", "No active management session"),
+        ("403", "Administrator role required"),
+        ("404", "Resource not found"),
+        ("409", "Conflicting request"),
+        ("503", "Service unavailable"),
+    ]
+}
+
+fn documented_operation(
+    summary: &str,
+    security: Option<&str>,
+    request: Option<(&str, &str)>,
+    success: (&str, &str, Option<&str>),
+    errors: &[(&str, &str)],
+) -> Value {
+    let mut operation = Map::new();
+    operation.insert("summary".to_owned(), Value::String(summary.to_owned()));
+    if let Some((content_type, schema)) = request {
+        operation.insert(
+            "requestBody".to_owned(),
+            json!({
+                "required": true,
+                "content": {content_type: {"schema": schema_reference(schema)}}
+            }),
+        );
+    }
+    if let Some(scheme) = security {
+        let mut requirement = Map::new();
+        requirement.insert(scheme.to_owned(), json!([]));
+        operation.insert(
+            "security".to_owned(),
+            Value::Array(vec![Value::Object(requirement)]),
+        );
+    }
+    let mut responses = Map::new();
+    responses.insert(success.0.to_owned(), response_value(success.1, success.2));
+    for (status, description) in errors {
+        responses.insert(
+            (*status).to_owned(),
+            response_value(description, Some("Error")),
+        );
+    }
+    operation.insert("responses".to_owned(), Value::Object(responses));
+    Value::Object(operation)
+}
+
+fn response_value(description: &str, schema: Option<&str>) -> Value {
+    let mut response = Map::new();
+    response.insert(
+        "description".to_owned(),
+        Value::String(description.to_owned()),
+    );
+    if let Some(schema) = schema {
+        response.insert(
+            "content".to_owned(),
+            json!({"application/json": {"schema": schema_reference(schema)}}),
+        );
+    }
+    Value::Object(response)
+}
+
+fn schema_reference(schema: &str) -> Value {
+    json!({"$ref": format!("#/components/schemas/{schema}")})
+}
+
+fn management_openapi_schemas() -> Value {
+    let mut schemas = Map::new();
+    schemas.insert(
+        "Error".to_owned(),
+        object_schema(json!({"error": {"type": "string"}}), &["error"]),
+    );
+    schemas.insert(
+        "SessionResponse".to_owned(),
+        object_schema(json!({"user_id": uuid_schema()}), &["user_id"]),
+    );
+    schemas.insert(
+        "LoginRequest".to_owned(),
+        object_schema(
+            json!({
+                "username": {"type": "string"},
+                "password": {"type": "string", "format": "password"}
+            }),
+            &["username", "password"],
+        ),
+    );
+    schemas.insert(
+        "OAuthTokenRequest".to_owned(),
+        object_schema(
+            json!({
+                "grant_type": {"type": "string"},
+                "code": {"type": "string"},
+                "redirect_uri": {"type": "string", "format": "uri"},
+                "client_id": {"type": "string"},
+                "code_verifier": {"type": "string"},
+                "scope": {"type": "string"}
+            }),
+            &["grant_type"],
+        ),
+    );
+    schemas.insert(
+        "AccessToken".to_owned(),
+        object_schema(
+            json!({
+                "access_token": {"type": "string"},
+                "token_type": {"type": "string"},
+                "expires_in": {"type": "integer", "format": "int64"},
+                "scope": {"type": "string"}
+            }),
+            &["access_token", "token_type", "expires_in"],
+        ),
+    );
+    schemas.insert(
+        "ApplicationRequest".to_owned(),
+        object_schema(
+            json!({
+                "app_id": {"type": "string"},
+                "kind": {"type": "string"},
+                "launch_url": {"type": "string", "format": "uri"},
+                "client_id": {"type": "string"},
+                "redirect_uris": {"type": "array", "items": {"type": "string", "format": "uri"}},
+                "allowed_scopes": {"type": "array", "items": {"type": "string"}},
+                "enabled": {"type": "boolean"}
+            }),
+            &[
+                "app_id",
+                "kind",
+                "launch_url",
+                "client_id",
+                "redirect_uris",
+                "allowed_scopes",
+                "enabled",
+            ],
+        ),
+    );
+    schemas.insert(
+        "ApplicationResponse".to_owned(),
+        object_schema(
+            json!({"app_id": {"type": "string"}, "client_id": {"type": "string"}}),
+            &["app_id", "client_id"],
+        ),
+    );
+    schemas.insert(
+        "ManagementUserCreateRequest".to_owned(),
+        object_schema(
+            json!({
+                "username": {"type": "string"},
+                "password": {"type": "string", "format": "password"},
+                "default_app": {"type": "string"},
+                "granted_apps": {"type": "array", "items": {"type": "string"}}
+            }),
+            &["username", "password", "default_app", "granted_apps"],
+        ),
+    );
+    schemas.insert(
+        "ManagementUserUpdateRequest".to_owned(),
+        object_schema(
+            json!({
+                "default_app": {"type": "string"},
+                "granted_apps": {"type": "array", "items": {"type": "string"}},
+                "role": {"type": "string"}
+            }),
+            &["default_app", "granted_apps"],
+        ),
+    );
+    schemas.insert(
+        "ManagementUser".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema(),
+                "username": {"type": "string"},
+                "role": {"type": "string"},
+                "account_class": {"type": "string"},
+                "default_app": {"type": "string"},
+                "granted_apps": {"type": "array", "items": {"type": "string"}}
+            }),
+            &[
+                "id",
+                "username",
+                "role",
+                "account_class",
+                "default_app",
+                "granted_apps",
+            ],
+        ),
+    );
+    schemas.insert(
+        "DeviceProfileRequest".to_owned(),
+        object_schema(
+            json!({
+                "name": {"type": "string"},
+                "telemetry_schema": json_object_schema(),
+                "metric_mapping": json_object_schema(),
+                "reporting_settings": json_object_schema()
+            }),
+            &[
+                "name",
+                "telemetry_schema",
+                "metric_mapping",
+                "reporting_settings",
+            ],
+        ),
+    );
+    schemas.insert(
+        "DeviceProfile".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema(),
+                "name": {"type": "string"},
+                "telemetry_schema": json_object_schema(),
+                "metric_mapping": json_object_schema(),
+                "reporting_settings": json_object_schema()
+            }),
+            &[
+                "id",
+                "name",
+                "telemetry_schema",
+                "metric_mapping",
+                "reporting_settings",
+            ],
+        ),
+    );
+    schemas.insert(
+        "AssetProfileRequest".to_owned(),
+        object_schema(
+            json!({
+                "name": {"type": "string"},
+                "fields": json_object_schema(),
+                "dashboard_defaults": json_object_schema()
+            }),
+            &["name", "fields", "dashboard_defaults"],
+        ),
+    );
+    schemas.insert(
+        "AssetProfile".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema(),
+                "name": {"type": "string"},
+                "fields": json_object_schema(),
+                "dashboard_defaults": json_object_schema()
+            }),
+            &["id", "name", "fields", "dashboard_defaults"],
+        ),
+    );
+    schemas.insert(
+        "DeviceProvisionRequest".to_owned(),
+        object_schema(
+            json!({"display_name": {"type": "string"}}),
+            &["display_name"],
+        ),
+    );
+    schemas.insert(
+        "ManagementDeviceUpdateRequest".to_owned(),
+        object_schema(
+            json!({
+                "display_name": {"type": "string"},
+                "asset_id": uuid_schema(),
+                "device_profile_id": uuid_schema(),
+                "attributes": json_object_schema(),
+                "topology": json_object_schema()
+            }),
+            &["display_name"],
+        ),
+    );
+    schemas.insert(
+        "ManagementDevice".to_owned(),
+        object_schema(
+            json!({
+                "device_id": {"type": "string"},
+                "display_name": {"type": ["string", "null"]},
+                "asset_id": uuid_schema(),
+                "device_profile_id": uuid_schema(),
+                "attributes": json_object_schema(),
+                "online": {"type": "boolean"},
+                "last_seen_at": {"type": ["string", "null"], "format": "date-time"},
+                "is_gateway": {"type": "boolean"},
+                "gateway_device_id": {"type": ["string", "null"]},
+                "gateway_status": {"type": ["string", "null"]},
+                "child_status": {"type": ["string", "null"]}
+            }),
+            &["device_id", "attributes", "online", "is_gateway"],
+        ),
+    );
+    schemas.insert(
+        "DeviceToken".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema(),
+                "device_id": {"type": "string"},
+                "token_prefix": {"type": "string"},
+                "token": {"type": "string"}
+            }),
+            &["id", "device_id", "token_prefix"],
+        ),
+    );
+    schemas.insert(
+        "ManagementAssetRequest".to_owned(),
+        object_schema(
+            json!({
+                "name": {"type": "string"},
+                "asset_profile_id": uuid_schema(),
+                "parent_asset_id": uuid_schema(),
+                "metadata": json_object_schema(),
+                "attributes": json_object_schema()
+            }),
+            &["name", "metadata"],
+        ),
+    );
+    schemas.insert(
+        "ManagementAsset".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema(),
+                "name": {"type": "string"},
+                "asset_profile_id": uuid_schema(),
+                "parent_asset_id": uuid_schema(),
+                "metadata": json_object_schema(),
+                "attributes": json_object_schema()
+            }),
+            &["id", "name", "metadata", "attributes"],
+        ),
+    );
+
+    for name in [
+        "PublicAssetRequest",
+        "PublicDeviceRequest",
+        "CommandRequest",
+        "ResourceGrantRequest",
+    ] {
+        schemas.insert(name.to_owned(), flexible_request_schema());
+    }
+    for name in [
+        "PublicAsset",
+        "PublicDevice",
+        "Telemetry",
+        "PublicAlert",
+        "Command",
+        "ResourceGrant",
+    ] {
+        schemas.insert(name.to_owned(), flexible_response_schema());
+    }
+    for (name, item) in [
+        ("ManagementUserList", "ManagementUser"),
+        ("DeviceProfileList", "DeviceProfile"),
+        ("AssetProfileList", "AssetProfile"),
+        ("ManagementDeviceList", "ManagementDevice"),
+        ("ManagementAssetList", "ManagementAsset"),
+    ] {
+        schemas.insert(name.to_owned(), array_schema(item));
+    }
+    for (name, item) in [
+        ("AssetPage", "PublicAsset"),
+        ("DevicePage", "PublicDevice"),
+        ("TelemetryPage", "Telemetry"),
+        ("AlertPage", "PublicAlert"),
+        ("GrantPage", "ResourceGrant"),
+    ] {
+        schemas.insert(name.to_owned(), page_schema(item));
+    }
+
+    Value::Object(schemas)
+}
+
+fn object_schema(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn array_schema(item: &str) -> Value {
+    json!({"type": "array", "items": schema_reference(item)})
+}
+
+fn page_schema(item: &str) -> Value {
+    object_schema(
+        json!({
+            "items": {"type": "array", "items": schema_reference(item)},
+            "next_cursor": {"type": ["string", "null"]},
+            "has_more": {"type": "boolean"}
+        }),
+        &["items", "next_cursor", "has_more"],
+    )
+}
+
+fn flexible_request_schema() -> Value {
+    json!({"type": "object", "additionalProperties": true})
+}
+
+fn flexible_response_schema() -> Value {
+    object_schema(
+        json!({"id": uuid_schema(), "status": {"type": "string"}, "attributes": json_object_schema()}),
+        &[],
+    )
+}
+
+fn json_object_schema() -> Value {
+    json!({"type": "object", "additionalProperties": true})
+}
+
+fn uuid_schema() -> Value {
+    json!({"type": ["string", "null"], "format": "uuid"})
 }
 
 #[derive(Default)]

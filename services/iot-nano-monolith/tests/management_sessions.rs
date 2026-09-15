@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Extension,
-    body::Body,
+    body::{Body, to_bytes},
     extract::ConnectInfo,
     http::{
         HeaderMap, HeaderValue, Request, StatusCode,
@@ -14,7 +14,7 @@ use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{BootstrapAdminError, ManagementSessionRouter, bootstrap_admin};
 use iot_storage::PlatformStore;
 use serde_json::json;
-use std::net::SocketAddr;
+use std::{collections::BTreeSet, net::SocketAddr};
 use tower::ServiceExt;
 
 async fn management_session_router() -> (tempfile::TempDir, ManagementSessionRouter) {
@@ -134,6 +134,112 @@ async fn management_login_rejects_invalid_credentials_without_setting_a_session_
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(response.headers().get(SET_COOKIE).is_none());
+}
+
+#[tokio::test]
+async fn management_openapi_has_only_the_operator_route_allowlist_without_sensitive_material() {
+    let (_directory, management) = management_session_router().await;
+    let response = management
+        .router
+        .oneshot(
+            Request::builder()
+                .uri("/api-docs/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let document: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(document["openapi"], "3.1.0");
+    assert_eq!(
+        document["components"]["securitySchemes"]["managementSession"]["type"],
+        "apiKey"
+    );
+    assert_eq!(
+        document["components"]["securitySchemes"]["bearerAuth"]["scheme"],
+        "bearer"
+    );
+
+    let paths = document["paths"].as_object().unwrap();
+    let actual_paths: BTreeSet<_> = paths.keys().map(String::as_str).collect();
+    let expected_paths = BTreeSet::from([
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/me",
+        "/api/management/applications",
+        "/api/management/assets",
+        "/api/management/assets/{asset_id}",
+        "/api/management/devices",
+        "/api/management/devices/{device_id}",
+        "/api/management/devices/{device_id}/tokens",
+        "/api/management/profiles/asset-profiles",
+        "/api/management/profiles/asset-profiles/{profile_id}",
+        "/api/management/profiles/device-profiles",
+        "/api/management/profiles/device-profiles/{profile_id}",
+        "/api/management/users",
+        "/api/management/users/{username}",
+        "/api/v1/alerts",
+        "/api/v1/alerts/{alert_id}",
+        "/api/v1/alerts/{alert_id}/acknowledge",
+        "/api/v1/assets",
+        "/api/v1/assets/{asset_id}",
+        "/api/v1/commands/{command_id}",
+        "/api/v1/devices",
+        "/api/v1/devices/{device_id}",
+        "/api/v1/devices/{device_id}/commands",
+        "/api/v1/resource-grants",
+        "/api/v1/resource-grants/{grant_id}",
+        "/api/v1/telemetry",
+        "/api/v1/telemetry/{device_id}",
+        "/oauth/authorize",
+        "/oauth/token",
+    ]);
+    assert_eq!(actual_paths, expected_paths);
+
+    let rendered = document.to_string();
+    for forbidden in [
+        "/internal/",
+        "client_secret",
+        "password_hash",
+        "token_hash",
+        "database_url",
+        "sqlite",
+        "postgres",
+        "/opt/",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "OpenAPI document exposed forbidden content: {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn management_swagger_ui_serves_the_operator_documentation() {
+    let (_directory, management) = management_session_router().await;
+    let response = management
+        .router
+        .oneshot(
+            Request::builder()
+                .uri("/docs/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("Swagger UI"));
 }
 
 #[tokio::test]

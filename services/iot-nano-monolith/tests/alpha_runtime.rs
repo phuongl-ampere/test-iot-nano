@@ -170,6 +170,29 @@ async fn alpha_runtime_mounts_management_login_endpoint() {
 }
 
 #[tokio::test]
+async fn alpha_runtime_exposes_openapi_and_swagger_only_on_the_management_listener() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+
+    assert_http_status(
+        fixture.config.management_http,
+        "/api-docs/openapi.json",
+        200,
+    )
+    .await;
+    assert_http_status(fixture.config.management_http, "/docs/", 200).await;
+    assert_http_status(fixture.config.public_http, "/api-docs/openapi.json", 404).await;
+    assert_http_status(fixture.config.public_http, "/docs/", 404).await;
+
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn alpha_runtime_uses_a_management_session_to_issue_a_public_pkce_code() {
     let fixture = Fixture::new().await;
     let mut runtime = MonolithRuntime::start(fixture.config.clone())
