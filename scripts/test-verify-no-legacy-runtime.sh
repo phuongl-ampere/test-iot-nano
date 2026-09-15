@@ -123,6 +123,17 @@ assert_log_contains() {
   fi
 }
 
+assert_log_excludes() {
+  local unexpected_line="$1"
+  local log_path="$2"
+
+  if rg -Fqx -- "$unexpected_line" "$log_path"; then
+    printf 'installer requested an unexpected privilege command: %s\n' \
+      "$unexpected_line" >&2
+    exit 1
+  fi
+}
+
 create_fake_privilege_command() {
   local command_name="$1"
   local command_path="$2/$command_name"
@@ -131,9 +142,28 @@ create_fake_privilege_command() {
     '#!/usr/bin/env bash' \
     'set -euo pipefail' \
     'printf "%s %s\n" "$(basename "$0")" "$*" >>"$FAKE_COMMAND_LOG"' \
-    'if [[ "$(basename "$0")" == "sudo" ]]; then' \
-    '  "$@"' \
-    'fi' >"$command_path"
+    '[[ "${FAKE_INSTALL_DRY_RUN:-0}" != "1" ]] || exit 0' \
+    'case "$(basename "$0")" in' \
+    '  sudo|fake-sudo)' \
+    '    [[ "${1:-}" == "-v" ]] || "$@"' \
+    '    ;;' \
+    '  getent|id|fake-getent|fake-id)' \
+    '    exit 1' \
+    '    ;;' \
+    '  install|fake-install)' \
+    '    if [[ "${1:-}" == "-d" ]]; then' \
+    '      mkdir -p "${!#}"' \
+    '    else' \
+    '      destination="${!#}"' \
+    '      source_path="${@: -2:1}"' \
+    '      mkdir -p "$(dirname "$destination")"' \
+    '      cp "$source_path" "$destination"' \
+    '    fi' \
+    '    ;;' \
+    '  chmod|fake-chmod)' \
+    '    /bin/chmod "$@"' \
+    '    ;;' \
+    'esac' >"$command_path"
   chmod 0755 "$command_path"
 }
 
@@ -243,31 +273,102 @@ populate_fixture
 
 installer_fixture="$(mktemp -d)"
 fake_bin="$installer_fixture/bin"
-config_path="$installer_fixture/iot-nano-mqttd.toml"
-original_config="$installer_fixture/original.toml"
 fake_command_log="$installer_fixture/privilege.log"
-mkdir -p "$fake_bin"
-printf '%s\n' 'existing standalone configuration' >"$config_path"
-cp "$config_path" "$original_config"
-for fake_command in sudo install chown chmod; do
+installer_root="$installer_fixture/root"
+template_path="$installer_root/services/iot-nano-mqttd/config/standalone.toml"
+config_path="$installer_fixture/etc/rush-iot-nano/iot-nano-mqttd.toml"
+config_dir="$(dirname "$config_path")"
+state_path="$installer_fixture/var/lib/iot-nano-mqttd"
+service_path="$installer_fixture/etc/systemd/system/iot-nano-mqttd-standalone.service"
+install_path="$installer_fixture/opt/rush-iot-nano"
+mkdir -p \
+  "$fake_bin" \
+  "$(dirname "$template_path")" \
+  "$(dirname "$service_path")" \
+  "$installer_root/infra/systemd" \
+  "$installer_root/target/release"
+cp "$root/services/iot-nano-mqttd/config/standalone.toml" "$template_path"
+cp "$root/infra/systemd/$standalone_unit" \
+  "$installer_root/infra/systemd/$standalone_unit"
+printf '%s\n' 'fake mqttd binary' >"$installer_root/target/release/iot-nano-mqttd"
+for fake_command in \
+  fake-sudo fake-cargo fake-getent fake-id fake-groupadd fake-useradd \
+  fake-install fake-chown fake-chmod fake-systemctl; do
   create_fake_privilege_command "$fake_command" "$fake_bin"
+done
+for command_name in \
+  sudo cargo getent id groupadd useradd install chown chmod systemctl; do
+  ln -s "fake-$command_name" "$fake_bin/$command_name"
 done
 
 PATH="$fake_bin:$PATH" \
   FAKE_COMMAND_LOG="$fake_command_log" \
-  IOT_NANO_MQTTD_INSTALLER_LIB=1 \
-  bash -c 'source "$1"; config_path="$2"; install_config' -- \
-  "$root/scripts/$standalone_installer" "$config_path"
+  FAKE_INSTALL_DRY_RUN=1 \
+  bash -c 'source "$1"' -- "$root/scripts/$standalone_installer"
+if [[ -s "$fake_command_log" ]]; then
+  printf 'sourcing the standalone installer invoked production commands\n' >&2
+  exit 1
+fi
 
-if ! cmp -s "$original_config" "$config_path"; then
+run_standalone_installer() {
+  PATH="$fake_bin:$PATH" \
+    FAKE_COMMAND_LOG="$fake_command_log" \
+    IOT_NANO_MQTTD_ROOT="$installer_root" \
+    IOT_NANO_MQTTD_CONFIG_DIR="$config_dir" \
+    IOT_NANO_MQTTD_CONFIG_PATH="$config_path" \
+    IOT_NANO_MQTTD_STATE_PATH="$state_path" \
+    IOT_NANO_MQTTD_SERVICE_PATH="$service_path" \
+    IOT_NANO_MQTTD_INSTALL_PATH="$install_path" \
+    IOT_NANO_MQTTD_SUDO_BIN=fake-sudo \
+    IOT_NANO_MQTTD_CARGO_BIN=fake-cargo \
+    IOT_NANO_MQTTD_GETENT_BIN=fake-getent \
+    IOT_NANO_MQTTD_ID_BIN=fake-id \
+    IOT_NANO_MQTTD_GROUPADD_BIN=fake-groupadd \
+    IOT_NANO_MQTTD_USERADD_BIN=fake-useradd \
+    IOT_NANO_MQTTD_INSTALL_BIN=fake-install \
+    IOT_NANO_MQTTD_CHOWN_BIN=fake-chown \
+    IOT_NANO_MQTTD_CHMOD_BIN=fake-chmod \
+    IOT_NANO_MQTTD_SYSTEMCTL_BIN=fake-systemctl \
+    bash -c 'source "$1"; install_mqttd_standalone' -- \
+    "$root/scripts/$standalone_installer" >/dev/null
+}
+
+: >"$fake_command_log"
+run_standalone_installer
+
+if ! cmp -s "$template_path" "$config_path"; then
+  printf 'standalone installer did not create config from the template\n' >&2
+  exit 1
+fi
+assert_log_contains \
+  "fake-sudo fake-install --owner root --group iot --mode 0640 $template_path $config_path" \
+  "$fake_command_log"
+assert_log_contains \
+  "fake-install --owner root --group iot --mode 0640 $template_path $config_path" \
+  "$fake_command_log"
+assert_log_contains "fake-sudo fake-chown root:iot $config_path" "$fake_command_log"
+assert_log_contains "fake-chown root:iot $config_path" "$fake_command_log"
+assert_log_contains "fake-sudo fake-chmod 0640 $config_path" "$fake_command_log"
+assert_log_contains "fake-chmod 0640 $config_path" "$fake_command_log"
+
+printf '%s\n' 'existing standalone configuration' >"$config_path"
+chmod 0600 "$config_path"
+cp "$config_path" "$installer_fixture/original.toml"
+: >"$fake_command_log"
+run_standalone_installer
+
+if ! cmp -s "$installer_fixture/original.toml" "$config_path"; then
   printf 'standalone installer changed existing config content\n' >&2
   exit 1
 fi
-if rg -q '^install ' "$fake_command_log"; then
-  printf 'standalone installer replaced existing config content\n' >&2
+if [[ "$(permission_mode "$config_path")" != "640" ]]; then
+  printf 'standalone installer did not normalize existing config mode\n' >&2
   exit 1
 fi
-assert_log_contains "sudo chown root:iot $config_path" "$fake_command_log"
-assert_log_contains "chown root:iot $config_path" "$fake_command_log"
-assert_log_contains "sudo chmod 0640 $config_path" "$fake_command_log"
-assert_log_contains "chmod 0640 $config_path" "$fake_command_log"
+assert_log_excludes \
+  "fake-sudo fake-install --owner root --group iot --mode 0640 $template_path $config_path" \
+  "$fake_command_log"
+assert_log_contains "fake-sudo fake-chown root:iot $config_path" "$fake_command_log"
+assert_log_contains "fake-chown root:iot $config_path" "$fake_command_log"
+assert_log_contains "fake-sudo fake-chmod 0640 $config_path" "$fake_command_log"
+assert_log_contains "fake-chmod 0640 $config_path" "$fake_command_log"
