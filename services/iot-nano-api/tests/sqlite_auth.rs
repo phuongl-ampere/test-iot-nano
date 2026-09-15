@@ -2865,6 +2865,141 @@ async fn sqlite_management_admin_crud_covers_profiles_assets_devices_and_users()
 }
 
 #[tokio::test]
+async fn sqlite_management_asset_deletes_preserve_reference_invariants() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("rush.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    };
+    let store = SqliteStore::open(&configuration).await.unwrap();
+    bootstrap_users_sqlite(store.pool()).await.unwrap();
+    let app = sqlite_router(SqliteApiState::new(store.clone()));
+    let session_id = sqlite_session_id(&app, "admin", "NanoAdmin@1234").await;
+
+    let profile = sqlite_json_response(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/profiles/asset-profiles")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Session {session_id}"))
+            .body(Body::from(r#"{"name":"Referenced profile","fields":{}}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(profile.0, StatusCode::CREATED);
+    let profile_id = profile.1["id"].as_str().unwrap().to_owned();
+
+    let asset = sqlite_json_response(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/assets")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Session {session_id}"))
+            .body(Body::from(
+                json!({
+                    "name": "Referenced asset",
+                    "asset_profile_id": profile_id,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(asset.0, StatusCode::CREATED);
+    let asset_id = asset.1["id"].as_str().unwrap().to_owned();
+
+    let device = sqlite_json_response(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/devices")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Session {session_id}"))
+            .body(Body::from(r#"{"display_name":"Referenced device"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(device.0, StatusCode::CREATED);
+    let device_id = device.1["device_id"].as_str().unwrap().to_owned();
+
+    let assigned = sqlite_json_response(
+        &app,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/management/devices/{device_id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Session {session_id}"))
+            .body(Body::from(
+                json!({
+                    "display_name": "Referenced device",
+                    "asset_id": asset_id,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(assigned.0, StatusCode::OK);
+
+    let profile_in_use = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/management/profiles/asset-profiles/{profile_id}"
+                ))
+                .header("authorization", format!("Session {session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile_in_use.status(), StatusCode::CONFLICT);
+
+    let deleted_asset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/management/assets/{asset_id}"))
+                .header("authorization", format!("Session {session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_asset.status(), StatusCode::NO_CONTENT);
+
+    let device_asset_id: Option<String> =
+        sqlx::query_scalar("SELECT asset_id FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(device_asset_id, None);
+
+    let deleted_profile = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/management/profiles/asset-profiles/{profile_id}"
+                ))
+                .header("authorization", format!("Session {session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted_profile.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn sqlite_management_writes_require_an_admin_session() {
     let directory = tempfile::tempdir().unwrap();
     let configuration = StorageConfiguration {
