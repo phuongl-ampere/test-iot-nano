@@ -78,9 +78,11 @@ stage_internal_archive() {
   restore_archives '
     set -eu
     stage="$(mktemp -d)"
-    trap "rm -rf \"$stage\"" EXIT
+    validation_archive="$(mktemp)"
+    trap "rm -rf \"$stage\"; rm -f \"$validation_archive\"" EXIT
     tar -xzf /rollback/internal-state.tar.gz -C "$stage"
-    tar -C "$stage" -cf - . | tar -tf - >/dev/null'
+    tar -C "$stage" -cf "$validation_archive" .
+    tar -tf "$validation_archive" >/dev/null'
 }
 
 swap_staged_internal_archive() {
@@ -94,23 +96,37 @@ swap_staged_internal_archive() {
     replacement_started=0
     replacement_complete=0
 
+    path_exists() {
+      [ -e "$1" ] || [ -L "$1" ]
+    }
+
     move_state() {
       source="$1"
       destination="$2"
-      find "$source" -mindepth 1 -maxdepth 1 -exec mv -- {} "$destination" \; ||
-        return 1
+      for entry in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+        path_exists "$entry" || continue
+        mv -- "$entry" "$destination" || return 1
+      done
     }
 
     move_live_state() {
-      find "$target" -mindepth 1 -maxdepth 1 \
-        ! -path "$stage" ! -path "$candidate" ! -path "$previous" \
-        -exec mv -- {} "$previous" \; || return 1
+      for entry in "$target"/* "$target"/.[!.]* "$target"/..?*; do
+        path_exists "$entry" || continue
+        case "$entry" in
+          "$stage" | "$candidate" | "$previous") continue ;;
+        esac
+        mv -- "$entry" "$previous" || return 1
+      done
     }
 
     clear_replaced_state() {
-      find "$target" -mindepth 1 -maxdepth 1 \
-        ! -path "$stage" ! -path "$candidate" ! -path "$previous" \
-        -exec rm -rf -- {} + || return 1
+      for entry in "$target"/* "$target"/.[!.]* "$target"/..?*; do
+        path_exists "$entry" || continue
+        case "$entry" in
+          "$stage" | "$candidate" | "$previous") continue ;;
+        esac
+        rm -rf -- "$entry" || return 1
+      done
     }
 
     restore_original_internal_state() {
@@ -214,12 +230,15 @@ restore_archives '
     archive="$1"
     target="$2"
     stage="$(mktemp -d)"
+    transfer_archive="$(mktemp)"
     tar -xzf "$archive" -C "$stage"
+    tar -C "$stage" -cf "$transfer_archive" .
     find "$target" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-    tar -C "$stage" -cf - . | tar -C "$target" -xf -
+    tar -xpf "$transfer_archive" -C "$target"
     find "$target" -type d -exec chmod 0700 {} +
     find "$target" -type f -exec chmod 0600 {} +
     rm -rf "$stage"
+    rm -f "$transfer_archive"
   }
   restore_archive /rollback/platform-state.tar.gz /var/lib/iot-nano/platform
   restore_archive /rollback/internal-state.tar.gz /var/lib/iot-nano/internal'

@@ -20,6 +20,9 @@ archive_source="$sandbox/archive-source"
 fake_bin="$sandbox/bin"
 docker_log="$sandbox/docker.log"
 restore_log="$sandbox/restore.log"
+original_state="$sandbox/original-state"
+real_mv="$(command -v mv)"
+real_tar="$(command -v tar)"
 mkdir -p "$backup_dir" "$internal_dir" "$archive_source" "$fake_bin"
 chmod 0700 "$backup_dir"
 
@@ -31,8 +34,9 @@ printf '%s\n' \
 printf 'restored-state\n' > "$archive_source/restored-state"
 tar -C "$archive_source" -czf "$backup_dir/internal-state.tar.gz" .
 printf 'restore-point\n' > "$backup_dir/timescale-restore-point"
-printf 'old-state\n' > "$internal_dir/state"
+printf 'old-state\0must-survive\n' > "$internal_dir/state"
 chmod 0600 "$internal_dir/state"
+cp -p "$internal_dir/state" "$original_state"
 
 cat > "$sandbox/restore-success" <<'EOF'
 #!/usr/bin/env bash
@@ -41,11 +45,48 @@ printf '%s\n' "$1" >> "$ROLLBACK_FIXTURE_RESTORE_LOG"
 EOF
 chmod 0700 "$sandbox/restore-success"
 
-cat > "$fake_bin/cp" <<'EOF'
+cat > "$fake_bin/tar" <<'EOF'
 #!/usr/bin/env bash
-exit 1
+set -euo pipefail
+
+for argument in "$@"; do
+  if [[ "${ROLLBACK_FIXTURE_FAIL_TAR_CREATE:-0}" == 1 &&
+    "$argument" == -cf ]]; then
+    "$ROLLBACK_FIXTURE_REAL_TAR" -cf - --files-from /dev/null
+    exit 1
+  fi
+done
+
+exec "$ROLLBACK_FIXTURE_REAL_TAR" "$@"
 EOF
-chmod 0700 "$fake_bin/cp"
+chmod 0700 "$fake_bin/tar"
+
+cat > "$fake_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+arguments=("$@")
+if [[ "${arguments[0]:-}" == -- ]]; then
+  arguments=("${arguments[@]:1}")
+fi
+source="${arguments[0]:-}"
+destination="${arguments[1]:-}"
+
+if [[ "${ROLLBACK_FIXTURE_FAIL_CANDIDATE_MOVE:-0}" == 1 &&
+  "$source" == "$ROLLBACK_FIXTURE_INTERNAL_DIR"/.rollback-internal-candidate.*/* &&
+  "$destination" == "$ROLLBACK_FIXTURE_INTERNAL_DIR" ]]; then
+  previous_state="$(find "$ROLLBACK_FIXTURE_INTERNAL_DIR"/.rollback-internal-previous.* \
+    -type f -name state -print -quit)"
+  [[ -n "$previous_state" ]] &&
+    cmp -s "$previous_state" "$ROLLBACK_FIXTURE_ORIGINAL_STATE" ||
+    exit 97
+  printf 'candidate-move-after-live-state-moved\n' >> "$ROLLBACK_FIXTURE_DOCKER_LOG"
+  exit 1
+fi
+
+exec "$ROLLBACK_FIXTURE_REAL_MV" "${arguments[@]}"
+EOF
+chmod 0700 "$fake_bin/mv"
 
 cat > "$fake_bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -97,27 +138,54 @@ PATH="$ROLLBACK_FIXTURE_FAKE_BIN:$PATH" /bin/sh -c "$restore_command"
 EOF
 chmod 0700 "$fake_bin/docker"
 
-set +e
-PATH="$fake_bin:$PATH" \
-  IOT_NANO_TIMESCALE_COMPOSE=1 \
-  ROLLBACK_BACKUP_DIR="$backup_dir" \
-  TIMESCALE_RESTORE_COMMAND="$sandbox/restore-success" \
-  ROLLBACK_FIXTURE_DOCKER_LOG="$docker_log" \
-  ROLLBACK_FIXTURE_RESTORE_LOG="$restore_log" \
-  ROLLBACK_FIXTURE_INTERNAL_DIR="$internal_dir" \
-  ROLLBACK_FIXTURE_FAKE_BIN="$fake_bin" \
-  "$rollback_script" > "$sandbox/rollback.log" 2>&1
-status=$?
-set -e
+run_rollback() {
+  local tar_create_failure="$1"
+  local candidate_move_failure="$2"
+
+  set +e
+  PATH="$fake_bin:$PATH" \
+    IOT_NANO_TIMESCALE_COMPOSE=1 \
+    ROLLBACK_BACKUP_DIR="$backup_dir" \
+    TIMESCALE_RESTORE_COMMAND="$sandbox/restore-success" \
+    ROLLBACK_FIXTURE_DOCKER_LOG="$docker_log" \
+    ROLLBACK_FIXTURE_RESTORE_LOG="$restore_log" \
+    ROLLBACK_FIXTURE_INTERNAL_DIR="$internal_dir" \
+    ROLLBACK_FIXTURE_ORIGINAL_STATE="$original_state" \
+    ROLLBACK_FIXTURE_FAKE_BIN="$fake_bin" \
+    ROLLBACK_FIXTURE_REAL_MV="$real_mv" \
+    ROLLBACK_FIXTURE_REAL_TAR="$real_tar" \
+    ROLLBACK_FIXTURE_FAIL_TAR_CREATE="$tar_create_failure" \
+    ROLLBACK_FIXTURE_FAIL_CANDIDATE_MOVE="$candidate_move_failure" \
+    "$rollback_script" > "$sandbox/rollback.log" 2>&1
+  status=$?
+  set -e
+}
+
+run_rollback 1 0
 
 [[ "$status" -ne 0 ]] ||
-  fail 'rollback succeeded after the injected target-copy failure'
-cmp -s "$internal_dir/state" <(printf 'old-state\n') ||
+  fail 'rollback succeeded after the injected staging archive failure'
+cmp -s "$internal_dir/state" "$original_state" ||
+  fail 'staging archive failure changed the original internal state'
+[[ ! -s "$restore_log" ]] ||
+  fail 'external Timescale restore ran after the injected staging archive failure'
+if [[ -f "$docker_log" ]] && grep -qx 'up' "$docker_log"; then
+  fail 'compose up ran after the injected staging archive failure'
+fi
+
+: > "$docker_log"
+run_rollback 0 1
+
+[[ "$status" -ne 0 ]] ||
+  fail 'rollback succeeded after the injected candidate-move failure'
+grep -qx 'candidate-move-after-live-state-moved' "$docker_log" ||
+  fail 'injected candidate move did not observe the original internal state moved'
+cmp -s "$internal_dir/state" "$original_state" ||
   fail 'rollback did not restore the original internal state'
 [[ ! -e "$internal_dir/restored-state" ]] ||
   fail 'rollback left a partial replacement in internal state'
 [[ -s "$restore_log" ]] ||
   fail 'external Timescale restore did not run'
 if [[ -f "$docker_log" ]] && grep -qx 'up' "$docker_log"; then
-  fail 'compose up ran after the injected target-copy failure'
+  fail 'compose up ran after the injected candidate-move failure'
 fi
