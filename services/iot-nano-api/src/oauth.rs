@@ -541,14 +541,57 @@ fn token_client_authentication(
         .decode(encoded)
         .map_err(|_| OAuthError::InvalidClient)?;
     let decoded = std::str::from_utf8(&decoded).map_err(|_| OAuthError::InvalidClient)?;
-    let (client_id, client_secret) = decoded.split_once(':').ok_or(OAuthError::InvalidClient)?;
+    let (encoded_client_id, encoded_client_secret) =
+        decoded.split_once(':').ok_or(OAuthError::InvalidClient)?;
+    let client_id = decode_form_component(encoded_client_id)?;
+    let client_secret = decode_form_component(encoded_client_secret)?;
     if client_id.is_empty() || client_secret.is_empty() {
         return Err(OAuthError::InvalidClient);
     }
     Ok(TokenClientAuthentication {
-        client_id: client_id.to_owned(),
-        client_secret: Some(client_secret.to_owned()),
+        client_id,
+        client_secret: Some(client_secret),
     })
+}
+
+fn decode_form_component(value: &str) -> Result<String, OAuthError> {
+    let input = value.as_bytes();
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        match input[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let high = input
+                    .get(index + 1)
+                    .and_then(|byte| hex_digit(*byte))
+                    .ok_or(OAuthError::InvalidClient)?;
+                let low = input
+                    .get(index + 2)
+                    .and_then(|byte| hex_digit(*byte))
+                    .ok_or(OAuthError::InvalidClient)?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| OAuthError::InvalidClient)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn token_response(access_token: String, scopes: Vec<String>) -> Result<Response, OAuthError> {

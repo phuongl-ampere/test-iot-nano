@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createCallbackHandler, createLoginHandler, readSession } from "../lib/oauth";
+import {
+  createCallbackHandler,
+  createLoginHandler,
+  exchangeAuthorizationCode,
+  readSession,
+} from "../lib/oauth";
 
 process.env.SESSION_SECRET = "test-session-secret-with-sufficient-length";
 
@@ -84,6 +89,38 @@ describe("PowerMonitor OAuth BFF", () => {
       redirectUri,
     });
     expect(response.headers.get("location")).toBe("https://powermonitor.example.test/");
+  });
+
+  it("form-encodes Basic credentials individually and omits duplicate body credentials", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ access_token: "opaque-access-token" }), { status: 200 }),
+    );
+    const config = {
+      platformBaseUrl: "https://platform.example.test",
+      clientId: "client: id+%",
+      clientSecret: "secret: value+%",
+      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      scope: "devices:read",
+    };
+
+    await exchangeAuthorizationCode(
+      config,
+      {
+        code: "code-123",
+        codeVerifier: "verifier-123",
+        redirectUri: config.redirectUri,
+      },
+      fetcher,
+    );
+
+    const [url, init] = fetcher.mock.calls[0] as [URL, RequestInit];
+    expect(String(url)).toBe("https://platform.example.test/oauth/token");
+    expect(new Headers(init.headers).get("authorization")).toBe(
+      `Basic ${Buffer.from("client%3A+id%2B%25:secret%3A+value%2B%25").toString("base64")}`,
+    );
+    expect(String(init.body)).toBe(
+      "grant_type=authorization_code&code=code-123&code_verifier=verifier-123&redirect_uri=https%3A%2F%2Fpowermonitor.example.test%2Fapi%2Fauth%2Fcallback",
+    );
   });
 
   it("recovers only a valid encrypted application session for BFF bearer requests", async () => {

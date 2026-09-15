@@ -119,11 +119,13 @@ export async function exchangeAuthorizationCode(
     code: input.code,
     code_verifier: input.codeVerifier,
     redirect_uri: input.redirectUri,
-    client_id: config.clientId,
+    ...(config.clientSecret === undefined ? { client_id: config.clientId } : {}),
   });
   const headers = new Headers({ "content-type": "application/x-www-form-urlencoded" });
   if (config.clientSecret !== undefined) {
-    headers.set("authorization", `Basic ${Buffer.from(`${config.clientId}:${config.clientSecret}`).toString("base64")}`);
+    const clientId = formEncode(config.clientId);
+    const clientSecret = formEncode(config.clientSecret);
+    headers.set("authorization", `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`);
   }
 
   const response = await fetcher(new URL("/oauth/token", config.platformBaseUrl), {
@@ -179,6 +181,10 @@ function required(name: string): string {
     throw new Error(`${name} is required`);
   }
   return value;
+}
+
+function formEncode(value: string): string {
+  return new URLSearchParams({ value }).toString().slice("value=".length);
 }
 
 function seal(value: object): string {

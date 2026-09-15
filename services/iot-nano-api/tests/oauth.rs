@@ -25,9 +25,18 @@ use uuid::Uuid;
 
 const BROWSER_SESSION: &str = "oauth-browser-session";
 const CLIENT_ID: &str = "oauth-test-client";
+const SPECIAL_CLIENT_ID: &str = "oauth: test+%";
+const SPECIAL_CLIENT_SECRET: &str = "secret: value+%";
 const REDIRECT_URI: &str = "https://client.example.test/callback";
 
 async fn oauth_test_state(enabled: bool) -> (tempfile::TempDir, PlatformStore, ApiState) {
+    oauth_test_state_for_client(enabled, CLIENT_ID).await
+}
+
+async fn oauth_test_state_for_client(
+    enabled: bool,
+    client_id: &str,
+) -> (tempfile::TempDir, PlatformStore, ApiState) {
     let directory = tempfile::tempdir().unwrap();
     let configuration = StorageConfiguration {
         storage: DatabaseStorage::Sqlite,
@@ -51,7 +60,7 @@ async fn oauth_test_state(enabled: bool) -> (tempfile::TempDir, PlatformStore, A
             app_id: "oauth-test-app".parse().unwrap(),
             kind: ApplicationKind::FullStack,
             launch_url: "https://client.example.test".to_owned(),
-            client_id: CLIENT_ID.parse().unwrap(),
+            client_id: client_id.parse().unwrap(),
             redirect_uris: vec![REDIRECT_URI.parse().unwrap()],
             allowed_scopes: vec!["devices:read".to_owned()],
             enabled,
@@ -422,6 +431,83 @@ async fn token_endpoint_authenticates_a_confidential_client_with_http_basic() {
     let payload: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(payload["scope"], "devices:read");
+}
+
+#[tokio::test]
+async fn token_endpoint_form_decodes_special_characters_in_http_basic_credentials() {
+    let (_directory, store, state) = oauth_test_state_for_client(true, SPECIAL_CLIENT_ID).await;
+    OAuthRepository::register_client_secret(
+        &store,
+        NewOAuthClientSecret {
+            app_id: "oauth-test-app".parse().unwrap(),
+            client_secret: SPECIAL_CLIENT_SECRET.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let basic = STANDARD.encode("oauth%3A+test%2B%25:secret%3A+value%2B%25");
+    let response = routers(state)
+        .public
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(AUTHORIZATION, format!("Basic {basic}"))
+                .body(Body::from(
+                    "grant_type=client_credentials&scope=devices%3Aread",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["scope"], "devices:read");
+}
+
+#[tokio::test]
+async fn token_endpoint_rejects_malformed_form_encoding_in_http_basic_credentials() {
+    let (_directory, store, state) = oauth_test_state_for_client(true, SPECIAL_CLIENT_ID).await;
+    OAuthRepository::register_client_secret(
+        &store,
+        NewOAuthClientSecret {
+            app_id: "oauth-test-app".parse().unwrap(),
+            client_secret: SPECIAL_CLIENT_SECRET.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let basic = STANDARD.encode("oauth%3A+test%2B%25:secret%3A+value%2B%ZZ");
+    let response = routers(state)
+        .public
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(AUTHORIZATION, format!("Basic {basic}"))
+                .body(Body::from(
+                    "grant_type=client_credentials&scope=devices%3Aread",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["error"], "invalid_client");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM oauth_access_tokens")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
