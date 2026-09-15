@@ -18,6 +18,15 @@ use std::net::SocketAddr;
 use tower::ServiceExt;
 
 async fn management_session_router() -> (tempfile::TempDir, ManagementSessionRouter) {
+    let (directory, _store, management) = management_session_router_with_store().await;
+    (directory, management)
+}
+
+async fn management_session_router_with_store() -> (
+    tempfile::TempDir,
+    Arc<PlatformStore>,
+    ManagementSessionRouter,
+) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         PlatformStore::open(&StorageConfiguration {
@@ -32,7 +41,7 @@ async fn management_session_router() -> (tempfile::TempDir, ManagementSessionRou
     bootstrap_users_sqlite(store.sqlite_pool().unwrap())
         .await
         .unwrap();
-    let management = ManagementSessionRouter::new(store, test_token_vault());
+    let management = ManagementSessionRouter::new(Arc::clone(&store), test_token_vault());
     let router = management
         .router
         .clone()
@@ -42,6 +51,7 @@ async fn management_session_router() -> (tempfile::TempDir, ManagementSessionRou
         )))));
     (
         directory,
+        store,
         ManagementSessionRouter {
             router,
             session_verifier: management.session_verifier,
@@ -772,6 +782,56 @@ async fn management_mutations_require_admin_and_map_token_errors() {
         .unwrap();
     assert_eq!(invalid_session.status(), StatusCode::UNAUTHORIZED);
 
+    let malformed_anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed_anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let viewer_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"viewer","password":"NanoView@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_cookie = viewer_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let malformed_viewer = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, viewer_cookie)
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(malformed_viewer.status(), StatusCode::FORBIDDEN);
+
     let login = router
         .clone()
         .oneshot(
@@ -866,6 +926,48 @@ async fn management_mutations_require_admin_and_map_token_errors() {
         .await
         .unwrap();
     assert_eq!(child_token.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn management_mutation_reports_unavailable_when_the_store_closes_after_login() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    store.sqlite_pool().unwrap().close().await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(r#"{"display_name":"Unavailable"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 async fn management_provision_device(

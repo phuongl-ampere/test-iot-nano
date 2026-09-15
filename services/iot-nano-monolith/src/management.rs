@@ -8,7 +8,8 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, State},
+    body::to_bytes,
+    extract::{ConnectInfo, Path, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{COOKIE, SET_COOKIE},
@@ -28,7 +29,7 @@ use iot_storage::{
     ManagementDeviceTopology, ManagementGatewayStatus, NewApplication, NewOAuthClientSecret,
     OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri, UpdateManagementDevice,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
@@ -37,6 +38,7 @@ const SESSION_COOKIE: &str = "iot_nano_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: u8 = 5;
+const MAX_MANAGEMENT_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum BootstrapAdminError {
@@ -482,10 +484,11 @@ async fn current_session(
 
 async fn create_application(
     State(state): State<ManagementState>,
-    headers: HeaderMap,
-    Json(request): Json<CreateApplicationRequest>,
+    request: Request,
 ) -> Result<(StatusCode, Json<ApplicationResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
+    let request: CreateApplicationRequest = management_request_json(request).await?;
     let app_id = request
         .app_id
         .parse()
@@ -541,10 +544,11 @@ async fn create_application(
 
 async fn provision_device(
     State(state): State<ManagementState>,
-    headers: HeaderMap,
-    Json(request): Json<ProvisionDeviceRequest>,
+    request: Request,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
+    let request: ProvisionDeviceRequest = management_request_json(request).await?;
     let display_name = request.display_name.trim();
     if display_name.is_empty() || display_name.len() > 128 {
         return Err(ManagementSessionError::BadRequest);
@@ -575,11 +579,12 @@ async fn list_management_devices(
 
 async fn update_management_device(
     State(state): State<ManagementState>,
-    headers: HeaderMap,
     Path(device_id): Path<String>,
-    Json(request): Json<UpdateManagementDeviceRequest>,
+    request: Request,
 ) -> Result<Json<ManagementDeviceResponse>, ManagementSessionError> {
+    let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
+    let request: UpdateManagementDeviceRequest = management_request_json(request).await?;
     let device = ManagementDeviceRepository::update_management_device(
         state.store.as_ref(),
         &device_id,
@@ -665,6 +670,16 @@ fn require_management_admin(
     } else {
         Err(ManagementSessionError::Forbidden)
     }
+}
+
+async fn management_request_json<T>(request: Request) -> Result<T, ManagementSessionError>
+where
+    T: DeserializeOwned,
+{
+    let body = to_bytes(request.into_body(), MAX_MANAGEMENT_REQUEST_BYTES)
+        .await
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    serde_json::from_slice(&body).map_err(|_| ManagementSessionError::BadRequest)
 }
 
 fn management_device_token_error(error: DeviceTokenStoreError) -> ManagementSessionError {
