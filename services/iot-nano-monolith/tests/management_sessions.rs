@@ -648,6 +648,11 @@ async fn management_admin_manages_assets_through_the_typed_storage_port() {
     )
     .unwrap();
     let asset_id = created["id"].as_str().unwrap();
+    assert_eq!(created["name"], "Operations Campus");
+    assert!(created["asset_profile_id"].is_null());
+    assert!(created["parent_asset_id"].is_null());
+    assert_eq!(created["metadata"], json!({ "region": "north" }));
+    assert_eq!(created["attributes"], json!({ "region": "north" }));
 
     let listed = router
         .clone()
@@ -669,6 +674,9 @@ async fn management_admin_manages_assets_through_the_typed_storage_port() {
     )
     .unwrap();
     assert_eq!(listed[0]["id"], asset_id);
+    assert_eq!(listed[0]["name"], "Operations Campus");
+    assert_eq!(listed[0]["metadata"], json!({ "region": "north" }));
+    assert_eq!(listed[0]["attributes"], json!({ "region": "north" }));
 
     let updated = router
         .clone()
@@ -693,6 +701,80 @@ async fn management_admin_manages_assets_through_the_typed_storage_port() {
         .await
         .unwrap();
     assert_eq!(updated.status(), StatusCode::OK);
+    let updated: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(updated.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(updated["id"], asset_id);
+    assert_eq!(updated["name"], "Operations Campus Updated");
+    assert!(updated["asset_profile_id"].is_null());
+    assert!(updated["parent_asset_id"].is_null());
+    assert_eq!(updated["metadata"], json!({ "region": "south" }));
+    assert_eq!(updated["attributes"], json!({ "region": "south" }));
+
+    let invalid_id = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/management/assets/not-a-uuid")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "name": "Ignored",
+                        "asset_profile_id": null,
+                        "parent_asset_id": null,
+                        "metadata": {},
+                        "attributes": {},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_id.status(), StatusCode::BAD_REQUEST);
+
+    let duplicate = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/assets")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "name": "Operations Campus Updated",
+                        "asset_profile_id": null,
+                        "parent_asset_id": null,
+                        "metadata": {},
+                        "attributes": {},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    let missing = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/management/assets/00000000-0000-0000-0000-000000000000")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
     let deleted = router
         .oneshot(
@@ -1095,6 +1177,24 @@ async fn management_mutation_reports_unavailable_when_the_store_closes_after_log
             .header(COOKIE, &cookie)
             .body(Body::from(r#"{"display_name":"Unavailable"}"#))
             .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/assets")
+            .header(CONTENT_TYPE, "application/json")
+            .header(COOKIE, &cookie)
+            .body(Body::from(
+                r#"{"name":"Unavailable","asset_profile_id":null,"parent_asset_id":null,"metadata":{},"attributes":{}}"#,
+            ))
+            .unwrap(),
+        Request::builder()
+            .method("PUT")
+            .uri("/api/management/assets/00000000-0000-0000-0000-000000000000")
+            .header(CONTENT_TYPE, "application/json")
+            .header(COOKIE, &cookie)
+            .body(Body::from(
+                r#"{"name":"Unavailable","asset_profile_id":null,"parent_asset_id":null,"metadata":{},"attributes":{}}"#,
+            ))
+            .unwrap(),
     ] {
         let response = router.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1190,6 +1290,8 @@ async fn management_mutation_authorization_precedes_json_rejection_for_every_bod
         ("POST", "/api/management/applications"),
         ("POST", "/api/management/devices"),
         ("PUT", "/api/management/devices/not-valid"),
+        ("POST", "/api/management/assets"),
+        ("PUT", "/api/management/assets/not-valid"),
     ] {
         let anonymous = router
             .clone()
