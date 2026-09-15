@@ -9,7 +9,7 @@ use axum::{
         header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
 };
-use iot_api::{OAuthBrowserSessionVerifier, bootstrap_users_sqlite};
+use iot_api::{OAuthBrowserSessionVerifier, TokenVault, bootstrap_users_sqlite};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{BootstrapAdminError, ManagementSessionRouter, bootstrap_admin};
 use iot_storage::PlatformStore;
@@ -31,7 +31,7 @@ async fn management_session_router() -> (tempfile::TempDir, ManagementSessionRou
     bootstrap_users_sqlite(store.sqlite_pool().unwrap())
         .await
         .unwrap();
-    let management = ManagementSessionRouter::new(store);
+    let management = ManagementSessionRouter::new(store, test_token_vault());
     let router = management
         .router
         .clone()
@@ -172,7 +172,7 @@ async fn bootstrap_admin_creates_the_only_initial_user_and_enables_management_lo
     .unwrap();
     assert_eq!(grants, vec!["powermonitor"]);
 
-    let management = ManagementSessionRouter::new(store);
+    let management = ManagementSessionRouter::new(store, test_token_vault());
     let router = management
         .router
         .layer(Extension(ConnectInfo(SocketAddr::from((
@@ -211,7 +211,7 @@ async fn management_admin_can_register_an_oauth_application() {
     bootstrap_admin(&store, "initial-admin", "BootstrapAdmin@2026")
         .await
         .unwrap();
-    let management = ManagementSessionRouter::new(Arc::clone(&store));
+    let management = ManagementSessionRouter::new(Arc::clone(&store), test_token_vault());
     let router = management
         .router
         .layer(Extension(ConnectInfo(SocketAddr::from((
@@ -262,6 +262,129 @@ async fn management_admin_can_register_an_oauth_application() {
     assert_eq!(applications, 1);
 }
 
+#[tokio::test]
+async fn management_admin_can_provision_a_device_token() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let provisioned = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(r#"{"display_name":"Provisioned Device"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::CREATED);
+    let payload: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(provisioned.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        payload["token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn management_admin_can_rotate_an_existing_device_token() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let provisioned = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(r#"{"display_name":"Rotated Device"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::CREATED);
+    let provisioned: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(provisioned.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let device_id = provisioned["device_id"].as_str().unwrap();
+    let first_token = provisioned["token"].as_str().unwrap();
+
+    let rotated = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/management/devices/{device_id}/tokens"))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::CREATED);
+    let rotated: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(rotated.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rotated["device_id"], device_id);
+    assert!(
+        rotated["token"]
+            .as_str()
+            .is_some_and(|token| token != first_token)
+    );
+}
+
 fn invalid_login_request() -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -269,4 +392,8 @@ fn invalid_login_request() -> Request<Body> {
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))
         .unwrap()
+}
+
+fn test_token_vault() -> TokenVault {
+    TokenVault::from_key_material("management-session-test-vault-key-material-0001")
 }

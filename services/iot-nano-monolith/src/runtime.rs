@@ -164,13 +164,15 @@ impl MonolithRuntime {
         };
 
         let readiness = Readiness::default();
-        let management_sessions = ManagementSessionRouter::new(Arc::clone(&platform));
+        let token_vault = TokenVault::from_key_material(&config.device_token_vault_key);
+        let management_sessions =
+            ManagementSessionRouter::new(Arc::clone(&platform), token_vault.clone());
         let browser_session_verifier: Arc<dyn iot_api::OAuthBrowserSessionVerifier> =
             management_sessions.session_verifier.clone();
         let public_router = health_router(readiness.clone())
             .merge(iot_api::public_v1_router(
                 Arc::clone(&platform),
-                TokenVault::from_key_material(&config.device_token_vault_key),
+                token_vault,
                 Arc::new(PlatformCoreFacade::new(Arc::clone(&platform))),
             ))
             .merge(iot_api::public_oauth_router_with_browser_session_verifier(

@@ -6611,7 +6611,8 @@ fn device_token_error(error: DeviceTokenStoreError) -> ApiError {
         }
         other @ (DeviceTokenStoreError::Token(_)
         | DeviceTokenStoreError::Vault(_)
-        | DeviceTokenStoreError::AllocationFailed) => ApiError::DeviceToken(other),
+        | DeviceTokenStoreError::AllocationFailed
+        | DeviceTokenStoreError::PlatformUnavailable) => ApiError::DeviceToken(other),
     }
 }
 
@@ -6620,9 +6621,9 @@ fn mqttd_device_token_error(error: DeviceTokenStoreError) -> ApiError {
         DeviceTokenStoreError::Database(error) => ApiError::Database(error),
         DeviceTokenStoreError::NotFound | DeviceTokenStoreError::Token(_) => ApiError::Unauthorized,
         DeviceTokenStoreError::GatewayChild => ApiError::Unauthorized,
-        error @ (DeviceTokenStoreError::Vault(_) | DeviceTokenStoreError::AllocationFailed) => {
-            ApiError::DeviceToken(error)
-        }
+        error @ (DeviceTokenStoreError::Vault(_)
+        | DeviceTokenStoreError::AllocationFailed
+        | DeviceTokenStoreError::PlatformUnavailable) => ApiError::DeviceToken(error),
     }
 }
 

@@ -26,6 +26,10 @@ pub use core_client::{
     CoreCommandResponseRequest, CoreTelemetryBucket, CoreTelemetryPoint,
 };
 pub use core_facade::{CoreFacade, CoreFacadeError, CoreTelemetryQuery};
+pub use device_tokens::{
+    DeviceTokenResponse, DeviceTokenStoreError, create_platform_device_token,
+    provision_platform_device_token,
+};
 pub use oauth::{
     OAuthBrowserSessionVerifier, public_oauth_router,
     public_oauth_router_with_browser_session_verifier,

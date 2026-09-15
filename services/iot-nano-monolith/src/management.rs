@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Path, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{COOKIE, SET_COOKIE},
@@ -17,8 +17,10 @@ use axum::{
     routing::{get, post},
 };
 use iot_api::{
-    AuthError, OAuthBrowserSessionVerifier, POWER_MONITOR_APP, Role, authenticate_credentials,
-    authenticate_credentials_sqlite, generate_session_id, hash_password, validate_password,
+    AuthError, DeviceTokenResponse, OAuthBrowserSessionVerifier, POWER_MONITOR_APP, Role,
+    TokenVault, authenticate_credentials, authenticate_credentials_sqlite,
+    create_platform_device_token, generate_session_id, hash_password,
+    provision_platform_device_token, validate_password,
 };
 use iot_storage::{
     ApplicationKind, ApplicationRepository, ClientId, NewApplication, NewOAuthClientSecret,
@@ -167,11 +169,12 @@ pub struct ManagementSessionRouter {
 }
 
 impl ManagementSessionRouter {
-    pub fn new(store: Arc<PlatformStore>) -> Self {
+    pub fn new(store: Arc<PlatformStore>, token_vault: TokenVault) -> Self {
         let session_verifier = Arc::new(ManagementSessionVerifier::default());
         let state = ManagementState {
             store,
             session_verifier: Arc::clone(&session_verifier),
+            token_vault,
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
         };
         let router = Router::new()
@@ -179,6 +182,11 @@ impl ManagementSessionRouter {
             .route("/api/auth/logout", post(logout))
             .route("/api/auth/me", get(current_session))
             .route("/api/management/applications", post(create_application))
+            .route("/api/management/devices", post(provision_device))
+            .route(
+                "/api/management/devices/{device_id}/tokens",
+                post(create_device_token),
+            )
             .with_state(state);
         Self {
             router,
@@ -256,6 +264,7 @@ impl OAuthBrowserSessionVerifier for ManagementSessionVerifier {
 struct ManagementState {
     store: Arc<PlatformStore>,
     session_verifier: Arc<ManagementSessionVerifier>,
+    token_vault: TokenVault,
     login_limiter: Arc<Mutex<LoginRateLimiter>>,
 }
 
@@ -352,6 +361,11 @@ struct CreateApplicationRequest {
 struct ApplicationResponse {
     app_id: String,
     client_id: String,
+}
+
+#[derive(Deserialize)]
+struct ProvisionDeviceRequest {
+    display_name: String,
 }
 
 async fn login(
@@ -481,6 +495,38 @@ async fn create_application(
             client_id: application.client_id.as_str().to_owned(),
         }),
     ))
+}
+
+async fn provision_device(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Json(request): Json<ProvisionDeviceRequest>,
+) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
+    if !state.session_verifier.is_admin(&headers) {
+        return Err(ManagementSessionError::Forbidden);
+    }
+    let display_name = request.display_name.trim();
+    if display_name.is_empty() || display_name.len() > 128 {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let token = provision_platform_device_token(&state.store, &state.token_vault, display_name)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok((StatusCode::CREATED, Json(token)))
+}
+
+async fn create_device_token(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
+    if !state.session_verifier.is_admin(&headers) {
+        return Err(ManagementSessionError::Forbidden);
+    }
+    let token = create_platform_device_token(&state.store, &state.token_vault, &device_id)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok((StatusCode::CREATED, Json(token)))
 }
 
 async fn authenticate(

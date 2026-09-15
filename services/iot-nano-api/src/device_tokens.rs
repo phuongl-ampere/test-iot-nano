@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::token_vault::{TokenVault, TokenVaultError};
+use iot_storage::PlatformStore;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeviceTokenResponse {
@@ -44,6 +45,36 @@ pub enum DeviceTokenStoreError {
     GatewayChild,
     #[error("could not allocate a unique device token")]
     AllocationFailed,
+    #[error("platform storage backend is unavailable")]
+    PlatformUnavailable,
+}
+
+pub async fn provision_platform_device_token(
+    store: &PlatformStore,
+    vault: &TokenVault,
+    display_name: &str,
+) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
+    if let Some(pool) = store.sqlite_pool() {
+        return provision_sqlite(pool, vault, display_name).await;
+    }
+    let pool = store
+        .timescale_pool()
+        .ok_or(DeviceTokenStoreError::PlatformUnavailable)?;
+    provision(pool, vault, display_name).await
+}
+
+pub async fn create_platform_device_token(
+    store: &PlatformStore,
+    vault: &TokenVault,
+    device_id: &str,
+) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
+    if let Some(pool) = store.sqlite_pool() {
+        return create_sqlite(pool, vault, device_id).await;
+    }
+    let pool = store
+        .timescale_pool()
+        .ok_or(DeviceTokenStoreError::PlatformUnavailable)?;
+    create(pool, vault, device_id).await
 }
 
 pub async fn list(
