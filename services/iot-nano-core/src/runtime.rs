@@ -20,9 +20,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    CommandTransport, CoreStreamConsumer, EmailSender, IngestMetrics, PlatformAlertEvaluator,
-    PlatformCommandDispatcher, PlatformNotificationDispatcher, PlatformTelemetryWriter,
-    WriterError,
+    CommandError, CommandTransport, CoreStreamConsumer, EmailSender, IngestMetrics,
+    PlatformAlertEvaluator, PlatformCommandDispatcher, PlatformNotificationDispatcher,
+    PlatformTelemetryWriter, WriterError,
 };
 
 #[derive(Clone)]
@@ -64,6 +64,8 @@ pub enum CoreRuntimeError {
     Worker(#[from] CoreRuntimeWorkerError),
     #[error("runtime drain failed: {0}")]
     Drain(#[source] StreamError),
+    #[error("runtime command drain failed: {0}")]
+    CommandDrain(#[source] CommandError),
     #[error("runtime drain deadline elapsed")]
     Deadline,
 }
@@ -91,10 +93,18 @@ enum WorkError {
 
 type Work = Box<dyn FnMut() -> Pin<Box<dyn Future<Output = Result<(), WorkError>> + Send>> + Send>;
 
+#[derive(Default)]
+struct CommandWorkerHandoff {
+    quiescing: AtomicBool,
+    dispatch_lock: AsyncMutex<()>,
+}
+
 pub struct CoreRuntime {
     stop_claiming: Arc<AtomicBool>,
     cancellation: CancellationToken,
     stream: Arc<dyn StreamPort>,
+    command_dispatcher: Arc<PlatformCommandDispatcher<Arc<dyn CommandTransport>>>,
+    command_handoff: Arc<CommandWorkerHandoff>,
     workers: Mutex<Option<Vec<WorkerHandle>>>,
     startup_barriers: AtomicUsize,
     drain_lock: AsyncMutex<()>,
@@ -133,6 +143,7 @@ impl CoreRuntime {
             Arc::clone(&config.command_transport),
             config.command_batch_size,
         ));
+        let command_handoff = Arc::new(CommandWorkerHandoff::default());
         let notification_dispatcher = Arc::new(
             PlatformNotificationDispatcher::new(
                 Arc::clone(&config.store),
@@ -219,6 +230,8 @@ impl CoreRuntime {
                 })
             }),
         ));
+        let command_dispatcher_for_worker = Arc::clone(&command_dispatcher);
+        let command_handoff_for_worker = Arc::clone(&command_handoff);
         let command_handle = tokio::spawn(run_outbox_worker(
             "commands",
             config.command_interval,
@@ -226,8 +239,16 @@ impl CoreRuntime {
             Arc::clone(&config.metrics),
             ready_tx.clone(),
             Box::new(move || {
-                let dispatcher = Arc::clone(&command_dispatcher);
+                let dispatcher = Arc::clone(&command_dispatcher_for_worker);
+                let handoff = Arc::clone(&command_handoff_for_worker);
                 Box::pin(async move {
+                    if handoff.quiescing.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let _dispatch_lock = handoff.dispatch_lock.lock().await;
+                    if handoff.quiescing.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
                     dispatcher
                         .dispatch_once(Utc::now())
                         .await
@@ -260,6 +281,8 @@ impl CoreRuntime {
             stop_claiming,
             cancellation,
             stream: config.stream,
+            command_dispatcher,
+            command_handoff,
             workers: Mutex::new(Some(vec![
                 writer_handle,
                 event_handle,
@@ -317,10 +340,39 @@ impl CoreRuntime {
         self.stream.stop_claiming();
     }
 
+    pub async fn quiesce_and_drain_commands(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), CoreRuntimeError> {
+        self.command_handoff
+            .quiescing
+            .store(true, Ordering::Release);
+        let remaining = remaining_until(deadline)?;
+        let _dispatch_lock = time::timeout(remaining, self.command_handoff.dispatch_lock.lock())
+            .await
+            .map_err(|_| CoreRuntimeError::Deadline)?;
+        loop {
+            let remaining = remaining_until(deadline)?;
+            let result =
+                time::timeout(remaining, self.command_dispatcher.dispatch_once(Utc::now()))
+                    .await
+                    .map_err(|_| CoreRuntimeError::Deadline)?
+                    .map_err(CoreRuntimeError::CommandDrain)?;
+            if result.claimed == 0 {
+                return Ok(());
+            }
+        }
+    }
+
     pub async fn drain(&self, deadline: Instant) -> Result<(), CoreRuntimeError> {
         self.stop_claiming();
         let _drain_lock = self.drain_lock.lock().await;
         if !self.drain_started.swap(true, Ordering::AcqRel) {
+            if let Err(error) = self.quiesce_and_drain_commands(deadline).await {
+                self.cancellation.cancel();
+                let _ = self.join_all(deadline).await;
+                return Err(error);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             let drain_result = time::timeout(remaining, self.stream.drain(deadline)).await;
             match drain_result {
@@ -402,6 +454,12 @@ impl CoreRuntime {
         }
         first_error.map_or(Ok(()), Err)
     }
+}
+
+fn remaining_until(deadline: Instant) -> Result<Duration, CoreRuntimeError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(CoreRuntimeError::Deadline)
 }
 
 fn validate(config: &CoreRuntimeConfig) -> Result<(), CoreRuntimeError> {

@@ -48,6 +48,47 @@ impl CommandTransport for UnavailableTransport {
     }
 }
 
+#[derive(Clone, Default)]
+struct FirstPublishBlockingTransport {
+    publishes: Arc<AtomicUsize>,
+    first_publish_started: Arc<Notify>,
+    release_first_publish: Arc<Notify>,
+}
+
+impl FirstPublishBlockingTransport {
+    async fn wait_for_first_publish(&self) {
+        while self.publishes.load(Ordering::SeqCst) == 0 {
+            self.first_publish_started.notified().await;
+        }
+    }
+
+    fn release_first_publish(&self) {
+        self.release_first_publish.notify_one();
+    }
+
+    fn publishes(&self) -> usize {
+        self.publishes.load(Ordering::SeqCst)
+    }
+}
+
+impl CommandTransport for FirstPublishBlockingTransport {
+    fn publish(
+        &self,
+        _request: TransportRpcPublishRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CommandTransportError>> + Send + '_>> {
+        let publish_number = self.publishes.fetch_add(1, Ordering::SeqCst);
+        let first_publish_started = Arc::clone(&self.first_publish_started);
+        let release_first_publish = Arc::clone(&self.release_first_publish);
+        Box::pin(async move {
+            if publish_number == 0 {
+                first_publish_started.notify_one();
+                release_first_publish.notified().await;
+            }
+            Ok(())
+        })
+    }
+}
+
 #[derive(Clone)]
 struct FailingEmailSender;
 
@@ -520,6 +561,90 @@ async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
 }
 
 #[tokio::test]
+async fn command_worker_handoff_waits_for_an_in_flight_claim_then_drains_remaining_commands() {
+    let stream = RecordingStream::default();
+    let (_directory, mut config) = runtime_config(Arc::new(stream)).await;
+    let transport = Arc::new(FirstPublishBlockingTransport::default());
+    config.command_transport = transport.clone();
+    config.command_batch_size = 1;
+    config
+        .store
+        .register_device("runtime-device")
+        .await
+        .unwrap();
+    let first_command_id = Uuid::now_v7();
+    let now = Utc::now();
+    config
+        .store
+        .enqueue_command(PlatformCommand {
+            id: first_command_id.to_string(),
+            device_id: "runtime-device".to_owned(),
+            method: "sample_now".to_owned(),
+            params: "{}".to_owned(),
+            mode: RpcMode::OneWay,
+            expires_at: now + chrono::Duration::minutes(5),
+            next_attempt_at: now,
+        })
+        .await
+        .unwrap();
+    let pool = config.store.sqlite_pool().unwrap().clone();
+    let runtime = Arc::new(CoreRuntime::start(config).await.unwrap());
+
+    timeout(Duration::from_secs(1), transport.wait_for_first_publish())
+        .await
+        .expect("the core command worker did not claim the first command");
+    assert_eq!(
+        command_outbox_state(&pool, first_command_id).await,
+        "leased",
+        "the first command must already be owned by the core worker"
+    );
+
+    let second_command_id = Uuid::now_v7();
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO command_outbox (
+            id, device_id, method, params, mode, created_at, expires_at, next_attempt_at
+         ) VALUES (?, 'runtime-device', 'sample_now', '{}', 'one_way', ?, ?, ?)",
+    )
+    .bind(second_command_id.to_string())
+    .bind(now.to_rfc3339())
+    .bind((now + chrono::Duration::minutes(5)).to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let handoff_runtime = Arc::clone(&runtime);
+    let mut handoff = tokio::spawn(async move {
+        handoff_runtime
+            .quiesce_and_drain_commands(Instant::now() + Duration::from_secs(1))
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(25), &mut handoff)
+            .await
+            .is_err(),
+        "handoff must wait for the in-flight command PUBACK"
+    );
+
+    transport.release_first_publish();
+    assert!(matches!(handoff.await, Ok(Ok(()))));
+    assert_eq!(transport.publishes(), 2);
+    assert_eq!(
+        command_outbox_state(&pool, first_command_id).await,
+        "published_to_broker"
+    );
+    assert_eq!(
+        command_outbox_state(&pool, second_command_id).await,
+        "published_to_broker"
+    );
+    runtime
+        .drain(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
     let stream = RecordingStream::default();
     let (_directory, config) = runtime_config(Arc::new(stream)).await;
@@ -561,6 +686,14 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
         .drain(Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+async fn command_outbox_state(pool: &sqlx::SqlitePool, command_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT state FROM command_outbox WHERE id = ?")
+        .bind(command_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
