@@ -14,20 +14,29 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    process::{Child, Command},
+    process::{Child, ChildStderr, Command},
+    task::JoinHandle,
     time::{sleep, timeout},
 };
 use uuid::Uuid;
 
 const TEST_DATABASE_PREFIX: &str = "iot_nano_test_";
+const DEVICE_TOKEN_VAULT_KEY: &str = "e2e-timescale-device-token-vault-key-material-0001";
 const START_ATTEMPTS: usize = 3;
 const READY_ATTEMPTS: usize = 200;
+const MAX_CHILD_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = " [truncated]";
 
 type E2eResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 struct InitialDatabaseState {
     had_timescaledb: bool,
     had_uuid_ossp: bool,
+}
+
+struct ManagedChild {
+    child: Child,
+    stderr: Option<JoinHandle<io::Result<String>>>,
 }
 
 struct Fixture {
@@ -109,10 +118,7 @@ impl Fixture {
             .env("IOT_NANO_INTERNAL_DIR", &self.internal_dir)
             .env("IOT_NANO_TLS_CERT_PATH", &self.tls_cert_path)
             .env("IOT_NANO_TLS_KEY_PATH", &self.tls_key_path)
-            .env(
-                "IOT_DEVICE_TOKEN_VAULT_KEY",
-                "e2e-timescale-device-token-vault-key-material-0001",
-            )
+            .env("IOT_DEVICE_TOKEN_VAULT_KEY", DEVICE_TOKEN_VAULT_KEY)
             .env(
                 "IOT_NANO_PUBLIC_HTTP_ADDRESS",
                 self.public_address.to_string(),
@@ -130,6 +136,21 @@ impl Fixture {
                 self.mqtt_tls_address.to_string(),
             )
             .env("IOT_NANO_SHUTDOWN_DEADLINE_SECONDS", "10");
+    }
+
+    fn child_redactions(&self, additional_values: &[&str]) -> Vec<String> {
+        let mut values = vec![
+            self.database_url.clone(),
+            DEVICE_TOKEN_VAULT_KEY.to_owned(),
+            self.tls_key_path.display().to_string(),
+        ];
+        values.extend(
+            additional_values
+                .iter()
+                .filter(|value| !value.is_empty())
+                .map(|value| (*value).to_owned()),
+        );
+        values
     }
 }
 
@@ -166,13 +187,21 @@ async fn run_process_e2e(mut fixture: Fixture) -> E2eResult {
     let admin_password = "E2eTimescaleBootstrapAdmin@2026";
     let mut bootstrap = Command::new(binary);
     fixture.configure(&mut bootstrap);
-    let output = bootstrap
+    bootstrap
         .arg("--bootstrap-admin")
         .env("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME", &admin_username)
-        .env("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD", admin_password)
-        .output()
-        .await?;
-    require_success(output.status.success(), "bootstrap admin", &output.stderr)?;
+        .env("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD", admin_password);
+    let mut bootstrap = spawn_child(
+        &mut bootstrap,
+        fixture.child_redactions(&[&admin_username, admin_password]),
+    )?;
+    let bootstrap_exit = bootstrap.child.wait().await?;
+    let bootstrap_diagnostic = bootstrap.diagnostic().await?;
+    require_success(
+        bootstrap_exit.success(),
+        "bootstrap admin",
+        &bootstrap_diagnostic,
+    )?;
 
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -180,8 +209,11 @@ async fn run_process_e2e(mut fixture: Fixture) -> E2eResult {
     let mut child = start_monolith(&mut fixture, binary, &client).await?;
     let flow = run_e2e_flow(&fixture, &client, &admin_username, admin_password).await;
     let shutdown = stop_child(&mut child).await;
-    flow?;
-    shutdown?;
+    let shutdown = match shutdown {
+        Ok(()) => assert_all_addresses_rebind(&fixture).await,
+        Err(error) => Err(error),
+    };
+    combine_e2e_outcomes(flow, shutdown)?;
 
     if !fixture.internal_dir.join("stream.sqlite").is_file()
         || !fixture.internal_dir.join("mqttd.sqlite").is_file()
@@ -205,45 +237,57 @@ async fn prove_migration_lock_serialization(fixture: &Fixture, binary: &str) -> 
         .execute(&mut lock_holder)
         .await?;
 
+    let migration_application_name = format!("iot-nano-e2e-migrate-{}", Uuid::now_v7());
+    let migration_database_url =
+        migration_database_url(&fixture.database_url, &migration_application_name);
     let mut migrate = Command::new(binary);
     fixture.configure(&mut migrate);
-    let migration = migrate
+    migrate
         .arg("--migrate-only")
-        .kill_on_drop(true)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .env("DATABASE_URL", &migration_database_url)
+        .env("PGAPPNAME", &migration_application_name);
+    let mut migration = spawn_child(
+        &mut migrate,
+        fixture.child_redactions(&[&migration_database_url]),
+    )?;
 
-    let observation = wait_for_migration_lock(&fixture.database_url).await;
+    let observation =
+        wait_for_migration_lock(&fixture.database_url, &migration_application_name).await;
     let unlock = sqlx::query("SELECT pg_advisory_unlock(hashtext('iot_nano:migrate'))")
         .execute(&mut lock_holder)
         .await;
     observation?;
     unlock?;
 
-    let output = timeout(Duration::from_secs(30), migration.wait_with_output()).await??;
+    let exit = match timeout(Duration::from_secs(30), migration.child.wait()).await {
+        Ok(exit) => exit?,
+        Err(_) => {
+            let cleanup = force_stop_child(&mut migration).await;
+            return combine_outcomes(
+                "migration did not finish after advisory-lock release",
+                Err(test_error(
+                    "migration did not finish within 30 seconds after advisory-lock release",
+                )),
+                "forced migration cleanup",
+                cleanup,
+            );
+        }
+    };
+    let diagnostic = migration.diagnostic().await?;
     require_success(
-        output.status.success(),
+        exit.success(),
         "migration after advisory-lock release",
-        &output.stderr,
+        &diagnostic,
     )
 }
 
-async fn wait_for_migration_lock(database_url: &str) -> E2eResult {
+async fn wait_for_migration_lock(database_url: &str, application_name: &str) -> E2eResult {
     let mut observer = PgConnection::connect(database_url).await?;
     for _ in 0..READY_ATTEMPTS {
-        let waiting: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                SELECT 1
-                FROM pg_locks
-                WHERE locktype = 'advisory'
-                  AND classid = 0
-                  AND objid::integer = hashtext('iot_nano:migrate')
-                  AND granted = FALSE
-            )",
-        )
-        .fetch_one(&mut observer)
-        .await?;
+        let waiting: bool = sqlx::query_scalar(migration_lock_query())
+            .bind(application_name)
+            .fetch_one(&mut observer)
+            .await?;
         if waiting {
             return Ok(());
         }
@@ -252,6 +296,25 @@ async fn wait_for_migration_lock(database_url: &str) -> E2eResult {
     Err(test_error(
         "migration did not block on the iot_nano:migrate advisory lock",
     ))
+}
+
+fn migration_lock_query() -> &'static str {
+    "SELECT EXISTS (
+        SELECT 1
+        FROM pg_locks AS waiting
+        JOIN pg_stat_activity AS activity ON waiting.pid = activity.pid
+        WHERE waiting.locktype = 'advisory'
+          AND waiting.classid = 0
+          AND waiting.objid::integer = hashtext('iot_nano:migrate')
+          AND waiting.granted = FALSE
+          AND activity.application_name = $1
+          AND activity.datname = current_database()
+    )"
+}
+
+fn migration_database_url(database_url: &str, application_name: &str) -> String {
+    let separator = if database_url.contains('?') { '&' } else { '?' };
+    format!("{database_url}{separator}application_name={application_name}")
 }
 
 async fn assert_telemetry_is_hypertable(database_url: &str) -> E2eResult {
@@ -271,27 +334,47 @@ async fn assert_telemetry_is_hypertable(database_url: &str) -> E2eResult {
     Ok(())
 }
 
-async fn start_monolith(fixture: &mut Fixture, binary: &str, client: &Client) -> E2eResult<Child> {
+async fn start_monolith(
+    fixture: &mut Fixture,
+    binary: &str,
+    client: &Client,
+) -> E2eResult<ManagedChild> {
     for attempt in 1..=START_ATTEMPTS {
         fixture.release_reserved_addresses();
         let mut command = Command::new(binary);
         fixture.configure(&mut command);
-        let mut child = command
-            .kill_on_drop(true)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = spawn_child(&mut command, fixture.child_redactions(&[]))?;
 
-        match wait_ready(client, fixture.public_address, &mut child).await {
+        match wait_ready(client, fixture.public_address, &mut child.child).await {
             Ok(()) => return Ok(child),
             Err(error) => {
-                let bind_conflict = child_exited_for_bind_conflict(&mut child).await?;
-                force_stop_child(&mut child).await;
-                if bind_conflict && attempt < START_ATTEMPTS {
+                let exited_before_cleanup = child.child.try_wait()?.is_some();
+                let cleanup = force_stop_child(&mut child).await;
+                let diagnostic = match child.child.try_wait() {
+                    Ok(Some(_)) => child.diagnostic().await.unwrap_or_else(|capture_error| {
+                        format!("stderr capture failed: {capture_error}")
+                    }),
+                    Ok(None) => "child remained running after failed forced cleanup".to_owned(),
+                    Err(error) => format!("could not inspect child after forced cleanup: {error}"),
+                };
+                let bind_conflict = exited_before_cleanup && is_bind_conflict(&diagnostic);
+                let cleanup_succeeded = cleanup.is_ok();
+                let startup = Err(test_error(child_failure_message(
+                    "monolith failed before becoming ready",
+                    error,
+                    &diagnostic,
+                )));
+                let outcome = combine_outcomes(
+                    "monolith startup",
+                    startup,
+                    "forced startup cleanup",
+                    cleanup,
+                );
+                if bind_conflict && cleanup_succeeded && attempt < START_ATTEMPTS {
                     fixture.rotate_reserved_addresses().await?;
                     continue;
                 }
-                return Err(error);
+                return outcome.map(|()| unreachable!());
             }
         }
     }
@@ -624,57 +707,110 @@ async fn wait_ready(client: &Client, address: SocketAddr, child: &mut Child) -> 
     Err(test_error("monolith did not become ready"))
 }
 
-async fn child_exited_for_bind_conflict(child: &mut Child) -> E2eResult<bool> {
-    if child.try_wait()?.is_none() {
-        return Ok(false);
-    }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_string(&mut stderr).await?;
-    }
-    Ok(stderr.contains("Address already in use") || stderr.contains("listener bind failed"))
+fn is_bind_conflict(diagnostic: &str) -> bool {
+    diagnostic
+        .to_ascii_lowercase()
+        .contains("address already in use")
 }
 
-async fn stop_child(child: &mut Child) -> E2eResult {
-    if let Some(status) = child.try_wait()? {
-        return if status.success() {
-            Ok(())
-        } else {
-            Err(test_error(format!(
-                "monolith exited unexpectedly with {status}"
-            )))
-        };
+async fn stop_child(child: &mut ManagedChild) -> E2eResult {
+    if let Some(status) = child.child.try_wait()? {
+        let diagnostic = child.diagnostic().await?;
+        return require_success(
+            status.success(),
+            "monolith exited unexpectedly",
+            &diagnostic,
+        );
     }
 
     let pid = child
+        .child
         .id()
         .ok_or_else(|| test_error("monolith process has no PID"))?;
     let signal = Command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
         .status()
-        .await?;
-    if !signal.success() {
-        child.start_kill()?;
+        .await;
+    match signal {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            return combine_outcomes(
+                "graceful shutdown signal",
+                Err(test_error(format!("SIGTERM exited with {status}"))),
+                "forced shutdown cleanup",
+                force_stop_child(child).await,
+            );
+        }
+        Err(error) => {
+            return combine_outcomes(
+                "graceful shutdown signal",
+                Err(error.into()),
+                "forced shutdown cleanup",
+                force_stop_child(child).await,
+            );
+        }
     }
-    let exit = match timeout(Duration::from_secs(15), child.wait()).await {
-        Ok(status) => status?,
+
+    let exit = match timeout(Duration::from_secs(15), child.child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            return combine_outcomes(
+                "graceful shutdown wait",
+                Err(error.into()),
+                "forced shutdown cleanup",
+                force_stop_child(child).await,
+            );
+        }
         Err(_) => {
-            child.start_kill()?;
-            timeout(Duration::from_secs(5), child.wait()).await??
+            return combine_outcomes(
+                "graceful shutdown wait",
+                Err(test_error(
+                    "monolith did not exit within 15 seconds of SIGTERM",
+                )),
+                "forced shutdown cleanup",
+                force_stop_child(child).await,
+            );
         }
     };
-    if exit.success() {
-        Ok(())
-    } else {
-        Err(test_error(format!("monolith exited with {exit}")))
+    let diagnostic = child.diagnostic().await?;
+    require_success(exit.success(), "monolith graceful shutdown", &diagnostic)
+}
+
+async fn force_stop_child(child: &mut ManagedChild) -> E2eResult {
+    if child.child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    child.child.start_kill()?;
+    match timeout(Duration::from_secs(5), child.child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(_) => Err(test_error(
+            "forced child kill did not complete within 5 seconds",
+        )),
     }
 }
 
-async fn force_stop_child(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ = child.start_kill();
-        let _ = timeout(Duration::from_secs(5), child.wait()).await;
+async fn assert_all_addresses_rebind(fixture: &Fixture) -> E2eResult {
+    let mut failures = Vec::new();
+    for address in [
+        fixture.public_address,
+        fixture.management_address,
+        fixture.mqtt_tcp_address,
+        fixture.mqtt_tls_address,
+    ] {
+        match TcpListener::bind(address).await {
+            Ok(listener) => drop(listener),
+            Err(error) => failures.push(format!("{address}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(test_error(format!(
+            "monolith graceful shutdown did not release all addresses: {}",
+            failures.join("; ")
+        )))
     }
 }
 
@@ -755,15 +891,204 @@ fn require_status(response: &Response, expected: StatusCode, context: &str) -> E
     }
 }
 
-fn require_success(success: bool, context: &str, stderr: &[u8]) -> E2eResult {
+fn require_success(success: bool, context: &str, diagnostic: &str) -> E2eResult {
     if success {
         Ok(())
+    } else if diagnostic.is_empty() {
+        Err(test_error(format!("{context} failed")))
     } else {
-        Err(test_error(format!(
-            "{context} failed: {}",
-            String::from_utf8_lossy(stderr)
-        )))
+        Err(test_error(format!("{context} failed: {diagnostic}")))
     }
+}
+
+fn child_failure_message(
+    context: &str,
+    error: Box<dyn Error + Send + Sync>,
+    diagnostic: &str,
+) -> String {
+    if diagnostic.is_empty() {
+        format!("{context}: {error}")
+    } else {
+        format!("{context}: {error}; child stderr: {diagnostic}")
+    }
+}
+
+fn combine_e2e_outcomes(flow: E2eResult, shutdown: E2eResult) -> E2eResult {
+    combine_outcomes("E2E flow", flow, "shutdown", shutdown)
+}
+
+fn combine_outcomes(
+    primary_context: &str,
+    primary: E2eResult,
+    secondary_context: &str,
+    secondary: E2eResult,
+) -> E2eResult {
+    match (primary, secondary) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(primary), Err(secondary)) => Err(test_error(format!(
+            "{primary_context} failed: {primary}; {secondary_context} also failed: {secondary}"
+        ))),
+    }
+}
+
+fn spawn_child(command: &mut Command, redactions: Vec<String>) -> E2eResult<ManagedChild> {
+    let mut child = command
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| test_error("child stderr pipe was unavailable"))?;
+    Ok(ManagedChild {
+        child,
+        stderr: Some(tokio::spawn(collect_redacted_stderr(stderr, redactions))),
+    })
+}
+
+impl ManagedChild {
+    async fn diagnostic(&mut self) -> E2eResult<String> {
+        let task = self
+            .stderr
+            .take()
+            .ok_or_else(|| test_error("child stderr was already collected"))?;
+        task.await
+            .map_err(|error| test_error(format!("child stderr capture task failed: {error}")))?
+            .map_err(Into::into)
+    }
+}
+
+async fn collect_redacted_stderr(
+    mut stderr: ChildStderr,
+    redactions: Vec<String>,
+) -> io::Result<String> {
+    let mut redactor = ChildDiagnosticRedactor::new(redactions.iter().map(String::as_str));
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stderr.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(redactor.finish());
+        }
+        redactor.push(&chunk[..read]);
+    }
+}
+
+struct ChildDiagnosticRedactor {
+    redactions: Vec<Vec<u8>>,
+    pending: Vec<u8>,
+    diagnostic: String,
+    truncated: bool,
+}
+
+impl ChildDiagnosticRedactor {
+    fn new<'a>(redactions: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut redactions: Vec<Vec<u8>> = redactions
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        Self {
+            redactions,
+            pending: Vec::new(),
+            diagnostic: String::new(),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        self.drain(false);
+    }
+
+    fn finish(mut self) -> String {
+        self.drain(true);
+        if self.truncated {
+            self.diagnostic.push_str(TRUNCATED_DIAGNOSTIC_SUFFIX);
+        }
+        self.diagnostic
+    }
+
+    fn drain(&mut self, final_chunk: bool) {
+        let longest_redaction = self
+            .redactions
+            .first()
+            .map_or(1, |value| value.len().max(1));
+        let safe_end = if final_chunk {
+            self.pending.len()
+        } else {
+            self.pending
+                .len()
+                .saturating_sub(longest_redaction.saturating_sub(1))
+        };
+        let mut index = 0;
+        while index < safe_end {
+            if let Some(redaction_length) = self
+                .redactions
+                .iter()
+                .find(|value| self.pending[index..].starts_with(value))
+                .map(Vec::len)
+            {
+                self.append(b"[REDACTED]");
+                index += redaction_length;
+                continue;
+            }
+            if final_chunk
+                && self.redactions.iter().any(|value| {
+                    self.pending[index..].len() < value.len()
+                        && value.starts_with(&self.pending[index..])
+                })
+            {
+                self.append(b"[REDACTED]");
+                index = self.pending.len();
+                break;
+            }
+
+            let start = index;
+            index += 1;
+            while index < safe_end
+                && !self
+                    .redactions
+                    .iter()
+                    .any(|value| self.pending[index..].starts_with(value))
+            {
+                index += 1;
+            }
+            let bytes = self.pending[start..index].to_vec();
+            self.append(&bytes);
+        }
+        self.pending.drain(..index);
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let limit = MAX_CHILD_DIAGNOSTIC_BYTES - TRUNCATED_DIAGNOSTIC_SUFFIX.len();
+        if self.diagnostic.len() >= limit {
+            self.truncated = true;
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let remaining = limit - self.diagnostic.len();
+        if text.len() <= remaining {
+            self.diagnostic.push_str(&text);
+        } else {
+            let mut end = remaining;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.diagnostic.push_str(&text[..end]);
+            self.truncated = true;
+        }
+    }
+}
+
+fn redact_child_diagnostic(stderr: &[u8], was_truncated: bool, redactions: &[&str]) -> String {
+    let mut redactor = ChildDiagnosticRedactor::new(redactions.iter().copied());
+    redactor.push(stderr);
+    redactor.truncated |= was_truncated;
+    redactor.finish()
 }
 
 fn test_error(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
@@ -813,4 +1138,70 @@ fn timescale_test_url_must_name_an_isolated_test_database() {
 #[test]
 fn timescale_test_url_requires_an_explicit_opt_in_value() {
     assert!(validated_test_database_url("").is_err());
+}
+
+#[test]
+fn child_diagnostics_are_bounded_and_redact_child_secrets() {
+    let database_url = "postgres://iot:database-password@localhost/iot_nano_test_018f4e40-5d2c-7d19-9d6f-6f996de6f722";
+    let vault_key = "e2e-timescale-device-token-vault-key-material-0001";
+    let bootstrap_password = "E2eTimescaleBootstrapAdmin@2026";
+    let stderr = format!(
+        "{database_url} {vault_key} {bootstrap_password}{}",
+        "x".repeat(MAX_CHILD_DIAGNOSTIC_BYTES - 2)
+    );
+
+    let diagnostic = redact_child_diagnostic(
+        stderr.as_bytes(),
+        false,
+        &[database_url, vault_key, bootstrap_password],
+    );
+
+    assert!(diagnostic.len() <= MAX_CHILD_DIAGNOSTIC_BYTES);
+    assert!(diagnostic.contains("[REDACTED]"));
+    assert!(!diagnostic.contains(database_url));
+    assert!(!diagnostic.contains(vault_key));
+    assert!(!diagnostic.contains(bootstrap_password));
+}
+
+#[test]
+fn combined_e2e_outcomes_preserve_flow_and_shutdown_failures() {
+    let error = combine_e2e_outcomes(
+        Err(test_error("flow failure")),
+        Err(test_error("shutdown failure")),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("flow failure"));
+    assert!(error.contains("shutdown failure"));
+}
+
+#[test]
+fn migration_lock_query_identifies_the_marked_child_on_the_target_database() {
+    let query = migration_lock_query();
+
+    assert!(query.contains("pg_stat_activity"));
+    assert!(query.contains("waiting.pid = activity.pid"));
+    assert!(query.contains("activity.application_name = $1"));
+    assert!(query.contains("activity.datname = current_database()"));
+}
+
+#[test]
+fn migration_database_url_overrides_an_existing_application_name() {
+    assert_eq!(
+        migration_database_url(
+            "postgres://iot:secret@localhost/iot_nano_test_018f4e40-5d2c-7d19-9d6f-6f996de6f722?application_name=unrelated&sslmode=require",
+            "iot-nano-e2e-migrate-marker",
+        ),
+        "postgres://iot:secret@localhost/iot_nano_test_018f4e40-5d2c-7d19-9d6f-6f996de6f722?application_name=unrelated&sslmode=require&application_name=iot-nano-e2e-migrate-marker"
+    );
+}
+
+#[test]
+fn only_unambiguous_bind_conflicts_are_retried() {
+    assert!(is_bind_conflict(
+        "listener bind failed: Address already in use"
+    ));
+    assert!(!is_bind_conflict("listener bind failed: permission denied"));
+    assert!(!is_bind_conflict("database connection failed"));
 }
