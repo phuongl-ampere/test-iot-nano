@@ -1,11 +1,143 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{Postgres, Row, Sqlite, Transaction, error::DatabaseError, types::Json};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{PlatformStore, PlatformStoreError};
+use crate::{AccountClass, PlatformStore, PlatformStoreError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagementUserRole {
+    Admin,
+    Viewer,
+}
+
+impl ManagementUserRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self, ManagementUserError> {
+        match value {
+            "admin" => Ok(Self::Admin),
+            "viewer" => Ok(Self::Viewer),
+            _ => Err(ManagementUserError::InvalidStoredRole(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagementUser {
+    pub id: Uuid,
+    pub username: String,
+    pub role: ManagementUserRole,
+    pub account_class: AccountClass,
+    pub default_app: String,
+    pub granted_apps: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateManagementUser {
+    pub username: String,
+    pub password_hash: String,
+    pub default_app: String,
+    pub granted_apps: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateManagementUser {
+    pub default_app: String,
+    pub granted_apps: Vec<String>,
+    pub role: Option<ManagementUserRole>,
+}
+
+#[derive(Debug, Error)]
+pub enum ManagementUserError {
+    #[error("invalid management username: {0:?}")]
+    InvalidUsername(String),
+    #[error("management user password hash must not be empty")]
+    EmptyPasswordHash,
+    #[error("invalid management default app: {0:?}")]
+    InvalidDefaultApp(String),
+    #[error("invalid management granted apps")]
+    InvalidGrantedApps,
+    #[error("management username already exists: {0:?}")]
+    UsernameConflict(String),
+    #[error("management user was not found")]
+    UserNotFound,
+    #[error("system management users cannot be changed")]
+    SystemUserImmutable,
+    #[error("at least one administrator must remain")]
+    LastAdministrator,
+    #[error("stored management user ID is invalid")]
+    InvalidStoredUserId,
+    #[error("stored management user role is invalid: {0:?}")]
+    InvalidStoredRole(String),
+    #[error("stored management user account class is invalid: {0:?}")]
+    InvalidStoredAccountClass(String),
+    #[error("management user storage operation failed")]
+    Storage {
+        #[source]
+        source: PlatformStoreError,
+    },
+}
+
+impl From<PlatformStoreError> for ManagementUserError {
+    fn from(source: PlatformStoreError) -> Self {
+        Self::Storage { source }
+    }
+}
+
+impl From<sqlx::Error> for ManagementUserError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::from(PlatformStoreError::from(source))
+    }
+}
+
+pub trait ManagementUserRepository: Send + Sync {
+    fn list_management_users<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementUser>, ManagementUserError>> + Send + 'a>>;
+    fn create_management_user<'a>(
+        &'a self,
+        user: CreateManagementUser,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementUser, ManagementUserError>> + Send + 'a>>;
+    fn update_management_user<'a>(
+        &'a self,
+        username: &'a str,
+        user: UpdateManagementUser,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementUser, ManagementUserError>> + Send + 'a>>;
+}
+
+impl ManagementUserRepository for PlatformStore {
+    fn list_management_users<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementUser>, ManagementUserError>> + Send + 'a>>
+    {
+        Box::pin(async move { list_management_users(self).await })
+    }
+
+    fn create_management_user<'a>(
+        &'a self,
+        user: CreateManagementUser,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementUser, ManagementUserError>> + Send + 'a>>
+    {
+        Box::pin(async move { create_management_user(self, user).await })
+    }
+
+    fn update_management_user<'a>(
+        &'a self,
+        username: &'a str,
+        user: UpdateManagementUser,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementUser, ManagementUserError>> + Send + 'a>>
+    {
+        Box::pin(async move { update_management_user(self, username, user).await })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManagementDevice {
@@ -270,6 +402,464 @@ impl ManagementDeviceRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementDeviceError>> + Send + 'a>> {
         Box::pin(async move { delete_management_device(self, device_id).await })
     }
+}
+
+async fn list_management_users(
+    store: &PlatformStore,
+) -> Result<Vec<ManagementUser>, ManagementUserError> {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let rows = sqlx::query(
+                "SELECT id, username, role, account_class, default_app
+                 FROM users
+                 ORDER BY username, id",
+            )
+            .fetch_all(store.pool())
+            .await?;
+            let mut users = Vec::with_capacity(rows.len());
+            for row in rows {
+                users.push(sqlite_management_user_from_row(store.pool(), row).await?);
+            }
+            Ok(users)
+        }
+        PlatformStore::Timescale(pool) => {
+            let rows = sqlx::query(
+                "SELECT id, username, role, account_class, default_app
+                 FROM users
+                 ORDER BY username, id",
+            )
+            .fetch_all(pool)
+            .await?;
+            let mut users = Vec::with_capacity(rows.len());
+            for row in rows {
+                users.push(timescale_management_user_from_row(pool, row).await?);
+            }
+            Ok(users)
+        }
+    }
+}
+
+async fn create_management_user(
+    store: &PlatformStore,
+    user: CreateManagementUser,
+) -> Result<ManagementUser, ManagementUserError> {
+    let user = validate_new_management_user(user)?;
+    let user_id = Uuid::now_v7();
+    let username = user.username.clone();
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin().await?;
+            sqlx::query(
+                "INSERT INTO users (
+                    id, username, password_hash, role, account_class, default_app, updated_at
+                 ) VALUES (?, ?, ?, 'viewer', 'user', ?, ?)",
+            )
+            .bind(user_id.to_string())
+            .bind(&user.username)
+            .bind(user.password_hash)
+            .bind(user.default_app)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_management_username_conflict(error, &username))?;
+            for app_key in user.granted_apps {
+                sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES (?, ?)")
+                    .bind(user_id.to_string())
+                    .bind(app_key)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            sqlx::query(
+                "INSERT INTO users (
+                    id, username, password_hash, role, account_class, default_app
+                 ) VALUES ($1, $2, $3, 'viewer', 'user', $4)",
+            )
+            .bind(user_id)
+            .bind(&user.username)
+            .bind(user.password_hash)
+            .bind(user.default_app)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| map_management_username_conflict(error, &username))?;
+            for app_key in user.granted_apps {
+                sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES ($1, $2)")
+                    .bind(user_id)
+                    .bind(app_key)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+        }
+    }
+    management_user(store, user_id).await
+}
+
+async fn update_management_user(
+    store: &PlatformStore,
+    username: &str,
+    user: UpdateManagementUser,
+) -> Result<ManagementUser, ManagementUserError> {
+    if !management_identifier(username) {
+        return Err(ManagementUserError::InvalidUsername(username.to_owned()));
+    }
+    validate_management_user_apps(&user.default_app, &user.granted_apps)?;
+    let user_id = match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            let (user_id, current_role, account_class) =
+                sqlite_management_user_mutation_target(&mut transaction, username).await?;
+            protect_management_user_invariants(
+                &mut transaction,
+                username,
+                current_role,
+                account_class,
+                user.role,
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE users
+                 SET default_app = ?, role = COALESCE(?, role), updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(&user.default_app)
+            .bind(user.role.map(ManagementUserRole::as_str))
+            .bind(Utc::now().to_rfc3339())
+            .bind(user_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("DELETE FROM user_app_grants WHERE user_id = ?")
+                .bind(user_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            for app_key in &user.granted_apps {
+                sqlx::query(
+                    "INSERT INTO user_app_grants (user_id, app_key)
+                     VALUES (?, ?)
+                     ON CONFLICT(user_id, app_key) DO NOTHING",
+                )
+                .bind(user_id.to_string())
+                .bind(app_key)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+            user_id
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtext('iot_nano:management-users-admin-role'))",
+            )
+            .execute(&mut *transaction)
+            .await?;
+            let (user_id, current_role, account_class) =
+                timescale_management_user_mutation_target(&mut transaction, username).await?;
+            protect_timescale_management_user_invariants(
+                &mut transaction,
+                username,
+                current_role,
+                account_class,
+                user.role,
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE users
+                 SET default_app = $2, role = COALESCE($3, role), updated_at = now()
+                 WHERE id = $1",
+            )
+            .bind(user_id)
+            .bind(&user.default_app)
+            .bind(user.role.map(ManagementUserRole::as_str))
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query("DELETE FROM user_app_grants WHERE user_id = $1")
+                .bind(user_id)
+                .execute(&mut *transaction)
+                .await?;
+            for app_key in &user.granted_apps {
+                sqlx::query(
+                    "INSERT INTO user_app_grants (user_id, app_key)
+                     VALUES ($1, $2)
+                     ON CONFLICT(user_id, app_key) DO NOTHING",
+                )
+                .bind(user_id)
+                .bind(app_key)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+            user_id
+        }
+    };
+    management_user(store, user_id).await
+}
+
+async fn sqlite_management_user_mutation_target(
+    transaction: &mut Transaction<'_, Sqlite>,
+    username: &str,
+) -> Result<(Uuid, ManagementUserRole, AccountClass), ManagementUserError> {
+    let row = sqlx::query(
+        "SELECT id, role, account_class
+         FROM users
+         WHERE username = ?",
+    )
+    .bind(username)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ManagementUserError::UserNotFound)?;
+    let user_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
+        .map_err(|_| ManagementUserError::InvalidStoredUserId)?;
+    Ok((
+        user_id,
+        ManagementUserRole::from_database(&row.try_get::<String, _>("role")?)?,
+        management_user_account_class(row.try_get::<String, _>("account_class")?)?,
+    ))
+}
+
+async fn timescale_management_user_mutation_target(
+    transaction: &mut Transaction<'_, Postgres>,
+    username: &str,
+) -> Result<(Uuid, ManagementUserRole, AccountClass), ManagementUserError> {
+    let row = sqlx::query(
+        "SELECT id, role, account_class
+         FROM users
+         WHERE username = $1",
+    )
+    .bind(username)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ManagementUserError::UserNotFound)?;
+    Ok((
+        row.try_get("id")?,
+        ManagementUserRole::from_database(&row.try_get::<String, _>("role")?)?,
+        management_user_account_class(row.try_get::<String, _>("account_class")?)?,
+    ))
+}
+
+async fn protect_management_user_invariants(
+    transaction: &mut Transaction<'_, Sqlite>,
+    username: &str,
+    current_role: ManagementUserRole,
+    account_class: AccountClass,
+    next_role: Option<ManagementUserRole>,
+) -> Result<(), ManagementUserError> {
+    if account_class == AccountClass::System {
+        return Err(ManagementUserError::SystemUserImmutable);
+    }
+    if current_role == ManagementUserRole::Admin && next_role == Some(ManagementUserRole::Viewer) {
+        let remaining_admins: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND username <> ?")
+                .bind(username)
+                .fetch_one(&mut **transaction)
+                .await?;
+        if remaining_admins == 0 {
+            return Err(ManagementUserError::LastAdministrator);
+        }
+    }
+    Ok(())
+}
+
+async fn protect_timescale_management_user_invariants(
+    transaction: &mut Transaction<'_, Postgres>,
+    username: &str,
+    current_role: ManagementUserRole,
+    account_class: AccountClass,
+    next_role: Option<ManagementUserRole>,
+) -> Result<(), ManagementUserError> {
+    if account_class == AccountClass::System {
+        return Err(ManagementUserError::SystemUserImmutable);
+    }
+    if current_role == ManagementUserRole::Admin && next_role == Some(ManagementUserRole::Viewer) {
+        let remaining_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND username <> $1",
+        )
+        .bind(username)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if remaining_admins == 0 {
+            return Err(ManagementUserError::LastAdministrator);
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_management_user(
+    user: CreateManagementUser,
+) -> Result<CreateManagementUser, ManagementUserError> {
+    if !management_identifier(&user.username) {
+        return Err(ManagementUserError::InvalidUsername(user.username));
+    }
+    if user.password_hash.trim().is_empty() {
+        return Err(ManagementUserError::EmptyPasswordHash);
+    }
+    validate_management_user_apps(&user.default_app, &user.granted_apps)?;
+    Ok(user)
+}
+
+fn validate_management_user_apps(
+    default_app: &str,
+    granted_apps: &[String],
+) -> Result<(), ManagementUserError> {
+    let Some(default_app_key) = default_app.strip_prefix("/apps/") else {
+        return Err(ManagementUserError::InvalidDefaultApp(
+            default_app.to_owned(),
+        ));
+    };
+    if !management_identifier(default_app_key) {
+        return Err(ManagementUserError::InvalidDefaultApp(
+            default_app.to_owned(),
+        ));
+    }
+    if granted_apps.is_empty()
+        || granted_apps
+            .iter()
+            .any(|app_key| !management_identifier(app_key))
+        || !granted_apps
+            .iter()
+            .any(|app_key| app_key == default_app_key)
+    {
+        return Err(ManagementUserError::InvalidGrantedApps);
+    }
+    let distinct_apps = granted_apps.iter().collect::<BTreeSet<_>>();
+    if distinct_apps.len() != granted_apps.len() {
+        return Err(ManagementUserError::InvalidGrantedApps);
+    }
+    Ok(())
+}
+
+fn management_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|character| {
+            character.is_ascii_alphanumeric() || character == b'_' || character == b'-'
+        })
+}
+
+fn map_management_username_conflict(error: sqlx::Error, username: &str) -> ManagementUserError {
+    if error
+        .as_database_error()
+        .is_some_and(|database| database.is_unique_violation())
+    {
+        ManagementUserError::UsernameConflict(username.to_owned())
+    } else {
+        ManagementUserError::from(error)
+    }
+}
+
+async fn management_user(
+    store: &PlatformStore,
+    user_id: Uuid,
+) -> Result<ManagementUser, ManagementUserError> {
+    let users = list_management_users(store).await?;
+    users
+        .into_iter()
+        .find(|user| user.id == user_id)
+        .ok_or(ManagementUserError::InvalidStoredUserId)
+}
+
+async fn sqlite_management_user_from_row(
+    pool: &sqlx::SqlitePool,
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ManagementUser, ManagementUserError> {
+    let id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
+        .map_err(|_| ManagementUserError::InvalidStoredUserId)?;
+    let granted_apps = sqlite_management_user_grants(pool, id).await?;
+    management_user_from_parts(
+        id,
+        row.try_get("username")?,
+        row.try_get("role")?,
+        row.try_get("account_class")?,
+        row.try_get("default_app")?,
+        granted_apps,
+    )
+}
+
+async fn sqlite_management_user_grants(
+    pool: &sqlx::SqlitePool,
+    user_id: Uuid,
+) -> Result<Vec<String>, ManagementUserError> {
+    sqlx::query_scalar(
+        "SELECT app_key
+         FROM user_app_grants
+         WHERE user_id = ?
+         ORDER BY app_key",
+    )
+    .bind(user_id.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(ManagementUserError::from)
+}
+
+async fn timescale_management_user_from_row(
+    pool: &sqlx::PgPool,
+    row: sqlx::postgres::PgRow,
+) -> Result<ManagementUser, ManagementUserError> {
+    let id = row.try_get("id")?;
+    let granted_apps = timescale_management_user_grants(pool, id).await?;
+    management_user_from_parts(
+        id,
+        row.try_get("username")?,
+        row.try_get("role")?,
+        row.try_get("account_class")?,
+        row.try_get("default_app")?,
+        granted_apps,
+    )
+}
+
+async fn timescale_management_user_grants(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+) -> Result<Vec<String>, ManagementUserError> {
+    sqlx::query_scalar(
+        "SELECT app_key
+         FROM user_app_grants
+         WHERE user_id = $1
+         ORDER BY app_key",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(ManagementUserError::from)
+}
+
+fn management_user_from_parts(
+    id: Uuid,
+    username: String,
+    role: String,
+    account_class: String,
+    default_app: String,
+    granted_apps: Vec<String>,
+) -> Result<ManagementUser, ManagementUserError> {
+    let role = ManagementUserRole::from_database(&role)?;
+    let account_class = management_user_account_class(account_class)?;
+    Ok(ManagementUser {
+        id,
+        username,
+        role,
+        account_class,
+        default_app,
+        granted_apps,
+    })
+}
+
+fn management_user_account_class(
+    account_class: String,
+) -> Result<AccountClass, ManagementUserError> {
+    let account_class = match account_class.as_str() {
+        "system" => AccountClass::System,
+        "admin" => AccountClass::Admin,
+        "user" => AccountClass::User,
+        _ => {
+            return Err(ManagementUserError::InvalidStoredAccountClass(
+                account_class,
+            ));
+        }
+    };
+    Ok(account_class)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
