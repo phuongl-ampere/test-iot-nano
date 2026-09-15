@@ -330,6 +330,37 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
     }
     assert_eq!(device_token["properties"]["token"]["type"], "string");
 
+    for (schema_name, field_name) in [
+        ("SessionResponse", "user_id"),
+        ("ManagementUser", "id"),
+        ("DeviceProfile", "id"),
+        ("AssetProfile", "id"),
+        ("DeviceToken", "id"),
+        ("ManagementAsset", "id"),
+    ] {
+        assert_eq!(
+            schemas[schema_name]["properties"][field_name],
+            json!({"type": "string", "format": "uuid"}),
+            "{schema_name}.{field_name} must be non-null"
+        );
+    }
+    for (schema_name, field_name) in [
+        ("ManagementDeviceUpdateRequest", "asset_id"),
+        ("ManagementDeviceUpdateRequest", "device_profile_id"),
+        ("ManagementDevice", "asset_id"),
+        ("ManagementDevice", "device_profile_id"),
+        ("ManagementAssetRequest", "asset_profile_id"),
+        ("ManagementAssetRequest", "parent_asset_id"),
+        ("ManagementAsset", "asset_profile_id"),
+        ("ManagementAsset", "parent_asset_id"),
+    ] {
+        assert_eq!(
+            schemas[schema_name]["properties"][field_name],
+            json!({"type": ["string", "null"], "format": "uuid"}),
+            "{schema_name}.{field_name} must remain nullable"
+        );
+    }
+
     for forbidden_schema in [
         "AccessToken",
         "AlertPage",

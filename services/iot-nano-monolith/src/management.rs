@@ -687,7 +687,7 @@ fn management_openapi_schemas() -> Value {
     );
     schemas.insert(
         "SessionResponse".to_owned(),
-        object_schema(json!({"user_id": uuid_schema()}), &["user_id"]),
+        object_schema(json!({"user_id": uuid_schema_non_null()}), &["user_id"]),
     );
     schemas.insert(
         "LoginRequest".to_owned(),
@@ -756,7 +756,7 @@ fn management_openapi_schemas() -> Value {
         "ManagementUser".to_owned(),
         object_schema(
             json!({
-                "id": uuid_schema(),
+                "id": uuid_schema_non_null(),
                 "username": {"type": "string"},
                 "role": {"type": "string"},
                 "account_class": {"type": "string"},
@@ -794,7 +794,7 @@ fn management_openapi_schemas() -> Value {
         "DeviceProfile".to_owned(),
         object_schema(
             json!({
-                "id": uuid_schema(),
+                "id": uuid_schema_non_null(),
                 "name": {"type": "string"},
                 "telemetry_schema": json_object_schema(),
                 "metric_mapping": json_object_schema(),
@@ -824,7 +824,7 @@ fn management_openapi_schemas() -> Value {
         "AssetProfile".to_owned(),
         object_schema(
             json!({
-                "id": uuid_schema(),
+                "id": uuid_schema_non_null(),
                 "name": {"type": "string"},
                 "fields": json_object_schema(),
                 "dashboard_defaults": json_object_schema()
@@ -875,7 +875,7 @@ fn management_openapi_schemas() -> Value {
         "DeviceToken".to_owned(),
         object_schema(
             json!({
-                "id": {"type": "string", "format": "uuid"},
+                "id": uuid_schema_non_null(),
                 "device_id": {"type": "string"},
                 "token_prefix": {"type": "string"},
                 "created_at": {"type": "string", "format": "date-time"},
@@ -910,7 +910,7 @@ fn management_openapi_schemas() -> Value {
         "ManagementAsset".to_owned(),
         object_schema(
             json!({
-                "id": uuid_schema(),
+                "id": uuid_schema_non_null(),
                 "name": {"type": "string"},
                 "asset_profile_id": uuid_schema(),
                 "parent_asset_id": uuid_schema(),
@@ -953,6 +953,10 @@ fn json_object_schema() -> Value {
 
 fn uuid_schema() -> Value {
     json!({"type": ["string", "null"], "format": "uuid"})
+}
+
+fn uuid_schema_non_null() -> Value {
+    json!({"type": "string", "format": "uuid"})
 }
 
 #[derive(Default)]
