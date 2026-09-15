@@ -1,4 +1,16 @@
-use std::{net::SocketAddr, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    path::PathBuf,
+    process::{Child, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{SyncSender, sync_channel},
+    },
+    thread::Builder,
+    time::Duration,
+};
 
 use chrono::Utc;
 use reqwest::{
@@ -24,6 +36,13 @@ struct Fixture {
     mqtt_tls_address: SocketAddr,
     tls_cert_path: PathBuf,
     tls_key_path: PathBuf,
+}
+
+struct ManagedChild {
+    child: Option<Child>,
+    process_group: rustix::process::Pid,
+    reaper: Option<SyncSender<Child>>,
+    reaped: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -97,22 +116,67 @@ async fn sqlite_monolith_process_runs_management_oauth_public_api_and_graceful_s
 
     let mut command = Command::new(binary);
     fixture.configure(&mut command);
-    let mut child = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = spawn_child(&mut command).unwrap();
     let result = run_e2e_flow(&fixture, &mut child).await;
-    if child.try_wait().unwrap().is_none() {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    }
     result.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_child_drop_during_task_panic_kills_and_reaps_its_process_group() {
+    let directory = tempfile::tempdir().unwrap();
+    let descendant_pid_path = directory.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("sleep 30 & echo $! > \"$1\"; wait")
+        .arg("shutdown-test")
+        .arg(&descendant_pid_path);
+    let child = spawn_child(&mut command).unwrap();
+    let reaped = Arc::clone(&child.reaped);
+    let descendant_pid = wait_for_pid(&descendant_pid_path).await;
+
+    let task = tokio::spawn(async move {
+        let _child = child;
+        panic!("panic the managed child fixture");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+
+    wait_until_process_is_gone(descendant_pid).await;
+    wait_until_reaped(reaped).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_child_drop_during_task_error_kills_and_reaps_its_process_group() {
+    let directory = tempfile::tempdir().unwrap();
+    let descendant_pid_path = directory.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("sleep 30 & echo $! > \"$1\"; wait")
+        .arg("shutdown-test")
+        .arg(&descendant_pid_path);
+    let child = spawn_child(&mut command).unwrap();
+    let reaped = Arc::clone(&child.reaped);
+    let descendant_pid = wait_for_pid(&descendant_pid_path).await;
+
+    let task = tokio::spawn(async move {
+        let _child = child;
+        Err::<(), _>("return an error from the managed child fixture")
+    });
+    assert_eq!(
+        task.await.unwrap(),
+        Err("return an error from the managed child fixture")
+    );
+
+    wait_until_process_is_gone(descendant_pid).await;
+    wait_until_reaped(reaped).await;
 }
 
 async fn run_e2e_flow(
     fixture: &Fixture,
-    child: &mut tokio::process::Child,
+    child: &mut ManagedChild,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -231,13 +295,7 @@ async fn run_e2e_flow(
     TcpStream::connect(fixture.mqtt_tcp_address).await?;
     TcpStream::connect(fixture.mqtt_tls_address).await?;
 
-    let pid = child.id().expect("monolith process has no PID");
-    let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .await?;
-    assert!(status.success());
+    child.signal(rustix::process::Signal::TERM)?;
     let exit = timeout(Duration::from_secs(15), child.wait()).await??;
     assert!(exit.success(), "monolith exited with {exit}");
     for address in [
@@ -414,4 +472,146 @@ async fn reserve_address() -> SocketAddr {
     let address = listener.local_addr().unwrap();
     drop(listener);
     address
+}
+
+fn spawn_child(command: &mut Command) -> io::Result<ManagedChild> {
+    command.process_group(0);
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .as_std_mut()
+        .spawn()?;
+    let Some(process_group) = rustix::process::Pid::from_raw(child.id() as i32) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other("spawned child has no process group"));
+    };
+    let reaped = Arc::new(AtomicBool::new(false));
+    let reaper = match spawn_child_reaper(Arc::clone(&reaped)) {
+        Ok(reaper) => reaper,
+        Err(error) => {
+            let _ =
+                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    Ok(ManagedChild {
+        child: Some(child),
+        process_group,
+        reaper: Some(reaper),
+        reaped,
+    })
+}
+
+impl ManagedChild {
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let status = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("child was handed to its reaper"))?
+            .try_wait()?;
+        if status.is_some() {
+            self.reaped.store(true, Ordering::Release);
+        }
+        Ok(status)
+    }
+
+    async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn signal(&self, signal: rustix::process::Signal) -> rustix::io::Result<()> {
+        rustix::process::kill_process_group(self.process_group, signal)
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        let _ = self
+            .signal(rustix::process::Signal::KILL)
+            .or_else(ignore_missing_process_group);
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let Some(reaper) = self.reaper.take() else {
+            return;
+        };
+        if let Err(error) = reaper.send(child) {
+            let mut child = error.0;
+            if child.wait().is_ok() {
+                self.reaped.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn spawn_child_reaper(reaped: Arc<AtomicBool>) -> io::Result<SyncSender<Child>> {
+    let (sender, receiver) = sync_channel::<Child>(1);
+    Builder::new()
+        .name("iot-nano-e2e-reaper".to_owned())
+        .spawn(move || {
+            if let Ok(mut child) = receiver.recv() {
+                if child.wait().is_ok() {
+                    reaped.store(true, Ordering::Release);
+                }
+            }
+        })?;
+    Ok(sender)
+}
+
+fn ignore_missing_process_group(error: rustix::io::Errno) -> rustix::io::Result<()> {
+    if error == rustix::io::Errno::SRCH {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_pid(path: &std::path::Path) -> u32 {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process-group descendant did not report its PID")
+}
+
+#[cfg(unix)]
+async fn wait_until_process_is_gone(pid: u32) {
+    let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if rustix::process::test_kill_process(pid).is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process-group descendant remained alive after fixture cleanup");
+}
+
+#[cfg(unix)]
+async fn wait_until_reaped(reaped: Arc<AtomicBool>) {
+    timeout(Duration::from_secs(1), async {
+        while !reaped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("managed child remained unreaped after fixture cleanup");
 }
