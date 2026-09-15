@@ -26,8 +26,10 @@ use iot_core::{
 };
 use iot_storage::{
     AuthorizationRepository, AuthorizationSubject, AuthorizedDeviceSummary, CommandOutboxState,
-    DeviceAuthorizationRepository, NewCommandOutboxEntry, PlatformStore, PlatformStoreError,
-    SqliteStore, SqliteStoreError,
+    DeviceAuthorizationRepository, ManagementChildStatus,
+    ManagementDevice as StorageManagementDevice, ManagementDeviceError, ManagementDeviceRepository,
+    ManagementDeviceTopology, ManagementGatewayStatus, NewCommandOutboxEntry, PlatformStore,
+    PlatformStoreError, SqliteStore, SqliteStoreError, UpdateManagementDevice,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -2153,106 +2155,15 @@ async fn sqlite_update_management_device(
     Path(device_id): Path<String>,
     Json(request): Json<UpdateManagementDeviceRequest>,
 ) -> Result<Json<ManagementDevice>, ApiError> {
-    if !is_identifier(&device_id) {
-        return Err(ApiError::BadRequest("invalid device ID".to_owned()));
-    }
-    let display_name = validated_name(&request.display_name, "device name")?.to_owned();
-    let attributes = request
-        .attributes
-        .map(|value| object_value(value, "device attributes"))
-        .transpose()?
-        .map(|value| value.to_string());
-    let mut transaction = state.store.pool().begin().await?;
-    let current = sqlx::query(
-        "SELECT is_gateway, gateway_device_id
-         FROM devices
-         WHERE device_id = ? AND deleted_at IS NULL",
+    ManagementDeviceRepository::update_management_device(
+        state.token_store.as_ref(),
+        &device_id,
+        storage_management_device_update(request),
     )
-    .bind(&device_id)
-    .fetch_optional(&mut *transaction)
-    .await?
-    .ok_or(ApiError::NotFound("device"))?;
-    let current_is_gateway = current.try_get::<i64, _>("is_gateway")? != 0;
-    let current_gateway_device_id = current.try_get::<Option<String>, _>("gateway_device_id")?;
-    let (is_gateway, gateway_device_id) = request
-        .topology
-        .map(|topology| (topology.is_gateway, topology.gateway_device_id))
-        .unwrap_or((current_is_gateway, current_gateway_device_id));
-    if is_gateway && gateway_device_id.is_some() {
-        return Err(ApiError::BadRequest(
-            "a gateway cannot be assigned to another gateway".to_owned(),
-        ));
-    }
-    if gateway_device_id.as_deref() == Some(device_id.as_str()) {
-        return Err(ApiError::BadRequest(
-            "a device cannot be its own gateway".to_owned(),
-        ));
-    }
-    if current_is_gateway && !is_gateway {
-        let has_children = sqlx::query(
-            "SELECT 1 FROM devices
-             WHERE gateway_device_id = ? AND deleted_at IS NULL
-             LIMIT 1",
-        )
-        .bind(&device_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .is_some();
-        if has_children {
-            return Err(ApiError::Conflict(
-                "a gateway with assigned children cannot be demoted".to_owned(),
-            ));
-        }
-    }
-    if let Some(parent_device_id) = gateway_device_id.as_deref() {
-        let parent_is_gateway = sqlx::query(
-            "SELECT is_gateway FROM devices
-             WHERE device_id = ? AND deleted_at IS NULL",
-        )
-        .bind(parent_device_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .map(|row| row.try_get::<i64, _>("is_gateway"))
-        .transpose()?
-        .ok_or_else(|| ApiError::Conflict("gateway device is unavailable".to_owned()))?;
-        if parent_is_gateway == 0 {
-            return Err(ApiError::Conflict(
-                "assigned gateway device is not a gateway".to_owned(),
-            ));
-        }
-    }
-    let row = sqlx::query(
-        "UPDATE devices
-         SET display_name = ?, asset_id = ?, device_profile_id = ?,
-             metadata = COALESCE(?, metadata), is_gateway = ?, gateway_device_id = ?
-         WHERE device_id = ? AND deleted_at IS NULL
-         RETURNING device_id, display_name, asset_id, device_profile_id, metadata, last_seen_at,
-                   is_gateway, gateway_device_id, gateway_last_read_at, gateway_read_quality",
-    )
-    .bind(display_name)
-    .bind(request.asset_id.map(|id| id.to_string()))
-    .bind(request.device_profile_id.map(|id| id.to_string()))
-    .bind(attributes)
-    .bind(i64::from(is_gateway))
-    .bind(&gateway_device_id)
-    .bind(&device_id)
-    .fetch_optional(&mut *transaction)
-    .await?
-    .ok_or(ApiError::NotFound("device"))?;
-    if gateway_device_id.is_some() {
-        sqlx::query(
-            "UPDATE device_tokens
-             SET revoked_at = ?
-             WHERE device_id = ? AND revoked_at IS NULL",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(&device_id)
-        .execute(&mut *transaction)
-        .await?;
-    }
-    transaction.commit().await?;
-    sqlite_management_device_from_row(row, &(Utc::now() - Duration::minutes(5)).to_rfc3339())
-        .map(Json)
+    .await
+    .map(storage_management_device_response)
+    .map(Json)
+    .map_err(management_device_storage_error)
 }
 
 async fn sqlite_delete_management_device(
@@ -2260,47 +2171,10 @@ async fn sqlite_delete_management_device(
     _admin: Admin,
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if !is_identifier(&device_id) {
-        return Err(ApiError::BadRequest("invalid device ID".to_owned()));
-    }
-    let mut transaction = state.store.pool().begin().await?;
-    let has_children = sqlx::query(
-        "SELECT 1 FROM devices
-         WHERE gateway_device_id = ? AND deleted_at IS NULL
-         LIMIT 1",
-    )
-    .bind(&device_id)
-    .fetch_optional(&mut *transaction)
-    .await?
-    .is_some();
-    if has_children {
-        return Err(ApiError::Conflict(
-            "a gateway with assigned children cannot be deleted".to_owned(),
-        ));
-    }
-    let now = Utc::now().to_rfc3339();
-    let deleted = sqlx::query(
-        "UPDATE devices SET deleted_at = ?
-         WHERE device_id = ? AND deleted_at IS NULL",
-    )
-    .bind(&now)
-    .bind(&device_id)
-    .execute(&mut *transaction)
-    .await?
-    .rows_affected();
-    if deleted == 0 {
-        return Err(ApiError::NotFound("device"));
-    }
-    sqlx::query(
-        "UPDATE device_tokens SET revoked_at = ?
-         WHERE device_id = ? AND revoked_at IS NULL",
-    )
-    .bind(now)
-    .bind(device_id)
-    .execute(&mut *transaction)
-    .await?;
-    transaction.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    ManagementDeviceRepository::delete_management_device(state.token_store.as_ref(), &device_id)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(management_device_storage_error)
 }
 
 async fn sqlite_list_management_assets(
@@ -3347,12 +3221,13 @@ async fn sqlite_mqttd_device_transport_session_authorization(
     Json(request): Json<MqttdDeviceTransportSessionAuthorizationRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
-    require_active_device_response_token(
+    DeviceAuthorizationRepository::authorize_device_session(
         state.token_store.as_ref(),
         request.token_id,
         &request.device_id,
     )
-    .await?;
+    .await
+    .map_err(platform_device_token_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3380,12 +3255,13 @@ async fn sqlite_mqttd_device_transport_rpc_response(
     Json(request): Json<MqttdDeviceTransportRpcResponseRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
-    require_active_device_response_token(
+    DeviceAuthorizationRepository::authorize_device_session(
         state.token_store.as_ref(),
         request.token_id,
         &request.device_id,
     )
-    .await?;
+    .await
+    .map_err(platform_device_token_error)?;
     let now = Utc::now();
     if let Some(facade) = &state.core_facade {
         facade
@@ -5330,111 +5206,15 @@ async fn update_management_device(
     Path(device_id): Path<String>,
     Json(request): Json<UpdateManagementDeviceRequest>,
 ) -> Result<Json<ManagementDevice>, ApiError> {
-    if !is_identifier(&device_id) {
-        return Err(ApiError::BadRequest("invalid device ID".to_owned()));
-    }
-    let display_name = validated_name(&request.display_name, "device name")?.to_owned();
-    let attributes = request
-        .attributes
-        .map(|value| object_value(value, "device attributes"))
-        .transpose()?
-        .map(sqlx::types::Json);
-    let mut transaction = state.pool.begin().await?;
-    let current = sqlx::query(
-        "SELECT is_gateway, gateway_device_id
-         FROM devices
-         WHERE device_id = $1 AND deleted_at IS NULL
-         FOR UPDATE",
+    ManagementDeviceRepository::update_management_device(
+        state.token_store.as_ref(),
+        &device_id,
+        storage_management_device_update(request),
     )
-    .bind(&device_id)
-    .fetch_optional(&mut *transaction)
-    .await?
-    .ok_or(ApiError::NotFound("device"))?;
-    let current_is_gateway = current.try_get::<bool, _>("is_gateway")?;
-    let current_gateway_device_id = current.try_get::<Option<String>, _>("gateway_device_id")?;
-    let (is_gateway, gateway_device_id) = request
-        .topology
-        .map(|topology| (topology.is_gateway, topology.gateway_device_id))
-        .unwrap_or((current_is_gateway, current_gateway_device_id));
-
-    if is_gateway && gateway_device_id.is_some() {
-        return Err(ApiError::BadRequest(
-            "a gateway cannot be assigned to another gateway".to_owned(),
-        ));
-    }
-    if gateway_device_id.as_deref() == Some(device_id.as_str()) {
-        return Err(ApiError::BadRequest(
-            "a device cannot be its own gateway".to_owned(),
-        ));
-    }
-    if current_is_gateway && !is_gateway {
-        let has_children = sqlx::query(
-            "SELECT 1
-             FROM devices
-             WHERE gateway_device_id = $1 AND deleted_at IS NULL
-             FOR UPDATE",
-        )
-        .bind(&device_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .is_some();
-        if has_children {
-            return Err(ApiError::Conflict(
-                "a gateway with assigned children cannot be demoted".to_owned(),
-            ));
-        }
-    }
-    if let Some(parent_device_id) = gateway_device_id.as_deref() {
-        let parent_is_gateway = sqlx::query(
-            "SELECT is_gateway
-             FROM devices
-             WHERE device_id = $1 AND deleted_at IS NULL
-             FOR UPDATE",
-        )
-        .bind(parent_device_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .map(|row| row.try_get::<bool, _>("is_gateway"))
-        .transpose()?
-        .ok_or_else(|| ApiError::Conflict("gateway device is unavailable".to_owned()))?;
-        if !parent_is_gateway {
-            return Err(ApiError::Conflict(
-                "assigned gateway device is not a gateway".to_owned(),
-            ));
-        }
-    }
-
-    let row = sqlx::query(
-        "UPDATE devices
-         SET display_name = $2, asset_id = $3, device_profile_id = $4,
-             metadata = COALESCE($5, metadata), is_gateway = $6,
-             gateway_device_id = $7
-         WHERE device_id = $1 AND deleted_at IS NULL
-         RETURNING device_id, display_name, asset_id, device_profile_id, metadata, last_seen_at,
-                   is_gateway, gateway_device_id, gateway_last_read_at, gateway_read_quality",
-    )
-    .bind(&device_id)
-    .bind(display_name)
-    .bind(request.asset_id)
-    .bind(request.device_profile_id)
-    .bind(attributes)
-    .bind(is_gateway)
-    .bind(&gateway_device_id)
-    .fetch_optional(&mut *transaction)
-    .await?
-    .ok_or(ApiError::NotFound("device"))?;
-    if gateway_device_id.is_some() {
-        sqlx::query(
-            "UPDATE device_tokens
-             SET revoked_at = now()
-             WHERE device_id = $1 AND revoked_at IS NULL",
-        )
-        .bind(&device_id)
-        .execute(&mut *transaction)
-        .await?;
-    }
-    transaction.commit().await?;
-    management_device_from_row(row, Utc::now() - Duration::minutes(5)).map(Json)
+    .await
+    .map(storage_management_device_response)
+    .map(Json)
+    .map_err(management_device_storage_error)
 }
 
 #[utoipa::path(
@@ -5450,47 +5230,10 @@ async fn delete_management_device(
     _admin: Admin,
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    if !is_identifier(&device_id) {
-        return Err(ApiError::BadRequest("invalid device ID".to_owned()));
-    }
-    let mut transaction = state.pool.begin().await?;
-    let has_children = sqlx::query(
-        "SELECT 1
-         FROM devices
-         WHERE gateway_device_id = $1 AND deleted_at IS NULL
-         FOR UPDATE",
-    )
-    .bind(&device_id)
-    .fetch_optional(&mut *transaction)
-    .await?
-    .is_some();
-    if has_children {
-        return Err(ApiError::Conflict(
-            "a gateway with assigned children cannot be deleted".to_owned(),
-        ));
-    }
-    let deleted = sqlx::query(
-        "UPDATE devices
-         SET deleted_at = now()
-         WHERE device_id = $1 AND deleted_at IS NULL",
-    )
-    .bind(&device_id)
-    .execute(&mut *transaction)
-    .await?
-    .rows_affected();
-    if deleted == 0 {
-        return Err(ApiError::NotFound("device"));
-    }
-    sqlx::query(
-        "UPDATE device_tokens
-         SET revoked_at = now()
-         WHERE device_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(&device_id)
-    .execute(&mut *transaction)
-    .await?;
-    transaction.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    ManagementDeviceRepository::delete_management_device(state.token_store.as_ref(), &device_id)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(management_device_storage_error)
 }
 
 #[utoipa::path(
@@ -6487,23 +6230,6 @@ fn platform_device_token_error(error: PlatformStoreError) -> ApiError {
         ApiError::Unauthorized
     } else {
         ApiError::DeviceToken(DeviceTokenStoreError::Platform(error))
-    }
-}
-
-async fn require_active_device_response_token(
-    store: &PlatformStore,
-    token_id: Uuid,
-    device_id: &str,
-) -> Result<(), ApiError> {
-    let token = active_platform_device_token(store, token_id)
-        .await
-        .map_err(device_token_error)?;
-    if token.is_some_and(|token| token.device_id == device_id) {
-        Ok(())
-    } else {
-        Err(ApiError::Conflict(
-            "RPC response does not match an active two-way command".to_owned(),
-        ))
     }
 }
 
@@ -8615,6 +8341,83 @@ fn object_value(value: serde_json::Value, label: &str) -> Result<serde_json::Val
         Ok(value)
     } else {
         Err(ApiError::BadRequest(format!("{label} must be an object")))
+    }
+}
+
+fn storage_management_device_update(
+    request: UpdateManagementDeviceRequest,
+) -> UpdateManagementDevice {
+    UpdateManagementDevice {
+        display_name: request.display_name,
+        asset_id: request.asset_id,
+        device_profile_id: request.device_profile_id,
+        attributes: request.attributes,
+        topology: request.topology.map(|topology| ManagementDeviceTopology {
+            is_gateway: topology.is_gateway,
+            gateway_device_id: topology.gateway_device_id,
+        }),
+    }
+}
+
+fn storage_management_device_response(device: StorageManagementDevice) -> ManagementDevice {
+    ManagementDevice {
+        device_id: device.device_id,
+        display_name: device.display_name,
+        asset_id: device.asset_id,
+        device_profile_id: device.device_profile_id,
+        attributes: device.attributes,
+        online: device.health.online,
+        last_seen_at: device.health.last_seen_at,
+        is_gateway: device.topology.is_gateway,
+        gateway_device_id: device.topology.gateway_device_id,
+        gateway_status: device.health.gateway_status.map(|status| match status {
+            ManagementGatewayStatus::Online => "online".to_owned(),
+            ManagementGatewayStatus::Offline => "offline".to_owned(),
+        }),
+        child_status: device.health.child_status.map(|status| match status {
+            ManagementChildStatus::Fresh => "fresh".to_owned(),
+            ManagementChildStatus::Stale => "stale".to_owned(),
+            ManagementChildStatus::Unavailable => "unavailable".to_owned(),
+        }),
+    }
+}
+
+fn management_device_storage_error(error: ManagementDeviceError) -> ApiError {
+    match error {
+        ManagementDeviceError::InvalidDeviceId(_) => {
+            ApiError::BadRequest("invalid device ID".to_owned())
+        }
+        ManagementDeviceError::InvalidDisplayName => {
+            ApiError::BadRequest("invalid device name".to_owned())
+        }
+        ManagementDeviceError::AttributesMustBeObject => {
+            ApiError::BadRequest("device attributes must be an object".to_owned())
+        }
+        ManagementDeviceError::DeviceNotFound => ApiError::NotFound("device"),
+        ManagementDeviceError::GatewayCannotHaveParent => {
+            ApiError::BadRequest("a gateway cannot be assigned to another gateway".to_owned())
+        }
+        ManagementDeviceError::DeviceCannotBeOwnGateway => {
+            ApiError::BadRequest("a device cannot be its own gateway".to_owned())
+        }
+        ManagementDeviceError::GatewayHasChildren => ApiError::Conflict(
+            "a gateway with assigned children cannot be changed or deleted".to_owned(),
+        ),
+        ManagementDeviceError::GatewayUnavailable => {
+            ApiError::Conflict("gateway device is unavailable".to_owned())
+        }
+        ManagementDeviceError::GatewayIsNotGateway => {
+            ApiError::Conflict("assigned gateway device is not a gateway".to_owned())
+        }
+        ManagementDeviceError::AssetUnavailable(_) => {
+            ApiError::Conflict("assigned asset is unavailable".to_owned())
+        }
+        ManagementDeviceError::DeviceProfileUnavailable(_) => {
+            ApiError::Conflict("assigned device profile is unavailable".to_owned())
+        }
+        ManagementDeviceError::InvalidStoredAttributes
+        | ManagementDeviceError::InvalidStoredTimestamp
+        | ManagementDeviceError::Storage { .. } => ApiError::StorageData,
     }
 }
 

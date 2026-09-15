@@ -1265,7 +1265,7 @@ async fn sqlite_transport_records_a_two_way_response_once_for_the_active_token()
     .await
     .unwrap();
 
-    assert_eq!(wrong_token.status(), StatusCode::CONFLICT);
+    assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(first.status(), StatusCode::NO_CONTENT);
     assert_eq!(duplicate.status(), StatusCode::NO_CONTENT);
     assert_eq!(row.try_get::<String, _>("state").unwrap(), "responded");
@@ -3147,6 +3147,56 @@ async fn sqlite_management_gateway_child_assignment_revokes_the_child_token() {
         "SELECT COUNT(*) FROM device_tokens WHERE device_id = ? AND revoked_at IS NULL",
     )
     .bind(child_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(active_token_count, 0);
+}
+
+#[tokio::test]
+async fn sqlite_management_delete_revokes_active_device_tokens() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("rush.db")),
+        sqlite_busy_timeout_ms: 5_000,
+    };
+    let store = SqliteStore::open(&configuration).await.unwrap();
+    bootstrap_users_sqlite(store.pool()).await.unwrap();
+    let app = sqlite_router(SqliteApiState::new(store.clone()));
+    let session_id = sqlite_session_id(&app, "admin", "NanoAdmin@1234").await;
+
+    let provisioned = sqlite_json_response(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/devices")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("authorization", format!("Session {session_id}"))
+            .body(Body::from(r#"{"display_name":"Delete me"}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(provisioned.0, StatusCode::CREATED);
+    let device_id = provisioned.1["device_id"].as_str().unwrap().to_owned();
+
+    let deleted = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/management/devices/{device_id}"))
+                .header("authorization", format!("Session {session_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let active_token_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM device_tokens WHERE device_id = ? AND revoked_at IS NULL",
+    )
+    .bind(device_id)
     .fetch_one(store.pool())
     .await
     .unwrap();
