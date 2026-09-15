@@ -5,6 +5,8 @@ use iot_storage::{
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
+mod common;
+
 const USER_ID: Uuid = Uuid::from_u128(1);
 const OTHER_USER_ID: Uuid = Uuid::from_u128(2);
 const ROOT_ASSET_ID: Uuid = Uuid::from_u128(10);
@@ -487,12 +489,7 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
         database_name.starts_with("iot_nano_test_"),
         "refusing to reset non-test database {database_name:?}"
     );
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
-        .execute(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {

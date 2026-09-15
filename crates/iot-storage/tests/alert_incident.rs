@@ -6,6 +6,8 @@ use iot_storage::{
 };
 use sqlx::{Connection, PgConnection};
 
+mod common;
+
 async fn store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let platform = PlatformStore::open(&StorageConfiguration {
@@ -518,12 +520,7 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
         .await
         .unwrap();
     assert!(database.starts_with("iot_nano_test_"));
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
-        .execute(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {

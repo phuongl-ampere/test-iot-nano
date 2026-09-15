@@ -2,6 +2,8 @@ use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::PlatformStore;
 use sqlx::{Connection, PgConnection, Row, SqliteConnection};
 
+mod common;
+
 #[test]
 fn platform_store_owns_its_postgres_migration_source() {
     let migration = include_str!("../migrations/0001_platform.sql");
@@ -196,8 +198,7 @@ async fn timescale_migration_rejects_duplicate_root_asset_names_without_mutating
         database_name.starts_with("iot_nano_test_"),
         "refusing to reset non-test database {database_name:?}"
     );
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
-        .execute(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     sqlx::query("CREATE SCHEMA iot_nano")

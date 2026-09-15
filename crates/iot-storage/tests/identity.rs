@@ -7,6 +7,8 @@ use iot_storage::{IdentityRepository, PlatformStore, PlatformStoreError};
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
+mod common;
+
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -58,12 +60,7 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
         database_name.starts_with("iot_nano_test_"),
         "refusing to reset non-test database {database_name:?}"
     );
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
-        .execute(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
 

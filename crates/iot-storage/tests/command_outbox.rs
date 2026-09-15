@@ -8,6 +8,8 @@ use iot_storage::{
 };
 use sqlx::{Connection, PgConnection, Row};
 
+mod common;
+
 const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
 
 async fn store() -> (tempfile::TempDir, SqliteStore) {
@@ -50,12 +52,7 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
         database_name, "iot_nano_test_platform",
         "refusing to reset non-test database {database_name:?}"
     );
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
-        .execute(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {

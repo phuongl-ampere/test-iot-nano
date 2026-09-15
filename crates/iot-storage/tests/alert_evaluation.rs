@@ -9,6 +9,8 @@ use serde_json::{Map, Value};
 use sqlx::{Connection, PgConnection};
 use tokio::{sync::Barrier, time::Duration as TokioDuration};
 
+mod common;
+
 const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
 
 async fn store() -> (tempfile::TempDir, PlatformStore) {
@@ -37,12 +39,7 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
         .await
         .unwrap();
     assert!(database.starts_with("iot_nano_test_"));
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
-        .execute(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {

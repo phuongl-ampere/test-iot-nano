@@ -7,6 +7,8 @@ use iot_storage::{
 use sqlx::{Connection, PgConnection, Row};
 use tokio::time::{Duration, sleep, timeout};
 
+mod common;
+
 const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
 
 struct TimescaleTestLock {
@@ -18,12 +20,7 @@ async fn timescale_test_store() -> (TimescaleTestLock, PlatformStore) {
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
     assert_eq!(database_url, TIMESCALE_TEST_URL);
     let mut connection = PgConnection::connect(&database_url).await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:gateway-ingest-test'))")
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
-        .execute(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
