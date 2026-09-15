@@ -276,6 +276,67 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     ));
 }
 
+#[tokio::test]
+async fn sqlite_device_profile_deletion_preserves_active_references_and_clears_soft_deleted_ones() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let active_profile = ManagementDeviceProfileRepository::create_management_device_profile(
+        &store,
+        device_profile("Active reference device profile"),
+    )
+    .await
+    .unwrap();
+    let deleted_profile = ManagementDeviceProfileRepository::create_management_device_profile(
+        &store,
+        device_profile("Soft-deleted reference device profile"),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, device_profile_id)
+         VALUES ('active-profile-reference-device', 'Active profile reference', ?)",
+    )
+    .bind(active_profile.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, device_profile_id, deleted_at)
+         VALUES (
+             'soft-deleted-profile-reference-device',
+             'Soft-deleted profile reference',
+             ?,
+             CURRENT_TIMESTAMP
+         )",
+    )
+    .bind(deleted_profile.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        ManagementDeviceProfileRepository::delete_management_device_profile(
+            &store,
+            active_profile.id,
+        )
+        .await,
+        Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == active_profile.id
+    ));
+
+    ManagementDeviceProfileRepository::delete_management_device_profile(&store, deleted_profile.id)
+        .await
+        .unwrap();
+    let stale_reference: Option<String> = sqlx::query_scalar(
+        "SELECT device_profile_id
+         FROM devices
+         WHERE device_id = 'soft-deleted-profile-reference-device'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(stale_reference, None);
+}
+
 struct TimescaleTestLock {
     _connection: PgConnection,
 }
@@ -619,6 +680,159 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementAssetProfileRepository::delete_management_asset_profile(&store, updated_asset.id).await,
         Err(ManagementAssetProfileError::AssetProfileInUse(id)) if id == updated_asset.id
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_device_profile_deletion_handles_active_and_soft_deleted_references() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let active_profile = ManagementDeviceProfileRepository::create_management_device_profile(
+        &store,
+        device_profile("Timescale active reference device profile"),
+    )
+    .await
+    .unwrap();
+    let deleted_profile = ManagementDeviceProfileRepository::create_management_device_profile(
+        &store,
+        device_profile("Timescale soft-deleted reference device profile"),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, device_profile_id)
+         VALUES ('timescale-active-profile-reference', 'Active profile reference', $1)",
+    )
+    .bind(active_profile.id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, device_profile_id, deleted_at)
+         VALUES (
+             'timescale-soft-deleted-profile-reference',
+             'Soft-deleted profile reference',
+             $1,
+             now()
+         )",
+    )
+    .bind(deleted_profile.id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        ManagementDeviceProfileRepository::delete_management_device_profile(
+            &store,
+            active_profile.id,
+        )
+        .await,
+        Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == active_profile.id
+    ));
+
+    ManagementDeviceProfileRepository::delete_management_device_profile(&store, deleted_profile.id)
+        .await
+        .unwrap();
+    let stale_reference: Option<Uuid> = sqlx::query_scalar(
+        "SELECT device_profile_id
+         FROM devices
+         WHERE device_id = 'timescale-soft-deleted-profile-reference'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(stale_reference, None);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typed_error() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
+
+    let device_profile = ManagementDeviceProfileRepository::create_management_device_profile(
+        &store,
+        device_profile("Concurrent device profile"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, display_name) VALUES ($1, $2)")
+        .bind("concurrent-profile-device")
+        .bind("Concurrent profile device")
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut device_profile_gate = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN")
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM device_profiles WHERE id = $1 FOR UPDATE")
+        .bind(device_profile.id)
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    let delete_store = store.clone();
+    let mut device_delete = tokio::spawn(async move {
+        ManagementDeviceProfileRepository::delete_management_device_profile(
+            &delete_store,
+            device_profile.id,
+        )
+        .await
+    });
+    wait_for_timescale_table_lock(pool, "devices", "ShareRowExclusiveLock", true).await;
+    let update_store = store.clone();
+    let mut device_update = tokio::spawn(async move {
+        ManagementDeviceRepository::update_management_device(
+            &update_store,
+            "concurrent-profile-device",
+            UpdateManagementDevice {
+                display_name: "Concurrent profile device".to_owned(),
+                asset_id: None,
+                device_profile_id: Some(device_profile.id),
+                attributes: Some(json!({})),
+                topology: None,
+            },
+        )
+        .await
+    });
+    wait_for_timescale_table_wait(pool, "devices").await;
+    let mut device_probe = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut device_probe)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT device_id FROM devices
+         WHERE device_id = 'concurrent-profile-device'
+         FOR UPDATE NOWAIT",
+    )
+    .execute(&mut device_probe)
+    .await
+    .expect("profile assignment must wait on the table lock before locking its device row");
+    sqlx::query("COMMIT")
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), &mut device_delete)
+            .await
+            .expect("device profile deletion deadlocked")
+            .unwrap()
+            .is_ok()
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(2), &mut device_update)
+            .await
+            .expect("device profile assignment deadlocked")
+            .unwrap(),
+        Err(ManagementDeviceError::DeviceProfileUnavailable(id)) if id == device_profile.id
     ));
 }
 

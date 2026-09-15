@@ -3274,7 +3274,11 @@ async fn delete_management_device_profile(
                 return Err(ManagementDeviceProfileError::DeviceProfileNotFound);
             }
             let referenced = sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(SELECT 1 FROM devices WHERE device_profile_id = ?)",
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM devices
+                    WHERE device_profile_id = ? AND deleted_at IS NULL
+                 )",
             )
             .bind(profile_id.to_string())
             .fetch_one(&mut *transaction)
@@ -3283,6 +3287,14 @@ async fn delete_management_device_profile(
             if referenced {
                 return Err(ManagementDeviceProfileError::DeviceProfileInUse(profile_id));
             }
+            sqlx::query(
+                "UPDATE devices
+                 SET device_profile_id = NULL
+                 WHERE device_profile_id = ? AND deleted_at IS NOT NULL",
+            )
+            .bind(profile_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
             sqlx::query("DELETE FROM device_profiles WHERE id = ?")
                 .bind(profile_id.to_string())
                 .execute(&mut *transaction)
@@ -3305,7 +3317,11 @@ async fn delete_management_device_profile(
                 return Err(ManagementDeviceProfileError::DeviceProfileNotFound);
             }
             let referenced = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM devices WHERE device_profile_id = $1)",
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM devices
+                    WHERE device_profile_id = $1 AND deleted_at IS NULL
+                 )",
             )
             .bind(profile_id)
             .fetch_one(&mut *transaction)
@@ -3313,6 +3329,14 @@ async fn delete_management_device_profile(
             if referenced {
                 return Err(ManagementDeviceProfileError::DeviceProfileInUse(profile_id));
             }
+            sqlx::query(
+                "UPDATE devices
+                 SET device_profile_id = NULL
+                 WHERE device_profile_id = $1 AND deleted_at IS NOT NULL",
+            )
+            .bind(profile_id)
+            .execute(&mut *transaction)
+            .await?;
             sqlx::query("DELETE FROM device_profiles WHERE id = $1")
                 .bind(profile_id)
                 .execute(&mut *transaction)
