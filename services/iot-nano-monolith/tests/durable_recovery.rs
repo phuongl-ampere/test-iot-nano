@@ -21,12 +21,39 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     time::timeout,
 };
 use uuid::Uuid;
 
 const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
+const MAX_MQTT_PACKET_BODY_SIZE: usize = 1024 * 1024;
+
+#[tokio::test]
+async fn mqtt_packet_reader_rejects_a_fifth_remaining_length_byte() {
+    let panic = panic_from_mqtt_packet_reader(vec![0x10, 0x80, 0x80, 0x80, 0x80, 0x00]).await;
+
+    assert!(
+        panic.contains("four bytes"),
+        "unexpected MQTT parser panic: {panic}"
+    );
+}
+
+#[tokio::test]
+async fn mqtt_packet_reader_rejects_a_body_larger_than_the_test_limit() {
+    let oversized_body = vec![
+        0x10, 0x80, 0x80, 0x41, // more than 1 MiB remaining length
+    ]
+    .into_iter()
+    .chain(std::iter::repeat(0_u8).take(MAX_MQTT_PACKET_BODY_SIZE))
+    .collect();
+    let panic = panic_from_mqtt_packet_reader(oversized_body).await;
+
+    assert!(
+        panic.contains("exceeds"),
+        "unexpected MQTT parser panic: {panic}"
+    );
+}
 
 struct Fixture {
     _directory: TempDir,
@@ -717,23 +744,55 @@ async fn read_mqtt_packet(stream: &mut TcpStream) -> Vec<u8> {
         let mut packet = first.to_vec();
         let mut remaining = 0_usize;
         let mut multiplier = 1_usize;
-        loop {
+        for _ in 0..4 {
             let mut encoded = [0_u8; 1];
             stream.read_exact(&mut encoded).await.unwrap();
             packet.push(encoded[0]);
-            remaining += usize::from(encoded[0] & 0x7f) * multiplier;
+            let value = usize::from(encoded[0] & 0x7f)
+                .checked_mul(multiplier)
+                .expect("MQTT remaining length arithmetic overflowed");
+            remaining = remaining
+                .checked_add(value)
+                .expect("MQTT remaining length arithmetic overflowed");
             if encoded[0] & 0x80 == 0 {
-                break;
+                assert!(
+                    remaining <= MAX_MQTT_PACKET_BODY_SIZE,
+                    "MQTT packet body exceeds {MAX_MQTT_PACKET_BODY_SIZE} bytes"
+                );
+                let mut body = vec![0_u8; remaining];
+                stream.read_exact(&mut body).await.unwrap();
+                packet.extend(body);
+                return packet;
             }
-            multiplier *= 128;
+            multiplier = multiplier
+                .checked_mul(128)
+                .expect("MQTT remaining length arithmetic overflowed");
         }
-        let mut body = vec![0_u8; remaining];
-        stream.read_exact(&mut body).await.unwrap();
-        packet.extend(body);
-        packet
+        panic!("MQTT remaining length uses more than four bytes");
     })
     .await
     .expect("MQTT packet read timed out")
+}
+
+async fn panic_from_mqtt_packet_reader(packet: Vec<u8>) -> String {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let writer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = stream.write_all(&packet).await;
+    });
+    let mut reader = TcpStream::connect(address).await.unwrap();
+    let panic = tokio::spawn(async move { read_mqtt_packet(&mut reader).await })
+        .await
+        .expect_err("malformed MQTT packet was accepted")
+        .into_panic();
+    writer.await.unwrap();
+
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
+        .unwrap_or_else(|| "unknown panic payload".to_owned())
 }
 
 fn encode_remaining_length(mut value: usize, packet: &mut Vec<u8>) {
