@@ -727,6 +727,176 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
     assert_eq!(invalid_topology.status(), StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn management_mutations_require_admin_and_map_token_errors() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+
+    for request in [
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/applications")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"app_id":"test-app","kind":"frontend","launch_url":"https://example.test","client_id":"test-client","redirect_uris":["https://example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true}"#,
+            ))
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/devices")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"display_name":"Anonymous"}"#))
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri("/api/management/devices/missing-device/tokens")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let invalid_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, "iot_nano_session=invalid")
+                .body(Body::from(r#"{"display_name":"Invalid session"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_session.status(), StatusCode::UNAUTHORIZED);
+
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let missing = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices/missing-device/tokens")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let gateway = management_provision_device(&router, &cookie, "Gateway").await;
+    let gateway_id = gateway["device_id"].as_str().unwrap();
+    let gateway_update = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/devices/{gateway_id}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Gateway",
+                        "topology": { "is_gateway": true },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gateway_update.status(), StatusCode::OK);
+
+    let child = management_provision_device(&router, &cookie, "Child").await;
+    let child_id = child["device_id"].as_str().unwrap();
+    let child_update = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/devices/{child_id}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Child",
+                        "topology": { "is_gateway": false, "gateway_device_id": gateway_id },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(child_update.status(), StatusCode::OK);
+
+    let child_token = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/management/devices/{child_id}/tokens"))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(child_token.status(), StatusCode::CONFLICT);
+}
+
+async fn management_provision_device(
+    router: &axum::Router,
+    cookie: &str,
+    display_name: &str,
+) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(
+                    json!({ "display_name": display_name }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 fn invalid_login_request() -> Request<Body> {
     Request::builder()
         .method("POST")
