@@ -30,26 +30,31 @@ validate_volume_path() {
   done
 }
 
-verify_backup_directory() {
-  local path="$1"
+verify_safe_directory_path() {
+  local name="$1"
+  local path="$2"
   local component
   local current
   local -a components
 
-  validate_volume_path ROLLBACK_BACKUP_DIR "$path"
+  validate_volume_path "$name" "$path"
   IFS=/ read -r -a components <<< "${path#/}"
   current=""
   for component in "${components[@]}"; do
     current="$current/$component"
     if [[ -L "$current" ]]; then
-      fail 'ROLLBACK_BACKUP_DIR must not traverse symbolic links'
+      fail "$name must not traverse symbolic links"
     fi
     [[ -d "$current" ]] ||
-      fail 'ROLLBACK_BACKUP_DIR contains a missing or non-directory path component'
+      fail "$name contains a missing or non-directory path component"
   done
   [[ ! -L "$path" && -O "$path" ]] ||
-    fail 'ROLLBACK_BACKUP_DIR must name an owner-controlled non-symlink directory'
-  chmod 0700 "$path" || fail 'ROLLBACK_BACKUP_DIR must be owner-only'
+    fail "$name must name an owner-controlled non-symlink directory"
+  chmod 0700 "$path" || fail "$name must be owner-only"
+}
+
+verify_backup_directory() {
+  verify_safe_directory_path ROLLBACK_BACKUP_DIR "$1"
 }
 
 verify_archive() {
@@ -68,13 +73,41 @@ verify_archive() {
 
 verify_restore_point() {
   local name="$1"
-  local restore_point="$2"
+  local root_name="$2"
+  local restore_root="$3"
+  local restore_point="$4"
+  local component
+  local current
+  local relative_path
+  local symlink_path
+  local -a components
+
+  verify_safe_directory_path "$root_name" "$restore_root"
+  validate_volume_path "$name" "$restore_point"
+  [[ "$restore_point" == "$restore_root/"* ]] ||
+    fail "$name must be inside $root_name"
+
+  relative_path="${restore_point#"$restore_root/"}"
+  IFS=/ read -r -a components <<< "$relative_path"
+  current="$restore_root"
+  for component in "${components[@]}"; do
+    current="$current/$component"
+    [[ ! -L "$current" ]] ||
+      fail "$name must not traverse symbolic links"
+    if [[ "$current" != "$restore_point" ]]; then
+      [[ -d "$current" ]] ||
+        fail "$name contains a missing or non-directory path component"
+    fi
+  done
 
   [[ -e "$restore_point" && ! -L "$restore_point" && -r "$restore_point" ]] ||
     fail "$name is missing or unsafe"
   if [[ -f "$restore_point" ]]; then
     [[ -s "$restore_point" ]] || fail "$name is empty"
   elif [[ -d "$restore_point" ]]; then
+    [[ -x "$restore_point" ]] || fail "$name is missing or unsafe"
+    symlink_path="$(find "$restore_point" -type l -print -quit)"
+    [[ -z "$symlink_path" ]] || fail "$name contains symbolic links"
     find "$restore_point" -mindepth 1 -print -quit | grep -q . ||
       fail "$name is empty"
   else
@@ -90,12 +123,19 @@ verify_external_command() {
     fail "$name must name a non-symlink executable"
 }
 
-restore_point_identity() {
+restore_point_file_identity() {
   local path="$1"
-  local parent
+  local identity
 
-  parent="$(cd -P -- "$(dirname "$path")" && pwd)"
-  printf '%s/%s\n' "$parent" "$(basename "$path")"
+  if identity="$(stat -c '%d:%i' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$identity"
+    return
+  fi
+  if identity="$(stat -f '%d:%i' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$identity"
+    return
+  fi
+  fail "could not determine file identity for $path"
 }
 
 run_rollback_container() {
@@ -395,15 +435,17 @@ if [[ "${IOT_NANO_TIMESCALE_COMPOSE:-0}" == "1" ]]; then
 
   timescale_target_restore_point="$backup_dir/timescale-restore-point"
   timescale_current_restore_point="${TIMESCALE_CURRENT_RESTORE_POINT:-}"
+  timescale_restore_root="${TIMESCALE_RESTORE_ROOT:-}"
   [[ -n "$timescale_current_restore_point" &&
+    -n "$timescale_restore_root" &&
     -n "${TIMESCALE_COMPENSATE_COMMAND:-}" ]] ||
-    fail 'rollback Timescale requires TIMESCALE_CURRENT_RESTORE_POINT and TIMESCALE_COMPENSATE_COMMAND'
+    fail 'rollback Timescale requires TIMESCALE_CURRENT_RESTORE_POINT, TIMESCALE_RESTORE_ROOT, and TIMESCALE_COMPENSATE_COMMAND'
   verify_restore_point 'rollback Timescale target restore point' \
-    "$timescale_target_restore_point"
+    ROLLBACK_BACKUP_DIR "$backup_dir" "$timescale_target_restore_point"
   verify_restore_point 'rollback Timescale current restore point' \
-    "$timescale_current_restore_point"
-  [[ "$(restore_point_identity "$timescale_target_restore_point")" != "$(restore_point_identity "$timescale_current_restore_point")" ]] ||
-    fail 'rollback Timescale target and current restore points must differ'
+    TIMESCALE_RESTORE_ROOT "$timescale_restore_root" "$timescale_current_restore_point"
+  [[ "$(restore_point_file_identity "$timescale_target_restore_point")" != "$(restore_point_file_identity "$timescale_current_restore_point")" ]] ||
+    fail 'rollback Timescale target and current restore points must differ by file identity'
   verify_external_command TIMESCALE_RESTORE_COMMAND "${TIMESCALE_RESTORE_COMMAND:-}"
   verify_external_command TIMESCALE_COMPENSATE_COMMAND "${TIMESCALE_COMPENSATE_COMMAND:-}"
 

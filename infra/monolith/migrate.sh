@@ -75,8 +75,38 @@ verify_archive() {
 }
 
 verify_restore_point() {
-  local restore_point="$1"
-  [[ -e "$restore_point" && ! -L "$restore_point" ]] || {
+  local restore_root="$1"
+  local restore_point="$2"
+  local component
+  local current
+  local relative_path
+  local symlink_path
+  local -a components
+
+  ensure_safe_directory_path IOT_NANO_MONOLITH_BACKUP_DIR "$restore_root" 0
+  validate_volume_path 'Timescale restore point' "$restore_point"
+  [[ "$restore_point" == "$restore_root/"* ]] || {
+    printf 'Timescale restore point must remain inside IOT_NANO_MONOLITH_BACKUP_DIR\n' >&2
+    exit 1
+  }
+  relative_path="${restore_point#"$restore_root/"}"
+  IFS=/ read -r -a components <<< "$relative_path"
+  current="$restore_root"
+  for component in "${components[@]}"; do
+    current="$current/$component"
+    [[ ! -L "$current" ]] || {
+      printf 'Timescale restore point must not traverse symbolic links\n' >&2
+      exit 1
+    }
+    if [[ "$current" != "$restore_point" ]]; then
+      [[ -d "$current" ]] || {
+        printf 'Timescale restore point contains a missing or non-directory path component\n' >&2
+        exit 1
+      }
+    fi
+  done
+
+  [[ -e "$restore_point" && ! -L "$restore_point" && -r "$restore_point" ]] || {
     printf 'Timescale restore point was not created safely\n' >&2
     exit 1
   }
@@ -87,6 +117,15 @@ verify_restore_point() {
     }
     chmod 0600 "$restore_point"
   elif [[ -d "$restore_point" ]]; then
+    [[ -x "$restore_point" ]] || {
+      printf 'Timescale restore point was not created safely\n' >&2
+      exit 1
+    }
+    symlink_path="$(find "$restore_point" -type l -print -quit)"
+    [[ -z "$symlink_path" ]] || {
+      printf 'Timescale restore point contains symbolic links\n' >&2
+      exit 1
+    }
     find "$restore_point" -mindepth 1 -print -quit | grep -q .
     chmod 0700 "$restore_point"
   else
@@ -120,7 +159,7 @@ if [[ "${IOT_NANO_TIMESCALE_COMPOSE:-0}" == "1" ]]; then
 
   restore_point="$backup_dir/timescale-restore-point"
   "$TIMESCALE_BACKUP_COMMAND" "$restore_point" >/dev/null
-  verify_restore_point "$restore_point"
+  verify_restore_point "$backup_dir" "$restore_point"
 
   docker compose "${compose_args[@]}" run --rm --no-deps \
     --volume "$backup_dir:/backup" \

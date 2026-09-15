@@ -31,6 +31,19 @@ expect_unsafe_path_rejected() {
   fi
 }
 
+expect_migrate_restore_point_rejected() {
+  local restore_root="$1"
+  local restore_point="$2"
+
+  if IOT_NANO_MONOLITH_TEST_LIB=1 bash -c \
+    'source "$1"; verify_restore_point "$2" "$3"' -- \
+    "$migrate_script" "$restore_root" "$restore_point"; then
+    printf 'migrate.sh accepted unsafe Timescale restore point: %s\n' \
+      "$restore_point" >&2
+    exit 1
+  fi
+}
+
 path_mode() {
   stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
 }
@@ -116,6 +129,19 @@ expect_unsafe_path_rejected "$migrate_script" prepare_backup_root "$path_test_ro
 expect_unsafe_path_rejected "$rollback_script" verify_backup_directory "$path_test_root/backup:root"
 expect_unsafe_path_rejected "$rollback_script" verify_backup_directory "relative/backup-root"
 expect_unsafe_path_rejected "$rollback_script" verify_backup_directory "$path_test_root/symlink-root"
+
+migrate_restore_point="$safe_backup_root/timescale-restore-point"
+mkdir -m 0700 "$migrate_restore_point"
+ln -s "$safe_backup_root" "$migrate_restore_point/escape"
+expect_migrate_restore_point_rejected "$safe_backup_root" "$migrate_restore_point"
+rm -rf "$migrate_restore_point"
+
+outside_restore_root="$path_test_root/outside-restore-root"
+mkdir -m 0700 "$outside_restore_root"
+printf 'restore-point\n' > "$outside_restore_root/point"
+ln -s "$outside_restore_root" "$safe_backup_root/symlinked-restore-parent"
+expect_migrate_restore_point_rejected \
+  "$safe_backup_root" "$safe_backup_root/symlinked-restore-parent/point"
 
 "$rollback_copy_failure_fixture" "$rollback_script"
 "$rollback_coherence_fixture" "$rollback_script"

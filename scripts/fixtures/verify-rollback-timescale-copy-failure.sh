@@ -21,11 +21,18 @@ fake_bin="$sandbox/bin"
 docker_log="$sandbox/docker.log"
 restore_log="$sandbox/restore.log"
 original_state="$sandbox/original-state"
-current_restore_point="$sandbox/current-timescale-restore-point"
+timescale_restore_root="$sandbox/timescale-restore-points"
+current_restore_point="$timescale_restore_root/current-timescale-restore-point"
 real_mv="$(command -v mv)"
 real_tar="$(command -v tar)"
-mkdir -p "$backup_dir" "$internal_dir" "$archive_source" "$fake_bin"
+mkdir -p \
+  "$backup_dir" \
+  "$internal_dir" \
+  "$archive_source" \
+  "$fake_bin" \
+  "$timescale_restore_root"
 chmod 0700 "$backup_dir"
+chmod 0700 "$timescale_restore_root"
 
 printf '%s\n' \
   'backup_id=rollback-copy-failure' \
@@ -159,6 +166,7 @@ run_rollback() {
     IOT_NANO_TIMESCALE_COMPOSE=1 \
     ROLLBACK_BACKUP_DIR="$backup_dir" \
     TIMESCALE_RESTORE_COMMAND="$sandbox/restore-success" \
+    TIMESCALE_RESTORE_ROOT="$timescale_restore_root" \
     TIMESCALE_CURRENT_RESTORE_POINT="$current_restore_point" \
     TIMESCALE_COMPENSATE_COMMAND="$sandbox/restore-success" \
     ROLLBACK_FIXTURE_DOCKER_LOG="$docker_log" \

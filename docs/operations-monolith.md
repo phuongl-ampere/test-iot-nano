@@ -182,15 +182,20 @@ For a Timescale rollback, the operator must provide both sides of a
 compensation contract. `TIMESCALE_RESTORE_COMMAND` restores the target
 restore point from the paired backup. Before running rollback, create a
 separate, nonempty `TIMESCALE_CURRENT_RESTORE_POINT` that represents the
-currently deployed database after writes have stopped. It must differ from the
-target restore point. `TIMESCALE_COMPENSATE_COMMAND` must accept that current
-restore-point path as its sole argument and restore it exactly.
+currently deployed database after writes have stopped. Set
+`TIMESCALE_RESTORE_ROOT` to its existing, owner-only, non-symlinked parent
+directory; the current restore point must be inside that root. Both restore
+points are validated without symlinked path components or directory contents.
+They must have different device-and-inode identities, so a hardlink to the
+target restore point is rejected. `TIMESCALE_COMPENSATE_COMMAND` must accept
+that current restore-point path as its sole argument and restore it exactly.
 
 ```bash
 IOT_NANO_TIMESCALE_COMPOSE=1 \
   ROLLBACK_BACKUP_DIR=/var/backups/iot-nano/monolith/<timestamp-and-pid> \
   TIMESCALE_RESTORE_COMMAND=/usr/local/libexec/iot-nano/restore-timescale \
-  TIMESCALE_CURRENT_RESTORE_POINT=/var/backups/iot-nano/current-timescale-restore-point \
+  TIMESCALE_RESTORE_ROOT=/var/backups/iot-nano/timescale-restore-points \
+  TIMESCALE_CURRENT_RESTORE_POINT=/var/backups/iot-nano/timescale-restore-points/current \
   TIMESCALE_COMPENSATE_COMMAND=/usr/local/libexec/iot-nano/restore-timescale \
   infra/monolith/rollback.sh
 ```
