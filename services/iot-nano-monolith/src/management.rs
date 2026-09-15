@@ -875,12 +875,22 @@ fn management_openapi_schemas() -> Value {
         "DeviceToken".to_owned(),
         object_schema(
             json!({
-                "id": uuid_schema(),
+                "id": {"type": "string", "format": "uuid"},
                 "device_id": {"type": "string"},
                 "token_prefix": {"type": "string"},
+                "created_at": {"type": "string", "format": "date-time"},
+                "last_used_at": {"type": ["string", "null"], "format": "date-time"},
+                "revoked_at": {"type": ["string", "null"], "format": "date-time"},
                 "token": {"type": "string"}
             }),
-            &["id", "device_id", "token_prefix"],
+            &[
+                "id",
+                "device_id",
+                "token_prefix",
+                "created_at",
+                "last_used_at",
+                "revoked_at",
+            ],
         ),
     );
     schemas.insert(

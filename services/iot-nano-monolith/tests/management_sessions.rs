@@ -14,7 +14,10 @@ use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{BootstrapAdminError, ManagementSessionRouter, bootstrap_admin};
 use iot_storage::PlatformStore;
 use serde_json::json;
-use std::{collections::BTreeSet, net::SocketAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+};
 use tower::ServiceExt;
 
 async fn management_session_router() -> (tempfile::TempDir, ManagementSessionRouter) {
@@ -189,6 +192,65 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
     ]);
     assert_eq!(actual_paths, expected_paths);
 
+    let expected_methods = BTreeMap::from([
+        ("/api/auth/login", BTreeSet::from(["post"])),
+        ("/api/auth/logout", BTreeSet::from(["post"])),
+        ("/api/auth/me", BTreeSet::from(["get"])),
+        ("/api/management/applications", BTreeSet::from(["post"])),
+        ("/api/management/assets", BTreeSet::from(["get", "post"])),
+        (
+            "/api/management/assets/{asset_id}",
+            BTreeSet::from(["delete", "put"]),
+        ),
+        ("/api/management/devices", BTreeSet::from(["get", "post"])),
+        (
+            "/api/management/devices/{device_id}",
+            BTreeSet::from(["delete", "put"]),
+        ),
+        (
+            "/api/management/devices/{device_id}/tokens",
+            BTreeSet::from(["post"]),
+        ),
+        (
+            "/api/management/profiles/asset-profiles",
+            BTreeSet::from(["get", "post"]),
+        ),
+        (
+            "/api/management/profiles/asset-profiles/{profile_id}",
+            BTreeSet::from(["delete", "put"]),
+        ),
+        (
+            "/api/management/profiles/device-profiles",
+            BTreeSet::from(["get", "post"]),
+        ),
+        (
+            "/api/management/profiles/device-profiles/{profile_id}",
+            BTreeSet::from(["delete", "put"]),
+        ),
+        ("/api/management/users", BTreeSet::from(["get", "post"])),
+        ("/api/management/users/{username}", BTreeSet::from(["put"])),
+    ]);
+    for (path, expected_methods) in expected_methods {
+        let actual_methods = paths[path]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.as_str() != "parameters")
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_methods, expected_methods, "methods for {path}");
+    }
+
+    for (path, method) in [
+        ("/api/management/devices", "post"),
+        ("/api/management/devices/{device_id}/tokens", "post"),
+    ] {
+        assert_eq!(
+            paths[path][method]["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DeviceToken"
+        );
+    }
+
     let schemas = document["components"]["schemas"].as_object().unwrap();
     let actual_schemas: BTreeSet<_> = schemas.keys().map(String::as_str).collect();
     let expected_schemas = BTreeSet::from([
@@ -217,6 +279,56 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "SessionResponse",
     ]);
     assert_eq!(actual_schemas, expected_schemas);
+
+    let device_token = &schemas["DeviceToken"];
+    assert_eq!(device_token["type"], "object");
+    assert_eq!(device_token["additionalProperties"], false);
+    assert_eq!(
+        device_token["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "created_at",
+            "device_id",
+            "id",
+            "last_used_at",
+            "revoked_at",
+            "token",
+            "token_prefix",
+        ])
+    );
+    assert_eq!(
+        device_token["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "created_at",
+            "device_id",
+            "id",
+            "last_used_at",
+            "revoked_at",
+            "token_prefix",
+        ])
+    );
+    assert_eq!(device_token["properties"]["id"]["type"], "string");
+    assert_eq!(device_token["properties"]["id"]["format"], "uuid");
+    assert_eq!(
+        device_token["properties"]["created_at"],
+        json!({"type": "string", "format": "date-time"})
+    );
+    for field in ["last_used_at", "revoked_at"] {
+        assert_eq!(
+            device_token["properties"][field],
+            json!({"type": ["string", "null"], "format": "date-time"})
+        );
+    }
+    assert_eq!(device_token["properties"]["token"]["type"], "string");
 
     for forbidden_schema in [
         "AccessToken",
