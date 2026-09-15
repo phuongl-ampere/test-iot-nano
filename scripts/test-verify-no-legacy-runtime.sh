@@ -6,58 +6,99 @@ verifier="$root/scripts/verify-no-legacy-runtime.sh"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 
+expected_files=(
+  infra/compose.yaml
+  infra/compose.timescale.yaml
+  infra/docker/Dockerfile
+  infra/monolith/monolith.env.example
+  infra/monolith/migrate.sh
+  infra/monolith/rollback.sh
+  infra/systemd/iot-nano-monolith.service
+  scripts/e2e-local.sh
+  scripts/e2e-monolith.sh
+  scripts/install-raspberry-pi.sh
+  services/iot-nano-monolith/Cargo.toml
+  services/iot-nano-monolith/src/adapters.rs
+  services/iot-nano-monolith/src/cache.rs
+  services/iot-nano-monolith/src/config.rs
+  services/iot-nano-monolith/src/lib.rs
+  services/iot-nano-monolith/src/main.rs
+  services/iot-nano-monolith/src/management.rs
+  services/iot-nano-monolith/src/readiness.rs
+  services/iot-nano-monolith/src/runtime.rs
+)
+
+retired_paths=(
+  infra/systemd/iot-nano-api.service
+  infra/systemd/iot-nano-core.service
+  infra/systemd/iot-nano-mqttd.service
+  infra/systemd/iot-nano-stream.service
+  scripts/rpc-e2e.py
+)
+
 copy_file() {
   local relative_path="$1"
   mkdir -p "$(dirname "$fixture/$relative_path")"
   cp "$root/$relative_path" "$fixture/$relative_path"
 }
 
-copy_file infra/compose.yaml
-copy_file infra/compose.timescale.yaml
-copy_file infra/docker/Dockerfile
-cp -R "$root/infra/monolith" "$fixture/infra/monolith"
-copy_file infra/systemd/iot-nano-monolith.service
-copy_file scripts/e2e-local.sh
-copy_file scripts/e2e-monolith.sh
-copy_file scripts/install-mqttd-standalone.sh
-copy_file scripts/install-raspberry-pi.sh
+populate_fixture() {
+  local relative_path
 
-mkdir -p "$fixture/infra/systemd"
-cat >"$fixture/infra/systemd/iot-nano-api.service" <<'EOF'
-[Service]
-ExecStart=/opt/rush-iot-nano/iot-nano-api
-EOF
+  for relative_path in "${expected_files[@]}"; do
+    copy_file "$relative_path"
+  done
+  mkdir -p "$fixture/services/iot-nano-mqttd" "$fixture/infra/systemd"
+  cp -R "$root/services/iot-nano-mqttd/." "$fixture/services/iot-nano-mqttd/"
+  copy_file infra/systemd/iot-nano-mqttd-standalone.service
+}
 
-if output="$(IOT_NANO_VERIFY_ROOT="$fixture" "$verifier" 2>&1)"; then
-  printf 'verifier accepted an injected legacy deployment unit\n' >&2
+assert_failure_contains() {
+  local expected_reason="$1"
+  local output
+
+  if output="$(IOT_NANO_VERIFY_ROOT="$fixture" "$verifier" 2>&1)"; then
+    printf 'verifier accepted an invalid fixture (%s)\n' "$expected_reason" >&2
+    exit 1
+  fi
+  if [[ "$output" != *"$expected_reason"* ]]; then
+    printf 'verifier failed for the wrong reason (%s):\n%s\n' \
+      "$expected_reason" "$output" >&2
+    exit 1
+  fi
+}
+
+populate_fixture
+if ! IOT_NANO_VERIFY_ROOT="$fixture" "$verifier"; then
+  printf 'verifier rejected a clean monolith fixture with retained standalone assets\n' >&2
   exit 1
 fi
 
-if [[ "$output" != *"legacy runtime references found"* ]] ||
-  [[ "$output" != *"iot-nano-api.service"* ]]; then
-  printf 'verifier failed for the wrong reason:\n%s\n' "$output" >&2
-  exit 1
-fi
+for retired_path in "${retired_paths[@]}"; do
+  mkdir -p "$(dirname "$fixture/$retired_path")"
+  printf '%s\n' 'retired deployment asset' >"$fixture/$retired_path"
+  assert_failure_contains 'retired legacy deployment asset remains'
+  rm "$fixture/$retired_path"
+done
 
-rm "$fixture/infra/systemd/iot-nano-monolith.service"
-if output="$(IOT_NANO_VERIFY_ROOT="$fixture" "$verifier" 2>&1)"; then
-  printf 'verifier accepted a fixture missing an expected deployment path\n' >&2
-  exit 1
-fi
+printf '%s\n' 'exec "$root/scripts/install-mqttd-standalone.sh"' \
+  >>"$fixture/scripts/e2e-local.sh"
+assert_failure_contains 'legacy runtime references found'
+populate_fixture
 
-if [[ "$output" != *"expected production/deployment path is missing or unreadable"* ]]; then
-  printf 'verifier did not fail closed for a missing expected path:\n%s\n' "$output" >&2
-  exit 1
-fi
+printf '%s\n' 'const INJECTED_LEGACY_REFERENCE: &str = "x-iot-nano-legacy";' \
+  >>"$fixture/services/iot-nano-monolith/src/main.rs"
+assert_failure_contains 'legacy runtime references found'
+populate_fixture
 
-copy_file infra/systemd/iot-nano-monolith.service
-chmod 000 "$fixture/infra/systemd/iot-nano-monolith.service"
-if output="$(IOT_NANO_VERIFY_ROOT="$fixture" "$verifier" 2>&1)"; then
-  printf 'verifier accepted an unreadable expected deployment path\n' >&2
-  exit 1
-fi
+for relative_path in "${expected_files[@]}"; do
+  rm "$fixture/$relative_path"
+  assert_failure_contains \
+    "expected production/deployment path is missing or unreadable: $fixture/$relative_path"
+  populate_fixture
 
-if [[ "$output" != *"expected production/deployment path is missing or unreadable"* ]]; then
-  printf 'verifier did not fail closed for an unreadable expected path:\n%s\n' "$output" >&2
-  exit 1
-fi
+  chmod 000 "$fixture/$relative_path"
+  assert_failure_contains \
+    "expected production/deployment path is missing or unreadable: $fixture/$relative_path"
+  chmod "$(stat -f '%Lp' "$root/$relative_path")" "$fixture/$relative_path"
+done
