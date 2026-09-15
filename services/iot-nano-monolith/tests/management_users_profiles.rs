@@ -280,6 +280,48 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     .await;
     json_request(
         &router,
+        "POST",
+        "/api/management/users",
+        &admin_cookie,
+        json!({
+            "username": "not a valid username",
+            "password": "InvalidUsername@123",
+            "default_app": "/apps/fleet",
+            "granted_apps": ["fleet"],
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    json_request(
+        &router,
+        "POST",
+        "/api/management/users",
+        &admin_cookie,
+        json!({
+            "username": "invalid-default-app",
+            "password": "InvalidDefaultApp@123",
+            "default_app": "/apps/not valid",
+            "granted_apps": ["fleet"],
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    json_request(
+        &router,
+        "POST",
+        "/api/management/users",
+        &admin_cookie,
+        json!({
+            "username": "invalid-grants",
+            "password": "InvalidGrants@123",
+            "default_app": "/apps/fleet",
+            "granted_apps": ["fleet", "fleet"],
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    json_request(
+        &router,
         "PUT",
         "/api/management/users/missing",
         &admin_cookie,
@@ -306,6 +348,67 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     .await;
     assert_eq!(updated["role"], "admin");
     assert_eq!(updated["account_class"], "admin");
+
+    json_request(
+        &router,
+        "PUT",
+        "/api/management/users/alice",
+        &admin_cookie,
+        json!({
+            "default_app": "/apps/fleet",
+            "granted_apps": ["fleet"],
+            "role": "operator",
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let alice_first_session = login_cookie(&router, "alice", "AlicePassword@123").await;
+    let alice_second_session = login_cookie(&router, "alice", "AlicePassword@123").await;
+    for cookie in [&alice_first_session, &alice_second_session] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/management/users")
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    json_request(
+        &router,
+        "PUT",
+        "/api/management/users/alice",
+        &admin_cookie,
+        json!({
+            "default_app": "/apps/fleet",
+            "granted_apps": ["fleet"],
+            "role": "viewer",
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    for cookie in [&alice_first_session, &alice_second_session] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/management/users")
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[tokio::test]
@@ -429,6 +532,30 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
         StatusCode::NOT_FOUND,
     )
     .await;
+
+    for (profile_id, expected_status) in [
+        ("not-a-uuid", StatusCode::BAD_REQUEST),
+        (
+            "00000000-0000-0000-0000-000000000000",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/management/profiles/device-profiles/{profile_id}"
+                    ))
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+    }
 
     let device = json_request(
         &router,
@@ -603,11 +730,80 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     )
     .await;
 
-    let deleted = router
+    for (profile_id, expected_status) in [
+        ("not-a-uuid", StatusCode::BAD_REQUEST),
+        (
+            "00000000-0000-0000-0000-000000000000",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/management/profiles/asset-profiles/{profile_id}"
+                    ))
+                    .header(COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+    }
+
+    json_request(
+        &router,
+        "POST",
+        "/api/management/assets",
+        &cookie,
+        json!({
+            "name": "Referenced profile asset",
+            "asset_profile_id": id,
+            "parent_asset_id": null,
+            "metadata": {},
+            "attributes": {},
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let referenced = router
+        .clone()
         .oneshot(
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/api/management/profiles/asset-profiles/{id}"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(referenced.status(), StatusCode::CONFLICT);
+    let disposable = json_request(
+        &router,
+        "POST",
+        "/api/management/profiles/asset-profiles",
+        &cookie,
+        json!({
+            "name": "Disposable asset profile",
+            "fields": {},
+            "dashboard_defaults": {},
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let disposable_id = disposable["id"].as_str().unwrap();
+
+    let deleted = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/management/profiles/asset-profiles/{disposable_id}"
+                ))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),

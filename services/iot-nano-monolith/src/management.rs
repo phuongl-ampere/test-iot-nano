@@ -262,7 +262,7 @@ impl ManagementSessionVerifier {
                     session_id.clone(),
                     Session {
                         user_id,
-                        role,
+                        role: Some(role),
                         expires_at: Instant::now() + SESSION_TTL,
                     },
                 );
@@ -281,18 +281,34 @@ impl ManagementSessionVerifier {
             .remove(session_id);
     }
 
-    fn is_admin(&self, headers: &HeaderMap) -> bool {
+    fn authorization(&self, headers: &HeaderMap) -> ManagementAuthorization {
         let Some(session_id) = session_id(headers) else {
-            return false;
+            return ManagementAuthorization::Unauthenticated;
         };
         let mut sessions = self
             .sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_sessions(&mut sessions);
-        sessions
-            .get(session_id)
-            .is_some_and(|session| session.role == Role::Admin)
+        let role = sessions.get(session_id).map(|session| session.role);
+        match role {
+            Some(Some(Role::Admin)) => ManagementAuthorization::Admin,
+            Some(_) => ManagementAuthorization::Forbidden,
+            None => ManagementAuthorization::Unauthenticated,
+        }
+    }
+
+    fn invalidate_user(&self, user_id: Uuid) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        for session in sessions.values_mut() {
+            if session.user_id == user_id {
+                session.role = None;
+            }
+        }
     }
 }
 
@@ -318,8 +334,14 @@ struct ManagementState {
 
 struct Session {
     user_id: Uuid,
-    role: Role,
+    role: Option<Role>,
     expires_at: Instant,
+}
+
+enum ManagementAuthorization {
+    Unauthenticated,
+    Admin,
+    Forbidden,
 }
 
 #[derive(Default)]
@@ -721,6 +743,7 @@ async fn update_management_user(
         .as_deref()
         .map(management_user_role)
         .transpose()?;
+    let role_updated = role.is_some();
     let user = ManagementUserRepository::update_management_user(
         state.store.as_ref(),
         &username,
@@ -732,6 +755,9 @@ async fn update_management_user(
     )
     .await
     .map_err(management_user_error)?;
+    if role_updated {
+        state.session_verifier.invalidate_user(user.id);
+    }
     Ok(Json(management_user_response(user)))
 }
 
@@ -1194,13 +1220,10 @@ fn require_management_admin(
     session_verifier: &ManagementSessionVerifier,
     headers: &HeaderMap,
 ) -> Result<(), ManagementSessionError> {
-    if session_verifier.authenticated_user_id(headers).is_none() {
-        return Err(ManagementSessionError::Unauthorized);
-    }
-    if session_verifier.is_admin(headers) {
-        Ok(())
-    } else {
-        Err(ManagementSessionError::Forbidden)
+    match session_verifier.authorization(headers) {
+        ManagementAuthorization::Unauthenticated => Err(ManagementSessionError::Unauthorized),
+        ManagementAuthorization::Admin => Ok(()),
+        ManagementAuthorization::Forbidden => Err(ManagementSessionError::Forbidden),
     }
 }
 
