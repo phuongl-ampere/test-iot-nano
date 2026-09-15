@@ -1,10 +1,14 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    CreateManagementAsset, ManagementAssetError, ManagementAssetRepository, PlatformStore,
-    UpdateManagementAsset,
+    CreateManagementAsset, ManagementAsset, ManagementAssetError, ManagementAssetRepository,
+    PlatformStore, UpdateManagementAsset,
 };
 use serde_json::json;
-use sqlx::{Connection, PgConnection};
+use sqlx::{Connection, PgConnection, PgPool};
+use tokio::{
+    sync::Barrier,
+    time::{Duration, timeout},
+};
 use uuid::Uuid;
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
@@ -31,6 +35,20 @@ fn asset_mutation(
         parent_asset_id,
         metadata: json!({"ignored": true}),
         attributes: Some(json!({"zone": "lab"})),
+    }
+}
+
+fn asset_update(
+    asset: &ManagementAsset,
+    name: &str,
+    parent_asset_id: Option<Uuid>,
+) -> UpdateManagementAsset {
+    UpdateManagementAsset {
+        name: name.to_owned(),
+        asset_profile_id: asset.asset_profile_id,
+        parent_asset_id,
+        metadata: asset.metadata.clone(),
+        attributes: Some(asset.attributes.clone()),
     }
 }
 
@@ -281,6 +299,58 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
     );
 }
 
+#[tokio::test]
+async fn sqlite_management_asset_repository_maps_sibling_name_conflicts_to_domain_errors() {
+    let (_directory, store) = sqlite_store().await;
+    let parent = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Conflict parent", None, None),
+    )
+    .await
+    .unwrap();
+    let first = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Duplicate sibling", None, Some(parent.id)),
+    )
+    .await
+    .unwrap();
+    let second = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Other sibling", None, Some(parent.id)),
+    )
+    .await
+    .unwrap();
+
+    let create_conflict = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Duplicate sibling", None, Some(parent.id)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        create_conflict,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: Some(parent_asset_id),
+        } if name == "Duplicate sibling" && parent_asset_id == parent.id
+    ));
+
+    let update_conflict = ManagementAssetRepository::update_management_asset(
+        &store,
+        second.id,
+        asset_update(&second, &first.name, Some(parent.id)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        update_conflict,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: Some(parent_asset_id),
+        } if name == "Duplicate sibling" && parent_asset_id == parent.id
+    ));
+}
+
 struct TimescaleTestLock {
     _connection: PgConnection,
 }
@@ -394,4 +464,323 @@ async fn timescale_management_asset_repository_matches_sqlite_contract() {
         .unwrap(),
         None
     );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_management_asset_repository_covers_crud_validation_and_references() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO asset_profiles (id, name)
+         VALUES ($1, 'timescale expanded management asset profile')",
+    )
+    .bind(profile_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let parent = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Expanded Timescale parent", Some(profile_id), None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parent.asset_profile_id, Some(profile_id));
+    assert_eq!(parent.parent_asset_id, None);
+    assert_eq!(parent.metadata, json!({"zone": "lab"}));
+    assert_eq!(parent.attributes, json!({"zone": "lab"}));
+
+    let child = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Expanded Timescale child", None, Some(parent.id)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ManagementAssetRepository::list_management_assets(&store)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|asset| asset.name)
+            .collect::<Vec<_>>(),
+        ["Expanded Timescale child", "Expanded Timescale parent"]
+    );
+
+    let updated_child = ManagementAssetRepository::update_management_asset(
+        &store,
+        child.id,
+        UpdateManagementAsset {
+            name: "Expanded Timescale child".to_owned(),
+            asset_profile_id: Some(profile_id),
+            parent_asset_id: Some(parent.id),
+            metadata: json!({"ignored": true}),
+            attributes: Some(json!({"zone": "warehouse"})),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated_child.asset_profile_id, Some(profile_id));
+    assert_eq!(updated_child.metadata, json!({"zone": "warehouse"}));
+    assert_eq!(updated_child.attributes, json!({"zone": "warehouse"}));
+
+    let sibling_conflict = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Expanded Timescale child", None, Some(parent.id)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        sibling_conflict,
+        ManagementAssetError::SiblingNameConflict {
+            ref name,
+            parent_asset_id: Some(parent_asset_id),
+        } if name == "Expanded Timescale child" && parent_asset_id == parent.id
+    ));
+
+    assert!(matches!(
+        ManagementAssetRepository::create_management_asset(
+            &store,
+            asset_mutation(" ", None, None),
+        )
+        .await,
+        Err(ManagementAssetError::InvalidName)
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::create_management_asset(
+            &store,
+            CreateManagementAsset {
+                name: "Invalid Timescale metadata".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!("not an object"),
+                attributes: None,
+            },
+        )
+        .await,
+        Err(ManagementAssetError::MetadataMustBeObject)
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::create_management_asset(
+            &store,
+            CreateManagementAsset {
+                name: "Invalid Timescale attributes".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+                attributes: Some(json!(["not", "an", "object"])),
+            },
+        )
+        .await,
+        Err(ManagementAssetError::AttributesMustBeObject)
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::create_management_asset(
+            &store,
+            asset_mutation("Missing Timescale profile", Some(Uuid::now_v7()), None),
+        )
+        .await,
+        Err(ManagementAssetError::AssetProfileUnavailable(_))
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::create_management_asset(
+            &store,
+            asset_mutation("Missing Timescale parent", None, Some(Uuid::now_v7())),
+        )
+        .await,
+        Err(ManagementAssetError::ParentAssetUnavailable(_))
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::update_management_asset(
+            &store,
+            parent.id,
+            asset_update(&parent, &parent.name, Some(parent.id)),
+        )
+        .await,
+        Err(ManagementAssetError::AssetCannotBeOwnParent)
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::update_management_asset(
+            &store,
+            parent.id,
+            asset_update(&parent, &parent.name, Some(updated_child.id)),
+        )
+        .await,
+        Err(ManagementAssetError::AssetCannotHaveDescendantParent)
+    ));
+
+    sqlx::query(
+        "INSERT INTO devices (device_id, display_name, asset_id)
+         VALUES ('expanded-timescale-management-asset-device', 'Asset device', $1)",
+    )
+    .bind(parent.id)
+    .execute(pool)
+    .await
+    .unwrap();
+    ManagementAssetRepository::delete_management_asset(&store, parent.id)
+        .await
+        .unwrap();
+    let detached_child = ManagementAssetRepository::list_management_assets(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|asset| asset.id == updated_child.id)
+        .unwrap();
+    assert_eq!(detached_child.parent_asset_id, None);
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT asset_id FROM devices
+             WHERE device_id = 'expanded-timescale-management-asset-device'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        None
+    );
+    assert!(matches!(
+        ManagementAssetRepository::delete_management_asset(&store, Uuid::now_v7()).await,
+        Err(ManagementAssetError::AssetNotFound)
+    ));
+}
+
+async fn waiting_asset_update_barrier_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_locks
+         WHERE locktype = 'advisory'
+           AND classid = 7103
+           AND objid = 7103
+           AND NOT granted",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_reciprocal_parent_updates_do_not_create_a_cycle() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let first = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Concurrent first", None, None),
+    )
+    .await
+    .unwrap();
+    let second = ManagementAssetRepository::create_management_asset(
+        &store,
+        asset_mutation("Concurrent second", None, None),
+    )
+    .await
+    .unwrap();
+    let first_id = first.id;
+    let second_id = second.id;
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION gate_management_asset_parent_update() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(7103, 7103);
+             RETURN NEW;
+         END;
+         $$;
+         CREATE TRIGGER gate_management_asset_parent_update_trigger
+         BEFORE UPDATE OF parent_asset_id ON assets
+         FOR EACH ROW EXECUTE FUNCTION gate_management_asset_parent_update();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
+    let mut gate = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(7103, 7103)")
+        .execute(&mut gate)
+        .await
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(Barrier::new(3));
+    let first_store = store.clone();
+    let first_barrier = std::sync::Arc::clone(&barrier);
+    let first_update = tokio::spawn(async move {
+        first_barrier.wait().await;
+        ManagementAssetRepository::update_management_asset(
+            &first_store,
+            first_id,
+            asset_update(&first, &first.name, Some(second_id)),
+        )
+        .await
+    });
+    let second_store = store.clone();
+    let second_barrier = std::sync::Arc::clone(&barrier);
+    let second_update = tokio::spawn(async move {
+        second_barrier.wait().await;
+        ManagementAssetRepository::update_management_asset(
+            &second_store,
+            second_id,
+            asset_update(&second, &second.name, Some(first_id)),
+        )
+        .await
+    });
+
+    barrier.wait().await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if waiting_asset_update_barrier_count(pool).await >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("an update did not reach the guarded write barrier");
+    let both_reached_write_barrier = timeout(Duration::from_millis(250), async {
+        loop {
+            if waiting_asset_update_barrier_count(pool).await >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    sqlx::query("SELECT pg_advisory_unlock(7103, 7103)")
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    assert!(
+        !both_reached_write_barrier,
+        "reciprocal updates both passed hierarchy validation before either write committed"
+    );
+
+    let (first_result, second_result) = timeout(Duration::from_secs(5), async {
+        tokio::join!(first_update, second_update)
+    })
+    .await
+    .expect("reciprocal parent updates deadlocked");
+    let results = [first_result.unwrap(), second_result.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert!(results.iter().any(|result| {
+        matches!(
+            result,
+            Err(ManagementAssetError::AssetCannotHaveDescendantParent)
+        )
+    }));
+
+    let assets = ManagementAssetRepository::list_management_assets(&store)
+        .await
+        .unwrap();
+    let first_parent = assets
+        .iter()
+        .find(|asset| asset.id == first_id)
+        .unwrap()
+        .parent_asset_id;
+    let second_parent = assets
+        .iter()
+        .find(|asset| asset.id == second_id)
+        .unwrap()
+        .parent_asset_id;
+    assert!(!(first_parent == Some(second_id) && second_parent == Some(first_id)));
 }

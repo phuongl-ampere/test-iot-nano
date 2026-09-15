@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{Postgres, Row, Sqlite, Transaction, types::Json};
+use sqlx::{Postgres, Row, Sqlite, Transaction, error::DatabaseError, types::Json};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -147,6 +147,11 @@ pub enum ManagementAssetError {
     AssetCannotBeOwnParent,
     #[error("an asset cannot have a descendant as its parent")]
     AssetCannotHaveDescendantParent,
+    #[error("an asset named {name:?} already exists under the same parent")]
+    SiblingNameConflict {
+        name: String,
+        parent_asset_id: Option<Uuid>,
+    },
     #[error("stored management asset ID is invalid")]
     InvalidStoredAssetId,
     #[error("stored management asset references are invalid")]
@@ -503,6 +508,8 @@ async fn create_management_asset(
         asset.attributes,
     )?;
     let asset_id = Uuid::now_v7();
+    let sibling_name = asset.name.clone();
+    let sibling_parent_asset_id = asset.parent_asset_id;
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
@@ -522,7 +529,14 @@ async fn create_management_asset(
             .bind(asset.parent_asset_id.map(|id| id.to_string()))
             .bind(asset.metadata.to_string())
             .execute(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                map_management_asset_sibling_name_conflict(
+                    error,
+                    &sibling_name,
+                    sibling_parent_asset_id,
+                )
+            })?;
             transaction.commit().await?;
         }
         PlatformStore::Timescale(pool) => {
@@ -543,7 +557,14 @@ async fn create_management_asset(
             .bind(asset.parent_asset_id)
             .bind(Json(asset.metadata))
             .execute(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                map_management_asset_sibling_name_conflict(
+                    error,
+                    &sibling_name,
+                    sibling_parent_asset_id,
+                )
+            })?;
             transaction.commit().await?;
         }
     }
@@ -565,6 +586,8 @@ async fn update_management_asset(
     if asset.parent_asset_id == Some(asset_id) {
         return Err(ManagementAssetError::AssetCannotBeOwnParent);
     }
+    let sibling_name = asset.name.clone();
+    let sibling_parent_asset_id = asset.parent_asset_id;
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
@@ -593,11 +616,24 @@ async fn update_management_asset(
             .bind(Utc::now().to_rfc3339())
             .bind(asset_id.to_string())
             .execute(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                map_management_asset_sibling_name_conflict(
+                    error,
+                    &sibling_name,
+                    sibling_parent_asset_id,
+                )
+            })?;
             transaction.commit().await?;
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            lock_timescale_management_asset_update_scope(
+                &mut transaction,
+                asset_id,
+                asset.parent_asset_id,
+            )
+            .await?;
             timescale_require_management_asset(&mut transaction, asset_id).await?;
             validate_timescale_asset_references(
                 &mut transaction,
@@ -624,7 +660,14 @@ async fn update_management_asset(
             .bind(asset.parent_asset_id)
             .bind(Json(asset.metadata))
             .execute(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                map_management_asset_sibling_name_conflict(
+                    error,
+                    &sibling_name,
+                    sibling_parent_asset_id,
+                )
+            })?;
             transaction.commit().await?;
         }
     }
@@ -775,6 +818,41 @@ fn validate_management_asset(
     })
 }
 
+fn map_management_asset_sibling_name_conflict(
+    error: sqlx::Error,
+    name: &str,
+    parent_asset_id: Option<Uuid>,
+) -> ManagementAssetError {
+    if error
+        .as_database_error()
+        .is_some_and(is_management_asset_sibling_name_unique_violation)
+    {
+        ManagementAssetError::SiblingNameConflict {
+            name: name.to_owned(),
+            parent_asset_id,
+        }
+    } else {
+        ManagementAssetError::from(error)
+    }
+}
+
+fn is_management_asset_sibling_name_unique_violation(
+    database_error: &(dyn DatabaseError + 'static),
+) -> bool {
+    match database_error.code().as_deref() {
+        Some("23505") => {
+            database_error.constraint() == Some("assets_parent_asset_id_name_key")
+                || database_error
+                    .message()
+                    .contains("assets_parent_asset_id_name_key")
+        }
+        Some("19") | Some("2067") => database_error
+            .message()
+            .contains("UNIQUE constraint failed: assets.parent_asset_id, assets.name"),
+        _ => false,
+    }
+}
+
 fn validate_asset_metadata(
     value: serde_json::Value,
 ) -> Result<serde_json::Value, ManagementAssetError> {
@@ -829,6 +907,51 @@ async fn timescale_require_management_asset(
     } else {
         Err(ManagementAssetError::AssetNotFound)
     }
+}
+
+async fn lock_timescale_management_asset_update_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+    proposed_parent_asset_id: Option<Uuid>,
+) -> Result<(), ManagementAssetError> {
+    // Lock every row that can affect this hierarchy transition in UUID order. This
+    // serializes reciprocal reparenting before validation sees a stale hierarchy.
+    sqlx::query_scalar::<_, Uuid>(
+        "WITH RECURSIVE roots(id) AS (
+             SELECT id FROM assets WHERE id = $1
+             UNION
+             SELECT id FROM assets WHERE id = $2
+         ),
+         ancestors(id) AS (
+             SELECT id FROM roots
+             UNION
+             SELECT asset.parent_asset_id
+             FROM assets AS asset
+             JOIN ancestors ON asset.id = ancestors.id
+             WHERE asset.parent_asset_id IS NOT NULL
+         ),
+         descendants(id) AS (
+             SELECT id FROM roots
+             UNION
+             SELECT child.id
+             FROM assets AS child
+             JOIN descendants ON child.parent_asset_id = descendants.id
+         )
+         SELECT asset.id
+         FROM assets AS asset
+         WHERE asset.id IN (
+             SELECT id FROM ancestors
+             UNION
+             SELECT id FROM descendants
+         )
+         ORDER BY asset.id
+         FOR UPDATE",
+    )
+    .bind(asset_id)
+    .bind(proposed_parent_asset_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn validate_sqlite_asset_references(
