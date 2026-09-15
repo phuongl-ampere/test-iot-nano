@@ -23,10 +23,12 @@ use iot_api::{
     provision_platform_device_token, validate_password,
 };
 use iot_storage::{
-    ApplicationKind, ApplicationRepository, ClientId, ManagementChildStatus,
-    ManagementDevice as StorageManagementDevice, ManagementDeviceError, ManagementDeviceRepository,
-    ManagementDeviceTopology, ManagementGatewayStatus, NewApplication, NewOAuthClientSecret,
-    OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri, UpdateManagementDevice,
+    ApplicationKind, ApplicationRepository, ClientId, CreateManagementAsset,
+    ManagementAsset as StorageManagementAsset, ManagementAssetError, ManagementAssetRepository,
+    ManagementChildStatus, ManagementDevice as StorageManagementDevice, ManagementDeviceError,
+    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, NewApplication,
+    NewOAuthClientSecret, OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri,
+    UpdateManagementAsset, UpdateManagementDevice,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -191,6 +193,14 @@ impl ManagementSessionRouter {
             .route(
                 "/api/management/devices/{device_id}",
                 put(update_management_device).delete(delete_management_device),
+            )
+            .route(
+                "/api/management/assets",
+                get(list_management_assets).post(create_management_asset),
+            )
+            .route(
+                "/api/management/assets/{asset_id}",
+                put(update_management_asset).delete(delete_management_asset),
             )
             .route(
                 "/api/management/devices/{device_id}/tokens",
@@ -388,6 +398,25 @@ struct UpdateManagementDeviceRequest {
     attributes: Option<Value>,
     #[serde(default)]
     topology: Option<ManagementTopologyRequest>,
+}
+
+#[derive(Deserialize)]
+struct ManagementAssetRequest {
+    name: String,
+    asset_profile_id: Option<Uuid>,
+    parent_asset_id: Option<Uuid>,
+    metadata: Value,
+    attributes: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct ManagementAssetResponse {
+    id: Uuid,
+    name: String,
+    asset_profile_id: Option<Uuid>,
+    parent_asset_id: Option<Uuid>,
+    metadata: Value,
+    attributes: Value,
 }
 
 #[derive(Deserialize)]
@@ -614,6 +643,77 @@ async fn delete_management_device(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_management_assets(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementAssetResponse>>, ManagementSessionError> {
+    require_management_admin(&state.session_verifier, &headers)?;
+    ManagementAssetRepository::list_management_assets(state.store.as_ref())
+        .await
+        .map(|assets| Json(assets.into_iter().map(management_asset_response).collect()))
+        .map_err(management_asset_error)
+}
+
+async fn create_management_asset(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<(StatusCode, Json<ManagementAssetResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let request: ManagementAssetRequest = management_request_json(&state, request).await?;
+    let asset = ManagementAssetRepository::create_management_asset(
+        state.store.as_ref(),
+        CreateManagementAsset {
+            name: request.name,
+            asset_profile_id: request.asset_profile_id,
+            parent_asset_id: request.parent_asset_id,
+            metadata: request.metadata,
+            attributes: request.attributes,
+        },
+    )
+    .await
+    .map_err(management_asset_error)?;
+    Ok((StatusCode::CREATED, Json(management_asset_response(asset))))
+}
+
+async fn update_management_asset(
+    State(state): State<ManagementState>,
+    Path(asset_id): Path<String>,
+    request: Request,
+) -> Result<Json<ManagementAssetResponse>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let asset_id = Uuid::parse_str(&asset_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let request: ManagementAssetRequest = management_request_json(&state, request).await?;
+    let asset = ManagementAssetRepository::update_management_asset(
+        state.store.as_ref(),
+        asset_id,
+        UpdateManagementAsset {
+            name: request.name,
+            asset_profile_id: request.asset_profile_id,
+            parent_asset_id: request.parent_asset_id,
+            metadata: request.metadata,
+            attributes: request.attributes,
+        },
+    )
+    .await
+    .map_err(management_asset_error)?;
+    Ok(Json(management_asset_response(asset)))
+}
+
+async fn delete_management_asset(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(asset_id): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    require_management_admin(&state.session_verifier, &headers)?;
+    let asset_id = Uuid::parse_str(&asset_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    ManagementAssetRepository::delete_management_asset(state.store.as_ref(), asset_id)
+        .await
+        .map_err(management_asset_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn management_device_response(device: StorageManagementDevice) -> ManagementDeviceResponse {
     ManagementDeviceResponse {
         device_id: device.device_id,
@@ -637,6 +737,17 @@ fn management_device_response(device: StorageManagementDevice) -> ManagementDevi
     }
 }
 
+fn management_asset_response(asset: StorageManagementAsset) -> ManagementAssetResponse {
+    ManagementAssetResponse {
+        id: asset.id,
+        name: asset.name,
+        asset_profile_id: asset.asset_profile_id,
+        parent_asset_id: asset.parent_asset_id,
+        metadata: asset.metadata,
+        attributes: asset.attributes,
+    }
+}
+
 fn management_device_error(error: ManagementDeviceError) -> ManagementSessionError {
     match error {
         ManagementDeviceError::InvalidDeviceId(_)
@@ -653,6 +764,24 @@ fn management_device_error(error: ManagementDeviceError) -> ManagementSessionErr
         ManagementDeviceError::InvalidStoredAttributes
         | ManagementDeviceError::InvalidStoredTimestamp
         | ManagementDeviceError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_asset_error(error: ManagementAssetError) -> ManagementSessionError {
+    match error {
+        ManagementAssetError::InvalidName
+        | ManagementAssetError::MetadataMustBeObject
+        | ManagementAssetError::AttributesMustBeObject => ManagementSessionError::BadRequest,
+        ManagementAssetError::AssetNotFound => ManagementSessionError::NotFound,
+        ManagementAssetError::AssetProfileUnavailable(_)
+        | ManagementAssetError::ParentAssetUnavailable(_)
+        | ManagementAssetError::AssetCannotBeOwnParent
+        | ManagementAssetError::AssetCannotHaveDescendantParent
+        | ManagementAssetError::SiblingNameConflict { .. } => ManagementSessionError::Conflict,
+        ManagementAssetError::InvalidStoredAssetId
+        | ManagementAssetError::InvalidStoredReferences
+        | ManagementAssetError::InvalidStoredMetadata
+        | ManagementAssetError::Storage { .. } => ManagementSessionError::Unavailable,
     }
 }
 
