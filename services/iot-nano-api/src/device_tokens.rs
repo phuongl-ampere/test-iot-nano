@@ -10,7 +10,10 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::token_vault::{TokenVault, TokenVaultError};
-use iot_storage::PlatformStore;
+use iot_storage::{
+    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken,
+    PlatformStore,
+};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DeviceTokenResponse {
@@ -47,6 +50,8 @@ pub enum DeviceTokenStoreError {
     AllocationFailed,
     #[error("platform storage backend is unavailable")]
     PlatformUnavailable,
+    #[error("device token storage operation failed")]
+    Storage(#[source] DeviceTokenRepositoryError),
 }
 
 pub async fn provision_platform_device_token(
@@ -54,13 +59,15 @@ pub async fn provision_platform_device_token(
     vault: &TokenVault,
     display_name: &str,
 ) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    if let Some(pool) = store.sqlite_pool() {
-        return provision_sqlite(pool, vault, display_name).await;
+    for _ in 0..8 {
+        let (token, material) = new_platform_token(vault)?;
+        match DeviceTokenRepository::provision_device_token(store, display_name, material).await {
+            Ok(record) => return Ok(platform_token_response(record, token)),
+            Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
+            Err(error) => return Err(device_token_repository_error(error)),
+        }
     }
-    let pool = store
-        .timescale_pool()
-        .ok_or(DeviceTokenStoreError::PlatformUnavailable)?;
-    provision(pool, vault, display_name).await
+    Err(DeviceTokenStoreError::AllocationFailed)
 }
 
 pub async fn create_platform_device_token(
@@ -68,13 +75,53 @@ pub async fn create_platform_device_token(
     vault: &TokenVault,
     device_id: &str,
 ) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    if let Some(pool) = store.sqlite_pool() {
-        return create_sqlite(pool, vault, device_id).await;
+    for _ in 0..8 {
+        let (token, material) = new_platform_token(vault)?;
+        match DeviceTokenRepository::create_device_token(store, device_id, material).await {
+            Ok(record) => return Ok(platform_token_response(record, token)),
+            Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
+            Err(error) => return Err(device_token_repository_error(error)),
+        }
     }
-    let pool = store
-        .timescale_pool()
-        .ok_or(DeviceTokenStoreError::PlatformUnavailable)?;
-    create(pool, vault, device_id).await
+    Err(DeviceTokenStoreError::AllocationFailed)
+}
+
+fn new_platform_token(
+    vault: &TokenVault,
+) -> Result<(String, NewDeviceToken), DeviceTokenStoreError> {
+    let token = generate_device_token();
+    let token_prefix = device_token_prefix(&token)?.to_owned();
+    let token_hash = hash_device_token(&token)?;
+    let token_ciphertext = vault.encrypt(&token)?;
+    Ok((
+        token,
+        NewDeviceToken {
+            id: Uuid::new_v4(),
+            token_prefix,
+            token_hash,
+            token_ciphertext,
+        },
+    ))
+}
+
+fn platform_token_response(record: DeviceTokenRecord, token: String) -> DeviceTokenResponse {
+    DeviceTokenResponse {
+        id: record.id,
+        device_id: record.device_id,
+        token_prefix: record.token_prefix,
+        created_at: record.created_at,
+        last_used_at: None,
+        revoked_at: None,
+        token: Some(token),
+    }
+}
+
+fn device_token_repository_error(error: DeviceTokenRepositoryError) -> DeviceTokenStoreError {
+    match error {
+        DeviceTokenRepositoryError::DeviceNotFound => DeviceTokenStoreError::NotFound,
+        DeviceTokenRepositoryError::GatewayChild => DeviceTokenStoreError::GatewayChild,
+        other => DeviceTokenStoreError::Storage(other),
+    }
 }
 
 pub async fn list(

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod management;
 mod public_api;
 
 use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
@@ -27,6 +28,11 @@ use url::Url;
 
 const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform.sql");
 
+pub use management::{
+    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, ManagementChildStatus,
+    ManagementDevice, ManagementDeviceError, ManagementDeviceHealth, ManagementDeviceRepository,
+    ManagementDeviceTopology, ManagementGatewayStatus, NewDeviceToken, UpdateManagementDevice,
+};
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,
     PublicAsset, PublicDevice, PublicPrincipal, PublicResourceGrant, PublicTelemetry,
