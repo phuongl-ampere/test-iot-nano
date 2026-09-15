@@ -151,14 +151,24 @@ create_fake_privilege_command() {
     '    exit 1' \
     '    ;;' \
     '  install|fake-install)' \
+    '    arguments=("$@")' \
+    '    mode=""' \
+    '    for ((index = 0; index < ${#arguments[@]}; index += 1)); do' \
+    '      case "${arguments[index]}" in' \
+    '        --mode) mode="${arguments[index + 1]:-}" ;;' \
+    '        --mode=*) mode="${arguments[index]#--mode=}" ;;' \
+    '      esac' \
+    '    done' \
     '    if [[ "${1:-}" == "-d" ]]; then' \
-    '      mkdir -p "${!#}"' \
+    '      destination="${!#}"' \
+    '      mkdir -p "$destination"' \
     '    else' \
     '      destination="${!#}"' \
     '      source_path="${@: -2:1}"' \
     '      mkdir -p "$(dirname "$destination")"' \
     '      cp "$source_path" "$destination"' \
     '    fi' \
+    '    [[ -z "$mode" ]] || /bin/chmod "$mode" "$destination"' \
     '    ;;' \
     '  chmod|fake-chmod)' \
     '    /bin/chmod "$@"' \
@@ -301,6 +311,32 @@ for command_name in \
   ln -s "fake-$command_name" "$fake_bin/$command_name"
 done
 
+assert_direct_installer_rejects_test_overrides() {
+  local output
+
+  : >"$fake_command_log"
+  if output="$(PATH="$fake_bin:$PATH" \
+    FAKE_COMMAND_LOG="$fake_command_log" \
+    FAKE_INSTALL_DRY_RUN=1 \
+    IOT_NANO_MQTTD_TEST_OVERRIDE=1 \
+    "$root/scripts/$standalone_installer" 2>&1)"; then
+    printf 'executable standalone installer accepted a test override:\n%s\n' \
+      "$output" >&2
+    exit 1
+  fi
+  if [[ "$output" != *'IOT_NANO_MQTTD_'* ]]; then
+    printf 'executable standalone installer rejected an override without an explanation:\n%s\n' \
+      "$output" >&2
+    exit 1
+  fi
+  if [[ -s "$fake_command_log" ]]; then
+    printf 'executable standalone installer ran commands before rejecting a test override\n' >&2
+    exit 1
+  fi
+}
+
+assert_direct_installer_rejects_test_overrides
+
 PATH="$fake_bin:$PATH" \
   FAKE_COMMAND_LOG="$fake_command_log" \
   FAKE_INSTALL_DRY_RUN=1 \
@@ -329,7 +365,7 @@ run_standalone_installer() {
     IOT_NANO_MQTTD_CHOWN_BIN=fake-chown \
     IOT_NANO_MQTTD_CHMOD_BIN=fake-chmod \
     IOT_NANO_MQTTD_SYSTEMCTL_BIN=fake-systemctl \
-    bash -c 'source "$1"; install_mqttd_standalone' -- \
+    bash -c 'source "$1"; configure_mqttd_installer_for_test; install_mqttd_standalone' -- \
     "$root/scripts/$standalone_installer" >/dev/null
 }
 
@@ -338,6 +374,10 @@ run_standalone_installer
 
 if ! cmp -s "$template_path" "$config_path"; then
   printf 'standalone installer did not create config from the template\n' >&2
+  exit 1
+fi
+if [[ "$(permission_mode "$config_path")" != "640" ]]; then
+  printf 'standalone installer did not apply 0640 mode to a fresh config\n' >&2
   exit 1
 fi
 assert_log_contains \
