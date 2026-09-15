@@ -14,7 +14,8 @@ use iot_api::{SqliteApiState, bootstrap_users_sqlite, sqlite_router};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_core::{CoreControlState, CoreSqliteStore, core_control_router};
 use iot_storage::{
-    ApplicationKind, ApplicationRepository, NewApplication, PlatformStore, SqliteStore,
+    ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret, OAuthRepository,
+    PlatformStore, SqliteStore,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -159,7 +160,13 @@ async fn public_app_with_core() -> (tempfile::TempDir, SqliteStore, axum::Router
             launch_url: "https://client.example.test".to_owned(),
             client_id: CLIENT_ID.parse().unwrap(),
             redirect_uris: vec![REDIRECT_URI.parse().unwrap()],
-            allowed_scopes: vec!["commands:write".to_owned(), "commands:read".to_owned()],
+            allowed_scopes: vec![
+                "devices:read".to_owned(),
+                "devices:write".to_owned(),
+                "commands:write".to_owned(),
+                "commands:read".to_owned(),
+                "authorization:write".to_owned(),
+            ],
             enabled: true,
         },
     )
@@ -282,6 +289,32 @@ async fn oauth_bearer_token(app: &axum::Router, scope: &str) -> String {
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(format!(
                     "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fpublic-v1%2Fcallback&client_id={CLIENT_ID}&code_verifier={VERIFIER}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(token.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(token.into_body(), usize::MAX).await.unwrap()).unwrap();
+    payload["access_token"].as_str().unwrap().to_owned()
+}
+
+async fn client_credentials_token(
+    app: &axum::Router,
+    client_id: &str,
+    client_secret: &str,
+    scope: &str,
+) -> String {
+    let token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=client_credentials&client_id={client_id}&client_secret={client_secret}&scope={scope}"
                 )))
                 .unwrap(),
         )
@@ -509,6 +542,221 @@ async fn public_device_mutations_deny_unknown_and_inaccessible_targets_without_d
             .unwrap();
         assert_public_error(delete, StatusCode::FORBIDDEN, "forbidden").await;
     }
+}
+
+#[tokio::test]
+async fn application_clients_require_device_resource_grants_for_guessed_ids() {
+    const OWNER_APP_ID: &str = "public-v1-app";
+    const OWNER_CLIENT_SECRET: &str = "public-v1-owner-client-secret";
+    const GUEST_APP_ID: &str = "public-v1-guest-app";
+    const GUEST_CLIENT_ID: &str = "public-v1-guest-client";
+    const GUEST_CLIENT_SECRET: &str = "public-v1-guest-client-secret";
+    const DEVICE_ID: &str = "application-owned-device";
+
+    let (_directory, store, app) = public_app_with_core().await;
+    let oauth_store = PlatformStore::Sqlite(store.clone());
+    OAuthRepository::register_client_secret(
+        &oauth_store,
+        NewOAuthClientSecret {
+            app_id: OWNER_APP_ID.parse().unwrap(),
+            client_secret: OWNER_CLIENT_SECRET.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    ApplicationRepository::upsert_application(
+        &oauth_store,
+        NewApplication {
+            app_id: GUEST_APP_ID.parse().unwrap(),
+            kind: ApplicationKind::FullStack,
+            launch_url: "https://guest.example.test".to_owned(),
+            client_id: GUEST_CLIENT_ID.parse().unwrap(),
+            redirect_uris: vec!["https://guest.example.test/callback".parse().unwrap()],
+            allowed_scopes: vec![
+                "devices:read".to_owned(),
+                "devices:write".to_owned(),
+                "commands:write".to_owned(),
+                "authorization:write".to_owned(),
+            ],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    OAuthRepository::register_client_secret(
+        &oauth_store,
+        NewOAuthClientSecret {
+            app_id: GUEST_APP_ID.parse().unwrap(),
+            client_secret: GUEST_CLIENT_SECRET.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let owner_write_token =
+        client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "devices%3Awrite").await;
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices")
+                .header(AUTHORIZATION, format!("Bearer {owner_write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"device_id":"{DEVICE_ID}","metadata":{{}}}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT permission FROM resource_grants
+             WHERE resource_type = 'device' AND resource_id = ?
+               AND grantee_type = 'application' AND grantee_id = ?",
+        )
+        .bind(DEVICE_ID)
+        .bind(OWNER_APP_ID)
+        .fetch_one(store.pool())
+        .await
+        .unwrap(),
+        "manager"
+    );
+
+    let guest_read_token =
+        client_credentials_token(&app, GUEST_CLIENT_ID, GUEST_CLIENT_SECRET, "devices%3Aread")
+            .await;
+    let read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{DEVICE_ID}"))
+                .header(AUTHORIZATION, format!("Bearer {guest_read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(read, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let guest_write_token = client_credentials_token(
+        &app,
+        GUEST_CLIENT_ID,
+        GUEST_CLIENT_SECRET,
+        "devices%3Awrite",
+    )
+    .await;
+    let update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}"))
+                .header(AUTHORIZATION, format!("Bearer {guest_write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"display_name":"guest update"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(update, StatusCode::FORBIDDEN, "forbidden").await;
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}"))
+                .header(AUTHORIZATION, format!("Bearer {guest_write_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(delete, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let guest_authorization_token = client_credentials_token(
+        &app,
+        GUEST_CLIENT_ID,
+        GUEST_CLIENT_SECRET,
+        "authorization%3Awrite",
+    )
+    .await;
+    let create_share = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/resource-grants")
+                .header(AUTHORIZATION, format!("Bearer {guest_authorization_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"resource_type":"device","resource_id":"{DEVICE_ID}","grantee_type":"application","grantee_id":"{GUEST_APP_ID}","permission":"viewer"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(create_share, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let guest_command_token = client_credentials_token(
+        &app,
+        GUEST_CLIENT_ID,
+        GUEST_CLIENT_SECRET,
+        "commands%3Awrite",
+    )
+    .await;
+    let command = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/commands"))
+                .header(AUTHORIZATION, format!("Bearer {guest_command_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "guest-command")
+                .body(Body::from(
+                    r#"{"method":"setRelay","params":{"enabled":true}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(command, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let owner_read_token =
+        client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "devices%3Aread").await;
+    let owner_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{DEVICE_ID}"))
+                .header(AUTHORIZATION, format!("Bearer {owner_read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_read.status(), StatusCode::OK);
+    let owner_command_token =
+        client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "commands%3Awrite").await;
+    let owner_command = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/commands"))
+                .header(AUTHORIZATION, format!("Bearer {owner_command_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "owner-command")
+                .body(Body::from(
+                    r#"{"method":"setRelay","params":{"enabled":true}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_command.status(), StatusCode::ACCEPTED);
 }
 
 #[tokio::test]

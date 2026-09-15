@@ -489,8 +489,10 @@ async fn public_device_permission(
             if principal.account_class == AccountClass::Admin {
                 return Ok(Some(ResourcePermission::Owner));
             }
-            if principal.user_id.map(|id| id.to_string()) == owner {
-                return Ok(Some(ResourcePermission::Owner));
+            if let (Some(user_id), Some(owner)) = (principal.user_id, owner) {
+                if user_id.to_string() == owner {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
             }
             let user_id = principal.user_id.map(|id| id.to_string());
             let rows = sqlx::query_scalar::<_, String>(
@@ -526,8 +528,10 @@ async fn public_device_permission(
             if principal.account_class == AccountClass::Admin {
                 return Ok(Some(ResourcePermission::Owner));
             }
-            if principal.user_id == owner {
-                return Ok(Some(ResourcePermission::Owner));
+            if let (Some(user_id), Some(owner)) = (principal.user_id, owner) {
+                if user_id == owner {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
             }
             let rows = sqlx::query_scalar::<_, String>(
                 "SELECT permission FROM resource_shares

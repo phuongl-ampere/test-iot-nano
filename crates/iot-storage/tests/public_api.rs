@@ -235,6 +235,55 @@ async fn sqlite_public_device_repository_creates_updates_and_soft_deletes_owned_
 }
 
 #[tokio::test]
+async fn sqlite_public_device_permission_requires_an_application_grant() {
+    let (_directory, store) = sqlite_store().await;
+    let owning_application = PublicPrincipal {
+        user_id: None,
+        app_id: "public-device-owning-application".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let other_application = PublicPrincipal {
+        user_id: None,
+        app_id: "public-device-other-application".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let created = PublicApiRepository::create_public_device(
+        &store,
+        &owning_application,
+        NewPublicDevice {
+            device_id: "public-application-owned-device".to_owned(),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PublicApiRepository::public_device_permission(
+            &store,
+            &owning_application,
+            &created.device_id,
+        )
+        .await
+        .unwrap(),
+        Some(ResourcePermission::Manager)
+    );
+    assert_eq!(
+        PublicApiRepository::public_device_permission(
+            &store,
+            &other_application,
+            &created.device_id
+        )
+        .await
+        .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn sqlite_public_device_repository_hides_unknown_inaccessible_and_deleted_mutations() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
@@ -460,5 +509,76 @@ async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_device_permission_requires_an_application_grant() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let owning_application = PublicPrincipal {
+        user_id: None,
+        app_id: "timescale-public-device-owning-application".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let other_application = PublicPrincipal {
+        user_id: None,
+        app_id: "timescale-public-device-other-application".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let created = PublicApiRepository::create_public_device(
+        &store,
+        &owning_application,
+        NewPublicDevice {
+            device_id: format!("timescale-public-application-device-{}", Uuid::now_v7()),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PublicApiRepository::public_device_permission(
+            &store,
+            &owning_application,
+            &created.device_id,
+        )
+        .await
+        .unwrap(),
+        Some(ResourcePermission::Manager)
+    );
+    assert_eq!(
+        PublicApiRepository::public_device_permission(
+            &store,
+            &other_application,
+            &created.device_id
+        )
+        .await
+        .unwrap(),
+        None
     );
 }
