@@ -1,7 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountClass, NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PlatformStore,
-    PublicApiRepository, PublicPrincipal, ResourcePermission,
+    PublicApiRepository, PublicDeviceError, PublicPrincipal, ResourcePermission,
 };
 use serde_json::json;
 use sqlx::{Connection, PgConnection};
@@ -297,6 +297,98 @@ async fn sqlite_public_device_repository_creates_updates_and_soft_deletes_owned_
         !PublicApiRepository::delete_public_device(&store, &principal, &created.device_id)
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_public_device_asset_assignment_requires_asset_manager_permission() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let owner_id = Uuid::now_v7();
+    let attacker_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, 'public-asset-owner', 'unused', 'viewer', 'user'),
+                (?, 'public-asset-attacker', 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_id.to_string())
+    .bind(attacker_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, name, owner_user_id) VALUES (?, 'protected', ?)")
+        .bind(asset_id.to_string())
+        .bind(owner_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_shares (
+            id, resource_type, resource_id, target_user_id, permission,
+            inherit_children, state, created_by_user_id
+         ) VALUES (?, 'asset', ?, ?, 'viewer', 1, 'active', ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(asset_id.to_string())
+    .bind(attacker_id.to_string())
+    .bind(owner_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let attacker = PublicPrincipal {
+        user_id: Some(attacker_id),
+        app_id: "public-asset-attacker-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+
+    let create_error = PublicApiRepository::create_public_device(
+        &store,
+        &attacker,
+        NewPublicDevice {
+            device_id: "public-asset-unauthorized-create".to_owned(),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: Some(asset_id),
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        create_error,
+        PublicDeviceError::AssetUnavailable(id) if id == asset_id
+    ));
+
+    let device = PublicApiRepository::create_public_device(
+        &store,
+        &attacker,
+        NewPublicDevice {
+            device_id: "public-asset-unauthorized-update".to_owned(),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        PublicApiRepository::update_public_device(
+            &store,
+            &attacker,
+            &device.device_id,
+            NewPublicDevice {
+                device_id: device.device_id.clone(),
+                display_name: None,
+                metadata: json!({}),
+                asset_id: Some(asset_id),
+                device_profile_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -758,6 +850,111 @@ async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_device_asset_assignment_requires_asset_manager_permission() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let owner_id = Uuid::now_v7();
+    let attacker_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    let unique = Uuid::now_v7();
+    let pool = store.timescale_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'unused', 'viewer', 'user'),
+                ($3, $4, 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_id)
+    .bind(format!("timescale-public-asset-owner-{unique}"))
+    .bind(attacker_id)
+    .bind(format!("timescale-public-asset-attacker-{unique}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, name, owner_user_id) VALUES ($1, $2, $3)")
+        .bind(asset_id)
+        .bind(format!("timescale-public-protected-asset-{unique}"))
+        .bind(owner_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let attacker = PublicPrincipal {
+        user_id: Some(attacker_id),
+        app_id: format!("timescale-public-asset-attacker-app-{unique}"),
+        account_class: AccountClass::User,
+    };
+
+    let create_error = PublicApiRepository::create_public_device(
+        &store,
+        &attacker,
+        NewPublicDevice {
+            device_id: format!("timescale-public-asset-unauthorized-create-{unique}"),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: Some(asset_id),
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        create_error,
+        PublicDeviceError::AssetUnavailable(id) if id == asset_id
+    ));
+
+    let device = PublicApiRepository::create_public_device(
+        &store,
+        &attacker,
+        NewPublicDevice {
+            device_id: format!("timescale-public-asset-unauthorized-update-{unique}"),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        PublicApiRepository::update_public_device(
+            &store,
+            &attacker,
+            &device.device_id,
+            NewPublicDevice {
+                device_id: device.device_id.clone(),
+                display_name: None,
+                metadata: json!({}),
+                asset_id: Some(asset_id),
+                device_profile_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
 }
 

@@ -496,6 +496,112 @@ async fn public_device_mutations_create_update_and_soft_delete_through_generic_r
 }
 
 #[tokio::test]
+async fn public_device_asset_assignment_requires_manager_without_listing_or_detail_leaks() {
+    let (_directory, store, app) = public_app().await;
+    let viewer_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'viewer'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let root_asset_id = Uuid::now_v7();
+    let child_asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, name, owner_user_id)
+         VALUES (?, 'assignment-root', ?)",
+    )
+    .bind(root_asset_id.to_string())
+    .bind(&admin_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, name, parent_asset_id, owner_user_id)
+         VALUES (?, 'assignment-child', ?, ?)",
+    )
+    .bind(child_asset_id.to_string())
+    .bind(root_asset_id.to_string())
+    .bind(&admin_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_shares (
+            id, resource_type, resource_id, target_user_id, permission,
+            inherit_children, state, created_by_user_id
+         ) VALUES (?, 'asset', ?, ?, 'viewer', 1, 'active', ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(root_asset_id.to_string())
+    .bind(&viewer_id)
+    .bind(&admin_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let write_token = oauth_bearer_token(&app, "devices:write").await;
+    let device_id = "public-inherited-share-attach";
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices")
+                .header(AUTHORIZATION, format!("Bearer {write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "device_id": device_id,
+                        "metadata": {},
+                        "asset_id": child_asset_id,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(create, StatusCode::CONFLICT, "conflict").await;
+
+    let read_token = oauth_bearer_token(&app, "devices:read").await;
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices?limit=100")
+                .header(AUTHORIZATION, format!("Bearer {read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list: Value =
+        serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        !list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["device_id"] == device_id)
+    );
+
+    let detail = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{device_id}"))
+                .header(AUTHORIZATION, format!("Bearer {read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(detail, StatusCode::FORBIDDEN, "forbidden").await;
+}
+
+#[tokio::test]
 async fn public_device_mutations_deny_unknown_and_inaccessible_targets_without_disclosure() {
     let (_directory, store, app) = public_app().await;
     let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")

@@ -42,7 +42,8 @@ pub use management::{
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,
-    PublicAsset, PublicDevice, PublicPrincipal, PublicResourceGrant, PublicTelemetry,
+    PublicAsset, PublicDevice, PublicDeviceError, PublicPrincipal, PublicResourceGrant,
+    PublicTelemetry,
 };
 
 const SQLITE_SCHEMA: &str = r#"

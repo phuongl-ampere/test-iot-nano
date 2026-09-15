@@ -1,4 +1,5 @@
 use super::*;
+use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,29 @@ pub struct NewPublicDevice {
     pub metadata: serde_json::Value,
     pub asset_id: Option<Uuid>,
     pub device_profile_id: Option<Uuid>,
+}
+
+#[derive(Debug, Error)]
+pub enum PublicDeviceError {
+    #[error("public device asset is unavailable: {0}")]
+    AssetUnavailable(Uuid),
+    #[error("public device storage operation failed")]
+    Storage {
+        #[source]
+        source: PlatformStoreError,
+    },
+}
+
+impl From<PlatformStoreError> for PublicDeviceError {
+    fn from(source: PlatformStoreError) -> Self {
+        Self::Storage { source }
+    }
+}
+
+impl From<sqlx::Error> for PublicDeviceError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::from(PlatformStoreError::from(source))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +150,7 @@ pub trait PublicApiRepository: Send + Sync {
         &'a self,
         principal: &'a PublicPrincipal,
         device: NewPublicDevice,
-    ) -> Pin<Box<dyn Future<Output = Result<PublicDevice, PlatformStoreError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<PublicDevice, PublicDeviceError>> + Send + 'a>>;
     fn update_public_device<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
@@ -287,7 +311,7 @@ impl PublicApiRepository for PlatformStore {
         &'a self,
         principal: &'a PublicPrincipal,
         device: NewPublicDevice,
-    ) -> Pin<Box<dyn Future<Output = Result<PublicDevice, PlatformStoreError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PublicDevice, PublicDeviceError>> + Send + 'a>> {
         Box::pin(async move { create_public_device(self, principal, device).await })
     }
 
@@ -664,9 +688,17 @@ async fn create_public_device(
     store: &PlatformStore,
     principal: &PublicPrincipal,
     device: NewPublicDevice,
-) -> Result<PublicDevice, PlatformStoreError> {
-    let created = match store {
+) -> Result<PublicDevice, PublicDeviceError> {
+    match store {
         PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(asset_id) = device.asset_id {
+                if !sqlite_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                    .await?
+                {
+                    return Err(PublicDeviceError::AssetUnavailable(asset_id));
+                }
+            }
             let row = sqlx::query(
                 "INSERT INTO devices (
                     device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
@@ -680,11 +712,34 @@ async fn create_public_device(
             .bind(device.asset_id.map(|id| id.to_string()))
             .bind(device.device_profile_id.map(|id| id.to_string()))
             .bind(principal.user_id.map(|id| id.to_string()))
-            .fetch_one(store.pool())
+            .fetch_one(&mut *transaction)
             .await?;
-            sqlite_device_record(row)?
+            let created = sqlite_device_record(row)?;
+            if principal.user_id.is_none() {
+                sqlx::query(
+                    "INSERT INTO resource_grants (
+                        id, resource_type, resource_id, grantee_type, grantee_id, permission
+                     ) VALUES (?, 'device', ?, 'application', ?, 'manager')",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(&created.device_id)
+                .bind(&principal.app_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+            Ok(created)
         }
         PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            lock_timescale_public_device_asset_assignment(&mut transaction).await?;
+            if let Some(asset_id) = device.asset_id {
+                if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                    .await?
+                {
+                    return Err(PublicDeviceError::AssetUnavailable(asset_id));
+                }
+            }
             let row = sqlx::query(
                 "INSERT INTO devices (
                     device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
@@ -698,27 +753,10 @@ async fn create_public_device(
             .bind(device.asset_id)
             .bind(device.device_profile_id)
             .bind(principal.user_id)
-            .fetch_one(pool)
+            .fetch_one(&mut *transaction)
             .await?;
-            timescale_device_record(row)?
-        }
-    };
-
-    if principal.user_id.is_none() {
-        match store {
-            PlatformStore::Sqlite(store) => {
-                sqlx::query(
-                    "INSERT INTO resource_grants (
-                        id, resource_type, resource_id, grantee_type, grantee_id, permission
-                     ) VALUES (?, 'device', ?, 'application', ?, 'manager')",
-                )
-                .bind(Uuid::now_v7().to_string())
-                .bind(&created.device_id)
-                .bind(&principal.app_id)
-                .execute(store.pool())
-                .await?;
-            }
-            PlatformStore::Timescale(pool) => {
+            let created = timescale_device_record(row)?;
+            if principal.user_id.is_none() {
                 sqlx::query(
                     "INSERT INTO resource_grants (
                         id, resource_type, resource_id, grantee_type, grantee_id, permission
@@ -727,12 +765,13 @@ async fn create_public_device(
                 .bind(Uuid::now_v7())
                 .bind(&created.device_id)
                 .bind(&principal.app_id)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await?;
             }
+            transaction.commit().await?;
+            Ok(created)
         }
     }
-    Ok(created)
 }
 
 async fn update_public_device(
@@ -748,37 +787,182 @@ async fn update_public_device(
         return Ok(None);
     }
     match store {
-        PlatformStore::Sqlite(store) => sqlx::query(
-            "UPDATE devices
-             SET display_name = ?, metadata = ?, asset_id = ?, device_profile_id = ?
-             WHERE device_id = ? AND deleted_at IS NULL
-             RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
-        )
-        .bind(&device.display_name)
-        .bind(device.metadata.to_string())
-        .bind(device.asset_id.map(|id| id.to_string()))
-        .bind(device.device_profile_id.map(|id| id.to_string()))
-        .bind(device_id)
-        .fetch_optional(store.pool())
-        .await?
-        .map(sqlite_device_record)
-        .transpose(),
-        PlatformStore::Timescale(pool) => sqlx::query(
-            "UPDATE devices
-             SET display_name = $2, metadata = $3, asset_id = $4, device_profile_id = $5
-             WHERE device_id = $1 AND deleted_at IS NULL
-             RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
-        )
-        .bind(device_id)
-        .bind(&device.display_name)
-        .bind(sqlx::types::Json(device.metadata))
-        .bind(device.asset_id)
-        .bind(device.device_profile_id)
-        .fetch_optional(pool)
-        .await?
-        .map(timescale_device_record)
-        .transpose(),
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(asset_id) = device.asset_id {
+                if !sqlite_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                    .await?
+                {
+                    return Ok(None);
+                }
+            }
+            let updated = sqlx::query(
+                "UPDATE devices
+                 SET display_name = ?, metadata = ?, asset_id = ?, device_profile_id = ?
+                 WHERE device_id = ? AND deleted_at IS NULL
+                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+            )
+            .bind(&device.display_name)
+            .bind(device.metadata.to_string())
+            .bind(device.asset_id.map(|id| id.to_string()))
+            .bind(device.device_profile_id.map(|id| id.to_string()))
+            .bind(device_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(sqlite_device_record)
+            .transpose()?;
+            transaction.commit().await?;
+            Ok(updated)
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            lock_timescale_public_device_asset_assignment(&mut transaction).await?;
+            if let Some(asset_id) = device.asset_id {
+                if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                    .await?
+                {
+                    return Ok(None);
+                }
+            }
+            let updated = sqlx::query(
+                "UPDATE devices
+                 SET display_name = $2, metadata = $3, asset_id = $4, device_profile_id = $5
+                 WHERE device_id = $1 AND deleted_at IS NULL
+                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+            )
+            .bind(device_id)
+            .bind(&device.display_name)
+            .bind(sqlx::types::Json(device.metadata))
+            .bind(device.asset_id)
+            .bind(device.device_profile_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(timescale_device_record)
+            .transpose()?;
+            transaction.commit().await?;
+            Ok(updated)
+        }
     }
+}
+
+async fn sqlite_public_asset_manager_permission(
+    transaction: &mut Transaction<'_, Sqlite>,
+    principal: &PublicPrincipal,
+    asset_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    if principal.account_class == AccountClass::Admin {
+        return Ok(true);
+    }
+
+    let asset_id = asset_id.to_string();
+    let user_id = principal.user_id.map(|id| id.to_string());
+    let owner =
+        sqlx::query_scalar::<_, Option<String>>("SELECT owner_user_id FROM assets WHERE id = ?")
+            .bind(&asset_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    if owner.is_some() && owner.as_deref() == user_id.as_deref() {
+        return Ok(true);
+    }
+
+    let permissions = sqlx::query_scalar::<_, String>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT ?, 0
+            UNION ALL
+            SELECT assets.parent_asset_id, ancestors.depth + 1
+            FROM ancestors JOIN assets ON assets.id = ancestors.id
+            WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT permission FROM resource_shares
+         WHERE resource_type = 'asset' AND resource_id = ?
+           AND target_user_id = ? AND state = 'active'
+         UNION ALL
+         SELECT shares.permission FROM resource_shares AS shares
+         JOIN ancestors ON shares.resource_id = ancestors.id
+         WHERE shares.resource_type = 'asset' AND shares.target_user_id = ?
+           AND shares.state = 'active' AND shares.inherit_children = 1
+         UNION ALL
+         SELECT permission FROM resource_grants
+         WHERE resource_type = 'asset' AND resource_id = ?
+           AND ((grantee_type = 'user' AND grantee_id = ?)
+                OR (grantee_type = 'application' AND grantee_id = ?))",
+    )
+    .bind(&asset_id)
+    .bind(&asset_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&asset_id)
+    .bind(&user_id)
+    .bind(&principal.app_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(strongest_share_permission(permissions)
+        .is_some_and(|permission| permission.allows(ResourcePermission::Manager)))
+}
+
+async fn lock_timescale_public_device_asset_assignment(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), PlatformStoreError> {
+    sqlx::query("LOCK TABLE devices IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn timescale_public_asset_manager_permission(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal: &PublicPrincipal,
+    asset_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    if principal.account_class == AccountClass::Admin {
+        return Ok(true);
+    }
+
+    let owner = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT owner_user_id FROM assets WHERE id = $1 FOR SHARE",
+    )
+    .bind(asset_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    if owner.is_some() && owner == principal.user_id {
+        return Ok(true);
+    }
+
+    let permissions = sqlx::query_scalar::<_, String>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT $1::uuid, 0
+            UNION ALL
+            SELECT assets.parent_asset_id, ancestors.depth + 1
+            FROM ancestors JOIN assets ON assets.id = ancestors.id
+            WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT permission FROM resource_shares
+         WHERE resource_type = 'asset' AND resource_id = $1::text
+           AND target_user_id = $2 AND state = 'active'
+         UNION ALL
+         SELECT shares.permission FROM resource_shares AS shares
+         JOIN ancestors ON shares.resource_id = ancestors.id::text
+         WHERE shares.resource_type = 'asset' AND shares.target_user_id = $2
+           AND shares.state = 'active' AND shares.inherit_children = TRUE
+         UNION ALL
+         SELECT permission FROM resource_grants
+         WHERE resource_type = 'asset' AND resource_id = $1::text
+           AND ((grantee_type = 'user' AND grantee_id = $2::text)
+                OR (grantee_type = 'application' AND grantee_id = $3))",
+    )
+    .bind(asset_id)
+    .bind(principal.user_id)
+    .bind(&principal.app_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(strongest_share_permission(permissions)
+        .is_some_and(|permission| permission.allows(ResourcePermission::Manager)))
 }
 
 async fn delete_public_device(

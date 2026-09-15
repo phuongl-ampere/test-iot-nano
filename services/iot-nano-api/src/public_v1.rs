@@ -11,8 +11,8 @@ use chrono::Utc;
 use iot_core::RpcMode;
 use iot_storage::{
     AccountClass, AuthorizationRepository, NewPublicAsset, NewPublicDevice, NewPublicResourceGrant,
-    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicDevice, PublicPrincipal,
-    PublicResourceGrant, PublicTelemetry, ResourcePermission,
+    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicDevice, PublicDeviceError,
+    PublicPrincipal, PublicResourceGrant, PublicTelemetry, ResourcePermission,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -452,7 +452,7 @@ async fn create_device(
         },
     )
     .await
-    .map_err(|_| PublicApiError::Unavailable)?;
+    .map_err(public_device_error)?;
     Ok((
         axum::http::StatusCode::CREATED,
         Json(device_response(device)),
@@ -589,6 +589,13 @@ fn device_response(device: PublicDevice) -> DeviceResponse {
         metadata: device.metadata,
         asset_id: device.asset_id,
         device_profile_id: device.device_profile_id,
+    }
+}
+
+fn public_device_error(error: PublicDeviceError) -> PublicApiError {
+    match error {
+        PublicDeviceError::AssetUnavailable(_) => PublicApiError::Conflict,
+        PublicDeviceError::Storage { .. } => PublicApiError::Unavailable,
     }
 }
 
