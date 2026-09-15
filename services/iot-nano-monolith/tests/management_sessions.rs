@@ -970,6 +970,127 @@ async fn management_mutation_reports_unavailable_when_the_store_closes_after_log
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+#[tokio::test]
+async fn management_mutation_preserves_json_rejection_semantics_after_authorization() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let missing_content_type = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"display_name":"No content type"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_content_type.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+
+    let oversized_body = json!({ "display_name": "x".repeat(2 * 1024 * 1024) }).to_string();
+    let oversized = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(oversized_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn management_mutation_authorization_precedes_json_rejection_for_every_body_route() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let viewer_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"viewer","password":"NanoView@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_cookie = viewer_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    for (method, path) in [
+        ("POST", "/api/management/applications"),
+        ("POST", "/api/management/devices"),
+        ("PUT", "/api/management/devices/not-valid"),
+    ] {
+        let anonymous = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+        let viewer = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(COOKIE, &viewer_cookie)
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(viewer.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
 async fn management_provision_device(
     router: &axum::Router,
     cookie: &str,

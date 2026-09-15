@@ -8,8 +8,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::to_bytes,
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, FromRequest, Path, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{COOKIE, SET_COOKIE},
@@ -38,7 +37,6 @@ const SESSION_COOKIE: &str = "iot_nano_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: u8 = 5;
-const MAX_MANAGEMENT_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum BootstrapAdminError {
@@ -488,7 +486,7 @@ async fn create_application(
 ) -> Result<(StatusCode, Json<ApplicationResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
-    let request: CreateApplicationRequest = management_request_json(request).await?;
+    let request: CreateApplicationRequest = management_request_json(&state, request).await?;
     let app_id = request
         .app_id
         .parse()
@@ -548,7 +546,7 @@ async fn provision_device(
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
-    let request: ProvisionDeviceRequest = management_request_json(request).await?;
+    let request: ProvisionDeviceRequest = management_request_json(&state, request).await?;
     let display_name = request.display_name.trim();
     if display_name.is_empty() || display_name.len() > 128 {
         return Err(ManagementSessionError::BadRequest);
@@ -584,7 +582,7 @@ async fn update_management_device(
 ) -> Result<Json<ManagementDeviceResponse>, ManagementSessionError> {
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
-    let request: UpdateManagementDeviceRequest = management_request_json(request).await?;
+    let request: UpdateManagementDeviceRequest = management_request_json(&state, request).await?;
     let device = ManagementDeviceRepository::update_management_device(
         state.store.as_ref(),
         &device_id,
@@ -672,14 +670,21 @@ fn require_management_admin(
     }
 }
 
-async fn management_request_json<T>(request: Request) -> Result<T, ManagementSessionError>
+async fn management_request_json<T>(
+    state: &ManagementState,
+    request: Request,
+) -> Result<T, ManagementSessionError>
 where
     T: DeserializeOwned,
 {
-    let body = to_bytes(request.into_body(), MAX_MANAGEMENT_REQUEST_BYTES)
+    Json::<T>::from_request(request, state)
         .await
-        .map_err(|_| ManagementSessionError::BadRequest)?;
-    serde_json::from_slice(&body).map_err(|_| ManagementSessionError::BadRequest)
+        .map(|Json(value)| value)
+        .map_err(|rejection| match rejection.into_response().status() {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => ManagementSessionError::UnsupportedMediaType,
+            StatusCode::PAYLOAD_TOO_LARGE => ManagementSessionError::PayloadTooLarge,
+            _ => ManagementSessionError::BadRequest,
+        })
 }
 
 fn management_device_token_error(error: DeviceTokenStoreError) -> ManagementSessionError {
@@ -759,6 +764,8 @@ enum ManagementSessionError {
     TooManyRequests,
     Forbidden,
     BadRequest,
+    UnsupportedMediaType,
+    PayloadTooLarge,
     NotFound,
     Conflict,
     Unavailable,
@@ -771,6 +778,10 @@ impl IntoResponse for ManagementSessionError {
             Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Self::BadRequest => (StatusCode::BAD_REQUEST, "invalid_request"),
+            Self::UnsupportedMediaType => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type")
+            }
+            Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict => (StatusCode::CONFLICT, "conflict"),
             Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
