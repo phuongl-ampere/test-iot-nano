@@ -159,8 +159,13 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "apiKey"
     );
     assert_eq!(
-        document["components"]["securitySchemes"]["bearerAuth"]["scheme"],
-        "bearer"
+        document["components"]["securitySchemes"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["managementSession"])
     );
 
     let paths = document["paths"].as_object().unwrap();
@@ -181,27 +186,74 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "/api/management/profiles/device-profiles/{profile_id}",
         "/api/management/users",
         "/api/management/users/{username}",
-        "/api/v1/alerts",
-        "/api/v1/alerts/{alert_id}",
-        "/api/v1/alerts/{alert_id}/acknowledge",
-        "/api/v1/assets",
-        "/api/v1/assets/{asset_id}",
-        "/api/v1/commands/{command_id}",
-        "/api/v1/devices",
-        "/api/v1/devices/{device_id}",
-        "/api/v1/devices/{device_id}/commands",
-        "/api/v1/resource-grants",
-        "/api/v1/resource-grants/{grant_id}",
-        "/api/v1/telemetry",
-        "/api/v1/telemetry/{device_id}",
-        "/oauth/authorize",
-        "/oauth/token",
     ]);
     assert_eq!(actual_paths, expected_paths);
 
+    let schemas = document["components"]["schemas"].as_object().unwrap();
+    let actual_schemas: BTreeSet<_> = schemas.keys().map(String::as_str).collect();
+    let expected_schemas = BTreeSet::from([
+        "ApplicationRequest",
+        "ApplicationResponse",
+        "AssetProfile",
+        "AssetProfileList",
+        "AssetProfileRequest",
+        "DeviceProfile",
+        "DeviceProfileList",
+        "DeviceProfileRequest",
+        "DeviceProvisionRequest",
+        "DeviceToken",
+        "Error",
+        "LoginRequest",
+        "ManagementAsset",
+        "ManagementAssetList",
+        "ManagementAssetRequest",
+        "ManagementDevice",
+        "ManagementDeviceList",
+        "ManagementDeviceUpdateRequest",
+        "ManagementUser",
+        "ManagementUserCreateRequest",
+        "ManagementUserList",
+        "ManagementUserUpdateRequest",
+        "SessionResponse",
+    ]);
+    assert_eq!(actual_schemas, expected_schemas);
+
+    for forbidden_schema in [
+        "AccessToken",
+        "AlertPage",
+        "AssetPage",
+        "Command",
+        "CommandRequest",
+        "DevicePage",
+        "GrantPage",
+        "OAuthTokenRequest",
+        "PublicAlert",
+        "PublicAsset",
+        "PublicAssetRequest",
+        "PublicDevice",
+        "PublicDeviceRequest",
+        "ResourceGrant",
+        "ResourceGrantRequest",
+        "Telemetry",
+        "TelemetryPage",
+    ] {
+        assert!(
+            !schemas.contains_key(forbidden_schema),
+            "management OpenAPI exposed public schema: {forbidden_schema}"
+        );
+    }
+
+    let logout = &document["paths"]["/api/auth/logout"]["post"];
+    assert!(logout.get("security").is_none());
+    assert!(logout["responses"]["204"]["content"].is_null());
+
     let rendered = document.to_string();
     for forbidden in [
+        "/api/v1/",
+        "/oauth/",
         "/internal/",
+        "bearerAuth",
+        "oauth2",
         "client_secret",
         "password_hash",
         "token_hash",

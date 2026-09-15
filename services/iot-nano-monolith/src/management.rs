@@ -263,223 +263,6 @@ fn management_openapi() -> Value {
 
     documented_path(
         &mut paths,
-        "/oauth/authorize",
-        vec![(
-            "get",
-            documented_operation(
-                "Authorize an OAuth client with the active management browser session",
-                Some("managementSession"),
-                None,
-                ("302", "Authorization redirect", None),
-                &[
-                    ("400", "Invalid authorization request"),
-                    ("401", "No active browser session"),
-                ],
-            ),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/oauth/token",
-        vec![(
-            "post",
-            documented_operation(
-                "Exchange an OAuth authorization code or client credentials for an access token",
-                None,
-                Some(("application/x-www-form-urlencoded", "OAuthTokenRequest")),
-                ("200", "Access token issued", Some("AccessToken")),
-                &[
-                    ("400", "Invalid token request"),
-                    ("401", "Client authentication failed"),
-                ],
-            ),
-        )],
-    );
-
-    documented_path(
-        &mut paths,
-        "/api/v1/assets",
-        vec![
-            (
-                "get",
-                public_operation("List assets", None, "200", "AssetPage"),
-            ),
-            (
-                "post",
-                public_operation(
-                    "Create an asset",
-                    Some("PublicAssetRequest"),
-                    "201",
-                    "PublicAsset",
-                ),
-            ),
-        ],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/assets/{asset_id}",
-        vec![
-            (
-                "get",
-                public_operation("Get an asset", None, "200", "PublicAsset"),
-            ),
-            (
-                "patch",
-                public_operation(
-                    "Update an asset",
-                    Some("PublicAssetRequest"),
-                    "200",
-                    "PublicAsset",
-                ),
-            ),
-            ("delete", public_no_content_operation("Delete an asset")),
-        ],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/telemetry",
-        vec![(
-            "get",
-            public_operation("List telemetry", None, "200", "TelemetryPage"),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/telemetry/{device_id}",
-        vec![(
-            "get",
-            public_operation("Get device telemetry", None, "200", "TelemetryPage"),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/alerts",
-        vec![(
-            "get",
-            public_operation("List alerts", None, "200", "AlertPage"),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/alerts/{alert_id}",
-        vec![(
-            "get",
-            public_operation("Get an alert", None, "200", "PublicAlert"),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/alerts/{alert_id}/acknowledge",
-        vec![(
-            "post",
-            public_operation("Acknowledge an alert", None, "200", "PublicAlert"),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/devices",
-        vec![
-            (
-                "get",
-                public_operation("List devices", None, "200", "DevicePage"),
-            ),
-            (
-                "post",
-                public_operation(
-                    "Create a device",
-                    Some("PublicDeviceRequest"),
-                    "201",
-                    "PublicDevice",
-                ),
-            ),
-        ],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/devices/{device_id}",
-        vec![
-            (
-                "get",
-                public_operation("Get a device", None, "200", "PublicDevice"),
-            ),
-            (
-                "patch",
-                public_operation(
-                    "Update a device",
-                    Some("PublicDeviceRequest"),
-                    "200",
-                    "PublicDevice",
-                ),
-            ),
-            ("delete", public_no_content_operation("Delete a device")),
-        ],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/devices/{device_id}/commands",
-        vec![(
-            "post",
-            public_operation(
-                "Create a device command",
-                Some("CommandRequest"),
-                "202",
-                "Command",
-            ),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/commands/{command_id}",
-        vec![(
-            "get",
-            public_operation("Get a device command", None, "200", "Command"),
-        )],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/resource-grants",
-        vec![
-            (
-                "get",
-                public_operation("List resource grants", None, "200", "GrantPage"),
-            ),
-            (
-                "post",
-                public_operation(
-                    "Create a resource grant",
-                    Some("ResourceGrantRequest"),
-                    "201",
-                    "ResourceGrant",
-                ),
-            ),
-        ],
-    );
-    documented_path(
-        &mut paths,
-        "/api/v1/resource-grants/{grant_id}",
-        vec![
-            (
-                "get",
-                public_operation("Get a resource grant", None, "200", "ResourceGrant"),
-            ),
-            (
-                "patch",
-                public_operation(
-                    "Update a resource grant",
-                    Some("ResourceGrantRequest"),
-                    "200",
-                    "ResourceGrant",
-                ),
-            ),
-            (
-                "delete",
-                public_no_content_operation("Delete a resource grant"),
-            ),
-        ],
-    );
-
-    documented_path(
-        &mut paths,
         "/api/auth/login",
         vec![(
             "post",
@@ -503,7 +286,7 @@ fn management_openapi() -> Value {
             "post",
             documented_operation(
                 "End the current management session",
-                Some("managementSession"),
+                None,
                 None,
                 ("204", "Management session ended", None),
                 &[],
@@ -745,9 +528,9 @@ fn management_openapi() -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "IoT Nano operator API",
+            "title": "IoT Nano management API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Public OAuth and API v1 operations, plus management administration operations."
+            "description": "Management and authentication operations."
         },
         "paths": paths,
         "components": {
@@ -756,25 +539,6 @@ fn management_openapi() -> Value {
                     "type": "apiKey",
                     "in": "cookie",
                     "name": SESSION_COOKIE
-                },
-                "bearerAuth": {
-                    "type": "http",
-                    "scheme": "bearer",
-                    "bearerFormat": "OAuth 2.0 access token"
-                },
-                "oauth2": {
-                    "type": "oauth2",
-                    "flows": {
-                        "authorizationCode": {
-                            "authorizationUrl": "/oauth/authorize",
-                            "tokenUrl": "/oauth/token",
-                            "scopes": {}
-                        },
-                        "clientCredentials": {
-                            "tokenUrl": "/oauth/token",
-                            "scopes": {}
-                        }
-                    }
                 }
             },
             "schemas": management_openapi_schemas()
@@ -810,43 +574,6 @@ fn path_parameters(path: &str) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn public_operation(
-    summary: &str,
-    request_schema: Option<&str>,
-    success_status: &str,
-    response_schema: &str,
-) -> Value {
-    documented_operation(
-        summary,
-        Some("bearerAuth"),
-        request_schema.map(|schema| ("application/json", schema)),
-        (success_status, "Request completed", Some(response_schema)),
-        &[
-            ("400", "Invalid request"),
-            ("401", "Bearer token required"),
-            ("403", "Insufficient scope"),
-            ("404", "Resource not found"),
-            ("409", "Conflicting request"),
-            ("503", "Service unavailable"),
-        ],
-    )
-}
-
-fn public_no_content_operation(summary: &str) -> Value {
-    documented_operation(
-        summary,
-        Some("bearerAuth"),
-        None,
-        ("204", "Request completed", None),
-        &[
-            ("401", "Bearer token required"),
-            ("403", "Insufficient scope"),
-            ("404", "Resource not found"),
-            ("503", "Service unavailable"),
-        ],
-    )
 }
 
 fn management_operation(
@@ -970,32 +697,6 @@ fn management_openapi_schemas() -> Value {
                 "password": {"type": "string", "format": "password"}
             }),
             &["username", "password"],
-        ),
-    );
-    schemas.insert(
-        "OAuthTokenRequest".to_owned(),
-        object_schema(
-            json!({
-                "grant_type": {"type": "string"},
-                "code": {"type": "string"},
-                "redirect_uri": {"type": "string", "format": "uri"},
-                "client_id": {"type": "string"},
-                "code_verifier": {"type": "string"},
-                "scope": {"type": "string"}
-            }),
-            &["grant_type"],
-        ),
-    );
-    schemas.insert(
-        "AccessToken".to_owned(),
-        object_schema(
-            json!({
-                "access_token": {"type": "string"},
-                "token_type": {"type": "string"},
-                "expires_in": {"type": "integer", "format": "int64"},
-                "scope": {"type": "string"}
-            }),
-            &["access_token", "token_type", "expires_in"],
         ),
     );
     schemas.insert(
@@ -1210,24 +911,6 @@ fn management_openapi_schemas() -> Value {
         ),
     );
 
-    for name in [
-        "PublicAssetRequest",
-        "PublicDeviceRequest",
-        "CommandRequest",
-        "ResourceGrantRequest",
-    ] {
-        schemas.insert(name.to_owned(), flexible_request_schema());
-    }
-    for name in [
-        "PublicAsset",
-        "PublicDevice",
-        "Telemetry",
-        "PublicAlert",
-        "Command",
-        "ResourceGrant",
-    ] {
-        schemas.insert(name.to_owned(), flexible_response_schema());
-    }
     for (name, item) in [
         ("ManagementUserList", "ManagementUser"),
         ("DeviceProfileList", "DeviceProfile"),
@@ -1236,15 +919,6 @@ fn management_openapi_schemas() -> Value {
         ("ManagementAssetList", "ManagementAsset"),
     ] {
         schemas.insert(name.to_owned(), array_schema(item));
-    }
-    for (name, item) in [
-        ("AssetPage", "PublicAsset"),
-        ("DevicePage", "PublicDevice"),
-        ("TelemetryPage", "Telemetry"),
-        ("AlertPage", "PublicAlert"),
-        ("GrantPage", "ResourceGrant"),
-    ] {
-        schemas.insert(name.to_owned(), page_schema(item));
     }
 
     Value::Object(schemas)
@@ -1261,28 +935,6 @@ fn object_schema(properties: Value, required: &[&str]) -> Value {
 
 fn array_schema(item: &str) -> Value {
     json!({"type": "array", "items": schema_reference(item)})
-}
-
-fn page_schema(item: &str) -> Value {
-    object_schema(
-        json!({
-            "items": {"type": "array", "items": schema_reference(item)},
-            "next_cursor": {"type": ["string", "null"]},
-            "has_more": {"type": "boolean"}
-        }),
-        &["items", "next_cursor", "has_more"],
-    )
-}
-
-fn flexible_request_schema() -> Value {
-    json!({"type": "object", "additionalProperties": true})
-}
-
-fn flexible_response_schema() -> Value {
-    object_schema(
-        json!({"id": uuid_schema(), "status": {"type": "string"}, "attributes": json_object_schema()}),
-        &[],
-    )
 }
 
 fn json_object_schema() -> Value {
