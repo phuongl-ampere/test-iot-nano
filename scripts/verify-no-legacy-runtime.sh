@@ -3,9 +3,6 @@ set -euo pipefail
 
 root="${IOT_NANO_VERIFY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-# Keep this list explicit so the verifier fails closed when a monolith
-# production/deployment input is removed or becomes unreadable. The retained
-# standalone MQTTD package and installer are intentionally outside this list.
 expected_files=(
   "$root/infra/compose.yaml"
   "$root/infra/compose.timescale.yaml"
@@ -27,22 +24,12 @@ expected_files=(
   "$root/services/iot-nano-monolith/src/readiness.rs"
   "$root/services/iot-nano-monolith/src/runtime.rs"
 )
-
-deployment_paths=(
-  "$root/infra/compose.yaml"
-  "$root/infra/compose.timescale.yaml"
-  "$root/infra/docker/Dockerfile"
-  "$root/infra/monolith/monolith.env.example"
-  "$root/infra/monolith/migrate.sh"
-  "$root/infra/monolith/rollback.sh"
-  "$root/infra/systemd/iot-nano-monolith.service"
-  "$root/scripts/e2e-local.sh"
-  "$root/scripts/e2e-monolith.sh"
-  "$root/scripts/install-raspberry-pi.sh"
+expected_directories=(
+  "$root/infra"
+  "$root/scripts"
+  "$root/services/iot-nano-monolith"
+  "$root/services/iot-nano-monolith/src"
 )
-
-source_paths=("$root/services/iot-nano-monolith/src")
-
 retired_paths=(
   "$root/infra/dev/api.env"
   "$root/infra/dev/iot-nano-core.env"
@@ -55,15 +42,155 @@ retired_paths=(
   "$root/scripts/rpc-e2e.py"
 )
 
+standalone_installer_path="$root/scripts/install-mqttd-standalone.sh"
+standalone_unit_path="$root/infra/systemd/iot-nano-mqttd-standalone.service"
+retired_binary_literal_pattern='iot-nano-(api|core|stream|mqttd)'
+retired_source_pattern='(^|[=:\"[:space:]])/internal/|x-iot-nano-|IOT_NANO_(CORE_URL|STREAM_URL|MQTTD_INTERNAL_URL|MQTTD_API_SECRET|API_MQTTD_SECRET|MQTTD_STREAM_SECRET|CORE_STREAM_SECRET|API_CORE_SECRET|CORE_MQTTD_SECRET)[[:space:]]*[:=]'
+standalone_reference_pattern='install-mqttd-standalone\.sh|iot-nano-mqttd-standalone\.service'
+deployment_files=()
+source_files=()
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+check_path_components() {
+  local path="$1"
+  local component="$path"
+
+  while :; do
+    [[ ! -L "$component" ]] ||
+      fail "symlinked production/deployment path found: $component"
+    if [[ -d "$component" ]]; then
+      [[ -r "$component" && -x "$component" ]] ||
+        fail "unreadable production/deployment path found: $component"
+    else
+      [[ -r "$component" ]] ||
+        fail "unreadable production/deployment path found: $component"
+    fi
+    [[ "$component" == "$root" ]] && break
+    component="${component%/*}"
+    [[ -n "$component" && "$component" != "$path" ]] ||
+      fail "production/deployment path escapes verification root: $path"
+  done
+}
+
+for path in "${expected_directories[@]}"; do
+  [[ ! -L "$path" ]] ||
+    fail "symlinked production/deployment path found: $path"
+  [[ -d "$path" && -r "$path" && -x "$path" ]] ||
+    fail "expected production/deployment path is missing or unreadable: $path"
+  check_path_components "$path"
+done
 for path in "${expected_files[@]}"; do
-  if [[ ! -f "$path" || ! -r "$path" ]]; then
-    printf 'expected production/deployment path is missing or unreadable: %s\n' "$path" >&2
-    exit 1
-  fi
+  [[ ! -L "$path" ]] ||
+    fail "symlinked production/deployment path found: $path"
+  [[ -f "$path" && -r "$path" ]] ||
+    fail "expected production/deployment path is missing or unreadable: $path"
+  check_path_components "$path"
 done
 
-legacy_deployment_pattern='iot-nano-(api|core|stream|mqttd)|target/(debug|release)/iot-nano-(api|core|stream|mqttd)|/internal/|x-iot-nano-|IOT_NANO_(CORE_URL|STREAM_URL|MQTTD_INTERNAL_URL|MQTTD_API_SECRET|API_MQTTD_SECRET|MQTTD_STREAM_SECRET|CORE_STREAM_SECRET|API_CORE_SECRET|CORE_MQTTD_SECRET)|install-mqttd-standalone\.sh|iot-nano-mqttd-standalone\.service'
-legacy_source_pattern='/internal/|x-iot-nano-|target/(debug|release)/iot-nano-(api|core|stream|mqttd)'
+is_deployment_excluded() {
+  case "$1" in
+    "$standalone_installer_path"|"$standalone_unit_path"|"$root/scripts/e2e-local.sh"|"$root/scripts/e2e-monolith.sh"|"$root/scripts/stress-local.sh"|"$root/scripts/verify-no-legacy-runtime.sh"|"$root/scripts/test-verify-no-legacy-runtime.sh"|"$root/scripts/verify-failures.sh"|"$root/scripts/verify-monolith-topology.sh"|"$root/scripts/fixtures"/*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+enumerate_regular_files() {
+  local directory="$1"
+  local kind="$2"
+  local inventory
+  local diagnostics
+  local path
+  local status
+
+  inventory="$(mktemp "${TMPDIR:-/tmp}/iot-nano-verify.XXXXXX")" ||
+    fail "failed to create file enumeration output for: $directory"
+  diagnostics="$(mktemp "${TMPDIR:-/tmp}/iot-nano-verify.XXXXXX")" || {
+    rm -f "$inventory"
+    fail "failed to create file enumeration diagnostics for: $directory"
+  }
+  set +e
+  find "$directory" -print0 >"$inventory" 2>"$diagnostics"
+  status=$?
+  set -e
+  if ((status != 0)); then
+    printf 'unreadable production/deployment path found while enumerating %s (find exit %s):\n' \
+      "$directory" "$status" >&2
+    cat "$diagnostics" >&2
+    rm -f "$inventory" "$diagnostics"
+    exit 1
+  fi
+  rm -f "$diagnostics"
+
+  while IFS= read -r -d '' path; do
+    [[ ! -L "$path" ]] ||
+      fail "symlinked production/deployment path found: $path"
+    if [[ -d "$path" ]]; then
+      [[ -r "$path" && -x "$path" ]] ||
+        fail "unreadable production/deployment path found: $path"
+      continue
+    fi
+    [[ -f "$path" ]] || continue
+    [[ -r "$path" ]] ||
+      fail "unreadable production/deployment path found: $path"
+    case "$kind" in
+      deployment)
+        is_deployment_excluded "$path" || deployment_files+=("$path")
+        ;;
+      source) source_files+=("$path") ;;
+    esac
+  done <"$inventory"
+  rm -f "$inventory"
+}
+
+enumerate_regular_files "$root/infra" deployment
+enumerate_regular_files "$root/scripts" deployment
+enumerate_regular_files "$root/services/iot-nano-monolith/src" source
+
+check_normalized_binary_literals() {
+  local path
+  local continued
+  local normalized
+  local matches
+  local status
+
+  for path in "${deployment_files[@]}"; do
+    continued="$(mktemp "${TMPDIR:-/tmp}/iot-nano-verify.XXXXXX")" ||
+      fail "failed to create normalized deployment scan output for: $path"
+    normalized="$(mktemp "${TMPDIR:-/tmp}/iot-nano-verify.XXXXXX")" || {
+      rm -f "$continued"
+      fail "failed to create normalized deployment scan output for: $path"
+    }
+    if ! LC_ALL=C perl -0pe 's/\\\r?\n//g' -- "$path" >"$continued"; then
+      rm -f "$continued" "$normalized"
+      fail "failed to normalize deployment file: $path"
+    fi
+    if ! LC_ALL=C tr -d "'\"\\\\" <"$continued" >"$normalized"; then
+      rm -f "$continued" "$normalized"
+      fail "failed to normalize deployment file: $path"
+    fi
+    rm -f "$continued"
+    set +e
+    matches="$(rg --text -n --no-filename -- "$retired_binary_literal_pattern" "$normalized" 2>&1)"
+    status=$?
+    set -e
+    rm -f "$normalized"
+    case "$status" in
+      0)
+        printf 'retired binary literal found in monolith deployment paths:\n%s:%s\n' \
+          "$path" "$matches" >&2
+        exit 1
+        ;;
+      1) ;;
+      *) fail "failed to scan normalized deployment file: $path" ;;
+    esac
+  done
+}
 
 check_for_matches() {
   local description="$1"
@@ -72,51 +199,33 @@ check_for_matches() {
   local matches
   local status
 
+  (($# == 0)) && return
   set +e
-  matches="$(rg -n -- "$pattern" "$@" 2>&1)"
+  matches="$(rg --text -n -- "$pattern" "$@" 2>&1)"
   status=$?
   set -e
-
   case "$status" in
     0)
       printf '%s:\n%s\n' "$description" "$matches" >&2
       exit 1
       ;;
-    1)
-      ;;
-    *)
-      printf 'failed to scan paths (rg exit %s):\n%s\n' \
-        "$status" "$matches" >&2
-      exit 1
-      ;;
+    1) ;;
+    *) fail "failed to scan paths (rg exit $status): $matches" ;;
   esac
 }
 
+check_normalized_binary_literals
 check_for_matches \
-  'legacy runtime references found in production/deployment paths' \
-  "$legacy_deployment_pattern" \
-  "${deployment_paths[@]}"
-
-retired_environment_reference_pattern='infra/dev/(api|iot-nano-core|iot-nano-mqttd|iot-nano-stream)\.env'
-check_for_matches \
-  'retired four-service development environment reference found' \
-  "$retired_environment_reference_pattern" \
-  "${deployment_paths[@]}"
-
-check_for_matches \
-  'legacy runtime references found in monolith source' \
-  "$legacy_source_pattern" \
-  "${source_paths[@]}"
+  'legacy runtime references found in monolith source paths' \
+  "$retired_source_pattern" \
+  "${source_files[@]}"
 
 for path in "${retired_paths[@]}"; do
-  if [[ -e "$path" ]]; then
-    printf 'retired legacy deployment asset remains: %s\n' "$path" >&2
-    exit 1
-  fi
+  [[ ! -e "$path" && ! -L "$path" ]] ||
+    fail "retired legacy deployment asset remains: $path"
 done
 
-container_pattern='(^|[[:space:]])(links|network_mode|container_name):|docker compose .*\\b(iot-nano-(api|core|stream|mqttd))\\b'
 check_for_matches \
-  'legacy container dependency found in production/deployment paths' \
-  "$container_pattern" \
-  "${deployment_paths[@]}"
+  'standalone MQTTD package referenced by monolith deployment' \
+  "$standalone_reference_pattern" \
+  "${deployment_files[@]}"

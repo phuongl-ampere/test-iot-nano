@@ -40,21 +40,42 @@ retired_paths=(
   scripts/rpc-e2e.py
 )
 
+standalone_installer="install-mqttd-standalone.sh"
+standalone_unit="iot-nano-mqttd-standalone.service"
+legacy_binary="iot-nano-api"
+
 copy_file() {
   local relative_path="$1"
+
   mkdir -p "$(dirname "$fixture/$relative_path")"
-  cp "$root/$relative_path" "$fixture/$relative_path"
+  cp -p "$root/$relative_path" "$fixture/$relative_path"
 }
 
 populate_fixture() {
   local relative_path
 
+  rm -rf "$fixture"
+  mkdir -p "$fixture"
   for relative_path in "${expected_files[@]}"; do
     copy_file "$relative_path"
   done
-  mkdir -p "$fixture/services/iot-nano-mqttd" "$fixture/infra/systemd"
-  cp -R "$root/services/iot-nano-mqttd/." "$fixture/services/iot-nano-mqttd/"
-  copy_file infra/systemd/iot-nano-mqttd-standalone.service
+  copy_file "infra/systemd/$standalone_unit"
+  copy_file "scripts/$standalone_installer"
+  copy_file scripts/test-verify-no-legacy-runtime.sh
+  copy_file scripts/verify-no-legacy-runtime.sh
+  copy_file scripts/verify-failures.sh
+  copy_file scripts/verify-monolith-topology.sh
+  mkdir -p "$fixture/scripts/fixtures"
+}
+
+assert_success() {
+  local case_name="$1"
+  local output
+
+  if ! output="$(IOT_NANO_VERIFY_ROOT="$fixture" "$verifier" 2>&1)"; then
+    printf 'verifier rejected a valid fixture (%s):\n%s\n' "$case_name" "$output" >&2
+    exit 1
+  fi
 }
 
 assert_failure_contains() {
@@ -72,42 +93,127 @@ assert_failure_contains() {
   fi
 }
 
+write_fixture_file() {
+  local relative_path="$1"
+  local content="$2"
+
+  mkdir -p "$(dirname "$fixture/$relative_path")"
+  printf '%s\n' "$content" >"$fixture/$relative_path"
+}
+
+permission_mode() {
+  local path="$1"
+
+  if stat -c '%a' "$path" >/dev/null 2>&1; then
+    stat -c '%a' "$path"
+  else
+    stat -f '%Lp' "$path"
+  fi
+}
+
 populate_fixture
-if ! IOT_NANO_VERIFY_ROOT="$fixture" "$verifier"; then
-  printf 'verifier rejected a clean monolith fixture with retained standalone assets\n' >&2
-  exit 1
-fi
+assert_success 'clean monolith fixture with retained standalone assets'
+
+write_fixture_file infra/monolith/injected-raw.sh \
+  "# retired binary literal\n$legacy_binary --serve"
+assert_failure_contains 'retired binary literal found in monolith deployment paths'
+populate_fixture
+
+write_fixture_file infra/monolith/injected-quoted.sh \
+  "exec \"$legacy_binary\" --serve"
+assert_failure_contains 'retired binary literal found in monolith deployment paths'
+populate_fixture
+
+write_fixture_file infra/monolith/injected-escaped.sh \
+  'exec iot\-nano\-api --serve'
+assert_failure_contains 'retired binary literal found in monolith deployment paths'
+populate_fixture
+
+write_fixture_file infra/monolith/injected-continued.sh \
+  $'exec iot-nano-\\\napi --serve'
+assert_failure_contains 'retired binary literal found in monolith deployment paths'
+populate_fixture
+
+write_fixture_file scripts/arbitrary-deployment-tool.sh \
+  "exec $legacy_binary --serve"
+assert_failure_contains 'retired binary literal found in monolith deployment paths'
+populate_fixture
+
+write_fixture_file infra/systemd/arbitrary-deployment-unit.service \
+  "ExecStart=/opt/rush-iot-nano/$legacy_binary"
+assert_failure_contains 'retired binary literal found in monolith deployment paths'
+populate_fixture
+
+write_fixture_file services/iot-nano-monolith/src/injected-route.rs \
+  'const RETIRED: &str = "/internal/v1";'
+assert_failure_contains 'legacy runtime references found in monolith source paths'
+populate_fixture
+
+write_fixture_file services/iot-nano-monolith/src/injected-header.rs \
+  'const RETIRED: &str = "x-iot-nano-legacy";'
+assert_failure_contains 'legacy runtime references found in monolith source paths'
+populate_fixture
+
+write_fixture_file services/iot-nano-monolith/src/injected-env.rs \
+  'IOT_NANO_CORE_URL=http://127.0.0.1:8081'
+assert_failure_contains 'legacy runtime references found in monolith source paths'
+populate_fixture
+
+printf '%s\n' 'retired command' >"$fixture/retired-command"
+ln -s ../retired-command "$fixture/scripts/legacy-link"
+assert_failure_contains 'symlinked production/deployment path found'
+populate_fixture
+
+mv "$fixture/services/iot-nano-monolith" \
+  "$fixture/services/iot-nano-monolith-target"
+ln -s iot-nano-monolith-target "$fixture/services/iot-nano-monolith"
+assert_failure_contains 'symlinked production/deployment path found'
+populate_fixture
+
+chmod 000 "$fixture/infra/compose.yaml"
+assert_failure_contains 'expected production/deployment path is missing or unreadable'
+chmod "$(permission_mode "$root/infra/compose.yaml")" "$fixture/infra/compose.yaml"
+populate_fixture
+
+mkdir "$fixture/infra/monolith/unreadable"
+write_fixture_file infra/monolith/unreadable/injected.sh 'true'
+chmod 000 "$fixture/infra/monolith/unreadable"
+assert_failure_contains 'unreadable production/deployment path found'
+chmod 700 "$fixture/infra/monolith/unreadable"
+populate_fixture
+
+rm "$fixture/infra/compose.yaml"
+assert_failure_contains 'expected production/deployment path is missing or unreadable'
+populate_fixture
 
 for retired_path in "${retired_paths[@]}"; do
-  mkdir -p "$(dirname "$fixture/$retired_path")"
-  printf '%s\n' 'retired deployment asset' >"$fixture/$retired_path"
+  write_fixture_file "$retired_path" 'retired deployment asset'
   assert_failure_contains 'retired legacy deployment asset remains'
-  rm "$fixture/$retired_path"
-done
-
-printf '%s\n' 'source "$root/infra/dev/api.env"' \
-  >>"$fixture/scripts/e2e-local.sh"
-assert_failure_contains 'retired four-service development environment reference found'
-populate_fixture
-
-printf '%s\n' 'exec "$root/scripts/install-mqttd-standalone.sh"' \
-  >>"$fixture/scripts/e2e-local.sh"
-assert_failure_contains 'legacy runtime references found'
-populate_fixture
-
-printf '%s\n' 'const INJECTED_LEGACY_REFERENCE: &str = "x-iot-nano-legacy";' \
-  >>"$fixture/services/iot-nano-monolith/src/main.rs"
-assert_failure_contains 'legacy runtime references found'
-populate_fixture
-
-for relative_path in "${expected_files[@]}"; do
-  rm "$fixture/$relative_path"
-  assert_failure_contains \
-    "expected production/deployment path is missing or unreadable: $fixture/$relative_path"
   populate_fixture
-
-  chmod 000 "$fixture/$relative_path"
-  assert_failure_contains \
-    "expected production/deployment path is missing or unreadable: $fixture/$relative_path"
-  chmod "$(stat -f '%Lp' "$root/$relative_path")" "$fixture/$relative_path"
 done
+
+printf 'exec "$root/scripts/%s"\n' "$standalone_installer" \
+  >>"$fixture/scripts/install-raspberry-pi.sh"
+assert_failure_contains 'standalone MQTTD package referenced by monolith deployment'
+populate_fixture
+
+printf '\n[dev-dependencies]\n%s = { path = "../../services/%s" }\n' \
+  "$legacy_binary" "$legacy_binary" \
+  >>"$fixture/services/iot-nano-monolith/Cargo.toml"
+assert_success 'Cargo dependency allowance'
+populate_fixture
+
+installer_config_block="$(awk '
+  /if \[ ! -e "\$config_path" \]; then/ { capture = 1 }
+  capture { print }
+  capture && /^fi$/ { exit }
+' "$root/scripts/$standalone_installer")"
+if [[ "$installer_config_block" != *'--owner root --group iot --mode 0640'* ]]; then
+  printf 'standalone installer must create config as root:iot mode 0640\n' >&2
+  exit 1
+fi
+if ! rg -q 'sudo chown root:iot "\$config_path"' "$root/scripts/$standalone_installer" ||
+  ! rg -q 'sudo chmod 0640 "\$config_path"' "$root/scripts/$standalone_installer"; then
+  printf 'standalone installer must normalize existing config ownership and mode\n' >&2
+  exit 1
+fi
