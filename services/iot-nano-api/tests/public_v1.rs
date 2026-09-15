@@ -1508,6 +1508,106 @@ async fn public_resource_grants_support_crud_for_a_managed_asset() {
 }
 
 #[tokio::test]
+async fn public_grant_list_and_get_apply_authorization_read_after_visibility_pagination() {
+    let (_directory, store, app) = public_app().await;
+    let viewer_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'viewer'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let hidden_first = Uuid::from_u128(1);
+    let hidden_second = Uuid::from_u128(2);
+    let visible_first = Uuid::from_u128(3);
+    let visible_second = Uuid::from_u128(4);
+    for (id, created_by_user_id, grantee_id) in [
+        (hidden_first, &admin_id, "public-grant-hidden-app-one"),
+        (hidden_second, &admin_id, "public-grant-hidden-app-two"),
+        (visible_first, &viewer_id, "public-grant-visible-app-one"),
+        (visible_second, &viewer_id, "public-grant-visible-app-two"),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_grants
+                (id, resource_type, resource_id, grantee_type, grantee_id, permission,
+                 created_by_user_id)
+             VALUES (?, 'device', 'public-grant-page-device', 'application', ?, 'viewer', ?)",
+        )
+        .bind(id.to_string())
+        .bind(grantee_id)
+        .bind(created_by_user_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+    let token = oauth_bearer_token(&app, "authorization:read").await;
+
+    let hidden_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/resource-grants/{hidden_first}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(hidden_get, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let first_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/resource-grants?limit=1")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page: Value =
+        serde_json::from_slice(&to_bytes(first_page.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(first_page["items"][0]["id"], visible_first.to_string());
+    assert_eq!(first_page["has_more"], true);
+    let cursor = first_page["next_cursor"].as_str().unwrap().to_owned();
+
+    let second_page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/resource-grants?limit=1&after={cursor}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_page: Value =
+        serde_json::from_slice(&to_bytes(second_page.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(second_page["items"][0]["id"], visible_second.to_string());
+    assert_eq!(second_page["has_more"], false);
+    assert!(second_page["next_cursor"].is_null());
+
+    let visible_get = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/resource-grants/{visible_first}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(visible_get.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn public_alerts_list_detail_and_acknowledge_follow_device_authorization() {
     let (_directory, store, app) = public_app().await;
     let viewer_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'viewer'")

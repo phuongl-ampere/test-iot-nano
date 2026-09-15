@@ -1313,48 +1313,208 @@ async fn list_public_grants(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicResourceGrant>, PlatformStoreError> {
-    let rows = match store {
+    match store {
         PlatformStore::Sqlite(store) => {
+            let user_id = principal.user_id.map(|id| id.to_string());
             let rows = sqlx::query(
                 "SELECT id, resource_type, resource_id, grantee_type, grantee_id, permission,
                         created_by_user_id, created_at, updated_at
-                 FROM resource_grants
-                 WHERE (? IS NULL OR id > ?)
+                 FROM resource_grants AS listed_grant
+                 WHERE (? IS NULL OR listed_grant.id > ?)
+                   AND (
+                       listed_grant.created_by_user_id = ?
+                       OR (listed_grant.grantee_type = 'application' AND listed_grant.grantee_id = ?)
+                       OR (listed_grant.grantee_type = 'user' AND listed_grant.grantee_id = ?)
+                       OR (
+                           listed_grant.resource_type = 'asset'
+                           AND (
+                               ? = 1
+                               OR EXISTS (
+                                   SELECT 1 FROM assets
+                                   WHERE assets.id = listed_grant.resource_id
+                                     AND assets.owner_user_id = ?
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_shares
+                                   WHERE resource_shares.resource_type = 'asset'
+                                     AND resource_shares.resource_id = listed_grant.resource_id
+                                     AND resource_shares.target_user_id = ?
+                                     AND resource_shares.state = 'active'
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_grants AS resource_grant
+                                   WHERE resource_grant.resource_type = 'asset'
+                                     AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.permission = 'manager'
+                                     AND (
+                                         (resource_grant.grantee_type = 'user'
+                                          AND resource_grant.grantee_id = ?)
+                                         OR (resource_grant.grantee_type = 'application'
+                                             AND resource_grant.grantee_id = ?)
+                                     )
+                               )
+                           )
+                       )
+                       OR (
+                           listed_grant.resource_type = 'device'
+                           AND EXISTS (
+                               SELECT 1 FROM devices
+                               WHERE devices.device_id = listed_grant.resource_id
+                                 AND devices.deleted_at IS NULL
+                           )
+                           AND (
+                               ? = 1
+                               OR EXISTS (
+                                   SELECT 1 FROM devices
+                                   WHERE devices.device_id = listed_grant.resource_id
+                                     AND devices.owner_user_id = ?
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_shares
+                                   WHERE resource_shares.resource_type = 'device'
+                                     AND resource_shares.resource_id = listed_grant.resource_id
+                                     AND resource_shares.target_user_id = ?
+                                     AND resource_shares.state = 'active'
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_grants AS resource_grant
+                                   WHERE resource_grant.resource_type = 'device'
+                                     AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.permission = 'manager'
+                                     AND (
+                                         (resource_grant.grantee_type = 'user'
+                                          AND resource_grant.grantee_id = ?)
+                                         OR (resource_grant.grantee_type = 'application'
+                                             AND resource_grant.grantee_id = ?)
+                                     )
+                               )
+                           )
+                       )
+                   )
                  ORDER BY id LIMIT ?",
             )
             .bind(after)
             .bind(after)
+            .bind(&user_id)
+            .bind(&principal.app_id)
+            .bind(&user_id)
+            .bind(i64::from(principal.account_class == AccountClass::Admin))
+            .bind(&user_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .bind(&principal.app_id)
+            .bind(i64::from(principal.account_class == AccountClass::Admin))
+            .bind(&user_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .bind(&principal.app_id)
             .bind(i64::from(limit))
             .fetch_all(store.pool())
             .await?;
             rows.into_iter()
                 .map(sqlite_grant_record)
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
                 "SELECT id, resource_type, resource_id, grantee_type, grantee_id, permission,
                         created_by_user_id, created_at, updated_at
-                 FROM resource_grants
-                 WHERE ($1::uuid IS NULL OR id > $1)
-                 ORDER BY id LIMIT $2",
+                 FROM resource_grants AS listed_grant
+                 WHERE ($1::uuid IS NULL OR listed_grant.id > $1)
+                   AND (
+                       listed_grant.created_by_user_id = $2
+                       OR (listed_grant.grantee_type = 'application' AND listed_grant.grantee_id = $3)
+                       OR (listed_grant.grantee_type = 'user' AND listed_grant.grantee_id = $4::text)
+                       OR (
+                           listed_grant.resource_type = 'asset'
+                           AND (
+                               $5
+                               OR EXISTS (
+                                   SELECT 1 FROM assets
+                                   WHERE assets.id::text = listed_grant.resource_id
+                                     AND assets.owner_user_id = $6
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_shares
+                                   WHERE resource_shares.resource_type = 'asset'
+                                     AND resource_shares.resource_id = listed_grant.resource_id
+                                     AND resource_shares.target_user_id = $7
+                                     AND resource_shares.state = 'active'
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_grants AS resource_grant
+                                   WHERE resource_grant.resource_type = 'asset'
+                                     AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.permission = 'manager'
+                                     AND (
+                                         (resource_grant.grantee_type = 'user'
+                                          AND resource_grant.grantee_id = $8::text)
+                                         OR (resource_grant.grantee_type = 'application'
+                                             AND resource_grant.grantee_id = $9)
+                                     )
+                               )
+                           )
+                       )
+                       OR (
+                           listed_grant.resource_type = 'device'
+                           AND EXISTS (
+                               SELECT 1 FROM devices
+                               WHERE devices.device_id = listed_grant.resource_id
+                                 AND devices.deleted_at IS NULL
+                           )
+                           AND (
+                               $10
+                               OR EXISTS (
+                                   SELECT 1 FROM devices
+                                   WHERE devices.device_id = listed_grant.resource_id
+                                     AND devices.owner_user_id = $11
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_shares
+                                   WHERE resource_shares.resource_type = 'device'
+                                     AND resource_shares.resource_id = listed_grant.resource_id
+                                     AND resource_shares.target_user_id = $12
+                                     AND resource_shares.state = 'active'
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM resource_grants AS resource_grant
+                                   WHERE resource_grant.resource_type = 'device'
+                                     AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.permission = 'manager'
+                                     AND (
+                                         (resource_grant.grantee_type = 'user'
+                                          AND resource_grant.grantee_id = $13::text)
+                                         OR (resource_grant.grantee_type = 'application'
+                                             AND resource_grant.grantee_id = $14)
+                                     )
+                               )
+                           )
+                       )
+                   )
+                 ORDER BY id LIMIT $15",
             )
             .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
+            .bind(principal.user_id)
+            .bind(&principal.app_id)
+            .bind(principal.user_id)
+            .bind(principal.account_class == AccountClass::Admin)
+            .bind(principal.user_id)
+            .bind(principal.user_id)
+            .bind(principal.user_id)
+            .bind(&principal.app_id)
+            .bind(principal.account_class == AccountClass::Admin)
+            .bind(principal.user_id)
+            .bind(principal.user_id)
+            .bind(principal.user_id)
+            .bind(&principal.app_id)
             .bind(i64::from(limit))
             .fetch_all(pool)
             .await?;
             rows.into_iter()
                 .map(timescale_grant_record)
-                .collect::<Result<Vec<_>, _>>()?
-        }
-    };
-    let mut visible = Vec::new();
-    for grant in rows {
-        if public_grant_visible(store, principal, &grant).await? {
-            visible.push(grant);
+                .collect::<Result<Vec<_>, _>>()
         }
     }
-    Ok(visible)
 }
 
 async fn get_public_grant(

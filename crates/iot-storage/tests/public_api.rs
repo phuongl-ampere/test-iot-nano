@@ -91,6 +91,72 @@ async fn sqlite_public_repository_filters_assets_and_persists_grants() {
 }
 
 #[tokio::test]
+async fn sqlite_public_grant_pagination_filters_invisible_rows_before_limit() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let user_id = Uuid::now_v7();
+    let foreign_user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, 'public-grant-page-user', 'unused', 'viewer', 'user'),
+                (?, 'public-grant-page-foreign', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .bind(foreign_user_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let principal = PublicPrincipal {
+        user_id: Some(user_id),
+        app_id: "public-grant-page-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let hidden_first = Uuid::from_u128(1);
+    let hidden_second = Uuid::from_u128(2);
+    let visible_first = Uuid::from_u128(3);
+    let visible_second = Uuid::from_u128(4);
+    for (id, created_by_user_id, grantee_id) in [
+        (hidden_first, foreign_user_id, "foreign-grant-page-app-one"),
+        (hidden_second, foreign_user_id, "foreign-grant-page-app-two"),
+        (visible_first, user_id, "visible-grant-page-app-one"),
+        (visible_second, user_id, "visible-grant-page-app-two"),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_grants
+                (id, resource_type, resource_id, grantee_type, grantee_id, permission,
+                 created_by_user_id)
+             VALUES (?, 'device', 'public-grant-page-device', 'application', ?, 'viewer', ?)",
+        )
+        .bind(id.to_string())
+        .bind(grantee_id)
+        .bind(created_by_user_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let page = PublicApiRepository::list_public_grants(&store, &principal, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|grant| grant.id).collect::<Vec<_>>(),
+        [visible_first, visible_second]
+    );
+    let next_page = PublicApiRepository::list_public_grants(
+        &store,
+        &principal,
+        Some(&visible_first.to_string()),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        next_page.iter().map(|grant| grant.id).collect::<Vec<_>>(),
+        [visible_second]
+    );
+}
+
+#[tokio::test]
 async fn sqlite_public_device_permission_denies_active_shares_and_grants_for_deleted_devices() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
@@ -931,5 +997,117 @@ async fn timescale_public_assets_and_grants_require_matching_application_grants(
         PublicApiRepository::delete_public_asset(&store, &owning_application, asset.id)
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_grant_pagination_filters_invisible_rows_before_limit() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let unique = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
+    let foreign_user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'unused', 'viewer', 'user'),
+                ($3, $4, 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id)
+    .bind(format!("timescale-public-grant-page-user-{unique}"))
+    .bind(foreign_user_id)
+    .bind(format!("timescale-public-grant-page-foreign-{unique}"))
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let principal = PublicPrincipal {
+        user_id: Some(user_id),
+        app_id: format!("timescale-public-grant-page-app-{unique}"),
+        account_class: AccountClass::User,
+    };
+    let hidden_first = Uuid::now_v7();
+    let hidden_second = Uuid::now_v7();
+    let visible_first = Uuid::now_v7();
+    let visible_second = Uuid::now_v7();
+    for (id, created_by_user_id, grantee_id) in [
+        (
+            hidden_first,
+            foreign_user_id,
+            format!("timescale-public-grant-hidden-one-{unique}"),
+        ),
+        (
+            hidden_second,
+            foreign_user_id,
+            format!("timescale-public-grant-hidden-two-{unique}"),
+        ),
+        (
+            visible_first,
+            user_id,
+            format!("timescale-public-grant-visible-one-{unique}"),
+        ),
+        (
+            visible_second,
+            user_id,
+            format!("timescale-public-grant-visible-two-{unique}"),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_grants
+                (id, resource_type, resource_id, grantee_type, grantee_id, permission,
+                 created_by_user_id)
+             VALUES ($1, 'device', $2, 'application', $3, 'viewer', $4)",
+        )
+        .bind(id)
+        .bind(format!("timescale-public-grant-page-device-{unique}"))
+        .bind(grantee_id)
+        .bind(created_by_user_id)
+        .execute(store.timescale_pool().unwrap())
+        .await
+        .unwrap();
+    }
+
+    let page = PublicApiRepository::list_public_grants(
+        &store,
+        &principal,
+        Some(&hidden_first.to_string()),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        page.iter().map(|grant| grant.id).collect::<Vec<_>>(),
+        [visible_first, visible_second]
+    );
+    let next_page = PublicApiRepository::list_public_grants(
+        &store,
+        &principal,
+        Some(&visible_first.to_string()),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        next_page.iter().map(|grant| grant.id).collect::<Vec<_>>(),
+        [visible_second]
     );
 }
