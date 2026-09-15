@@ -4,7 +4,10 @@ use iot_storage::{
     PublicApiRepository, PublicPrincipal, ResourcePermission,
 };
 use serde_json::json;
+use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
+
+mod common;
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -313,6 +316,18 @@ async fn sqlite_public_device_repository_hides_unknown_inaccessible_and_deleted_
 async fn timescale_public_repository_creates_and_reads_an_asset() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
         storage: DatabaseStorage::Timescale,
         database_url: Some(database_url),
@@ -369,6 +384,18 @@ async fn timescale_public_repository_creates_and_reads_an_asset() {
 async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
         storage: DatabaseStorage::Timescale,
         database_url: Some(database_url),
