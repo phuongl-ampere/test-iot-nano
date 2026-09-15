@@ -1,4 +1,4 @@
-use std::{io, time::Instant};
+use std::{io, path::PathBuf, time::Instant};
 
 use clap::Parser;
 use iot_nano_monolith::{MonolithConfig, MonolithRuntime};
@@ -20,7 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if arguments.migrate_only {
         let storage = MonolithConfig::storage_from_env()?;
-        MonolithRuntime::migrate(&storage).await?;
+        let internal_dir = std::env::var_os("IOT_NANO_INTERNAL_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        MonolithRuntime::migrate(&storage, internal_dir.as_deref()).await?;
         return Ok(());
     }
 

@@ -64,11 +64,21 @@ impl MonolithRuntime {
         crate::management::bootstrap_admin(&platform, username, password).await
     }
 
-    pub async fn migrate(storage: &StorageConfiguration) -> Result<(), StartupError> {
+    pub async fn migrate(
+        storage: &StorageConfiguration,
+        internal_dir: Option<&Path>,
+    ) -> Result<(), StartupError> {
+        let internal_directory = internal_dir.map(prepare_internal_directory).transpose()?;
+        let instance_lock = internal_directory
+            .as_ref()
+            .map(InstanceLock::acquire)
+            .transpose()?;
         let platform = PlatformStore::open(storage)
             .await
             .map_err(StartupError::PlatformMigration)?;
         drop(platform);
+        drop(instance_lock);
+        drop(internal_directory);
         Ok(())
     }
 

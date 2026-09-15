@@ -54,14 +54,21 @@ IOT_NANO_INTERNAL_DIR=/var/lib/iot-nano/internal
 ```
 
 The platform volume contains platform data. The internal directory is separate
-and contains exactly these monolith-owned files:
+and contains exactly these monolith-owned state entries:
 
 ```text
+.iot-nano-monolith-state
 stream.sqlite
 mqttd.sqlite
 cache.sqlite
 instance.lock
 ```
+
+`.iot-nano-monolith-state` is the required owner-only marker for a dedicated
+monolith internal-state directory. It establishes that the directory belongs
+to this topology before the process opens the three internal SQLite databases
+or acquires `instance.lock`. Do not delete, replace, or copy the directory
+without this marker.
 
 Timescale mode requires `IOT_NANO_STORAGE=timescale` and `DATABASE_URL`. It
 uses only the internal-state volume locally; do not set
@@ -126,11 +133,26 @@ in the persistent environment file.
 This section applies only after a monolith has already been deployed. It is
 not a path for importing four-service state.
 
-Before an upgrade, stop the single monolith instance and create verified,
-timestamped backups of the complete platform volume and the complete internal
-state directory. For SQLite, stop the process before copying files so WAL
-state is included. For TimescaleDB, record a tested restore point or backup.
-Keep the previous binary and environment file available.
+Use `infra/monolith/migrate.sh` for Compose-managed upgrades. It stops the
+monolith before migration, then creates and verifies an owner-only,
+timestamped paired backup directory. In SQLite mode, each directory contains
+`platform-state.tar.gz`, `internal-state.tar.gz`, and a matching manifest.
+The archives cover the complete platform volume and the complete internal
+state directory, including the ownership marker, three SQLite databases, and
+instance lock. Keep the previous binary and environment file available.
+
+Set an owner-only destination outside the source checkout in production:
+
+```bash
+IOT_NANO_MONOLITH_BACKUP_DIR=/var/backups/iot-nano/monolith \
+  infra/monolith/migrate.sh
+```
+
+For TimescaleDB, provide an executable `TIMESCALE_BACKUP_COMMAND`. The script
+passes it one destination path inside the paired backup directory; it must
+create a nonempty restore-point file or directory there. The script archives
+and verifies internal state only after the restore point exists. The callback
+output is suppressed so it cannot disclose connection data.
 
 The safe upgrade order is:
 
@@ -142,18 +164,21 @@ stop -> backup platform and internal state -> install new binary
 If the new monolith fails before readiness:
 
 ```bash
-systemctl stop iot-nano-monolith.service
-# Restore the matching pre-migration platform and internal-state backups.
-# Install the previous monolith binary and its matching environment file.
-systemctl start iot-nano-monolith.service
-curl --fail http://127.0.0.1:8080/readyz
+ROLLBACK_BACKUP_DIR=/var/backups/iot-nano/monolith/<timestamp-and-pid> \
+  infra/monolith/rollback.sh
 ```
 
-Do not resume traffic against a partial migration. A rollback requires a
-matching pre-migration backup or a verified Timescale restore point; it is not
-the deletion of selected SQLite files. Restore the platform and internal
-state together so stream offsets, MQTT sessions, cache checkpoints, and
-platform records remain consistent.
+`rollback.sh` refuses individual SQLite files and requires the matched
+platform plus internal-state archives from one manifest before it stops the
+service. It verifies archive safety, restores both complete states while the
+monolith is stopped, and restarts only after restoration succeeds.
+
+For a Timescale rollback, set `IOT_NANO_TIMESCALE_COMPOSE=1`, provide the same
+paired backup directory, and set `TIMESCALE_RESTORE_COMMAND` to an executable
+that accepts the stored restore-point path as its single argument. The script
+requires both the restore point and internal-state archive, validates them
+before stopping, suppresses callback output, and does not restart after a
+failed restore. Do not resume traffic against a partial migration.
 
 ## Service Hardening
 
