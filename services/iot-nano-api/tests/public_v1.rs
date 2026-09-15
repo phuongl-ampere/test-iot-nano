@@ -161,10 +161,13 @@ async fn public_app_with_core() -> (tempfile::TempDir, SqliteStore, axum::Router
             client_id: CLIENT_ID.parse().unwrap(),
             redirect_uris: vec![REDIRECT_URI.parse().unwrap()],
             allowed_scopes: vec![
+                "assets:read".to_owned(),
+                "assets:write".to_owned(),
                 "devices:read".to_owned(),
                 "devices:write".to_owned(),
                 "commands:write".to_owned(),
                 "commands:read".to_owned(),
+                "authorization:read".to_owned(),
                 "authorization:write".to_owned(),
             ],
             enabled: true,
@@ -545,7 +548,7 @@ async fn public_device_mutations_deny_unknown_and_inaccessible_targets_without_d
 }
 
 #[tokio::test]
-async fn application_clients_require_device_resource_grants_for_guessed_ids() {
+async fn application_clients_require_matching_resource_grants_for_devices_assets_and_commands() {
     const OWNER_APP_ID: &str = "public-v1-app";
     const OWNER_CLIENT_SECRET: &str = "public-v1-owner-client-secret";
     const GUEST_APP_ID: &str = "public-v1-guest-app";
@@ -573,9 +576,13 @@ async fn application_clients_require_device_resource_grants_for_guessed_ids() {
             client_id: GUEST_CLIENT_ID.parse().unwrap(),
             redirect_uris: vec!["https://guest.example.test/callback".parse().unwrap()],
             allowed_scopes: vec![
+                "assets:read".to_owned(),
+                "assets:write".to_owned(),
                 "devices:read".to_owned(),
                 "devices:write".to_owned(),
+                "commands:read".to_owned(),
                 "commands:write".to_owned(),
+                "authorization:read".to_owned(),
                 "authorization:write".to_owned(),
             ],
             enabled: true,
@@ -742,6 +749,7 @@ async fn application_clients_require_device_resource_grants_for_guessed_ids() {
     let owner_command_token =
         client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "commands%3Awrite").await;
     let owner_command = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -757,6 +765,363 @@ async fn application_clients_require_device_resource_grants_for_guessed_ids() {
         .await
         .unwrap();
     assert_eq!(owner_command.status(), StatusCode::ACCEPTED);
+    let owner_command: Value = serde_json::from_slice(
+        &to_bytes(owner_command.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let command_id = owner_command["id"].as_str().unwrap().to_owned();
+
+    let guest_command_read_token = client_credentials_token(
+        &app,
+        GUEST_CLIENT_ID,
+        GUEST_CLIENT_SECRET,
+        "commands%3Aread",
+    )
+    .await;
+    let guest_command_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/commands/{command_id}"))
+                .header(AUTHORIZATION, format!("Bearer {guest_command_read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(guest_command_read, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let owner_command_read_token =
+        client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "commands%3Aread").await;
+    let owner_command_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/commands/{command_id}"))
+                .header(AUTHORIZATION, format!("Bearer {owner_command_read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_command_read.status(), StatusCode::OK);
+    let owner_command_read: Value = serde_json::from_slice(
+        &to_bytes(owner_command_read.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(owner_command_read["id"], command_id);
+
+    let owner_asset_write_token =
+        client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "assets%3Awrite").await;
+    let create_asset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/assets")
+                .header(AUTHORIZATION, format!("Bearer {owner_asset_write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"application-owned-asset","metadata":{"zone":"lab"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_asset.status(), StatusCode::CREATED);
+    let created_asset: Value = serde_json::from_slice(
+        &to_bytes(create_asset.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let asset_id = created_asset["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT permission FROM resource_grants
+             WHERE resource_type = 'asset' AND resource_id = ?
+               AND grantee_type = 'application' AND grantee_id = ?",
+        )
+        .bind(&asset_id)
+        .bind(OWNER_APP_ID)
+        .fetch_one(store.pool())
+        .await
+        .unwrap(),
+        "manager"
+    );
+
+    let guest_asset_read_token =
+        client_credentials_token(&app, GUEST_CLIENT_ID, GUEST_CLIENT_SECRET, "assets%3Aread").await;
+    let guest_asset_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(AUTHORIZATION, format!("Bearer {guest_asset_read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(guest_asset_read, StatusCode::FORBIDDEN, "forbidden").await;
+    let guest_asset_list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/assets")
+                .header(AUTHORIZATION, format!("Bearer {guest_asset_read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guest_asset_list.status(), StatusCode::OK);
+    let guest_asset_list: Value = serde_json::from_slice(
+        &to_bytes(guest_asset_list.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !guest_asset_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == asset_id)
+    );
+
+    let guest_asset_write_token =
+        client_credentials_token(&app, GUEST_CLIENT_ID, GUEST_CLIENT_SECRET, "assets%3Awrite")
+            .await;
+    let guest_asset_update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(AUTHORIZATION, format!("Bearer {guest_asset_write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"metadata":{"zone":"guest"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(guest_asset_update, StatusCode::FORBIDDEN, "forbidden").await;
+    let guest_asset_grant = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/resource-grants")
+                .header(AUTHORIZATION, format!("Bearer {guest_authorization_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"resource_type":"asset","resource_id":"{asset_id}","grantee_type":"application","grantee_id":"{GUEST_APP_ID}","permission":"viewer"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(guest_asset_grant, StatusCode::FORBIDDEN, "forbidden").await;
+    let guest_asset_delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(AUTHORIZATION, format!("Bearer {guest_asset_write_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(guest_asset_delete, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let owner_asset_read_token =
+        client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "assets%3Aread").await;
+    let owner_asset_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(AUTHORIZATION, format!("Bearer {owner_asset_read_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_asset_read.status(), StatusCode::OK);
+    let owner_asset_update = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(AUTHORIZATION, format!("Bearer {owner_asset_write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"metadata":{"zone":"office"}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_asset_update.status(), StatusCode::OK);
+    let owner_asset_update: Value = serde_json::from_slice(
+        &to_bytes(owner_asset_update.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(owner_asset_update["metadata"]["zone"], "office");
+
+    let owner_authorization_write_token = client_credentials_token(
+        &app,
+        CLIENT_ID,
+        OWNER_CLIENT_SECRET,
+        "authorization%3Awrite",
+    )
+    .await;
+    let owner_asset_grant = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/resource-grants")
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {owner_authorization_write_token}"),
+                )
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"resource_type":"asset","resource_id":"{asset_id}","grantee_type":"application","grantee_id":"public-v1-grant-recipient","permission":"viewer"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_asset_grant.status(), StatusCode::CREATED);
+    let owner_asset_grant: Value = serde_json::from_slice(
+        &to_bytes(owner_asset_grant.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let grant_id = owner_asset_grant["id"].as_str().unwrap().to_owned();
+
+    let owner_authorization_read_token =
+        client_credentials_token(&app, CLIENT_ID, OWNER_CLIENT_SECRET, "authorization%3Aread")
+            .await;
+    let owner_grant_list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/resource-grants")
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {owner_authorization_read_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_grant_list.status(), StatusCode::OK);
+    let owner_grant_list: Value = serde_json::from_slice(
+        &to_bytes(owner_grant_list.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        owner_grant_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == grant_id)
+    );
+    let owner_grant_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/resource-grants/{grant_id}"))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {owner_authorization_read_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_grant_get.status(), StatusCode::OK);
+
+    let guest_authorization_read_token = client_credentials_token(
+        &app,
+        GUEST_CLIENT_ID,
+        GUEST_CLIENT_SECRET,
+        "authorization%3Aread",
+    )
+    .await;
+    let guest_grant_list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/resource-grants")
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {guest_authorization_read_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guest_grant_list.status(), StatusCode::OK);
+    let guest_grant_list: Value = serde_json::from_slice(
+        &to_bytes(guest_grant_list.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !guest_grant_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == grant_id)
+    );
+    let guest_grant_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/resource-grants/{grant_id}"))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {guest_authorization_read_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(guest_grant_get, StatusCode::FORBIDDEN, "forbidden").await;
+
+    let owner_asset_delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(AUTHORIZATION, format!("Bearer {owner_asset_write_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner_asset_delete.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]

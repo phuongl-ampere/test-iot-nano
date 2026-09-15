@@ -284,6 +284,189 @@ async fn sqlite_public_device_permission_requires_an_application_grant() {
 }
 
 #[tokio::test]
+async fn sqlite_public_assets_and_grants_require_matching_application_grants() {
+    let (_directory, store) = sqlite_store().await;
+    let owning_application = PublicPrincipal {
+        user_id: None,
+        app_id: "public-asset-owning-application".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let other_application = PublicPrincipal {
+        user_id: None,
+        app_id: "public-asset-other-application".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let asset = PublicApiRepository::create_public_asset(
+        &store,
+        &owning_application,
+        NewPublicAsset {
+            name: "public-application-owned-asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({"zone":"lab"}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PublicApiRepository::public_asset_permission(&store, &owning_application, asset.id)
+            .await
+            .unwrap(),
+        Some(ResourcePermission::Manager)
+    );
+    assert_eq!(
+        PublicApiRepository::public_asset_permission(&store, &other_application, asset.id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        PublicApiRepository::get_public_asset(&store, &owning_application, asset.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        asset.id
+    );
+    assert_eq!(
+        PublicApiRepository::list_public_assets(&store, &owning_application, None, 10)
+            .await
+            .unwrap(),
+        [asset.clone()]
+    );
+    assert!(
+        PublicApiRepository::list_public_assets(&store, &other_application, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let denied_asset = NewPublicAsset {
+        name: "other application update".to_owned(),
+        asset_profile_id: None,
+        parent_asset_id: None,
+        metadata: json!({"zone":"guest"}),
+    };
+    assert!(
+        PublicApiRepository::update_public_asset(
+            &store,
+            &other_application,
+            asset.id,
+            denied_asset,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        !PublicApiRepository::delete_public_asset(&store, &other_application, asset.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        PublicApiRepository::get_public_asset(&store, &other_application, asset.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let grant_request = NewPublicResourceGrant {
+        resource_type: "asset".to_owned(),
+        resource_id: asset.id.to_string(),
+        grantee_type: "application".to_owned(),
+        grantee_id: "public-asset-recipient-application".to_owned(),
+        permission: "viewer".to_owned(),
+    };
+    assert!(
+        PublicApiRepository::create_public_grant(
+            &store,
+            &other_application,
+            grant_request.clone(),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let grant = PublicApiRepository::create_public_grant(
+        &store,
+        &owning_application,
+        grant_request.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        PublicApiRepository::get_public_grant(&store, &owning_application, grant.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        grant.id
+    );
+    assert!(
+        PublicApiRepository::list_public_grants(&store, &owning_application, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.id == grant.id)
+    );
+    assert!(
+        PublicApiRepository::get_public_grant(&store, &other_application, grant.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        PublicApiRepository::list_public_grants(&store, &other_application, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        PublicApiRepository::update_public_grant(
+            &store,
+            &other_application,
+            grant.id,
+            NewPublicResourceGrant {
+                permission: "manager".to_owned(),
+                ..grant_request.clone()
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        !PublicApiRepository::delete_public_grant(&store, &other_application, grant.id)
+            .await
+            .unwrap()
+    );
+
+    let updated_asset = PublicApiRepository::update_public_asset(
+        &store,
+        &owning_application,
+        asset.id,
+        NewPublicAsset {
+            name: "public-application-owned-asset-updated".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({"zone":"office"}),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(updated_asset.metadata, json!({"zone":"office"}));
+    assert!(
+        PublicApiRepository::delete_public_asset(&store, &owning_application, asset.id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_public_device_repository_hides_unknown_inaccessible_and_deleted_mutations() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
@@ -580,5 +763,173 @@ async fn timescale_public_device_permission_requires_an_application_grant() {
         .await
         .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_assets_and_grants_require_matching_application_grants() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let unique = Uuid::now_v7();
+    let owning_application = PublicPrincipal {
+        user_id: None,
+        app_id: format!("timescale-public-asset-owner-{unique}"),
+        account_class: AccountClass::User,
+    };
+    let other_application = PublicPrincipal {
+        user_id: None,
+        app_id: format!("timescale-public-asset-other-{unique}"),
+        account_class: AccountClass::User,
+    };
+    let asset = PublicApiRepository::create_public_asset(
+        &store,
+        &owning_application,
+        NewPublicAsset {
+            name: format!("timescale-public-application-asset-{unique}"),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({"backend":"timescale"}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PublicApiRepository::public_asset_permission(&store, &owning_application, asset.id)
+            .await
+            .unwrap(),
+        Some(ResourcePermission::Manager)
+    );
+    assert_eq!(
+        PublicApiRepository::public_asset_permission(&store, &other_application, asset.id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        PublicApiRepository::list_public_assets(&store, &other_application, None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        PublicApiRepository::update_public_asset(
+            &store,
+            &other_application,
+            asset.id,
+            NewPublicAsset {
+                name: format!("timescale-guest-update-{unique}"),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        !PublicApiRepository::delete_public_asset(&store, &other_application, asset.id)
+            .await
+            .unwrap()
+    );
+
+    let grant_request = NewPublicResourceGrant {
+        resource_type: "asset".to_owned(),
+        resource_id: asset.id.to_string(),
+        grantee_type: "application".to_owned(),
+        grantee_id: format!("timescale-public-asset-recipient-{unique}"),
+        permission: "viewer".to_owned(),
+    };
+    assert!(
+        PublicApiRepository::create_public_grant(
+            &store,
+            &other_application,
+            grant_request.clone(),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let grant = PublicApiRepository::create_public_grant(
+        &store,
+        &owning_application,
+        grant_request.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        PublicApiRepository::get_public_grant(&store, &owning_application, grant.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        grant.id
+    );
+    assert!(
+        PublicApiRepository::list_public_grants(&store, &owning_application, None, 100)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.id == grant.id)
+    );
+    assert!(
+        PublicApiRepository::get_public_grant(&store, &other_application, grant.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        PublicApiRepository::list_public_grants(&store, &other_application, None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        PublicApiRepository::update_public_grant(
+            &store,
+            &other_application,
+            grant.id,
+            NewPublicResourceGrant {
+                permission: "manager".to_owned(),
+                ..grant_request.clone()
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        !PublicApiRepository::delete_public_grant(&store, &other_application, grant.id)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        PublicApiRepository::delete_public_asset(&store, &owning_application, asset.id)
+            .await
+            .unwrap()
     );
 }

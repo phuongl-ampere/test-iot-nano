@@ -1261,7 +1261,9 @@ async fn public_grant_visible(
     principal: &PublicPrincipal,
     grant: &PublicResourceGrant,
 ) -> Result<bool, PlatformStoreError> {
-    if grant.created_by_user_id == principal.user_id
+    if principal
+        .user_id
+        .is_some_and(|user_id| grant.created_by_user_id == Some(user_id))
         || (grant.grantee_type == "application" && grant.grantee_id == principal.app_id)
         || (grant.grantee_type == "user"
             && principal
@@ -1567,8 +1569,10 @@ async fn public_asset_permission(
             .fetch_optional(store.pool())
             .await?
             .flatten();
-            if principal.user_id.map(|id| id.to_string()) == owner {
-                return Ok(Some(ResourcePermission::Owner));
+            if let (Some(user_id), Some(owner)) = (principal.user_id, owner) {
+                if user_id.to_string() == owner {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
             }
             let user_id = principal.user_id.map(|id| id.to_string());
             let rows = sqlx::query_scalar::<_, String>(
@@ -1598,8 +1602,10 @@ async fn public_asset_permission(
             .fetch_optional(pool)
             .await?
             .flatten();
-            if principal.user_id == owner {
-                return Ok(Some(ResourcePermission::Owner));
+            if let (Some(user_id), Some(owner)) = (principal.user_id, owner) {
+                if user_id == owner {
+                    return Ok(Some(ResourcePermission::Owner));
+                }
             }
             let rows = sqlx::query_scalar::<_, String>(
                 "SELECT permission FROM resource_shares
