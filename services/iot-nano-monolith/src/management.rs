@@ -40,6 +40,13 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
+use tokio::sync::Notify;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use tokio::sync::Barrier;
+
 const SESSION_COOKIE: &str = "iot_nano_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
@@ -185,6 +192,9 @@ impl ManagementSessionRouter {
             session_verifier: Arc::clone(&session_verifier),
             token_vault,
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
+            authorization_gate: Arc::new(ManagementAuthorizationGate::default()),
+            #[cfg(test)]
+            authorization_test_hooks: None,
         };
         let router = Router::new()
             .route("/api/auth/login", post(login))
@@ -330,6 +340,188 @@ struct ManagementState {
     session_verifier: Arc<ManagementSessionVerifier>,
     token_vault: TokenVault,
     login_limiter: Arc<Mutex<LoginRateLimiter>>,
+    authorization_gate: Arc<ManagementAuthorizationGate>,
+    #[cfg(test)]
+    authorization_test_hooks: Option<Arc<ManagementAuthorizationTestHooks>>,
+}
+
+#[derive(Default)]
+struct ManagementAuthorizationGate {
+    state: Mutex<ManagementAuthorizationGateState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct ManagementAuthorizationGateState {
+    active_mutations: usize,
+    role_change_in_progress: bool,
+    role_version: u64,
+}
+
+impl ManagementAuthorizationGate {
+    async fn stable_role_version(&self) -> u64 {
+        loop {
+            let notified = self.changed.notified();
+            let role_version = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (!state.role_change_in_progress).then_some(state.role_version)
+            };
+            if let Some(role_version) = role_version {
+                return role_version;
+            }
+            notified.await;
+        }
+    }
+
+    fn issue_if_current(
+        &self,
+        expected_role_version: u64,
+        session_verifier: &ManagementSessionVerifier,
+        user_id: Uuid,
+        role: Role,
+    ) -> Option<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.role_change_in_progress || state.role_version != expected_role_version {
+            return None;
+        }
+        Some(session_verifier.issue(user_id, role))
+    }
+
+    async fn acquire_mutation(&self) -> ManagementMutationLease<'_> {
+        loop {
+            let notified = self.changed.notified();
+            let acquired = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !state.role_change_in_progress {
+                    state.active_mutations = state.active_mutations.saturating_add(1);
+                    true
+                } else {
+                    false
+                }
+            };
+            if acquired {
+                return ManagementMutationLease { gate: self };
+            }
+            notified.await;
+        }
+    }
+
+    async fn begin_role_change(&self) -> ManagementRoleChangeLease<'_> {
+        loop {
+            let notified = self.changed.notified();
+            let acquired = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !state.role_change_in_progress {
+                    state.role_change_in_progress = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if acquired {
+                break;
+            }
+            notified.await;
+        }
+
+        loop {
+            let notified = self.changed.notified();
+            let drained = {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .active_mutations
+                    == 0
+            };
+            if drained {
+                return ManagementRoleChangeLease {
+                    gate: self,
+                    finished: false,
+                };
+            }
+            notified.await;
+        }
+    }
+
+    fn finish_role_change(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .role_change_in_progress = false;
+        self.changed.notify_waiters();
+    }
+}
+
+struct ManagementMutationLease<'a> {
+    gate: &'a ManagementAuthorizationGate,
+}
+
+impl Drop for ManagementMutationLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active_mutations = state.active_mutations.saturating_sub(1);
+        let notify = state.active_mutations == 0;
+        drop(state);
+        if notify {
+            self.gate.changed.notify_waiters();
+        }
+    }
+}
+
+struct ManagementRoleChangeLease<'a> {
+    gate: &'a ManagementAuthorizationGate,
+    finished: bool,
+}
+
+impl ManagementRoleChangeLease<'_> {
+    fn commit(mut self, session_verifier: &ManagementSessionVerifier, user_id: Uuid) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.role_version = state.role_version.wrapping_add(1);
+        session_verifier.invalidate_user(user_id);
+        state.role_change_in_progress = false;
+        self.finished = true;
+        drop(state);
+        self.gate.changed.notify_waiters();
+    }
+}
+
+impl Drop for ManagementRoleChangeLease<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.gate.finish_role_change();
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ManagementAuthorizationTestHooks {
+    login_authenticated: Arc<Barrier>,
+    release_login: Arc<Barrier>,
+    mutation_authorized: Arc<Barrier>,
+    release_mutation: Arc<Barrier>,
+    pause_login: Arc<AtomicBool>,
+    pause_mutation: Arc<AtomicBool>,
 }
 
 struct Session {
@@ -566,23 +758,36 @@ async fn login(
     if !reserved {
         return Err(ManagementSessionError::TooManyRequests);
     }
-    let user = match authenticate(&state.store, &request).await {
-        Ok(user) => user,
-        Err(AuthError::AuthenticationFailed) => {
-            state
-                .login_limiter
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .record_failure(address);
-            return Err(ManagementSessionError::Unauthorized);
-        }
-        Err(_) => {
-            state
-                .login_limiter
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .release(address);
-            return Err(ManagementSessionError::Unavailable);
+    let (session_id, user_id) = loop {
+        let role_version = state.authorization_gate.stable_role_version().await;
+        let user = match authenticate(&state.store, &request).await {
+            Ok(user) => user,
+            Err(AuthError::AuthenticationFailed) => {
+                state
+                    .login_limiter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record_failure(address);
+                return Err(ManagementSessionError::Unauthorized);
+            }
+            Err(_) => {
+                state
+                    .login_limiter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .release(address);
+                return Err(ManagementSessionError::Unavailable);
+            }
+        };
+        #[cfg(test)]
+        pause_after_login_authentication(&state).await;
+        if let Some(session_id) = state.authorization_gate.issue_if_current(
+            role_version,
+            &state.session_verifier,
+            user.user_id,
+            user.role,
+        ) {
+            break (session_id, user.user_id);
         }
     };
     state
@@ -590,12 +795,9 @@ async fn login(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .record_success(address);
-    let session_id = state.session_verifier.issue(user.user_id, user.role);
     Ok((
         session_cookie_headers(&session_id),
-        Json(SessionResponse {
-            user_id: user.user_id,
-        }),
+        Json(SessionResponse { user_id }),
     ))
 }
 
@@ -641,6 +843,7 @@ async fn create_application(
     if request.launch_url.is_empty() || request.allowed_scopes.is_empty() {
         return Err(ManagementSessionError::BadRequest);
     }
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let application = ApplicationRepository::upsert_application(
         state.store.as_ref(),
         NewApplication {
@@ -689,6 +892,7 @@ async fn provision_device(
     if display_name.is_empty() || display_name.len() > 128 {
         return Err(ManagementSessionError::BadRequest);
     }
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let token = provision_platform_device_token(&state.store, &state.token_vault, display_name)
         .await
         .map_err(|_| ManagementSessionError::Unavailable)?;
@@ -712,10 +916,13 @@ async fn create_management_user(
 ) -> Result<(StatusCode, Json<ManagementUserResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
+    #[cfg(test)]
+    pause_after_mutation_authorization(&state).await;
     let request: CreateManagementUserRequest = management_request_json(&state, request).await?;
     validate_password(&request.password).map_err(|_| ManagementSessionError::BadRequest)?;
     let password_hash =
         hash_password(&request.password).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let user = ManagementUserRepository::create_management_user(
         state.store.as_ref(),
         CreateManagementUser {
@@ -743,21 +950,29 @@ async fn update_management_user(
         .as_deref()
         .map(management_user_role)
         .transpose()?;
-    let role_updated = role.is_some();
-    let user = ManagementUserRepository::update_management_user(
-        state.store.as_ref(),
-        &username,
-        UpdateManagementUser {
-            default_app: request.default_app,
-            granted_apps: request.granted_apps,
-            role,
-        },
-    )
-    .await
-    .map_err(management_user_error)?;
-    if role_updated {
-        state.session_verifier.invalidate_user(user.id);
+    let update = UpdateManagementUser {
+        default_app: request.default_app,
+        granted_apps: request.granted_apps,
+        role,
+    };
+    if update.role.is_some() {
+        let role_change = state.authorization_gate.begin_role_change().await;
+        require_management_admin(&state.session_verifier, &headers)?;
+        let user = ManagementUserRepository::update_management_user(
+            state.store.as_ref(),
+            &username,
+            update,
+        )
+        .await
+        .map_err(management_user_error)?;
+        role_change.commit(&state.session_verifier, user.id);
+        return Ok(Json(management_user_response(user)));
     }
+    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let user =
+        ManagementUserRepository::update_management_user(state.store.as_ref(), &username, update)
+            .await
+            .map_err(management_user_error)?;
     Ok(Json(management_user_response(user)))
 }
 
@@ -786,6 +1001,7 @@ async fn create_management_device_profile(
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
     let request: ManagementDeviceProfileRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let profile = ManagementDeviceProfileRepository::create_management_device_profile(
         state.store.as_ref(),
         CreateManagementDeviceProfile {
@@ -813,6 +1029,7 @@ async fn update_management_device_profile(
     let request: ManagementDeviceProfileRequest = management_request_json(&state, request).await?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let profile = ManagementDeviceProfileRepository::update_management_device_profile(
         state.store.as_ref(),
         profile_id,
@@ -836,6 +1053,7 @@ async fn delete_management_device_profile(
     require_management_admin(&state.session_verifier, &headers)?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     ManagementDeviceProfileRepository::delete_management_device_profile(
         state.store.as_ref(),
         profile_id,
@@ -870,6 +1088,7 @@ async fn create_management_asset_profile(
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
     let request: ManagementAssetProfileRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let profile = ManagementAssetProfileRepository::create_management_asset_profile(
         state.store.as_ref(),
         CreateManagementAssetProfile {
@@ -896,6 +1115,7 @@ async fn update_management_asset_profile(
     let request: ManagementAssetProfileRequest = management_request_json(&state, request).await?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let profile = ManagementAssetProfileRepository::update_management_asset_profile(
         state.store.as_ref(),
         profile_id,
@@ -918,6 +1138,7 @@ async fn delete_management_asset_profile(
     require_management_admin(&state.session_verifier, &headers)?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     ManagementAssetProfileRepository::delete_management_asset_profile(
         state.store.as_ref(),
         profile_id,
@@ -953,6 +1174,7 @@ async fn update_management_device(
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
     let request: UpdateManagementDeviceRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let device = ManagementDeviceRepository::update_management_device(
         state.store.as_ref(),
         &device_id,
@@ -978,6 +1200,7 @@ async fn delete_management_device(
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ManagementSessionError> {
     require_management_admin(&state.session_verifier, &headers)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     ManagementDeviceRepository::delete_management_device(state.store.as_ref(), &device_id)
         .await
         .map_err(management_device_error)?;
@@ -1002,6 +1225,7 @@ async fn create_management_asset(
     let headers = request.headers().clone();
     require_management_admin(&state.session_verifier, &headers)?;
     let request: ManagementAssetRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let asset = ManagementAssetRepository::create_management_asset(
         state.store.as_ref(),
         CreateManagementAsset {
@@ -1026,6 +1250,7 @@ async fn update_management_asset(
     require_management_admin(&state.session_verifier, &headers)?;
     let asset_id = Uuid::parse_str(&asset_id).map_err(|_| ManagementSessionError::BadRequest)?;
     let request: ManagementAssetRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let asset = ManagementAssetRepository::update_management_asset(
         state.store.as_ref(),
         asset_id,
@@ -1049,6 +1274,7 @@ async fn delete_management_asset(
 ) -> Result<StatusCode, ManagementSessionError> {
     require_management_admin(&state.session_verifier, &headers)?;
     let asset_id = Uuid::parse_str(&asset_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     ManagementAssetRepository::delete_management_asset(state.store.as_ref(), asset_id)
         .await
         .map_err(management_asset_error)?;
@@ -1227,6 +1453,15 @@ fn require_management_admin(
     }
 }
 
+async fn authorize_management_mutation<'a>(
+    state: &'a ManagementState,
+    headers: &HeaderMap,
+) -> Result<ManagementMutationLease<'a>, ManagementSessionError> {
+    let lease = state.authorization_gate.acquire_mutation().await;
+    require_management_admin(&state.session_verifier, headers)?;
+    Ok(lease)
+}
+
 async fn management_request_json<T>(
     state: &ManagementState,
     request: Request,
@@ -1258,6 +1493,7 @@ async fn create_device_token(
     Path(device_id): Path<String>,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
     require_management_admin(&state.session_verifier, &headers)?;
+    let _lease = authorize_management_mutation(&state, &headers).await?;
     let token = create_platform_device_token(&state.store, &state.token_vault, &device_id)
         .await
         .map_err(management_device_token_error)?;
@@ -1275,6 +1511,30 @@ async fn authenticate(
         .timescale_pool()
         .ok_or_else(|| AuthError::AuthenticationFailed)?;
     authenticate_credentials(pool, &request.username, &request.password).await
+}
+
+#[cfg(test)]
+async fn pause_after_login_authentication(state: &ManagementState) {
+    let Some(hooks) = &state.authorization_test_hooks else {
+        return;
+    };
+    if !hooks.pause_login.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    hooks.login_authenticated.wait().await;
+    hooks.release_login.wait().await;
+}
+
+#[cfg(test)]
+async fn pause_after_mutation_authorization(state: &ManagementState) {
+    let Some(hooks) = &state.authorization_test_hooks else {
+        return;
+    };
+    if !hooks.pause_mutation.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    hooks.mutation_authorized.wait().await;
+    hooks.release_mutation.wait().await;
 }
 
 fn session_id(headers: &HeaderMap) -> Option<&str> {
@@ -1349,9 +1609,136 @@ impl IntoResponse for ManagementSessionError {
 
 #[cfg(test)]
 mod unit_tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::{Arc, atomic::AtomicBool},
+    };
 
-    use super::{LoginRateLimiter, MAX_LOGIN_FAILURES};
+    use axum::{
+        Json,
+        body::Body,
+        extract::{ConnectInfo, Path, State},
+        http::{
+            HeaderMap, HeaderValue, Request,
+            header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
+        },
+    };
+    use iot_api::bootstrap_users_sqlite;
+    use iot_core::{DatabaseStorage, StorageConfiguration};
+    use iot_storage::{
+        CreateManagementUser, ManagementUserRepository, ManagementUserRole, PlatformStore,
+        UpdateManagementUser,
+    };
+    use tokio::sync::Barrier;
+
+    use super::{
+        LoginRateLimiter, LoginRequest, MAX_LOGIN_FAILURES, ManagementAuthorizationTestHooks,
+        ManagementSessionError, ManagementSessionVerifier, ManagementState, authenticate,
+        create_management_user, hash_password, login, require_management_admin,
+        update_management_user,
+    };
+
+    async fn management_state_with_admin_target(
+        hooks: Arc<ManagementAuthorizationTestHooks>,
+    ) -> (tempfile::TempDir, ManagementState, HeaderMap, HeaderMap) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            PlatformStore::open(&StorageConfiguration {
+                storage: DatabaseStorage::Sqlite,
+                database_url: None,
+                sqlite_path: Some(directory.path().join("platform.sqlite")),
+                sqlite_busy_timeout_ms: 5_000,
+            })
+            .await
+            .unwrap(),
+        );
+        bootstrap_users_sqlite(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        ManagementUserRepository::create_management_user(
+            store.as_ref(),
+            CreateManagementUser {
+                username: "alice".to_owned(),
+                password_hash: hash_password("AlicePassword@123").unwrap(),
+                default_app: "/apps/fleet".to_owned(),
+                granted_apps: vec!["fleet".to_owned()],
+            },
+        )
+        .await
+        .unwrap();
+        let alice = ManagementUserRepository::update_management_user(
+            store.as_ref(),
+            "alice",
+            UpdateManagementUser {
+                default_app: "/apps/fleet".to_owned(),
+                granted_apps: vec!["fleet".to_owned()],
+                role: Some(ManagementUserRole::Admin),
+            },
+        )
+        .await
+        .unwrap();
+        let session_verifier = Arc::new(ManagementSessionVerifier::default());
+        let state = ManagementState {
+            store,
+            session_verifier: Arc::clone(&session_verifier),
+            token_vault: super::TokenVault::from_key_material(
+                "management-session-linearization-test-vault-key-0001",
+            ),
+            login_limiter: Arc::new(std::sync::Mutex::new(LoginRateLimiter::default())),
+            authorization_gate: Arc::new(super::ManagementAuthorizationGate::default()),
+            authorization_test_hooks: Some(hooks),
+        };
+        let admin = authenticate(
+            state.store.as_ref(),
+            &LoginRequest {
+                username: "admin".to_owned(),
+                password: "NanoAdmin@1234".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let admin_headers = session_headers(session_verifier.issue(admin.user_id, admin.role));
+        let alice_headers = session_headers(session_verifier.issue(alice.id, super::Role::Admin));
+        (directory, state, admin_headers, alice_headers)
+    }
+
+    async fn demote_alice(state: ManagementState, admin_headers: HeaderMap) {
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/api/management/users/alice")
+            .header(CONTENT_TYPE, "application/json")
+            .header(COOKIE, admin_headers[COOKIE].clone())
+            .body(Body::from(
+                r#"{"default_app":"/apps/fleet","granted_apps":["fleet"],"role":"viewer"}"#,
+            ))
+            .unwrap();
+        assert!(
+            update_management_user(State(state), Path("alice".to_owned()), request)
+                .await
+                .is_ok()
+        );
+    }
+
+    fn session_headers(session_id: String) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&format!("iot_nano_session={session_id}")).unwrap(),
+        );
+        headers
+    }
+
+    fn session_headers_from_login(login_headers: &HeaderMap) -> HeaderMap {
+        let cookie = login_headers[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_str(cookie).unwrap());
+        headers
+    }
 
     #[test]
     fn login_limiter_reserves_in_flight_attempts_before_authentication() {
@@ -1362,5 +1749,90 @@ mod unit_tests {
             assert!(limiter.reserve(address));
         }
         assert!(!limiter.reserve(address));
+    }
+
+    #[tokio::test]
+    async fn login_racing_a_role_demotion_does_not_issue_an_admin_session_after_commit() {
+        let hooks = Arc::new(ManagementAuthorizationTestHooks {
+            login_authenticated: Arc::new(Barrier::new(2)),
+            release_login: Arc::new(Barrier::new(2)),
+            mutation_authorized: Arc::new(Barrier::new(2)),
+            release_mutation: Arc::new(Barrier::new(2)),
+            pause_login: Arc::new(AtomicBool::new(true)),
+            pause_mutation: Arc::new(AtomicBool::new(true)),
+        });
+        let (_directory, state, admin_headers, old_alice_headers) =
+            management_state_with_admin_target(Arc::clone(&hooks)).await;
+        let login_state = state.clone();
+        let login_task = tokio::spawn(async move {
+            login(
+                State(login_state),
+                ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))),
+                Json(LoginRequest {
+                    username: "alice".to_owned(),
+                    password: "AlicePassword@123".to_owned(),
+                }),
+            )
+            .await
+            .map(|response| response.0)
+        });
+
+        hooks.login_authenticated.wait().await;
+        demote_alice(state.clone(), admin_headers).await;
+        assert!(matches!(
+            require_management_admin(&state.session_verifier, &old_alice_headers),
+            Err(ManagementSessionError::Forbidden)
+        ));
+        hooks.release_login.wait().await;
+        let Ok(login_headers) = login_task.await.unwrap() else {
+            panic!("login must succeed after a role demotion");
+        };
+        let new_alice_headers = session_headers_from_login(&login_headers);
+        assert!(matches!(
+            require_management_admin(&state.session_verifier, &new_alice_headers),
+            Err(ManagementSessionError::Forbidden)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mutation_authorized_before_body_parsing_cannot_run_after_role_demotion_commits() {
+        let hooks = Arc::new(ManagementAuthorizationTestHooks {
+            login_authenticated: Arc::new(Barrier::new(2)),
+            release_login: Arc::new(Barrier::new(2)),
+            mutation_authorized: Arc::new(Barrier::new(2)),
+            release_mutation: Arc::new(Barrier::new(2)),
+            pause_login: Arc::new(AtomicBool::new(true)),
+            pause_mutation: Arc::new(AtomicBool::new(true)),
+        });
+        let (_directory, state, admin_headers, alice_headers) =
+            management_state_with_admin_target(Arc::clone(&hooks)).await;
+        let mutation_state = state.clone();
+        let mutation_task = tokio::spawn(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/management/users")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, alice_headers[COOKIE].clone())
+                .body(Body::from(
+                    r#"{"username":"blocked","password":"BlockedPassword@123","default_app":"/apps/fleet","granted_apps":["fleet"]}"#,
+                ))
+                .unwrap();
+            create_management_user(State(mutation_state), request).await
+        });
+
+        hooks.mutation_authorized.wait().await;
+        demote_alice(state.clone(), admin_headers).await;
+        hooks.release_mutation.wait().await;
+        assert!(matches!(
+            mutation_task.await.unwrap(),
+            Err(ManagementSessionError::Forbidden)
+        ));
+        assert!(
+            ManagementUserRepository::list_management_users(state.store.as_ref())
+                .await
+                .unwrap()
+                .iter()
+                .all(|user| user.username != "blocked")
+        );
     }
 }
