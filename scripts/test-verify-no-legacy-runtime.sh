@@ -4,7 +4,8 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 verifier="$root/scripts/verify-no-legacy-runtime.sh"
 fixture="$(mktemp -d)"
-trap 'rm -rf "$fixture"' EXIT
+installer_fixture=""
+trap 'rm -rf "$fixture" "$installer_fixture"' EXIT
 
 expected_files=(
   infra/compose.yaml
@@ -111,6 +112,31 @@ permission_mode() {
   fi
 }
 
+assert_log_contains() {
+  local expected_line="$1"
+  local log_path="$2"
+
+  if ! rg -Fqx -- "$expected_line" "$log_path"; then
+    printf 'installer did not request expected privilege command: %s\n' \
+      "$expected_line" >&2
+    exit 1
+  fi
+}
+
+create_fake_privilege_command() {
+  local command_name="$1"
+  local command_path="$2/$command_name"
+
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'printf "%s %s\n" "$(basename "$0")" "$*" >>"$FAKE_COMMAND_LOG"' \
+    'if [[ "$(basename "$0")" == "sudo" ]]; then' \
+    '  "$@"' \
+    'fi' >"$command_path"
+  chmod 0755 "$command_path"
+}
+
 populate_fixture
 assert_success 'clean monolith fixture with retained standalone assets'
 
@@ -138,6 +164,18 @@ write_fixture_file scripts/arbitrary-deployment-tool.sh \
   "exec $legacy_binary --serve"
 assert_failure_contains 'retired binary literal found in monolith deployment paths'
 populate_fixture
+
+for e2e_script in scripts/e2e-local.sh scripts/e2e-monolith.sh; do
+  printf '\nexec %s --serve\n' "$legacy_binary" >>"$fixture/$e2e_script"
+  assert_failure_contains 'retired binary literal found in monolith deployment paths'
+  populate_fixture
+done
+
+for e2e_script in scripts/e2e-local.sh scripts/e2e-monolith.sh; do
+  printf '\n# %s\n' "$standalone_installer" >>"$fixture/$e2e_script"
+  assert_failure_contains 'standalone MQTTD package referenced by monolith deployment'
+  populate_fixture
+done
 
 write_fixture_file infra/systemd/arbitrary-deployment-unit.service \
   "ExecStart=/opt/rush-iot-nano/$legacy_binary"
@@ -203,17 +241,33 @@ printf '\n[dev-dependencies]\n%s = { path = "../../services/%s" }\n' \
 assert_success 'Cargo dependency allowance'
 populate_fixture
 
-installer_config_block="$(awk '
-  /if \[ ! -e "\$config_path" \]; then/ { capture = 1 }
-  capture { print }
-  capture && /^fi$/ { exit }
-' "$root/scripts/$standalone_installer")"
-if [[ "$installer_config_block" != *'--owner root --group iot --mode 0640'* ]]; then
-  printf 'standalone installer must create config as root:iot mode 0640\n' >&2
+installer_fixture="$(mktemp -d)"
+fake_bin="$installer_fixture/bin"
+config_path="$installer_fixture/iot-nano-mqttd.toml"
+original_config="$installer_fixture/original.toml"
+fake_command_log="$installer_fixture/privilege.log"
+mkdir -p "$fake_bin"
+printf '%s\n' 'existing standalone configuration' >"$config_path"
+cp "$config_path" "$original_config"
+for fake_command in sudo install chown chmod; do
+  create_fake_privilege_command "$fake_command" "$fake_bin"
+done
+
+PATH="$fake_bin:$PATH" \
+  FAKE_COMMAND_LOG="$fake_command_log" \
+  IOT_NANO_MQTTD_INSTALLER_LIB=1 \
+  bash -c 'source "$1"; config_path="$2"; install_config' -- \
+  "$root/scripts/$standalone_installer" "$config_path"
+
+if ! cmp -s "$original_config" "$config_path"; then
+  printf 'standalone installer changed existing config content\n' >&2
   exit 1
 fi
-if ! rg -q 'sudo chown root:iot "\$config_path"' "$root/scripts/$standalone_installer" ||
-  ! rg -q 'sudo chmod 0640 "\$config_path"' "$root/scripts/$standalone_installer"; then
-  printf 'standalone installer must normalize existing config ownership and mode\n' >&2
+if rg -q '^install ' "$fake_command_log"; then
+  printf 'standalone installer replaced existing config content\n' >&2
   exit 1
 fi
+assert_log_contains "sudo chown root:iot $config_path" "$fake_command_log"
+assert_log_contains "chown root:iot $config_path" "$fake_command_log"
+assert_log_contains "sudo chmod 0640 $config_path" "$fake_command_log"
+assert_log_contains "chmod 0640 $config_path" "$fake_command_log"

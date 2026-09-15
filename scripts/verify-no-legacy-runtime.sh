@@ -93,7 +93,7 @@ done
 
 is_deployment_excluded() {
   case "$1" in
-    "$standalone_installer_path"|"$standalone_unit_path"|"$root/scripts/e2e-local.sh"|"$root/scripts/e2e-monolith.sh"|"$root/scripts/stress-local.sh"|"$root/scripts/verify-no-legacy-runtime.sh"|"$root/scripts/test-verify-no-legacy-runtime.sh"|"$root/scripts/verify-failures.sh"|"$root/scripts/verify-monolith-topology.sh"|"$root/scripts/fixtures"/*)
+    "$standalone_installer_path"|"$standalone_unit_path"|"$root/scripts/stress-local.sh"|"$root/scripts/verify-no-legacy-runtime.sh"|"$root/scripts/test-verify-no-legacy-runtime.sh"|"$root/scripts/verify-failures.sh"|"$root/scripts/verify-monolith-topology.sh"|"$root/scripts/fixtures"/*)
       return 0
       ;;
     *) return 1 ;;
