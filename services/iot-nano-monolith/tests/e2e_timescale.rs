@@ -338,8 +338,8 @@ fn migration_lock_query() -> &'static str {
         FROM pg_locks AS waiting
         JOIN pg_stat_activity AS activity ON waiting.pid = activity.pid
         WHERE waiting.locktype = 'advisory'
-          AND waiting.classid = 0
-          AND waiting.objid::integer = hashtext('iot_nano:migrate')
+          AND ((waiting.classid::integer::bigint << 32) + waiting.objid::bigint)
+              = hashtext('iot_nano:migrate')::bigint
           AND waiting.granted = FALSE
           AND activity.application_name = $1
           AND activity.datname = current_database()
@@ -1394,7 +1394,7 @@ fn validated_test_database_url(value: &str) -> Result<String, String> {
     }
     if test_database_name(value).is_none() {
         return Err(format!(
-            "IOT_NANO_TIMESCALE_TEST_URL must name a disposable {TEST_DATABASE_PREFIX}<uuid> database"
+            "IOT_NANO_TIMESCALE_TEST_URL must name a disposable {TEST_DATABASE_PREFIX}* database"
         ));
     }
     Ok(value.to_owned())
@@ -1405,7 +1405,7 @@ fn test_database_name(database_url: &str) -> Option<String> {
     let database = options.get_database()?;
     database
         .strip_prefix(TEST_DATABASE_PREFIX)
-        .filter(|suffix| Uuid::parse_str(suffix).is_ok())
+        .filter(|suffix| !suffix.is_empty())
         .map(|_| database.to_owned())
 }
 
@@ -1416,6 +1416,10 @@ fn timescale_test_url_must_name_an_isolated_test_database() {
             "postgres://iot:secret@localhost/iot_nano_test_018f4e40-5d2c-7d19-9d6f-6f996de6f722"
         ),
         Some("iot_nano_test_018f4e40-5d2c-7d19-9d6f-6f996de6f722".to_owned())
+    );
+    assert_eq!(
+        test_database_name("postgres://iot:secret@localhost/iot_nano_test_local"),
+        Some("iot_nano_test_local".to_owned())
     );
     assert_eq!(
         test_database_name("postgres://iot:secret@localhost/iot"),
@@ -1430,6 +1434,14 @@ fn timescale_test_url_must_name_an_isolated_test_database() {
 #[test]
 fn timescale_test_url_requires_an_explicit_opt_in_value() {
     assert!(validated_test_database_url("").is_err());
+}
+
+#[test]
+fn migration_lock_query_matches_signed_hashtext_keys() {
+    assert!(
+        migration_lock_query()
+            .contains("((waiting.classid::integer::bigint << 32) + waiting.objid::bigint)")
+    );
 }
 
 #[test]
