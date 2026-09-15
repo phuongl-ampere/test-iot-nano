@@ -21,6 +21,7 @@ fake_bin="$sandbox/bin"
 docker_log="$sandbox/docker.log"
 restore_log="$sandbox/restore.log"
 original_state="$sandbox/original-state"
+current_restore_point="$sandbox/current-timescale-restore-point"
 real_mv="$(command -v mv)"
 real_tar="$(command -v tar)"
 mkdir -p "$backup_dir" "$internal_dir" "$archive_source" "$fake_bin"
@@ -34,6 +35,8 @@ printf '%s\n' \
 printf 'restored-state\n' > "$archive_source/restored-state"
 tar -C "$archive_source" -czf "$backup_dir/internal-state.tar.gz" .
 printf 'restore-point\n' > "$backup_dir/timescale-restore-point"
+printf 'current-restore-point\n' > "$current_restore_point"
+chmod 0600 "$current_restore_point"
 printf 'old-state\0must-survive\n' > "$internal_dir/state"
 chmod 0600 "$internal_dir/state"
 cp -p "$internal_dir/state" "$original_state"
@@ -115,10 +118,19 @@ done
 shift
 backup_dir=""
 restore_command=""
+environment=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --volume)
-      backup_dir="${2%:/rollback:ro}"
+      case "$2" in
+        *:/rollback:ro) backup_dir="${2%:/rollback:ro}" ;;
+        *:/rollback) backup_dir="${2%:/rollback}" ;;
+        *) exit 64 ;;
+      esac
+      shift 2
+      ;;
+    --env)
+      environment+=("$2")
       shift 2
       ;;
     -c)
@@ -134,7 +146,7 @@ done
 [[ -n "$backup_dir" && -n "$restore_command" ]] || exit 64
 restore_command="${restore_command//\/rollback/$backup_dir}"
 restore_command="${restore_command//\/var\/lib\/iot-nano\/internal/$ROLLBACK_FIXTURE_INTERNAL_DIR}"
-PATH="$ROLLBACK_FIXTURE_FAKE_BIN:$PATH" /bin/sh -c "$restore_command"
+env "${environment[@]}" PATH="$ROLLBACK_FIXTURE_FAKE_BIN:$PATH" /bin/sh -c "$restore_command"
 EOF
 chmod 0700 "$fake_bin/docker"
 
@@ -147,6 +159,8 @@ run_rollback() {
     IOT_NANO_TIMESCALE_COMPOSE=1 \
     ROLLBACK_BACKUP_DIR="$backup_dir" \
     TIMESCALE_RESTORE_COMMAND="$sandbox/restore-success" \
+    TIMESCALE_CURRENT_RESTORE_POINT="$current_restore_point" \
+    TIMESCALE_COMPENSATE_COMMAND="$sandbox/restore-success" \
     ROLLBACK_FIXTURE_DOCKER_LOG="$docker_log" \
     ROLLBACK_FIXTURE_RESTORE_LOG="$restore_log" \
     ROLLBACK_FIXTURE_INTERNAL_DIR="$internal_dir" \

@@ -170,15 +170,39 @@ ROLLBACK_BACKUP_DIR=/var/backups/iot-nano/monolith/<timestamp-and-pid> \
 
 `rollback.sh` refuses individual SQLite files and requires the matched
 platform plus internal-state archives from one manifest before it stops the
-service. It verifies archive safety, restores both complete states while the
-monolith is stopped, and restarts only after restoration succeeds.
+service. It verifies archive safety, snapshots the complete current platform
+and internal state, then stages both target archives before moving either live
+state. A target-side I/O failure triggers restoration of both current states
+and leaves the monolith stopped. If that compensation fails, the command
+reports the exact generated `rollback-current-platform-state-*.tar.gz` and
+`rollback-current-internal-state-*.tar.gz` archives for manual recovery and
+does not restart.
 
-For a Timescale rollback, set `IOT_NANO_TIMESCALE_COMPOSE=1`, provide the same
-paired backup directory, and set `TIMESCALE_RESTORE_COMMAND` to an executable
-that accepts the stored restore-point path as its single argument. The script
-requires both the restore point and internal-state archive, validates them
-before stopping, suppresses callback output, and does not restart after a
-failed restore. Do not resume traffic against a partial migration.
+For a Timescale rollback, the operator must provide both sides of a
+compensation contract. `TIMESCALE_RESTORE_COMMAND` restores the target
+restore point from the paired backup. Before running rollback, create a
+separate, nonempty `TIMESCALE_CURRENT_RESTORE_POINT` that represents the
+currently deployed database after writes have stopped. It must differ from the
+target restore point. `TIMESCALE_COMPENSATE_COMMAND` must accept that current
+restore-point path as its sole argument and restore it exactly.
+
+```bash
+IOT_NANO_TIMESCALE_COMPOSE=1 \
+  ROLLBACK_BACKUP_DIR=/var/backups/iot-nano/monolith/<timestamp-and-pid> \
+  TIMESCALE_RESTORE_COMMAND=/usr/local/libexec/iot-nano/restore-timescale \
+  TIMESCALE_CURRENT_RESTORE_POINT=/var/backups/iot-nano/current-timescale-restore-point \
+  TIMESCALE_COMPENSATE_COMMAND=/usr/local/libexec/iot-nano/restore-timescale \
+  infra/monolith/rollback.sh
+```
+
+The script stages and validates the target internal state and creates a
+recoverable snapshot of the current internal state before either live state is
+replaced. If target restore or the internal swap fails, it invokes the
+compensation command with the current restore point and restores the internal
+snapshot. It never restarts after any failed restore. If compensation fails,
+the command reports the exact database restore point and generated
+`rollback-current-internal-state-*.tar.gz` archive required for manual
+recovery; keep the service stopped until both are restored.
 
 ## Service Hardening
 
