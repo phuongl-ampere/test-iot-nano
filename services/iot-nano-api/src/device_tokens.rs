@@ -1,18 +1,14 @@
 use chrono::{DateTime, Utc};
-use iot_core::{
-    DeviceTokenError, device_token_prefix, generate_device_token, hash_device_token,
-    verify_device_token,
-};
+use iot_core::{DeviceTokenError, device_token_prefix, generate_device_token, hash_device_token};
 use serde::Serialize;
-use sqlx::{PgPool, Postgres, Row, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::token_vault::{TokenVault, TokenVaultError};
 use iot_storage::{
-    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken,
-    PlatformStore,
+    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, IdentityRepository,
+    NewDeviceToken, NewOwnedDeviceToken, PlatformStore, PlatformStoreError,
 };
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -29,6 +25,7 @@ pub struct DeviceTokenResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedDeviceToken {
+    pub token_id: Uuid,
     pub device_id: String,
     pub is_gateway: bool,
     pub gateway_device_id: Option<String>,
@@ -52,6 +49,8 @@ pub enum DeviceTokenStoreError {
     PlatformUnavailable,
     #[error("device token storage operation failed")]
     Storage(#[source] DeviceTokenRepositoryError),
+    #[error("platform token operation failed")]
+    Platform(#[source] PlatformStoreError),
 }
 
 pub async fn provision_platform_device_token(
@@ -78,6 +77,34 @@ pub async fn create_platform_device_token(
     for _ in 0..8 {
         let (token, material) = new_platform_token(vault)?;
         match DeviceTokenRepository::create_device_token(store, device_id, material).await {
+            Ok(record) => return Ok(platform_token_response(record, token)),
+            Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
+            Err(error) => return Err(device_token_repository_error(error)),
+        }
+    }
+    Err(DeviceTokenStoreError::AllocationFailed)
+}
+
+pub async fn provision_owned_platform_device_token(
+    store: &PlatformStore,
+    vault: &TokenVault,
+    display_name: &str,
+    owner_user_id: Uuid,
+    asset_id: Option<Uuid>,
+) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
+    for _ in 0..8 {
+        let (token, material) = new_platform_token(vault)?;
+        match DeviceTokenRepository::provision_owned_device_token(
+            store,
+            NewOwnedDeviceToken {
+                display_name: display_name.to_owned(),
+                owner_user_id,
+                asset_id,
+                token: material,
+            },
+        )
+        .await
+        {
             Ok(record) => return Ok(platform_token_response(record, token)),
             Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
             Err(error) => return Err(device_token_repository_error(error)),
@@ -135,6 +162,21 @@ pub async fn revoke_platform_device_token(
         .map_err(device_token_repository_error)
 }
 
+pub async fn resolve_platform_active_device_token(
+    store: &PlatformStore,
+    token: &str,
+) -> Result<AuthenticatedDeviceToken, DeviceTokenStoreError> {
+    IdentityRepository::resolve_active_device_token(store, token)
+        .await
+        .map(|token| AuthenticatedDeviceToken {
+            token_id: token.token_id,
+            device_id: token.device_id,
+            is_gateway: token.is_gateway,
+            gateway_device_id: token.gateway_device_id,
+        })
+        .map_err(platform_token_error)
+}
+
 fn new_platform_token(
     vault: &TokenVault,
 ) -> Result<(String, NewDeviceToken), DeviceTokenStoreError> {
@@ -187,264 +229,10 @@ fn device_token_repository_error(error: DeviceTokenRepositoryError) -> DeviceTok
     }
 }
 
-pub async fn provision_owned(
-    pool: &PgPool,
-    vault: &TokenVault,
-    display_name: &str,
-    owner_user_id: Uuid,
-    asset_id: Option<Uuid>,
-) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    let mut transaction = pool.begin().await?;
-    let device_id = Uuid::now_v7().to_string();
-    sqlx::query(
-        "INSERT INTO devices (
-            device_id, display_name, owner_user_id, asset_id, claimed_at
-         ) VALUES ($1, $2, $3, $4, now())",
-    )
-    .bind(&device_id)
-    .bind(display_name)
-    .bind(owner_user_id)
-    .bind(asset_id)
-    .execute(&mut *transaction)
-    .await?;
-    let response = insert_token(&mut transaction, vault, &device_id).await?;
-    transaction.commit().await?;
-    Ok(response)
-}
-
-pub async fn provision_owned_sqlite(
-    pool: &SqlitePool,
-    vault: &TokenVault,
-    display_name: &str,
-    owner_user_id: Uuid,
-    asset_id: Option<Uuid>,
-) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    let mut transaction = pool.begin().await?;
-    let device_id = Uuid::now_v7().to_string();
-    sqlx::query(
-        "INSERT INTO devices (
-            device_id, display_name, owner_user_id, asset_id, claimed_at
-         ) VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(&device_id)
-    .bind(display_name)
-    .bind(owner_user_id.to_string())
-    .bind(asset_id.map(|id| id.to_string()))
-    .bind(Utc::now().to_rfc3339())
-    .execute(&mut *transaction)
-    .await?;
-    let response = insert_token_sqlite(&mut transaction, vault, &device_id).await?;
-    transaction.commit().await?;
-    Ok(response)
-}
-
-pub async fn resolve_active(
-    pool: &PgPool,
-    token: &str,
-) -> Result<AuthenticatedDeviceToken, DeviceTokenStoreError> {
-    let prefix = device_token_prefix(token)?;
-    let row = sqlx::query(
-        "SELECT device_tokens.id, device_tokens.device_id, device_tokens.token_hash,
-                devices.is_gateway, devices.gateway_device_id
-         FROM device_tokens
-         JOIN devices ON devices.device_id = device_tokens.device_id
-         WHERE device_tokens.token_prefix = $1
-           AND device_tokens.revoked_at IS NULL
-           AND devices.deleted_at IS NULL",
-    )
-    .bind(prefix)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(DeviceTokenStoreError::NotFound)?;
-
-    let token_hash = row.try_get::<String, _>("token_hash")?;
-    if !verify_device_token(token, &token_hash)? {
-        return Err(DeviceTokenStoreError::NotFound);
-    }
-
-    let id = row.try_get::<Uuid, _>("id")?;
-    sqlx::query(
-        "UPDATE device_tokens
-         SET last_used_at = now()
-         WHERE id = $1 AND revoked_at IS NULL",
-    )
-    .bind(id)
-    .execute(pool)
-    .await?;
-
-    Ok(AuthenticatedDeviceToken {
-        device_id: row.try_get("device_id")?,
-        is_gateway: row.try_get("is_gateway")?,
-        gateway_device_id: row.try_get("gateway_device_id")?,
-    })
-}
-
-pub async fn resolve_active_sqlite(
-    pool: &SqlitePool,
-    token: &str,
-) -> Result<AuthenticatedDeviceToken, DeviceTokenStoreError> {
-    let prefix = device_token_prefix(token)?;
-    let row = sqlx::query(
-        "SELECT device_tokens.id, device_tokens.device_id, device_tokens.token_hash,
-                devices.is_gateway, devices.gateway_device_id
-         FROM device_tokens
-         JOIN devices ON devices.device_id = device_tokens.device_id
-         WHERE device_tokens.token_prefix = ?
-           AND device_tokens.revoked_at IS NULL
-           AND devices.deleted_at IS NULL",
-    )
-    .bind(prefix)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(DeviceTokenStoreError::NotFound)?;
-    let token_hash = row.try_get::<String, _>("token_hash")?;
-    if !verify_device_token(token, &token_hash)? {
-        return Err(DeviceTokenStoreError::NotFound);
-    }
-    let id = row.try_get::<String, _>("id")?;
-    sqlx::query(
-        "UPDATE device_tokens
-         SET last_used_at = ?
-         WHERE id = ? AND revoked_at IS NULL",
-    )
-    .bind(Utc::now().to_rfc3339())
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(AuthenticatedDeviceToken {
-        device_id: row.try_get("device_id")?,
-        is_gateway: row.try_get::<i64, _>("is_gateway")? != 0,
-        gateway_device_id: row.try_get("gateway_device_id")?,
-    })
-}
-
-async fn insert_token(
-    transaction: &mut Transaction<'_, Postgres>,
-    vault: &TokenVault,
-    device_id: &str,
-) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    ensure_token_eligible(transaction, device_id).await?;
-    for _ in 0..8 {
-        let token = generate_device_token();
-        let prefix = device_token_prefix(&token)?;
-        let hash = hash_device_token(&token)?;
-        let ciphertext = vault.encrypt(&token)?;
-        let row = sqlx::query(
-            "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash, token_ciphertext)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (token_prefix) DO NOTHING
-             RETURNING id, device_id, token_prefix, created_at, last_used_at, revoked_at",
-        )
-        .bind(Uuid::new_v4())
-        .bind(device_id)
-        .bind(prefix)
-        .bind(hash)
-        .bind(ciphertext)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        if let Some(row) = row {
-            let mut response = row_to_response(row)?;
-            response.token = Some(token);
-            return Ok(response);
-        }
-    }
-
-    Err(DeviceTokenStoreError::AllocationFailed)
-}
-
-async fn insert_token_sqlite(
-    transaction: &mut Transaction<'_, Sqlite>,
-    vault: &TokenVault,
-    device_id: &str,
-) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    ensure_token_eligible_sqlite(transaction, device_id).await?;
-    for _ in 0..8 {
-        let token = generate_device_token();
-        let prefix = device_token_prefix(&token)?;
-        let hash = hash_device_token(&token)?;
-        let ciphertext = vault.encrypt(&token)?;
-        let id = Uuid::new_v4();
-        let created_at = Utc::now();
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO device_tokens (
-                id, device_id, token_prefix, token_hash, token_ciphertext, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(device_id)
-        .bind(prefix)
-        .bind(hash)
-        .bind(ciphertext)
-        .bind(created_at.to_rfc3339())
-        .execute(&mut **transaction)
-        .await?;
-        if result.rows_affected() == 1 {
-            return Ok(DeviceTokenResponse {
-                id,
-                device_id: device_id.to_owned(),
-                token_prefix: prefix.to_owned(),
-                created_at,
-                last_used_at: None,
-                revoked_at: None,
-                token: Some(token),
-            });
-        }
-    }
-    Err(DeviceTokenStoreError::AllocationFailed)
-}
-
-async fn ensure_token_eligible(
-    transaction: &mut Transaction<'_, Postgres>,
-    device_id: &str,
-) -> Result<(), DeviceTokenStoreError> {
-    let gateway_device_id = sqlx::query(
-        "SELECT gateway_device_id
-         FROM devices
-         WHERE device_id = $1 AND deleted_at IS NULL
-         FOR UPDATE",
-    )
-    .bind(device_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .map(|row| row.try_get::<Option<String>, _>("gateway_device_id"))
-    .transpose()?
-    .ok_or(DeviceTokenStoreError::NotFound)?;
-    if gateway_device_id.is_some() {
-        return Err(DeviceTokenStoreError::GatewayChild);
-    }
-    Ok(())
-}
-
-async fn ensure_token_eligible_sqlite(
-    transaction: &mut Transaction<'_, Sqlite>,
-    device_id: &str,
-) -> Result<(), DeviceTokenStoreError> {
-    let gateway_device_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT gateway_device_id
-         FROM devices
-         WHERE device_id = ? AND deleted_at IS NULL",
-    )
-    .bind(device_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(DeviceTokenStoreError::NotFound)?;
-    if gateway_device_id.is_some() {
-        Err(DeviceTokenStoreError::GatewayChild)
+fn platform_token_error(error: PlatformStoreError) -> DeviceTokenStoreError {
+    if matches!(error, PlatformStoreError::DeviceTokenDenied) {
+        DeviceTokenStoreError::NotFound
     } else {
-        Ok(())
+        DeviceTokenStoreError::Platform(error)
     }
-}
-
-fn row_to_response(
-    row: sqlx::postgres::PgRow,
-) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    Ok(DeviceTokenResponse {
-        id: row.try_get("id")?,
-        device_id: row.try_get("device_id")?,
-        token_prefix: row.try_get("token_prefix")?,
-        created_at: row.try_get("created_at")?,
-        last_used_at: row.try_get("last_used_at")?,
-        revoked_at: row.try_get("revoked_at")?,
-        token: None,
-    })
 }

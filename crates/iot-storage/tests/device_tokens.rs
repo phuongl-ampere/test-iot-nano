@@ -1,6 +1,10 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_core::{
+    DatabaseStorage, StorageConfiguration, device_token_prefix, generate_device_token,
+    hash_device_token,
+};
 use iot_storage::{
-    DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken, PlatformStore,
+    DeviceTokenRepository, DeviceTokenRepositoryError, IdentityRepository, NewDeviceToken,
+    NewOwnedDeviceToken, PlatformStore,
 };
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
@@ -65,6 +69,17 @@ fn token(prefix: &str) -> NewDeviceToken {
         token_hash: format!("{prefix}-hash"),
         token_ciphertext: format!("{prefix}-ciphertext"),
     }
+}
+
+fn generated_token() -> (String, NewDeviceToken) {
+    let value = generate_device_token();
+    let token = NewDeviceToken {
+        id: Uuid::now_v7(),
+        token_prefix: device_token_prefix(&value).unwrap().to_owned(),
+        token_hash: hash_device_token(&value).unwrap(),
+        token_ciphertext: "encrypted-token-material".to_owned(),
+    };
+    (value, token)
 }
 
 #[tokio::test]
@@ -267,6 +282,57 @@ async fn sqlite_device_token_repository_lists_rotates_and_revokes_opaque_history
 }
 
 #[tokio::test]
+async fn sqlite_device_token_repository_provisions_owned_devices_and_identity_resolves_them() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let owner_user_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, 'token-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_user_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, name) VALUES (?, 'token asset')")
+        .bind(asset_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    let (raw_token, token) = generated_token();
+
+    let issued = DeviceTokenRepository::provision_owned_device_token(
+        &store,
+        NewOwnedDeviceToken {
+            display_name: "Owned device".to_owned(),
+            owner_user_id,
+            asset_id: Some(asset_id),
+            token,
+        },
+    )
+    .await
+    .unwrap();
+    let ownership: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT owner_user_id, asset_id, claimed_at
+         FROM devices WHERE device_id = ?",
+    )
+    .bind(&issued.device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(ownership.0, owner_user_id.to_string());
+    assert_eq!(ownership.1, asset_id.to_string());
+    assert!(ownership.2.is_some());
+
+    let resolved = IdentityRepository::resolve_active_device_token(&store, &raw_token)
+        .await
+        .unwrap();
+    assert_eq!(resolved.token_id, issued.id);
+    assert_eq!(resolved.device_id, issued.device_id);
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
     let (_lock, store) = timescale_store().await;
@@ -308,4 +374,56 @@ async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_device_token_repository_provisions_owned_devices_and_identity_resolves_them() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let owner_user_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES ($1, 'token-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, name) VALUES ($1, 'token asset')")
+        .bind(asset_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let (raw_token, token) = generated_token();
+
+    let issued = DeviceTokenRepository::provision_owned_device_token(
+        &store,
+        NewOwnedDeviceToken {
+            display_name: "Owned device".to_owned(),
+            owner_user_id,
+            asset_id: Some(asset_id),
+            token,
+        },
+    )
+    .await
+    .unwrap();
+    let ownership: (Uuid, Uuid, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT owner_user_id, asset_id, claimed_at
+         FROM devices WHERE device_id = $1",
+    )
+    .bind(&issued.device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(ownership.0, owner_user_id);
+    assert_eq!(ownership.1, asset_id);
+    assert!(ownership.2.is_some());
+
+    let resolved = IdentityRepository::resolve_active_device_token(&store, &raw_token)
+        .await
+        .unwrap();
+    assert_eq!(resolved.token_id, issued.id);
+    assert_eq!(resolved.device_id, issued.device_id);
 }

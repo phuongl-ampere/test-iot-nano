@@ -31,7 +31,8 @@ const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform
 pub use management::{
     DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, ManagementChildStatus,
     ManagementDevice, ManagementDeviceError, ManagementDeviceHealth, ManagementDeviceRepository,
-    ManagementDeviceTopology, ManagementGatewayStatus, NewDeviceToken, UpdateManagementDevice,
+    ManagementDeviceTopology, ManagementGatewayStatus, NewDeviceToken, NewOwnedDeviceToken,
+    UpdateManagementDevice,
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,

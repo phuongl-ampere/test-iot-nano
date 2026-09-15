@@ -21,12 +21,13 @@ use axum::{
 };
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use iot_core::{
-    RpcMode, RpcRequest, SystemConfiguration, SystemConfigurationUpdate, device_token_prefix,
-    generate_device_token, hash_device_token, verify_device_token,
+    RpcMode, RpcRequest, SystemConfiguration, SystemConfigurationUpdate, generate_device_token,
+    hash_device_token, verify_device_token,
 };
 use iot_storage::{
     AuthorizationRepository, AuthorizationSubject, AuthorizedDeviceSummary, CommandOutboxState,
-    NewCommandOutboxEntry, PlatformStore, SqliteStore, SqliteStoreError,
+    DeviceAuthorizationRepository, NewCommandOutboxEntry, PlatformStore, PlatformStoreError,
+    SqliteStore, SqliteStoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -54,10 +55,8 @@ use crate::{
     device_tokens::{
         DeviceTokenResponse, DeviceTokenStoreError, active_platform_device_token,
         create_platform_device_token, list_platform_device_tokens,
-        provision_owned as provision_owned_device_token,
-        provision_owned_sqlite as provision_owned_device_token_sqlite,
-        provision_platform_device_token, resolve_active as resolve_active_device_token,
-        resolve_active_sqlite as resolve_active_device_token_sqlite, revoke_platform_device_token,
+        provision_owned_platform_device_token, provision_platform_device_token,
+        resolve_platform_active_device_token, revoke_platform_device_token,
         rotate_platform_device_token,
     },
     powermonitor::{
@@ -171,6 +170,7 @@ impl MqttdDeviceTransportSessionRevoker for NoopMqttdDeviceTransportSessionRevok
 #[derive(Clone)]
 pub struct ApiState {
     pool: PgPool,
+    token_store: Arc<PlatformStore>,
     login_limiter: Arc<Mutex<LoginRateLimiter>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     mqttd_device_transport_secret: Option<Arc<str>>,
@@ -184,6 +184,7 @@ pub struct ApiState {
 #[derive(Clone)]
 pub struct SqliteApiState {
     store: SqliteStore,
+    token_store: Arc<PlatformStore>,
     login_limiter: Arc<Mutex<LoginRateLimiter>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     mqttd_device_transport_secret: Option<Arc<str>>,
@@ -207,8 +208,10 @@ struct Session {
 
 impl ApiState {
     pub fn new(pool: PgPool) -> Self {
+        let token_store = Arc::new(PlatformStore::Timescale(pool.clone()));
         Self {
             pool,
+            token_store,
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             mqttd_device_transport_secret: None,
@@ -385,8 +388,10 @@ impl ApiState {
 
 impl SqliteApiState {
     pub fn new(store: SqliteStore) -> Self {
+        let token_store = Arc::new(PlatformStore::Sqlite(store.clone()));
         Self {
             store,
+            token_store,
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             mqttd_device_transport_secret: None,
@@ -1890,8 +1895,8 @@ async fn sqlite_provision_my_device(
             return Err(ApiError::Forbidden);
         }
     }
-    let token = provision_owned_device_token_sqlite(
-        state.store.pool(),
+    let token = provision_owned_platform_device_token(
+        state.token_store.as_ref(),
         &state.token_vault,
         display_name,
         context.user_id,
@@ -1993,8 +1998,7 @@ async fn sqlite_provision_management_device(
     Json(request): Json<ProvisionDeviceTokenRequest>,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ApiError> {
     let display_name = validated_name(&request.display_name, "device name")?;
-    let platform = PlatformStore::Sqlite(state.store.clone());
-    provision_platform_device_token(&platform, &state.token_vault, display_name)
+    provision_platform_device_token(state.token_store.as_ref(), &state.token_vault, display_name)
         .await
         .map(|token| (StatusCode::CREATED, Json(token)))
         .map_err(device_token_error)
@@ -3200,8 +3204,7 @@ async fn sqlite_list_device_tokens_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let platform = PlatformStore::Sqlite(state.store.clone());
-    list_platform_device_tokens(&platform, &device_id)
+    list_platform_device_tokens(state.token_store.as_ref(), &device_id)
         .await
         .map(Json)
         .map_err(device_token_error)
@@ -3221,16 +3224,16 @@ async fn sqlite_create_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let platform = PlatformStore::Sqlite(state.store.clone());
-    let prior_token_id = list_platform_device_tokens(&platform, &device_id)
+    let prior_token_id = list_platform_device_tokens(state.token_store.as_ref(), &device_id)
         .await
         .map_err(device_token_error)?
         .into_iter()
         .find(|token| token.revoked_at.is_none())
         .map(|token| token.id);
-    let token = create_platform_device_token(&platform, &state.token_vault, &device_id)
-        .await
-        .map_err(device_token_error)?;
+    let token =
+        create_platform_device_token(state.token_store.as_ref(), &state.token_vault, &device_id)
+            .await
+            .map_err(device_token_error)?;
     if let Some(prior_token_id) = prior_token_id {
         revoke_mqttd_device_transport_session(
             state.mqttd_device_transport_session_revoker.as_ref(),
@@ -3248,8 +3251,7 @@ async fn sqlite_provision_device_token_handler(
     Json(request): Json<ProvisionDeviceTokenRequest>,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ApiError> {
     let display_name = validated_name(&request.display_name, "device name")?;
-    let platform = PlatformStore::Sqlite(state.store.clone());
-    provision_platform_device_token(&platform, &state.token_vault, display_name)
+    provision_platform_device_token(state.token_store.as_ref(), &state.token_vault, display_name)
         .await
         .map(|token| (StatusCode::CREATED, Json(token)))
         .map_err(device_token_error)
@@ -3260,8 +3262,7 @@ async fn sqlite_rotate_device_token_handler(
     Extension(context): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ApiError> {
-    let platform = PlatformStore::Sqlite(state.store.clone());
-    let device_id = active_platform_device_token(&platform, id)
+    let device_id = active_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?
         .map(|token| token.device_id)
@@ -3272,7 +3273,7 @@ async fn sqlite_rotate_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let token = rotate_platform_device_token(&platform, &state.token_vault, id)
+    let token = rotate_platform_device_token(state.token_store.as_ref(), &state.token_vault, id)
         .await
         .map_err(device_token_error)?;
     revoke_mqttd_device_transport_session(
@@ -3289,8 +3290,7 @@ async fn sqlite_revoke_device_token_handler(
     Extension(context): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let platform = PlatformStore::Sqlite(state.store.clone());
-    let device_id = active_platform_device_token(&platform, id)
+    let device_id = active_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?
         .map(|token| token.device_id)
@@ -3301,7 +3301,7 @@ async fn sqlite_revoke_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    revoke_platform_device_token(&platform, id)
+    revoke_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?;
     revoke_mqttd_device_transport_session(
@@ -3327,32 +3327,16 @@ async fn sqlite_mqttd_device_transport_session_resolution(
     {
         return Err(ApiError::Unauthorized);
     }
-    let device = resolve_active_device_token_sqlite(state.store.pool(), &request.username)
-        .await
-        .map_err(mqttd_device_token_error)?;
+    let device =
+        resolve_platform_active_device_token(state.token_store.as_ref(), &request.username)
+            .await
+            .map_err(mqttd_device_token_error)?;
     if device.gateway_device_id.is_some() {
         return Err(ApiError::Unauthorized);
     }
-    let token_prefix =
-        device_token_prefix(&request.username).map_err(|_| ApiError::Unauthorized)?;
-    let token_id = sqlx::query_scalar::<_, String>(
-        "SELECT device_tokens.id
-         FROM device_tokens
-         JOIN devices ON devices.device_id = device_tokens.device_id
-         WHERE device_tokens.token_prefix = ?
-           AND device_tokens.device_id = ?
-           AND device_tokens.revoked_at IS NULL
-           AND devices.deleted_at IS NULL",
-    )
-    .bind(token_prefix)
-    .bind(&device.device_id)
-    .fetch_optional(state.store.pool())
-    .await?
-    .ok_or(ApiError::Unauthorized)?;
-
     Ok(Json(MqttdDeviceTransportSessionResolution {
         device_id: device.device_id,
-        token_id: sqlite_uuid(&token_id)?,
+        token_id: device.token_id,
         is_gateway: device.is_gateway,
     }))
 }
@@ -3363,24 +3347,12 @@ async fn sqlite_mqttd_device_transport_session_authorization(
     Json(request): Json<MqttdDeviceTransportSessionAuthorizationRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
-    let authorized = sqlx::query_scalar::<_, i64>(
-        "SELECT 1
-         FROM device_tokens
-         JOIN devices ON devices.device_id = device_tokens.device_id
-         WHERE device_tokens.id = ?
-           AND device_tokens.device_id = ?
-           AND device_tokens.revoked_at IS NULL
-           AND devices.deleted_at IS NULL
-           AND devices.gateway_device_id IS NULL",
+    require_active_device_response_token(
+        state.token_store.as_ref(),
+        request.token_id,
+        &request.device_id,
     )
-    .bind(request.token_id.to_string())
-    .bind(&request.device_id)
-    .fetch_optional(state.store.pool())
-    .await?
-    .is_some();
-    if !authorized {
-        return Err(ApiError::Unauthorized);
-    }
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3391,35 +3363,14 @@ async fn sqlite_mqttd_gateway_authorization(
 ) -> Result<Json<GatewayAuthorizationResponse>, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
     validate_gateway_authorization_request(&request)?;
-    let authorized = sqlx::query_scalar::<_, i64>(
-        "SELECT 1
-         FROM device_tokens
-         JOIN devices AS gateway ON gateway.device_id = device_tokens.device_id
-         WHERE device_tokens.id = ?
-           AND gateway.device_id = ?
-           AND gateway.is_gateway = 1
-           AND device_tokens.revoked_at IS NULL
-           AND gateway.deleted_at IS NULL
-           AND (
-             ? IS NULL OR EXISTS (
-               SELECT 1
-               FROM devices AS child
-               WHERE child.device_id = ?
-                 AND child.gateway_device_id = gateway.device_id
-                 AND child.deleted_at IS NULL
-             )
-           )",
+    DeviceAuthorizationRepository::authorize_gateway_token(
+        state.token_store.as_ref(),
+        request.token_id,
+        &request.gateway_device_id,
+        request.child_device_id.as_deref(),
     )
-    .bind(request.token_id.to_string())
-    .bind(&request.gateway_device_id)
-    .bind(&request.child_device_id)
-    .bind(&request.child_device_id)
-    .fetch_optional(state.store.pool())
-    .await?
-    .is_some();
-    if !authorized {
-        return Err(ApiError::Unauthorized);
-    }
+    .await
+    .map_err(platform_device_token_error)?;
     Ok(Json(GatewayAuthorizationResponse::from(request)))
 }
 
@@ -3429,20 +3380,14 @@ async fn sqlite_mqttd_device_transport_rpc_response(
     Json(request): Json<MqttdDeviceTransportRpcResponseRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
+    require_active_device_response_token(
+        state.token_store.as_ref(),
+        request.token_id,
+        &request.device_id,
+    )
+    .await?;
     let now = Utc::now();
     if let Some(facade) = &state.core_facade {
-        let authorized = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM device_tokens
-             WHERE id = ? AND device_id = ? AND revoked_at IS NULL",
-        )
-        .bind(request.token_id.to_string())
-        .bind(&request.device_id)
-        .fetch_optional(state.store.pool())
-        .await?
-        .is_some();
-        if !authorized {
-            return Err(ApiError::Unauthorized);
-        }
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id: request.command_id,
@@ -3480,19 +3425,11 @@ async fn sqlite_mqttd_device_transport_rpc_response(
            AND command.device_id = ?
            AND command.mode = 'two_way'
            AND command.state = 'published_to_broker'
-           AND command.expires_at <= ?
-           AND EXISTS (
-                SELECT 1
-                FROM device_tokens
-                WHERE id = ?
-                  AND device_id = command.device_id
-                  AND revoked_at IS NULL
-           )",
+           AND command.expires_at <= ?",
     )
     .bind(request.command_id.to_string())
     .bind(&request.device_id)
     .bind(now.to_rfc3339())
-    .bind(request.token_id.to_string())
     .execute(state.store.pool())
     .await?
     .rows_affected();
@@ -3506,18 +3443,10 @@ async fn sqlite_mqttd_device_transport_rpc_response(
          WHERE command.id = ?
            AND command.device_id = ?
            AND command.mode = 'two_way'
-           AND command.state = 'responded'
-           AND EXISTS (
-                SELECT 1
-                FROM device_tokens
-                WHERE id = ?
-                  AND device_id = command.device_id
-                  AND revoked_at IS NULL
-           )",
+           AND command.state = 'responded'",
     )
     .bind(request.command_id.to_string())
     .bind(&request.device_id)
-    .bind(request.token_id.to_string())
     .fetch_optional(state.store.pool())
     .await?
     .is_some();
@@ -4483,8 +4412,7 @@ async fn list_device_tokens_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let platform = PlatformStore::Timescale(state.pool.clone());
-    list_platform_device_tokens(&platform, &device_id)
+    list_platform_device_tokens(state.token_store.as_ref(), &device_id)
         .await
         .map(Json)
         .map_err(device_token_error)
@@ -4512,16 +4440,16 @@ async fn create_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let platform = PlatformStore::Timescale(state.pool.clone());
-    let prior_token_id = list_platform_device_tokens(&platform, &device_id)
+    let prior_token_id = list_platform_device_tokens(state.token_store.as_ref(), &device_id)
         .await
         .map_err(device_token_error)?
         .into_iter()
         .find(|token| token.revoked_at.is_none())
         .map(|token| token.id);
-    let token = create_platform_device_token(&platform, &state.token_vault, &device_id)
-        .await
-        .map_err(device_token_error)?;
+    let token =
+        create_platform_device_token(state.token_store.as_ref(), &state.token_vault, &device_id)
+            .await
+            .map_err(device_token_error)?;
     if let Some(prior_token_id) = prior_token_id {
         revoke_mqttd_device_transport_session(
             state.mqttd_device_transport_session_revoker.as_ref(),
@@ -4550,11 +4478,14 @@ async fn provision_device_token_handler(
     if display_name.is_empty() || display_name.len() > 128 {
         return Err(ApiError::BadRequest("invalid device name".to_owned()));
     }
-    let platform = PlatformStore::Timescale(state.pool.clone());
-    provision_platform_device_token(&platform, &state.token_vault, &display_name)
-        .await
-        .map(|token| (StatusCode::CREATED, Json(token)))
-        .map_err(device_token_error)
+    provision_platform_device_token(
+        state.token_store.as_ref(),
+        &state.token_vault,
+        &display_name,
+    )
+    .await
+    .map(|token| (StatusCode::CREATED, Json(token)))
+    .map_err(device_token_error)
 }
 
 #[utoipa::path(
@@ -4570,8 +4501,7 @@ async fn rotate_device_token_handler(
     Extension(context): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ApiError> {
-    let platform = PlatformStore::Timescale(state.pool.clone());
-    let device_id = active_platform_device_token(&platform, id)
+    let device_id = active_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?
         .map(|token| token.device_id)
@@ -4582,7 +4512,7 @@ async fn rotate_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let token = rotate_platform_device_token(&platform, &state.token_vault, id)
+    let token = rotate_platform_device_token(state.token_store.as_ref(), &state.token_vault, id)
         .await
         .map_err(device_token_error)?;
     revoke_mqttd_device_transport_session(
@@ -4607,8 +4537,7 @@ async fn revoke_device_token_handler(
     Extension(context): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let platform = PlatformStore::Timescale(state.pool.clone());
-    let device_id = active_platform_device_token(&platform, id)
+    let device_id = active_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?
         .map(|token| token.device_id)
@@ -4619,7 +4548,7 @@ async fn revoke_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    revoke_platform_device_token(&platform, id)
+    revoke_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?;
     revoke_mqttd_device_transport_session(
@@ -5092,8 +5021,8 @@ async fn provision_my_device(
             return Err(ApiError::Forbidden);
         }
     }
-    let token = provision_owned_device_token(
-        &state.pool,
+    let token = provision_owned_platform_device_token(
+        state.token_store.as_ref(),
         &state.token_vault,
         display_name,
         context.user_id,
@@ -5219,11 +5148,14 @@ async fn provision_management_device(
     Json(request): Json<ProvisionDeviceTokenRequest>,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ApiError> {
     let display_name = validated_name(&request.display_name, "device name")?.to_owned();
-    let platform = PlatformStore::Timescale(state.pool.clone());
-    provision_platform_device_token(&platform, &state.token_vault, &display_name)
-        .await
-        .map(|token| (StatusCode::CREATED, Json(token)))
-        .map_err(device_token_error)
+    provision_platform_device_token(
+        state.token_store.as_ref(),
+        &state.token_vault,
+        &display_name,
+    )
+    .await
+    .map(|token| (StatusCode::CREATED, Json(token)))
+    .map_err(device_token_error)
 }
 
 #[utoipa::path(
@@ -6338,32 +6270,16 @@ async fn mqttd_device_transport_session_resolution(
     {
         return Err(ApiError::Unauthorized);
     }
-    let device = resolve_active_device_token(&state.pool, &request.username)
-        .await
-        .map_err(mqttd_device_token_error)?;
+    let device =
+        resolve_platform_active_device_token(state.token_store.as_ref(), &request.username)
+            .await
+            .map_err(mqttd_device_token_error)?;
     if device.gateway_device_id.is_some() {
         return Err(ApiError::Unauthorized);
     }
-    let token_prefix =
-        device_token_prefix(&request.username).map_err(|_| ApiError::Unauthorized)?;
-    let token_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT device_tokens.id
-         FROM device_tokens
-         JOIN devices ON devices.device_id = device_tokens.device_id
-         WHERE device_tokens.token_prefix = $1
-           AND device_tokens.device_id = $2
-           AND device_tokens.revoked_at IS NULL
-           AND devices.deleted_at IS NULL",
-    )
-    .bind(token_prefix)
-    .bind(&device.device_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::Unauthorized)?;
-
     Ok(Json(MqttdDeviceTransportSessionResolution {
         device_id: device.device_id,
-        token_id,
+        token_id: device.token_id,
         is_gateway: device.is_gateway,
     }))
 }
@@ -6374,24 +6290,13 @@ async fn mqttd_device_transport_session_authorization(
     Json(request): Json<MqttdDeviceTransportSessionAuthorizationRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
-    let authorized = sqlx::query_scalar::<_, i32>(
-        "SELECT 1
-         FROM device_tokens
-         JOIN devices ON devices.device_id = device_tokens.device_id
-         WHERE device_tokens.id = $1
-           AND device_tokens.device_id = $2
-           AND device_tokens.revoked_at IS NULL
-           AND devices.deleted_at IS NULL
-           AND devices.gateway_device_id IS NULL",
+    DeviceAuthorizationRepository::authorize_device_session(
+        state.token_store.as_ref(),
+        request.token_id,
+        &request.device_id,
     )
-    .bind(request.token_id)
-    .bind(&request.device_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .is_some();
-    if !authorized {
-        return Err(ApiError::Unauthorized);
-    }
+    .await
+    .map_err(platform_device_token_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6402,34 +6307,14 @@ async fn mqttd_gateway_authorization(
 ) -> Result<Json<GatewayAuthorizationResponse>, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
     validate_gateway_authorization_request(&request)?;
-    let authorized = sqlx::query_scalar::<_, i32>(
-        "SELECT 1
-         FROM device_tokens
-         JOIN devices AS gateway ON gateway.device_id = device_tokens.device_id
-         WHERE device_tokens.id = $1
-           AND gateway.device_id = $2
-           AND gateway.is_gateway = TRUE
-           AND device_tokens.revoked_at IS NULL
-           AND gateway.deleted_at IS NULL
-           AND (
-             $3::TEXT IS NULL OR EXISTS (
-               SELECT 1
-               FROM devices AS child
-               WHERE child.device_id = $3
-                 AND child.gateway_device_id = gateway.device_id
-                 AND child.deleted_at IS NULL
-             )
-           )",
+    DeviceAuthorizationRepository::authorize_gateway_token(
+        state.token_store.as_ref(),
+        request.token_id,
+        &request.gateway_device_id,
+        request.child_device_id.as_deref(),
     )
-    .bind(request.token_id)
-    .bind(&request.gateway_device_id)
-    .bind(&request.child_device_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .is_some();
-    if !authorized {
-        return Err(ApiError::Unauthorized);
-    }
+    .await
+    .map_err(platform_device_token_error)?;
     Ok(Json(GatewayAuthorizationResponse::from(request)))
 }
 
@@ -6439,20 +6324,15 @@ async fn mqttd_device_transport_rpc_response(
     Json(request): Json<MqttdDeviceTransportRpcResponseRequest>,
 ) -> Result<StatusCode, ApiError> {
     state.require_mqttd_device_transport_secret(&headers)?;
+    DeviceAuthorizationRepository::authorize_device_session(
+        state.token_store.as_ref(),
+        request.token_id,
+        &request.device_id,
+    )
+    .await
+    .map_err(platform_device_token_error)?;
     let now = Utc::now();
     if let Some(facade) = &state.core_facade {
-        let authorized = sqlx::query_scalar::<_, i32>(
-            "SELECT 1 FROM device_tokens
-             WHERE id = $1 AND device_id = $2 AND revoked_at IS NULL",
-        )
-        .bind(request.token_id)
-        .bind(&request.device_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .is_some();
-        if !authorized {
-            return Err(ApiError::Unauthorized);
-        }
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id: request.command_id,
@@ -6476,20 +6356,12 @@ async fn mqttd_device_transport_rpc_response(
            AND command.device_id = $4
            AND command.mode = 'two_way'
            AND command.state = 'published_to_broker'
-           AND command.expires_at > $2
-           AND EXISTS (
-                SELECT 1
-                FROM device_tokens
-                WHERE id = $5
-                  AND device_id = command.device_id
-                  AND revoked_at IS NULL
-           )",
+           AND command.expires_at > $2",
     )
     .bind(response)
     .bind(now)
     .bind(request.command_id)
     .bind(&request.device_id)
-    .bind(request.token_id)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -6505,19 +6377,11 @@ async fn mqttd_device_transport_rpc_response(
            AND command.device_id = $2
            AND command.mode = 'two_way'
            AND command.state = 'published_to_broker'
-           AND command.expires_at <= $3
-           AND EXISTS (
-                SELECT 1
-                FROM device_tokens
-                WHERE id = $4
-                  AND device_id = command.device_id
-                  AND revoked_at IS NULL
-           )",
+           AND command.expires_at <= $3",
     )
     .bind(request.command_id)
     .bind(&request.device_id)
     .bind(now)
-    .bind(request.token_id)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -6531,18 +6395,10 @@ async fn mqttd_device_transport_rpc_response(
          WHERE command.id = $1
            AND command.device_id = $2
            AND command.mode = 'two_way'
-           AND command.state = 'responded'
-           AND EXISTS (
-                SELECT 1
-                FROM device_tokens
-                WHERE id = $3
-                  AND device_id = command.device_id
-                  AND revoked_at IS NULL
-           )",
+           AND command.state = 'responded'",
     )
     .bind(request.command_id)
     .bind(&request.device_id)
-    .bind(request.token_id)
     .fetch_optional(&state.pool)
     .await?
     .is_some();
@@ -6608,7 +6464,8 @@ fn device_token_error(error: DeviceTokenStoreError) -> ApiError {
         | DeviceTokenStoreError::Vault(_)
         | DeviceTokenStoreError::AllocationFailed
         | DeviceTokenStoreError::PlatformUnavailable
-        | DeviceTokenStoreError::Storage(_)) => ApiError::DeviceToken(other),
+        | DeviceTokenStoreError::Storage(_)
+        | DeviceTokenStoreError::Platform(_)) => ApiError::DeviceToken(other),
     }
 }
 
@@ -6620,7 +6477,33 @@ fn mqttd_device_token_error(error: DeviceTokenStoreError) -> ApiError {
         error @ (DeviceTokenStoreError::Vault(_)
         | DeviceTokenStoreError::AllocationFailed
         | DeviceTokenStoreError::PlatformUnavailable
-        | DeviceTokenStoreError::Storage(_)) => ApiError::DeviceToken(error),
+        | DeviceTokenStoreError::Storage(_)
+        | DeviceTokenStoreError::Platform(_)) => ApiError::DeviceToken(error),
+    }
+}
+
+fn platform_device_token_error(error: PlatformStoreError) -> ApiError {
+    if matches!(error, PlatformStoreError::DeviceTokenDenied) {
+        ApiError::Unauthorized
+    } else {
+        ApiError::DeviceToken(DeviceTokenStoreError::Platform(error))
+    }
+}
+
+async fn require_active_device_response_token(
+    store: &PlatformStore,
+    token_id: Uuid,
+    device_id: &str,
+) -> Result<(), ApiError> {
+    let token = active_platform_device_token(store, token_id)
+        .await
+        .map_err(device_token_error)?;
+    if token.is_some_and(|token| token.device_id == device_id) {
+        Ok(())
+    } else {
+        Err(ApiError::Conflict(
+            "RPC response does not match an active two-way command".to_owned(),
+        ))
     }
 }
 

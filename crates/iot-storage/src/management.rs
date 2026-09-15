@@ -153,6 +153,14 @@ pub struct NewDeviceToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOwnedDeviceToken {
+    pub display_name: String,
+    pub owner_user_id: Uuid,
+    pub asset_id: Option<Uuid>,
+    pub token: NewDeviceToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceTokenRecord {
     pub id: Uuid,
     pub device_id: String,
@@ -198,6 +206,12 @@ pub trait DeviceTokenRepository: Send + Sync {
         &'a self,
         display_name: &'a str,
         token: NewDeviceToken,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
+    >;
+    fn provision_owned_device_token<'a>(
+        &'a self,
+        device: NewOwnedDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
     >;
@@ -250,6 +264,15 @@ impl DeviceTokenRepository for PlatformStore {
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
     > {
         Box::pin(async move { provision_device_token(self, display_name, token).await })
+    }
+
+    fn provision_owned_device_token<'a>(
+        &'a self,
+        device: NewOwnedDeviceToken,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
+    > {
+        Box::pin(async move { provision_owned_device_token(self, device).await })
     }
 
     fn create_device_token<'a>(
@@ -920,6 +943,52 @@ async fn provision_device_token(
             .execute(&mut *transaction)
             .await?;
             let record = insert_timescale_device_token(&mut transaction, &device_id, token).await?;
+            transaction.commit().await?;
+            Ok(record)
+        }
+    }
+}
+
+async fn provision_owned_device_token(
+    store: &PlatformStore,
+    device: NewOwnedDeviceToken,
+) -> Result<DeviceTokenRecord, DeviceTokenRepositoryError> {
+    let device_id = Uuid::now_v7().to_string();
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin().await?;
+            sqlx::query(
+                "INSERT INTO devices (
+                     device_id, display_name, owner_user_id, asset_id, claimed_at
+                 ) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&device_id)
+            .bind(&device.display_name)
+            .bind(device.owner_user_id.to_string())
+            .bind(device.asset_id.map(|id| id.to_string()))
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+            let record =
+                insert_sqlite_device_token(&mut transaction, &device_id, device.token).await?;
+            transaction.commit().await?;
+            Ok(record)
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            sqlx::query(
+                "INSERT INTO devices (
+                     device_id, display_name, owner_user_id, asset_id, claimed_at
+                 ) VALUES ($1, $2, $3, $4, now())",
+            )
+            .bind(&device_id)
+            .bind(&device.display_name)
+            .bind(device.owner_user_id)
+            .bind(device.asset_id)
+            .execute(&mut *transaction)
+            .await?;
+            let record =
+                insert_timescale_device_token(&mut transaction, &device_id, device.token).await?;
             transaction.commit().await?;
             Ok(record)
         }

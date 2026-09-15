@@ -563,9 +563,7 @@ async fn list_management_devices(
     State(state): State<ManagementState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ManagementDeviceResponse>>, ManagementSessionError> {
-    if !state.session_verifier.is_admin(&headers) {
-        return Err(ManagementSessionError::Forbidden);
-    }
+    require_management_admin(&state.session_verifier, &headers)?;
     ManagementDeviceRepository::list_management_devices(state.store.as_ref())
         .await
         .map(|devices| {
@@ -585,9 +583,7 @@ async fn update_management_device(
     Path(device_id): Path<String>,
     Json(request): Json<UpdateManagementDeviceRequest>,
 ) -> Result<Json<ManagementDeviceResponse>, ManagementSessionError> {
-    if !state.session_verifier.is_admin(&headers) {
-        return Err(ManagementSessionError::Forbidden);
-    }
+    require_management_admin(&state.session_verifier, &headers)?;
     let device = ManagementDeviceRepository::update_management_device(
         state.store.as_ref(),
         &device_id,
@@ -612,9 +608,7 @@ async fn delete_management_device(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ManagementSessionError> {
-    if !state.session_verifier.is_admin(&headers) {
-        return Err(ManagementSessionError::Forbidden);
-    }
+    require_management_admin(&state.session_verifier, &headers)?;
     ManagementDeviceRepository::delete_management_device(state.store.as_ref(), &device_id)
         .await
         .map_err(management_device_error)?;
@@ -660,6 +654,20 @@ fn management_device_error(error: ManagementDeviceError) -> ManagementSessionErr
         ManagementDeviceError::InvalidStoredAttributes
         | ManagementDeviceError::InvalidStoredTimestamp
         | ManagementDeviceError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn require_management_admin(
+    session_verifier: &ManagementSessionVerifier,
+    headers: &HeaderMap,
+) -> Result<(), ManagementSessionError> {
+    if session_verifier.authenticated_user_id(headers).is_none() {
+        return Err(ManagementSessionError::Unauthorized);
+    }
+    if session_verifier.is_admin(headers) {
+        Ok(())
+    } else {
+        Err(ManagementSessionError::Forbidden)
     }
 }
 

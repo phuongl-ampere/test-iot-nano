@@ -582,6 +582,151 @@ async fn management_admin_manages_devices_through_the_typed_storage_port() {
     assert_eq!(gateway_delete.status(), StatusCode::NO_CONTENT);
 }
 
+#[tokio::test]
+async fn management_device_routes_require_an_admin_and_map_typed_errors() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/devices")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let viewer_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"viewer","password":"NanoView@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let viewer_cookie = viewer_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let viewer = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/devices")
+                .header(COOKIE, viewer_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+
+    let admin_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let admin_cookie = admin_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let invalid_id = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/management/devices/not.valid")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &admin_cookie)
+                .body(Body::from(r#"{"display_name":"Device"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_id.status(), StatusCode::BAD_REQUEST);
+
+    let missing = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/management/devices/missing-device")
+                .header(COOKIE, &admin_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let gateway = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &admin_cookie)
+                .body(Body::from(r#"{"display_name":"Gateway"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let gateway: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(gateway.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let gateway_id = gateway["device_id"].as_str().unwrap();
+    let invalid_topology = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/devices/{gateway_id}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, admin_cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Gateway",
+                        "topology": { "is_gateway": true, "gateway_device_id": "other-gateway" },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_topology.status(), StatusCode::CONFLICT);
+}
+
 fn invalid_login_request() -> Request<Body> {
     Request::builder()
         .method("POST")
