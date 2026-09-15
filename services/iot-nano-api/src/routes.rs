@@ -28,7 +28,8 @@ use iot_storage::{
     AuthorizationRepository, AuthorizationSubject, AuthorizedDeviceSummary, CommandOutboxState,
     DeviceAuthorizationRepository, ManagementAssetError, ManagementAssetProfileError,
     ManagementAssetProfileRepository, ManagementAssetRepository, ManagementChildStatus,
-    ManagementDevice as StorageManagementDevice, ManagementDeviceError, ManagementDeviceRepository,
+    ManagementDevice as StorageManagementDevice, ManagementDeviceError,
+    ManagementDeviceProfileError, ManagementDeviceProfileRepository, ManagementDeviceRepository,
     ManagementDeviceTopology, ManagementGatewayStatus, NewCommandOutboxEntry, PlatformStore,
     PlatformStoreError, SqliteStore, SqliteStoreError, UpdateManagementDevice,
 };
@@ -2524,16 +2525,13 @@ async fn sqlite_delete_management_device_profile(
     _admin: Admin,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let deleted = sqlx::query("DELETE FROM device_profiles WHERE id = ?")
-        .bind(id.to_string())
-        .execute(state.store.pool())
-        .await?
-        .rows_affected();
-    if deleted == 0 {
-        Err(ApiError::NotFound("device profile"))
-    } else {
-        Ok(StatusCode::NO_CONTENT)
-    }
+    ManagementDeviceProfileRepository::delete_management_device_profile(
+        state.token_store.as_ref(),
+        id,
+    )
+    .await
+    .map(|_| StatusCode::NO_CONTENT)
+    .map_err(management_device_profile_storage_error)
 }
 
 async fn sqlite_list_management_asset_profiles(
@@ -5638,16 +5636,13 @@ async fn delete_management_device_profile(
     _admin: Admin,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let deleted = sqlx::query("DELETE FROM device_profiles WHERE id = $1")
-        .bind(id)
-        .execute(&state.pool)
-        .await?
-        .rows_affected();
-    if deleted == 0 {
-        Err(ApiError::NotFound("device profile"))
-    } else {
-        Ok(StatusCode::NO_CONTENT)
-    }
+    ManagementDeviceProfileRepository::delete_management_device_profile(
+        state.token_store.as_ref(),
+        id,
+    )
+    .await
+    .map(|_| StatusCode::NO_CONTENT)
+    .map_err(management_device_profile_storage_error)
 }
 
 #[utoipa::path(
@@ -8400,6 +8395,24 @@ fn management_asset_profile_storage_error(error: ManagementAssetProfileError) ->
         | ManagementAssetProfileError::DashboardDefaultsMustBeObject
         | ManagementAssetProfileError::NameConflict(_) => {
             ApiError::BadRequest("invalid asset profile deletion request".to_owned())
+        }
+    }
+}
+
+fn management_device_profile_storage_error(error: ManagementDeviceProfileError) -> ApiError {
+    match error {
+        ManagementDeviceProfileError::DeviceProfileNotFound => ApiError::NotFound("device profile"),
+        ManagementDeviceProfileError::DeviceProfileInUse(_) => {
+            ApiError::Conflict("device profile is still referenced".to_owned())
+        }
+        ManagementDeviceProfileError::InvalidStoredProfile
+        | ManagementDeviceProfileError::Storage { .. } => ApiError::StorageData,
+        ManagementDeviceProfileError::InvalidName
+        | ManagementDeviceProfileError::TelemetrySchemaMustBeObject
+        | ManagementDeviceProfileError::MetricMappingMustBeObject
+        | ManagementDeviceProfileError::ReportingSettingsMustBeObject
+        | ManagementDeviceProfileError::NameConflict(_) => {
+            ApiError::BadRequest("invalid device profile deletion request".to_owned())
         }
     }
 }
