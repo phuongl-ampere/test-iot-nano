@@ -24,11 +24,16 @@ use iot_api::{
 };
 use iot_storage::{
     ApplicationKind, ApplicationRepository, ClientId, CreateManagementAsset,
-    ManagementAsset as StorageManagementAsset, ManagementAssetError, ManagementAssetRepository,
+    CreateManagementAssetProfile, CreateManagementDeviceProfile, CreateManagementUser,
+    ManagementAsset as StorageManagementAsset, ManagementAssetError, ManagementAssetProfile,
+    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
     ManagementChildStatus, ManagementDevice as StorageManagementDevice, ManagementDeviceError,
-    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, NewApplication,
+    ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
+    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
+    ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
     NewOAuthClientSecret, OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri,
-    UpdateManagementAsset, UpdateManagementDevice,
+    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
+    UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -186,6 +191,30 @@ impl ManagementSessionRouter {
             .route("/api/auth/logout", post(logout))
             .route("/api/auth/me", get(current_session))
             .route("/api/management/applications", post(create_application))
+            .route(
+                "/api/management/users",
+                get(list_management_users).post(create_management_user),
+            )
+            .route(
+                "/api/management/users/{username}",
+                put(update_management_user),
+            )
+            .route(
+                "/api/management/profiles/device-profiles",
+                get(list_management_device_profiles).post(create_management_device_profile),
+            )
+            .route(
+                "/api/management/profiles/device-profiles/{profile_id}",
+                put(update_management_device_profile).delete(delete_management_device_profile),
+            )
+            .route(
+                "/api/management/profiles/asset-profiles",
+                get(list_management_asset_profiles).post(create_management_asset_profile),
+            )
+            .route(
+                "/api/management/profiles/asset-profiles/{profile_id}",
+                put(update_management_asset_profile).delete(delete_management_asset_profile),
+            )
             .route(
                 "/api/management/devices",
                 get(list_management_devices).post(provision_device),
@@ -380,6 +409,64 @@ struct CreateApplicationRequest {
 struct ApplicationResponse {
     app_id: String,
     client_id: String,
+}
+
+#[derive(Deserialize)]
+struct CreateManagementUserRequest {
+    username: String,
+    password: String,
+    default_app: String,
+    granted_apps: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateManagementUserRequest {
+    default_app: String,
+    granted_apps: Vec<String>,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ManagementUserResponse {
+    id: Uuid,
+    username: String,
+    role: String,
+    account_class: String,
+    default_app: String,
+    granted_apps: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ManagementDeviceProfileRequest {
+    name: String,
+    telemetry_schema: Value,
+    metric_mapping: Value,
+    reporting_settings: Value,
+}
+
+#[derive(Serialize)]
+struct ManagementDeviceProfileResponse {
+    id: Uuid,
+    name: String,
+    telemetry_schema: Value,
+    metric_mapping: Value,
+    reporting_settings: Value,
+}
+
+#[derive(Deserialize)]
+struct ManagementAssetProfileRequest {
+    name: String,
+    fields: Value,
+    dashboard_defaults: Value,
+}
+
+#[derive(Serialize)]
+struct ManagementAssetProfileResponse {
+    id: Uuid,
+    name: String,
+    fields: Value,
+    dashboard_defaults: Value,
 }
 
 #[derive(Deserialize)]
@@ -586,6 +673,234 @@ async fn provision_device(
     Ok((StatusCode::CREATED, Json(token)))
 }
 
+async fn list_management_users(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementUserResponse>>, ManagementSessionError> {
+    require_management_admin(&state.session_verifier, &headers)?;
+    ManagementUserRepository::list_management_users(state.store.as_ref())
+        .await
+        .map(|users| Json(users.into_iter().map(management_user_response).collect()))
+        .map_err(management_user_error)
+}
+
+async fn create_management_user(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<(StatusCode, Json<ManagementUserResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let request: CreateManagementUserRequest = management_request_json(&state, request).await?;
+    validate_password(&request.password).map_err(|_| ManagementSessionError::BadRequest)?;
+    let password_hash =
+        hash_password(&request.password).map_err(|_| ManagementSessionError::BadRequest)?;
+    let user = ManagementUserRepository::create_management_user(
+        state.store.as_ref(),
+        CreateManagementUser {
+            username: request.username,
+            password_hash,
+            default_app: request.default_app,
+            granted_apps: request.granted_apps,
+        },
+    )
+    .await
+    .map_err(management_user_error)?;
+    Ok((StatusCode::CREATED, Json(management_user_response(user))))
+}
+
+async fn update_management_user(
+    State(state): State<ManagementState>,
+    Path(username): Path<String>,
+    request: Request,
+) -> Result<Json<ManagementUserResponse>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let request: UpdateManagementUserRequest = management_request_json(&state, request).await?;
+    let role = request
+        .role
+        .as_deref()
+        .map(management_user_role)
+        .transpose()?;
+    let user = ManagementUserRepository::update_management_user(
+        state.store.as_ref(),
+        &username,
+        UpdateManagementUser {
+            default_app: request.default_app,
+            granted_apps: request.granted_apps,
+            role,
+        },
+    )
+    .await
+    .map_err(management_user_error)?;
+    Ok(Json(management_user_response(user)))
+}
+
+async fn list_management_device_profiles(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementDeviceProfileResponse>>, ManagementSessionError> {
+    require_management_admin(&state.session_verifier, &headers)?;
+    ManagementDeviceProfileRepository::list_management_device_profiles(state.store.as_ref())
+        .await
+        .map(|profiles| {
+            Json(
+                profiles
+                    .into_iter()
+                    .map(management_device_profile_response)
+                    .collect(),
+            )
+        })
+        .map_err(management_device_profile_error)
+}
+
+async fn create_management_device_profile(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<(StatusCode, Json<ManagementDeviceProfileResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let request: ManagementDeviceProfileRequest = management_request_json(&state, request).await?;
+    let profile = ManagementDeviceProfileRepository::create_management_device_profile(
+        state.store.as_ref(),
+        CreateManagementDeviceProfile {
+            name: request.name,
+            telemetry_schema: request.telemetry_schema,
+            metric_mapping: request.metric_mapping,
+            reporting_settings: request.reporting_settings,
+        },
+    )
+    .await
+    .map_err(management_device_profile_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(management_device_profile_response(profile)),
+    ))
+}
+
+async fn update_management_device_profile(
+    State(state): State<ManagementState>,
+    Path(profile_id): Path<String>,
+    request: Request,
+) -> Result<Json<ManagementDeviceProfileResponse>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let request: ManagementDeviceProfileRequest = management_request_json(&state, request).await?;
+    let profile_id =
+        Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let profile = ManagementDeviceProfileRepository::update_management_device_profile(
+        state.store.as_ref(),
+        profile_id,
+        UpdateManagementDeviceProfile {
+            name: request.name,
+            telemetry_schema: request.telemetry_schema,
+            metric_mapping: request.metric_mapping,
+            reporting_settings: request.reporting_settings,
+        },
+    )
+    .await
+    .map_err(management_device_profile_error)?;
+    Ok(Json(management_device_profile_response(profile)))
+}
+
+async fn delete_management_device_profile(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    require_management_admin(&state.session_verifier, &headers)?;
+    let profile_id =
+        Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    ManagementDeviceProfileRepository::delete_management_device_profile(
+        state.store.as_ref(),
+        profile_id,
+    )
+    .await
+    .map_err(management_device_profile_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_management_asset_profiles(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementAssetProfileResponse>>, ManagementSessionError> {
+    require_management_admin(&state.session_verifier, &headers)?;
+    ManagementAssetProfileRepository::list_management_asset_profiles(state.store.as_ref())
+        .await
+        .map(|profiles| {
+            Json(
+                profiles
+                    .into_iter()
+                    .map(management_asset_profile_response)
+                    .collect(),
+            )
+        })
+        .map_err(management_asset_profile_error)
+}
+
+async fn create_management_asset_profile(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<(StatusCode, Json<ManagementAssetProfileResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let request: ManagementAssetProfileRequest = management_request_json(&state, request).await?;
+    let profile = ManagementAssetProfileRepository::create_management_asset_profile(
+        state.store.as_ref(),
+        CreateManagementAssetProfile {
+            name: request.name,
+            fields: request.fields,
+            dashboard_defaults: request.dashboard_defaults,
+        },
+    )
+    .await
+    .map_err(management_asset_profile_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(management_asset_profile_response(profile)),
+    ))
+}
+
+async fn update_management_asset_profile(
+    State(state): State<ManagementState>,
+    Path(profile_id): Path<String>,
+    request: Request,
+) -> Result<Json<ManagementAssetProfileResponse>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_management_admin(&state.session_verifier, &headers)?;
+    let request: ManagementAssetProfileRequest = management_request_json(&state, request).await?;
+    let profile_id =
+        Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let profile = ManagementAssetProfileRepository::update_management_asset_profile(
+        state.store.as_ref(),
+        profile_id,
+        UpdateManagementAssetProfile {
+            name: request.name,
+            fields: request.fields,
+            dashboard_defaults: request.dashboard_defaults,
+        },
+    )
+    .await
+    .map_err(management_asset_profile_error)?;
+    Ok(Json(management_asset_profile_response(profile)))
+}
+
+async fn delete_management_asset_profile(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(profile_id): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    require_management_admin(&state.session_verifier, &headers)?;
+    let profile_id =
+        Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    ManagementAssetProfileRepository::delete_management_asset_profile(
+        state.store.as_ref(),
+        profile_id,
+    )
+    .await
+    .map_err(management_asset_profile_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_management_devices(
     State(state): State<ManagementState>,
     headers: HeaderMap,
@@ -712,6 +1027,96 @@ async fn delete_management_asset(
         .await
         .map_err(management_asset_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn management_user_role(value: &str) -> Result<ManagementUserRole, ManagementSessionError> {
+    match value {
+        "admin" => Ok(ManagementUserRole::Admin),
+        "viewer" => Ok(ManagementUserRole::Viewer),
+        _ => Err(ManagementSessionError::BadRequest),
+    }
+}
+
+fn management_user_response(user: ManagementUser) -> ManagementUserResponse {
+    ManagementUserResponse {
+        id: user.id,
+        username: user.username,
+        role: user.role.as_str().to_owned(),
+        account_class: user.account_class.as_str().to_owned(),
+        default_app: user.default_app,
+        granted_apps: user.granted_apps,
+    }
+}
+
+fn management_device_profile_response(
+    profile: ManagementDeviceProfile,
+) -> ManagementDeviceProfileResponse {
+    ManagementDeviceProfileResponse {
+        id: profile.id,
+        name: profile.name,
+        telemetry_schema: profile.telemetry_schema,
+        metric_mapping: profile.metric_mapping,
+        reporting_settings: profile.reporting_settings,
+    }
+}
+
+fn management_asset_profile_response(
+    profile: ManagementAssetProfile,
+) -> ManagementAssetProfileResponse {
+    ManagementAssetProfileResponse {
+        id: profile.id,
+        name: profile.name,
+        fields: profile.fields,
+        dashboard_defaults: profile.dashboard_defaults,
+    }
+}
+
+fn management_user_error(error: ManagementUserError) -> ManagementSessionError {
+    match error {
+        ManagementUserError::InvalidUsername(_)
+        | ManagementUserError::EmptyPasswordHash
+        | ManagementUserError::InvalidDefaultApp(_)
+        | ManagementUserError::InvalidGrantedApps => ManagementSessionError::BadRequest,
+        ManagementUserError::UsernameConflict(_)
+        | ManagementUserError::SystemUserImmutable
+        | ManagementUserError::LastAdministrator => ManagementSessionError::Conflict,
+        ManagementUserError::UserNotFound => ManagementSessionError::NotFound,
+        ManagementUserError::InvalidStoredUserId
+        | ManagementUserError::InvalidStoredRole(_)
+        | ManagementUserError::InvalidStoredAccountClass(_)
+        | ManagementUserError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_device_profile_error(error: ManagementDeviceProfileError) -> ManagementSessionError {
+    match error {
+        ManagementDeviceProfileError::InvalidName
+        | ManagementDeviceProfileError::TelemetrySchemaMustBeObject
+        | ManagementDeviceProfileError::MetricMappingMustBeObject
+        | ManagementDeviceProfileError::ReportingSettingsMustBeObject => {
+            ManagementSessionError::BadRequest
+        }
+        ManagementDeviceProfileError::DeviceProfileNotFound => ManagementSessionError::NotFound,
+        ManagementDeviceProfileError::NameConflict(_)
+        | ManagementDeviceProfileError::DeviceProfileInUse(_) => ManagementSessionError::Conflict,
+        ManagementDeviceProfileError::InvalidStoredProfile
+        | ManagementDeviceProfileError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_asset_profile_error(error: ManagementAssetProfileError) -> ManagementSessionError {
+    match error {
+        ManagementAssetProfileError::InvalidName
+        | ManagementAssetProfileError::FieldsMustBeObject
+        | ManagementAssetProfileError::DashboardDefaultsMustBeObject => {
+            ManagementSessionError::BadRequest
+        }
+        ManagementAssetProfileError::AssetProfileNotFound => ManagementSessionError::NotFound,
+        ManagementAssetProfileError::NameConflict(_)
+        | ManagementAssetProfileError::AssetProfileInUse(_) => ManagementSessionError::Conflict,
+        ManagementAssetProfileError::InvalidStoredProfile
+        | ManagementAssetProfileError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
 }
 
 fn management_device_response(device: StorageManagementDevice) -> ManagementDeviceResponse {
