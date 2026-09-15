@@ -9,6 +9,10 @@ use std::{
 use sqlx::{Connection, PgConnection};
 
 const SHARED_LOCK_KEY: &str = "iot_nano:platform-storage-test";
+const SHARED_SCHEMA_HELPER_MARKERS: &[&str] = &[
+    "common::reset_timescale_schema",
+    "common::lock_timescale_schema",
+];
 const SHARED_SCHEMA_TEST_FILES: &[&str] = &[
     "alert_evaluation.rs",
     "alert_incident.rs",
@@ -83,6 +87,12 @@ fn read_test_source(file_name: &str) -> String {
         .unwrap_or_else(|error| panic!("failed to read {file_name}: {error}"))
 }
 
+fn is_shared_schema_source(source: &str) -> bool {
+    SHARED_SCHEMA_HELPER_MARKERS
+        .iter()
+        .any(|marker| source.contains(marker))
+}
+
 fn function_body<'a>(source: &'a str, function_name: &str) -> &'a str {
     let marker = format!("fn {function_name}");
     let function_start = source
@@ -110,6 +120,16 @@ fn function_body<'a>(source: &'a str, function_name: &str) -> &'a str {
 }
 
 #[test]
+fn isolated_timescale_source_is_not_shared_by_backend_markers_alone() {
+    let isolated_source = r#"
+        let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
+        let storage = DatabaseStorage::Timescale;
+    "#;
+
+    assert!(!is_shared_schema_source(isolated_source));
+}
+
+#[test]
 fn shared_schema_inventory_is_explicit_and_excludes_isolated_tests() {
     let actual: BTreeSet<String> = fs::read_dir(tests_dir())
         .unwrap()
@@ -121,8 +141,7 @@ fn shared_schema_inventory_is_explicit_and_excludes_isolated_tests() {
         })
         .filter(|path| {
             let source = fs::read_to_string(path).unwrap();
-            source.contains("IOT_NANO_TIMESCALE_TEST_URL")
-                && source.contains("DatabaseStorage::Timescale")
+            is_shared_schema_source(&source)
         })
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
