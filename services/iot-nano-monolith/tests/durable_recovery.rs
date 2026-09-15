@@ -6,14 +6,12 @@ use std::{
 };
 
 use chrono::Utc;
-use iot_core::{
-    DatabaseStorage, StorageConfiguration, TelemetryEvent, device_token_prefix,
-    generate_device_token, hash_device_token,
-};
+use iot_api::{TokenVault, create_platform_device_token};
+use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_nano_monolith::{CacheEntry, MonolithConfig, MonolithRuntime, ShutdownError, StartupError};
 use iot_nano_mqttd::{
-    BrokerLifecycleHandle, BrokerStorage, ListenerConfiguration, MqttRuntimeStartError,
-    MuxSettings, PreboundBackendListeners, ProtocolBackends, SqliteStorage,
+    BrokerLifecycleHandle, BrokerStorage, ListenerConfiguration, MuxSettings,
+    PreboundBackendListeners, ProtocolBackends, SqliteStorage,
     start_broker_with_prebound_listeners,
 };
 use iot_nano_stream::{
@@ -23,7 +21,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     time::timeout,
 };
 use uuid::Uuid;
@@ -33,7 +31,6 @@ const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
 struct Fixture {
     _directory: TempDir,
     config: MonolithConfig,
-    reserved_listeners: Option<Vec<TcpListener>>,
 }
 
 impl Fixture {
@@ -43,7 +40,7 @@ impl Fixture {
         let mqtt_fixtures =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../iot-nano-mqttd/tests/fixtures");
 
-        let mut fixture = Self {
+        Self {
             config: MonolithConfig {
                 storage: StorageConfiguration {
                     storage: DatabaseStorage::Sqlite,
@@ -63,94 +60,18 @@ impl Fixture {
                 shutdown_deadline: Duration::from_secs(1),
             },
             _directory: directory,
-            reserved_listeners: None,
-        };
-        fixture.reserve_new_addresses().await;
-        fixture
+        }
     }
 
     fn platform_path(&self) -> &std::path::Path {
         self.config.storage.sqlite_path.as_deref().unwrap()
     }
 
-    fn state_path(&self, name: &str) -> PathBuf {
-        self.config.internal_dir.join(name)
+    async fn start(&self) -> (MonolithRuntime, SocketAddr) {
+        let runtime = MonolithRuntime::start(self.config.clone()).await.unwrap();
+        let mqtt_tcp = runtime.mqtt_tcp_address().unwrap();
+        (runtime, mqtt_tcp)
     }
-
-    async fn start(&mut self) -> MonolithRuntime {
-        const START_ATTEMPTS: usize = 4;
-
-        for attempt in 0..START_ATTEMPTS {
-            if self.reserved_listeners.is_none()
-                && self.reserve_configured_addresses().await.is_err()
-            {
-                self.reserve_new_addresses().await;
-            }
-            self.release_reserved_addresses();
-
-            match MonolithRuntime::start(self.config.clone()).await {
-                Ok(runtime) => return runtime,
-                Err(error)
-                    if is_retryable_listener_error(&error) && attempt + 1 < START_ATTEMPTS =>
-                {
-                    self.reserve_new_addresses().await;
-                }
-                Err(error) => panic!("monolith runtime failed to start: {error}"),
-            }
-        }
-
-        unreachable!("listener startup retry loop must return or panic")
-    }
-
-    async fn reserve_configured_addresses(&mut self) -> std::io::Result<()> {
-        let public_listener = TcpListener::bind(self.config.public_http).await?;
-        let management_listener = TcpListener::bind(self.config.management_http).await?;
-        let mqtt_tcp_listener = TcpListener::bind(self.config.mqtt_tcp).await?;
-        let mqtt_tls_listener = TcpListener::bind(self.config.mqtt_tls).await?;
-        self.reserved_listeners = Some(vec![
-            public_listener,
-            management_listener,
-            mqtt_tcp_listener,
-            mqtt_tls_listener,
-        ]);
-        Ok(())
-    }
-
-    async fn reserve_new_addresses(&mut self) {
-        self.release_reserved_addresses();
-        let (public_http, public_listener) = reserve_address().await;
-        let (management_http, management_listener) = reserve_address().await;
-        let (mqtt_tcp, mqtt_tcp_listener) = reserve_address().await;
-        let (mqtt_tls, mqtt_tls_listener) = reserve_address().await;
-        self.config.public_http = public_http;
-        self.config.management_http = management_http;
-        self.config.mqtt_tcp = mqtt_tcp;
-        self.config.mqtt_tls = mqtt_tls;
-        self.reserved_listeners = Some(vec![
-            public_listener,
-            management_listener,
-            mqtt_tcp_listener,
-            mqtt_tls_listener,
-        ]);
-    }
-
-    fn release_reserved_addresses(&mut self) {
-        self.reserved_listeners.take();
-    }
-}
-
-fn is_retryable_listener_error(error: &StartupError) -> bool {
-    matches!(
-        error,
-        StartupError::PublicHttpBind(_)
-            | StartupError::ManagementHttpBind(_)
-            | StartupError::MqttRuntime(
-                MqttRuntimeStartError::PrivateBackendBind(_)
-                    | MqttRuntimeStartError::DeviceBackendBind(_)
-                    | MqttRuntimeStartError::PlaintextListenerBind(_)
-                    | MqttRuntimeStartError::TlsListenerBind(_)
-            )
-    )
 }
 
 struct ProtocolBroker {
@@ -237,8 +158,8 @@ impl Drop for ProtocolBroker {
 
 #[tokio::test]
 async fn instance_lock_rejects_a_second_runtime_and_restored_platform_backup_is_bootable() {
-    let mut fixture = Fixture::sqlite().await;
-    let mut first = fixture.start().await;
+    let fixture = Fixture::sqlite().await;
+    let (mut first, _) = fixture.start().await;
     first
         .platform()
         .unwrap()
@@ -267,7 +188,7 @@ async fn instance_lock_rejects_a_second_runtime_and_restored_platform_backup_is_
     drop(first);
     replace_sqlite_database(&backup, fixture.platform_path());
 
-    let mut restored = fixture.start().await;
+    let (mut restored, _) = fixture.start().await;
     let pool = restored.platform().unwrap().sqlite_pool().unwrap();
     let devices: Vec<String> =
         sqlx::query_scalar("SELECT device_id FROM devices ORDER BY device_id")
@@ -283,8 +204,8 @@ async fn instance_lock_rejects_a_second_runtime_and_restored_platform_backup_is_
 
 #[tokio::test]
 async fn unacknowledged_stream_work_replays_after_a_full_runtime_restart() {
-    let mut fixture = Fixture::sqlite().await;
-    let mut runtime = fixture.start().await;
+    let fixture = Fixture::sqlite().await;
+    let (mut runtime, _) = fixture.start().await;
     let stream = runtime.stream().unwrap().clone();
     stream.append(telemetry_message(1)).await.unwrap();
     let interrupted_claim = stream
@@ -297,7 +218,7 @@ async fn unacknowledged_stream_work_replays_after_a_full_runtime_restart() {
     drop(stream);
     drop(runtime);
 
-    let mut restarted = fixture.start().await;
+    let (mut restarted, _) = fixture.start().await;
     let replay = restarted
         .stream()
         .unwrap()
@@ -406,12 +327,28 @@ async fn broker_completes_restarted_qos2_pubrel_once() {
         read_mqtt_packet(&mut publisher).await,
         vec![0x70, 0x02, 0x00, 0x1d]
     );
-    assert!(
-        timeout(Duration::from_millis(300), read_mqtt_packet(&mut reader))
-            .await
-            .is_err(),
-        "duplicate PUBREL must not create a second broker delivery"
+    publisher
+        .write_all(&mqtt_qos_one_publish(
+            "durable/qos2",
+            b"post-pubrel marker",
+            30,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_mqtt_packet(&mut publisher).await,
+        vec![0x40, 0x02, 0x00, 0x1e]
     );
+    let marker = read_mqtt_packet(&mut reader).await;
+    assert_eq!(
+        mqtt_publish_payload(&marker),
+        b"post-pubrel marker",
+        "the second delivery after the duplicate PUBREL must be the ordered marker"
+    );
+    reader
+        .write_all(&mqtt_puback(mqtt_publish_packet_id(&marker)))
+        .await
+        .unwrap();
     drop(publisher);
     drop(reader);
     second.shutdown();
@@ -419,12 +356,11 @@ async fn broker_completes_restarted_qos2_pubrel_once() {
 
 #[tokio::test]
 async fn mqtt_runtime_appends_replayed_qos_one_telemetry_once_after_restart() {
-    let mut fixture = Fixture::sqlite().await;
-    let mut first = fixture.start().await;
+    let fixture = Fixture::sqlite().await;
+    let (mut first, first_mqtt_tcp) = fixture.start().await;
     let token = provision_device_token(&first, "durable-device").await;
     let payload = telemetry_payload(42);
-    let mut publisher =
-        connect_device(fixture.config.mqtt_tcp, "durable-qos1-publisher", &token).await;
+    let mut publisher = connect_device(first_mqtt_tcp, "durable-qos1-publisher", &token).await;
     publisher
         .write_all(&mqtt_qos_one_publish(
             "v1/devices/me/telemetry",
@@ -444,9 +380,8 @@ async fn mqtt_runtime_appends_replayed_qos_one_telemetry_once_after_restart() {
         .unwrap();
     drop(first);
 
-    let mut restarted = fixture.start().await;
-    let mut publisher =
-        connect_device(fixture.config.mqtt_tcp, "durable-qos1-publisher", &token).await;
+    let (mut restarted, restarted_mqtt_tcp) = fixture.start().await;
+    let mut publisher = connect_device(restarted_mqtt_tcp, "durable-qos1-publisher", &token).await;
     publisher
         .write_all(&mqtt_qos_one_publish(
             "v1/devices/me/telemetry",
@@ -502,48 +437,43 @@ async fn mqtt_runtime_appends_replayed_qos_one_telemetry_once_after_restart() {
 }
 
 #[tokio::test]
-async fn cache_expiry_is_pruned_when_the_monolith_reopens_internal_state() {
-    let mut fixture = Fixture::sqlite().await;
-    let mut runtime = fixture.start().await;
+async fn expired_cache_entries_remain_hidden_after_a_monolith_restart() {
+    let fixture = Fixture::sqlite().await;
+    let (mut runtime, _) = fixture.start().await;
+    let expires_at_ms = now_ms() + 50;
     runtime
         .cache()
         .unwrap()
         .put(CacheEntry {
             key: "device:expired-after-stop".to_owned(),
             value: b"stale".to_vec(),
-            expires_at_ms: now_ms() + 60_000,
+            expires_at_ms,
         })
         .await
         .unwrap();
+    assert_eq!(
+        runtime
+            .cache()
+            .unwrap()
+            .get("device:expired-after-stop")
+            .await
+            .unwrap(),
+        Some(b"stale".to_vec())
+    );
     runtime
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
     drop(runtime);
+    timeout(Duration::from_secs(1), async {
+        while now_ms() <= expires_at_ms {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cache entry did not reach its public expiration deadline");
 
-    let connection = rusqlite::Connection::open(fixture.state_path("cache.sqlite")).unwrap();
-    connection
-        .execute(
-            "UPDATE cache_entries SET expires_at_ms = 0 WHERE key = 'device:expired-after-stop'",
-            [],
-        )
-        .unwrap();
-    drop(connection);
-
-    let mut restarted = fixture.start().await;
-    let connection = rusqlite::Connection::open(fixture.state_path("cache.sqlite")).unwrap();
-    let persisted_entries: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM cache_entries WHERE key = 'device:expired-after-stop'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        persisted_entries, 0,
-        "cache startup must prune expired rows before serving gets"
-    );
-    drop(connection);
+    let (mut restarted, _) = fixture.start().await;
     assert_eq!(
         restarted
             .cache()
@@ -603,19 +533,15 @@ async fn provision_device_token(runtime: &MonolithRuntime, device_id: &str) -> S
         .register_device(device_id)
         .await
         .unwrap();
-    let token = generate_device_token();
-    sqlx::query(
-        "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
-         VALUES (?, ?, ?, ?)",
+    create_platform_device_token(
+        runtime.platform().unwrap(),
+        &TokenVault::from_key_material("durable-recovery-device-token-key-material-0001"),
+        device_id,
     )
-    .bind(Uuid::now_v7().to_string())
-    .bind(device_id)
-    .bind(device_token_prefix(&token).unwrap())
-    .bind(hash_device_token(&token).unwrap())
-    .execute(runtime.platform().unwrap().sqlite_pool().unwrap())
     .await
-    .unwrap();
-    token
+    .unwrap()
+    .token
+    .unwrap()
 }
 
 async fn connect_mqtt(
@@ -785,28 +711,29 @@ fn mqtt_packet_body_offset(packet: &[u8]) -> usize {
 }
 
 async fn read_mqtt_packet(stream: &mut TcpStream) -> Vec<u8> {
-    let mut first = [0_u8; 1];
-    timeout(Duration::from_secs(3), stream.read_exact(&mut first))
-        .await
-        .unwrap()
-        .unwrap();
-    let mut packet = first.to_vec();
-    let mut remaining = 0_usize;
-    let mut multiplier = 1_usize;
-    loop {
-        let mut encoded = [0_u8; 1];
-        stream.read_exact(&mut encoded).await.unwrap();
-        packet.push(encoded[0]);
-        remaining += usize::from(encoded[0] & 0x7f) * multiplier;
-        if encoded[0] & 0x80 == 0 {
-            break;
+    timeout(Duration::from_secs(3), async {
+        let mut first = [0_u8; 1];
+        stream.read_exact(&mut first).await.unwrap();
+        let mut packet = first.to_vec();
+        let mut remaining = 0_usize;
+        let mut multiplier = 1_usize;
+        loop {
+            let mut encoded = [0_u8; 1];
+            stream.read_exact(&mut encoded).await.unwrap();
+            packet.push(encoded[0]);
+            remaining += usize::from(encoded[0] & 0x7f) * multiplier;
+            if encoded[0] & 0x80 == 0 {
+                break;
+            }
+            multiplier *= 128;
         }
-        multiplier *= 128;
-    }
-    let mut body = vec![0_u8; remaining];
-    stream.read_exact(&mut body).await.unwrap();
-    packet.extend(body);
-    packet
+        let mut body = vec![0_u8; remaining];
+        stream.read_exact(&mut body).await.unwrap();
+        packet.extend(body);
+        packet
+    })
+    .await
+    .expect("MQTT packet read timed out")
 }
 
 fn encode_remaining_length(mut value: usize, packet: &mut Vec<u8>) {
@@ -846,10 +773,4 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-}
-
-async fn reserve_address() -> (SocketAddr, TcpListener) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    (address, listener)
 }

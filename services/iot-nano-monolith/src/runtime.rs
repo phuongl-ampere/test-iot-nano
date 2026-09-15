@@ -256,6 +256,10 @@ impl MonolithRuntime {
         self.mqtt_storage.as_ref()
     }
 
+    pub fn mqtt_tcp_address(&self) -> Option<SocketAddr> {
+        self.mqtt.as_ref().map(MqttRuntime::plaintext_address)
+    }
+
     pub fn cache(&self) -> Option<&Arc<PersistentCache>> {
         self.cache.as_ref()
     }

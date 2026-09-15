@@ -66,6 +66,7 @@ pub struct MqttRuntime {
     shutdown: RuntimeShutdownControl,
     parent_cancellation_watcher: Option<JoinHandle<()>>,
     drain_started: watch::Sender<bool>,
+    plaintext_address: SocketAddr,
     public_connections: Arc<AtomicUsize>,
     _cache: Arc<dyn CachePort>,
 }
@@ -507,6 +508,13 @@ impl MqttRuntime {
                 return Err(MqttRuntimeStartError::PlaintextListenerBind(error));
             }
         };
+        let plaintext_address = match plaintext_listener.local_addr() {
+            Ok(address) => address,
+            Err(error) => {
+                cancel_startup(&shutdown, &mut supervisor).await;
+                return Err(MqttRuntimeStartError::PlaintextListenerBind(error));
+            }
+        };
         let tls_listener = match TcpListener::bind(config.listeners.tls_address).await {
             Ok(listener) => listener,
             Err(error) => {
@@ -590,6 +598,7 @@ impl MqttRuntime {
             shutdown,
             parent_cancellation_watcher: Some(parent_cancellation_watcher),
             drain_started,
+            plaintext_address,
             public_connections,
             _cache: config.cache,
         })
@@ -597,6 +606,10 @@ impl MqttRuntime {
 
     pub fn session_router(&self) -> RpcSessionRouter {
         self.session_router.clone()
+    }
+
+    pub fn plaintext_address(&self) -> SocketAddr {
+        self.plaintext_address
     }
 
     pub fn is_accepting(&self) -> bool {
@@ -751,7 +764,9 @@ pub enum MqttRuntimeError {
 }
 
 fn validate_listeners(listeners: &MqttListenerConfig) -> Result<(), MqttRuntimeStartError> {
-    if listeners.plaintext_address == listeners.tls_address {
+    if listeners.plaintext_address == listeners.tls_address
+        && listeners.plaintext_address.port() != 0
+    {
         return Err(MqttRuntimeStartError::DuplicatePublicListenerAddress);
     }
     for (name, value) in [
