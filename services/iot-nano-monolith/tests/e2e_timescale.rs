@@ -1,5 +1,17 @@
 use std::{
-    env, error::Error, io, net::SocketAddr, path::PathBuf, process::Stdio, str::FromStr,
+    env,
+    error::Error,
+    io::{self, Read},
+    net::SocketAddr,
+    path::PathBuf,
+    process::{Child, Stdio},
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{SyncSender, sync_channel},
+    },
+    thread::{Builder, JoinHandle},
     time::Duration,
 };
 
@@ -14,8 +26,7 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    process::{Child, ChildStderr, Command},
-    task::JoinHandle,
+    process::Command,
     time::{sleep, timeout},
 };
 use uuid::Uuid;
@@ -35,8 +46,11 @@ struct InitialDatabaseState {
 }
 
 struct ManagedChild {
-    child: Child,
+    child: Option<Child>,
     stderr: Option<JoinHandle<io::Result<String>>>,
+    process_group: rustix::process::Pid,
+    reaper: Option<SyncSender<Child>>,
+    reaped: Arc<AtomicBool>,
 }
 
 struct FlowCredentials {
@@ -370,12 +384,12 @@ async fn start_monolith(
         )
         .await?;
 
-        match wait_ready(client, fixture.public_address, &mut child.child).await {
+        match wait_ready(client, fixture.public_address, child.child_mut()?).await {
             Ok(()) => return Ok(child),
             Err(error) => {
-                let exited_before_cleanup = matches!(child.child.try_wait(), Ok(Some(_)));
+                let exited_before_cleanup = matches!(child.try_wait(), Ok(Some(_)));
                 let cleanup = force_stop_child(&mut child).await;
-                let diagnostic = match child.child.try_wait() {
+                let diagnostic = match child.try_wait() {
                     Ok(Some(_)) => child.diagnostic().await.unwrap_or_else(|capture_error| {
                         format!("stderr capture failed: {capture_error}")
                     }),
@@ -740,7 +754,7 @@ fn is_bind_conflict(diagnostic: &str) -> bool {
 }
 
 async fn wait_for_child_success(child: &mut ManagedChild, context: &str) -> E2eResult {
-    let exit = match child.child.wait().await {
+    let exit = match child.wait().await {
         Ok(exit) => exit,
         Err(error) => {
             return force_stop_after_failure(child, context, Err(error.into())).await;
@@ -755,7 +769,7 @@ async fn wait_for_child_success_with_timeout(
     context: &str,
     wait_timeout: Duration,
 ) -> E2eResult {
-    let exit = match timeout(wait_timeout, child.child.wait()).await {
+    let exit = match timeout(wait_timeout, child.wait()).await {
         Ok(Ok(exit)) => exit,
         Ok(Err(error)) => {
             return force_stop_after_failure(child, context, Err(error.into())).await;
@@ -777,7 +791,7 @@ async fn wait_for_child_success_with_timeout(
 }
 
 async fn stop_child(child: &mut ManagedChild) -> E2eResult {
-    match child.child.try_wait() {
+    match child.try_wait() {
         Ok(Some(status)) => {
             let diagnostic = child.diagnostic().await?;
             return require_success(
@@ -797,7 +811,7 @@ async fn stop_child(child: &mut ManagedChild) -> E2eResult {
         }
     }
 
-    let pid = match child.child.id() {
+    let pid = match child.id() {
         Some(pid) => pid,
         None => {
             return force_stop_after_failure(
@@ -808,28 +822,20 @@ async fn stop_child(child: &mut ManagedChild) -> E2eResult {
             .await;
         }
     };
-    let signal = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .await;
+    let signal = child.signal(rustix::process::Signal::TERM);
     match signal {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
+        Ok(()) => {}
+        Err(error) => {
             return force_stop_after_failure(
                 child,
                 "graceful shutdown signal",
-                Err(test_error(format!("SIGTERM exited with {status}"))),
+                Err(test_error(format!("SIGTERM failed for {pid}: {error}"))),
             )
             .await;
         }
-        Err(error) => {
-            return force_stop_after_failure(child, "graceful shutdown signal", Err(error.into()))
-                .await;
-        }
     }
 
-    let exit = match timeout(Duration::from_secs(15), child.child.wait()).await {
+    let exit = match timeout(Duration::from_secs(15), child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             return force_stop_after_failure(child, "graceful shutdown wait", Err(error.into()))
@@ -851,21 +857,14 @@ async fn stop_child(child: &mut ManagedChild) -> E2eResult {
 }
 
 async fn force_stop_child(child: &mut ManagedChild) -> E2eResult {
-    match child.child.try_wait() {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => kill_and_wait_for_child(child).await,
-        Err(error) => combine_outcomes(
-            "child status inspection",
-            Err(error.into()),
-            "forced child cleanup",
-            kill_and_wait_for_child(child).await,
-        ),
-    }
+    kill_and_wait_for_child(child).await
 }
 
 async fn kill_and_wait_for_child(child: &mut ManagedChild) -> E2eResult {
-    let kill = child.child.start_kill();
-    let wait = match timeout(Duration::from_secs(5), child.child.wait()).await {
+    let kill = child
+        .signal(rustix::process::Signal::KILL)
+        .or_else(ignore_missing_process_group);
+    let wait = match timeout(Duration::from_secs(5), child.wait()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(error.into()),
         Err(_) => Err(test_error(
@@ -882,6 +881,31 @@ async fn kill_and_wait_for_child(child: &mut ManagedChild) -> E2eResult {
             Err(wait),
         ),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_child_drop_during_task_abort_kills_its_process_group() {
+    let directory = tempfile::tempdir().unwrap();
+    let descendant_pid_path = directory.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("sleep 30 & echo $! > \"$1\"; wait")
+        .arg("shutdown-test")
+        .arg(&descendant_pid_path);
+    let child = spawn_child(&mut command, Vec::new()).await.unwrap();
+    let reaped = Arc::clone(&child.reaped);
+    let descendant_pid = wait_for_pid(&descendant_pid_path).await;
+
+    let task = tokio::spawn(async move {
+        let _child = child;
+        panic!("abort the managed child fixture");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+
+    wait_until_process_is_gone(descendant_pid).await;
+    wait_until_reaped(reaped).await;
 }
 
 async fn assert_all_addresses_rebind(fixture: &Fixture) -> E2eResult {
@@ -910,6 +934,49 @@ async fn assert_all_addresses_rebind(fixture: &Fixture) -> E2eResult {
 async fn reserve_address() -> E2eResult<(SocketAddr, TcpListener)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     Ok((listener.local_addr()?, listener))
+}
+
+#[cfg(unix)]
+async fn wait_for_pid(path: &std::path::Path) -> u32 {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process-group descendant did not report its PID")
+}
+
+#[cfg(unix)]
+async fn wait_until_process_is_gone(pid: u32) {
+    let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if rustix::process::test_kill_process(pid).is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("process-group descendant remained alive after fixture cleanup");
+}
+
+#[cfg(unix)]
+async fn wait_until_reaped(reaped: Arc<AtomicBool>) {
+    timeout(Duration::from_secs(1), async {
+        while !reaped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("managed child remained unreaped after fixture cleanup");
 }
 
 async fn assert_pristine_test_database(database_url: &str) -> E2eResult<InitialDatabaseState> {
@@ -1043,20 +1110,34 @@ fn combine_outcomes(
 }
 
 async fn spawn_child(command: &mut Command, redactions: Vec<String>) -> E2eResult<ManagedChild> {
+    let reaped = Arc::new(AtomicBool::new(false));
+    let reaper = spawn_child_reaper(Arc::clone(&reaped))?;
+    command.process_group(0);
     let mut child = command
-        .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .as_std_mut()
         .spawn()?;
-    let stderr = match child.stderr.take() {
+    let process_group = match rustix::process::Pid::from_raw(child.id() as i32) {
+        Some(process_group) => process_group,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(test_error("spawned child has no process group"));
+        }
+    };
+    let mut managed = ManagedChild {
+        child: Some(child),
+        stderr: None,
+        process_group,
+        reaper: Some(reaper),
+        reaped,
+    };
+    let stderr = match managed.child_mut()?.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            let mut child = ManagedChild {
-                child,
-                stderr: None,
-            };
             return force_stop_after_failure(
-                &mut child,
+                &mut managed,
                 "child stderr setup",
                 Err(test_error("child stderr pipe was unavailable")),
             )
@@ -1064,32 +1145,122 @@ async fn spawn_child(command: &mut Command, redactions: Vec<String>) -> E2eResul
             .map(|()| unreachable!());
         }
     };
-    Ok(ManagedChild {
-        child,
-        stderr: Some(tokio::spawn(collect_redacted_stderr(stderr, redactions))),
-    })
+    match Builder::new()
+        .name("iot-nano-e2e-stderr".to_owned())
+        .spawn(move || collect_redacted_stderr(stderr, redactions))
+    {
+        Ok(stderr) => {
+            managed.stderr = Some(stderr);
+            Ok(managed)
+        }
+        Err(error) => force_stop_after_failure(
+            &mut managed,
+            "child stderr capture setup",
+            Err(error.into()),
+        )
+        .await
+        .map(|()| unreachable!()),
+    }
 }
 
 impl ManagedChild {
+    fn child_mut(&mut self) -> E2eResult<&mut Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| test_error("child was handed to its reaper"))
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let status = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("child was handed to its reaper"))?
+            .try_wait()?;
+        if status.is_some() {
+            self.reaped.store(true, Ordering::Release);
+        }
+        Ok(status)
+    }
+
+    async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn signal(&self, signal: rustix::process::Signal) -> rustix::io::Result<()> {
+        rustix::process::kill_process_group(self.process_group, signal)
+    }
+
     async fn diagnostic(&mut self) -> E2eResult<String> {
         let task = self
             .stderr
             .take()
             .ok_or_else(|| test_error("child stderr was already collected"))?;
-        task.await
-            .map_err(|error| test_error(format!("child stderr capture task failed: {error}")))?
+        task.join()
+            .map_err(|_| test_error("child stderr capture thread panicked"))?
             .map_err(Into::into)
     }
 }
 
-async fn collect_redacted_stderr(
-    mut stderr: ChildStderr,
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        let _ = self
+            .signal(rustix::process::Signal::KILL)
+            .or_else(ignore_missing_process_group);
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let Some(reaper) = self.reaper.take() else {
+            return;
+        };
+        if let Err(error) = reaper.send(child) {
+            let mut child = error.0;
+            if child.wait().is_ok() {
+                self.reaped.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn spawn_child_reaper(reaped: Arc<AtomicBool>) -> io::Result<SyncSender<Child>> {
+    let (sender, receiver) = sync_channel::<Child>(1);
+    // Provision before spawning so Drop can always transfer the direct child to a synchronous wait.
+    Builder::new()
+        .name("iot-nano-e2e-reaper".to_owned())
+        .spawn(move || {
+            if let Ok(mut child) = receiver.recv() {
+                if child.wait().is_ok() {
+                    reaped.store(true, Ordering::Release);
+                }
+            }
+        })?;
+    Ok(sender)
+}
+
+fn ignore_missing_process_group(error: rustix::io::Errno) -> rustix::io::Result<()> {
+    if error == rustix::io::Errno::SRCH {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn collect_redacted_stderr(
+    mut stderr: std::process::ChildStderr,
     redactions: Vec<String>,
 ) -> io::Result<String> {
     let mut redactor = ChildDiagnosticRedactor::new(redactions.iter().map(String::as_str));
     let mut chunk = [0_u8; 1024];
     loop {
-        let read = stderr.read(&mut chunk).await?;
+        let read = stderr.read(&mut chunk)?;
         if read == 0 {
             return Ok(redactor.finish());
         }
