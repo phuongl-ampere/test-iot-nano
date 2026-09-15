@@ -39,6 +39,29 @@ struct ManagedChild {
     stderr: Option<JoinHandle<io::Result<String>>>,
 }
 
+struct FlowCredentials {
+    admin_username: String,
+    admin_password: String,
+    client_id: String,
+    client_secret: String,
+}
+
+impl FlowCredentials {
+    fn generate() -> Self {
+        let suffix = Uuid::now_v7();
+        Self {
+            admin_username: format!("e2e-admin-{suffix}"),
+            admin_password: format!("E2eTimescaleBootstrapAdmin-{suffix}@2026"),
+            client_id: format!("e2e-client-{suffix}"),
+            client_secret: format!("E2eClientSecret-{suffix}@2026"),
+        }
+    }
+
+    fn child_redactions(&self) -> [&str; 2] {
+        [&self.admin_password, &self.client_secret]
+    }
+}
+
 struct Fixture {
     _directory: TempDir,
     database_url: String,
@@ -183,31 +206,31 @@ async fn run_process_e2e(mut fixture: Fixture) -> E2eResult {
     prove_migration_lock_serialization(&fixture, binary).await?;
     assert_telemetry_is_hypertable(&fixture.database_url).await?;
 
-    let admin_username = format!("e2e-admin-{}", Uuid::now_v7());
-    let admin_password = "E2eTimescaleBootstrapAdmin@2026";
+    let credentials = FlowCredentials::generate();
     let mut bootstrap = Command::new(binary);
     fixture.configure(&mut bootstrap);
     bootstrap
         .arg("--bootstrap-admin")
-        .env("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME", &admin_username)
-        .env("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD", admin_password);
+        .env(
+            "IOT_NANO_BOOTSTRAP_ADMIN_USERNAME",
+            &credentials.admin_username,
+        )
+        .env(
+            "IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD",
+            &credentials.admin_password,
+        );
     let mut bootstrap = spawn_child(
         &mut bootstrap,
-        fixture.child_redactions(&[&admin_username, admin_password]),
-    )?;
-    let bootstrap_exit = bootstrap.child.wait().await?;
-    let bootstrap_diagnostic = bootstrap.diagnostic().await?;
-    require_success(
-        bootstrap_exit.success(),
-        "bootstrap admin",
-        &bootstrap_diagnostic,
-    )?;
+        fixture.child_redactions(&credentials.child_redactions()),
+    )
+    .await?;
+    wait_for_child_success(&mut bootstrap, "bootstrap admin").await?;
 
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let mut child = start_monolith(&mut fixture, binary, &client).await?;
-    let flow = run_e2e_flow(&fixture, &client, &admin_username, admin_password).await;
+    let mut child = start_monolith(&mut fixture, binary, &client, &credentials).await?;
+    let flow = run_e2e_flow(&fixture, &client, &credentials).await;
     let shutdown = stop_child(&mut child).await;
     let shutdown = match shutdown {
         Ok(()) => assert_all_addresses_rebind(&fixture).await,
@@ -249,36 +272,33 @@ async fn prove_migration_lock_serialization(fixture: &Fixture, binary: &str) -> 
     let mut migration = spawn_child(
         &mut migrate,
         fixture.child_redactions(&[&migration_database_url]),
-    )?;
+    )
+    .await?;
 
     let observation =
         wait_for_migration_lock(&fixture.database_url, &migration_application_name).await;
     let unlock = sqlx::query("SELECT pg_advisory_unlock(hashtext('iot_nano:migrate'))")
         .execute(&mut lock_holder)
         .await;
-    observation?;
-    unlock?;
-
-    let exit = match timeout(Duration::from_secs(30), migration.child.wait()).await {
-        Ok(exit) => exit?,
-        Err(_) => {
-            let cleanup = force_stop_child(&mut migration).await;
-            return combine_outcomes(
-                "migration did not finish after advisory-lock release",
-                Err(test_error(
-                    "migration did not finish within 30 seconds after advisory-lock release",
-                )),
-                "forced migration cleanup",
-                cleanup,
-            );
+    let lock_phase = combine_outcomes(
+        "migration lock observation",
+        observation,
+        "migration advisory unlock",
+        unlock.map(|_| ()).map_err(Into::into),
+    );
+    match lock_phase {
+        Ok(()) => {
+            wait_for_child_success_with_timeout(
+                &mut migration,
+                "migration after advisory-lock release",
+                Duration::from_secs(30),
+            )
+            .await
         }
-    };
-    let diagnostic = migration.diagnostic().await?;
-    require_success(
-        exit.success(),
-        "migration after advisory-lock release",
-        &diagnostic,
-    )
+        Err(error) => {
+            force_stop_after_failure(&mut migration, "migration lock phase", Err(error)).await
+        }
+    }
 }
 
 async fn wait_for_migration_lock(database_url: &str, application_name: &str) -> E2eResult {
@@ -338,17 +358,22 @@ async fn start_monolith(
     fixture: &mut Fixture,
     binary: &str,
     client: &Client,
+    credentials: &FlowCredentials,
 ) -> E2eResult<ManagedChild> {
     for attempt in 1..=START_ATTEMPTS {
         fixture.release_reserved_addresses();
         let mut command = Command::new(binary);
         fixture.configure(&mut command);
-        let mut child = spawn_child(&mut command, fixture.child_redactions(&[]))?;
+        let mut child = spawn_child(
+            &mut command,
+            fixture.child_redactions(&credentials.child_redactions()),
+        )
+        .await?;
 
         match wait_ready(client, fixture.public_address, &mut child.child).await {
             Ok(()) => return Ok(child),
             Err(error) => {
-                let exited_before_cleanup = child.child.try_wait()?.is_some();
+                let exited_before_cleanup = matches!(child.child.try_wait(), Ok(Some(_)));
                 let cleanup = force_stop_child(&mut child).await;
                 let diagnostic = match child.child.try_wait() {
                     Ok(Some(_)) => child.diagnostic().await.unwrap_or_else(|capture_error| {
@@ -359,17 +384,18 @@ async fn start_monolith(
                 };
                 let bind_conflict = exited_before_cleanup && is_bind_conflict(&diagnostic);
                 let cleanup_succeeded = cleanup.is_ok();
-                let startup = Err(test_error(child_failure_message(
-                    "monolith failed before becoming ready",
-                    error,
-                    &diagnostic,
-                )));
-                let outcome = combine_outcomes(
+                let outcome = combine_failure_with_cleanup(
                     "monolith startup",
-                    startup,
-                    "forced startup cleanup",
+                    Err(test_error(error.to_string())),
                     cleanup,
-                );
+                )
+                .map_err(|cleanup_error| {
+                    test_error(child_failure_message(
+                        "monolith failed before becoming ready",
+                        cleanup_error,
+                        &diagnostic,
+                    ))
+                });
                 if bind_conflict && cleanup_succeeded && attempt < START_ATTEMPTS {
                     fixture.rotate_reserved_addresses().await?;
                     continue;
@@ -384,15 +410,17 @@ async fn start_monolith(
 async fn run_e2e_flow(
     fixture: &Fixture,
     client: &Client,
-    admin_username: &str,
-    admin_password: &str,
+    credentials: &FlowCredentials,
 ) -> E2eResult {
     let login = client
         .post(format!(
             "http://{}/api/auth/login",
             fixture.management_address
         ))
-        .json(&json!({ "username": admin_username, "password": admin_password }))
+        .json(&json!({
+            "username": credentials.admin_username,
+            "password": credentials.admin_password
+        }))
         .send()
         .await?;
     require_status(&login, StatusCode::OK, "management login")?;
@@ -409,8 +437,6 @@ async fn run_e2e_flow(
 
     let suffix = Uuid::now_v7().to_string();
     let app_id = format!("e2e-app-{suffix}");
-    let client_id = format!("e2e-client-{suffix}");
-    let client_secret = format!("E2eClientSecret-{suffix}@2026");
     let device_id = format!("e2e-device-{suffix}");
     let registered = client
         .post(format!(
@@ -422,11 +448,11 @@ async fn run_e2e_flow(
             "app_id": app_id,
             "kind": "full_stack",
             "launch_url": "https://client.example.test",
-            "client_id": client_id,
+            "client_id": credentials.client_id,
             "redirect_uris": ["https://client.example.test/callback"],
             "allowed_scopes": ["devices:read", "devices:write", "telemetry:read"],
             "enabled": true,
-            "client_secret": client_secret
+            "client_secret": credentials.client_secret
         }))
         .send()
         .await?;
@@ -436,8 +462,8 @@ async fn run_e2e_flow(
         .post(format!("http://{}/oauth/token", fixture.public_address))
         .form(&[
             ("grant_type", "client_credentials"),
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
+            ("client_id", credentials.client_id.as_str()),
+            ("client_secret", credentials.client_secret.as_str()),
             ("scope", "devices:read devices:write telemetry:read"),
         ])
         .send()
@@ -713,20 +739,75 @@ fn is_bind_conflict(diagnostic: &str) -> bool {
         .contains("address already in use")
 }
 
+async fn wait_for_child_success(child: &mut ManagedChild, context: &str) -> E2eResult {
+    let exit = match child.child.wait().await {
+        Ok(exit) => exit,
+        Err(error) => {
+            return force_stop_after_failure(child, context, Err(error.into())).await;
+        }
+    };
+    let diagnostic = child.diagnostic().await?;
+    require_success(exit.success(), context, &diagnostic)
+}
+
+async fn wait_for_child_success_with_timeout(
+    child: &mut ManagedChild,
+    context: &str,
+    wait_timeout: Duration,
+) -> E2eResult {
+    let exit = match timeout(wait_timeout, child.child.wait()).await {
+        Ok(Ok(exit)) => exit,
+        Ok(Err(error)) => {
+            return force_stop_after_failure(child, context, Err(error.into())).await;
+        }
+        Err(_) => {
+            return force_stop_after_failure(
+                child,
+                context,
+                Err(test_error(format!(
+                    "{context} did not finish within {} seconds",
+                    wait_timeout.as_secs()
+                ))),
+            )
+            .await;
+        }
+    };
+    let diagnostic = child.diagnostic().await?;
+    require_success(exit.success(), context, &diagnostic)
+}
+
 async fn stop_child(child: &mut ManagedChild) -> E2eResult {
-    if let Some(status) = child.child.try_wait()? {
-        let diagnostic = child.diagnostic().await?;
-        return require_success(
-            status.success(),
-            "monolith exited unexpectedly",
-            &diagnostic,
-        );
+    match child.child.try_wait() {
+        Ok(Some(status)) => {
+            let diagnostic = child.diagnostic().await?;
+            return require_success(
+                status.success(),
+                "monolith exited unexpectedly",
+                &diagnostic,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return force_stop_after_failure(
+                child,
+                "monolith shutdown status inspection",
+                Err(error.into()),
+            )
+            .await;
+        }
     }
 
-    let pid = child
-        .child
-        .id()
-        .ok_or_else(|| test_error("monolith process has no PID"))?;
+    let pid = match child.child.id() {
+        Some(pid) => pid,
+        None => {
+            return force_stop_after_failure(
+                child,
+                "monolith shutdown PID lookup",
+                Err(test_error("monolith process has no PID")),
+            )
+            .await;
+        }
+    };
     let signal = Command::new("kill")
         .arg("-TERM")
         .arg(pid.to_string())
@@ -735,42 +816,34 @@ async fn stop_child(child: &mut ManagedChild) -> E2eResult {
     match signal {
         Ok(status) if status.success() => {}
         Ok(status) => {
-            return combine_outcomes(
+            return force_stop_after_failure(
+                child,
                 "graceful shutdown signal",
                 Err(test_error(format!("SIGTERM exited with {status}"))),
-                "forced shutdown cleanup",
-                force_stop_child(child).await,
-            );
+            )
+            .await;
         }
         Err(error) => {
-            return combine_outcomes(
-                "graceful shutdown signal",
-                Err(error.into()),
-                "forced shutdown cleanup",
-                force_stop_child(child).await,
-            );
+            return force_stop_after_failure(child, "graceful shutdown signal", Err(error.into()))
+                .await;
         }
     }
 
     let exit = match timeout(Duration::from_secs(15), child.child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            return combine_outcomes(
-                "graceful shutdown wait",
-                Err(error.into()),
-                "forced shutdown cleanup",
-                force_stop_child(child).await,
-            );
+            return force_stop_after_failure(child, "graceful shutdown wait", Err(error.into()))
+                .await;
         }
         Err(_) => {
-            return combine_outcomes(
+            return force_stop_after_failure(
+                child,
                 "graceful shutdown wait",
                 Err(test_error(
                     "monolith did not exit within 15 seconds of SIGTERM",
                 )),
-                "forced shutdown cleanup",
-                force_stop_child(child).await,
-            );
+            )
+            .await;
         }
     };
     let diagnostic = child.diagnostic().await?;
@@ -778,16 +851,36 @@ async fn stop_child(child: &mut ManagedChild) -> E2eResult {
 }
 
 async fn force_stop_child(child: &mut ManagedChild) -> E2eResult {
-    if child.child.try_wait()?.is_some() {
-        return Ok(());
+    match child.child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => kill_and_wait_for_child(child).await,
+        Err(error) => combine_outcomes(
+            "child status inspection",
+            Err(error.into()),
+            "forced child cleanup",
+            kill_and_wait_for_child(child).await,
+        ),
     }
-    child.child.start_kill()?;
-    match timeout(Duration::from_secs(5), child.child.wait()).await {
+}
+
+async fn kill_and_wait_for_child(child: &mut ManagedChild) -> E2eResult {
+    let kill = child.child.start_kill();
+    let wait = match timeout(Duration::from_secs(5), child.child.wait()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(error.into()),
         Err(_) => Err(test_error(
             "forced child kill did not complete within 5 seconds",
         )),
+    };
+    match (kill, wait) {
+        (_, Ok(())) => Ok(()),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(kill), Err(wait)) => combine_outcomes(
+            "forced child kill",
+            Err(kill.into()),
+            "forced child wait",
+            Err(wait),
+        ),
     }
 }
 
@@ -917,6 +1010,22 @@ fn combine_e2e_outcomes(flow: E2eResult, shutdown: E2eResult) -> E2eResult {
     combine_outcomes("E2E flow", flow, "shutdown", shutdown)
 }
 
+async fn force_stop_after_failure(
+    child: &mut ManagedChild,
+    primary_context: &str,
+    primary: E2eResult,
+) -> E2eResult {
+    combine_failure_with_cleanup(primary_context, primary, force_stop_child(child).await)
+}
+
+fn combine_failure_with_cleanup(
+    primary_context: &str,
+    primary: E2eResult,
+    cleanup: E2eResult,
+) -> E2eResult {
+    combine_outcomes(primary_context, primary, "forced child cleanup", cleanup)
+}
+
 fn combine_outcomes(
     primary_context: &str,
     primary: E2eResult,
@@ -933,16 +1042,28 @@ fn combine_outcomes(
     }
 }
 
-fn spawn_child(command: &mut Command, redactions: Vec<String>) -> E2eResult<ManagedChild> {
+async fn spawn_child(command: &mut Command, redactions: Vec<String>) -> E2eResult<ManagedChild> {
     let mut child = command
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| test_error("child stderr pipe was unavailable"))?;
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let mut child = ManagedChild {
+                child,
+                stderr: None,
+            };
+            return force_stop_after_failure(
+                &mut child,
+                "child stderr setup",
+                Err(test_error("child stderr pipe was unavailable")),
+            )
+            .await
+            .map(|()| unreachable!());
+        }
+    };
     Ok(ManagedChild {
         child,
         stderr: Some(tokio::spawn(collect_redacted_stderr(stderr, redactions))),
@@ -1164,6 +1285,22 @@ fn child_diagnostics_are_bounded_and_redact_child_secrets() {
 }
 
 #[test]
+fn monolith_child_redactor_covers_generated_flow_secrets() {
+    let credentials = FlowCredentials::generate();
+    let stderr = format!(
+        "bootstrap password={} client secret={}",
+        credentials.admin_password, credentials.client_secret
+    );
+    let redactions = credentials.child_redactions();
+
+    let diagnostic = redact_child_diagnostic(stderr.as_bytes(), false, &redactions);
+
+    assert!(diagnostic.contains("[REDACTED]"));
+    assert!(!diagnostic.contains(&credentials.admin_password));
+    assert!(!diagnostic.contains(&credentials.client_secret));
+}
+
+#[test]
 fn combined_e2e_outcomes_preserve_flow_and_shutdown_failures() {
     let error = combine_e2e_outcomes(
         Err(test_error("flow failure")),
@@ -1174,6 +1311,20 @@ fn combined_e2e_outcomes_preserve_flow_and_shutdown_failures() {
 
     assert!(error.contains("flow failure"));
     assert!(error.contains("shutdown failure"));
+}
+
+#[test]
+fn migration_lock_observation_failure_preserves_forced_cleanup_failure() {
+    let error = combine_failure_with_cleanup(
+        "migration lock observation",
+        Err(test_error("lock observation failure")),
+        Err(test_error("forced cleanup failure")),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("lock observation failure"));
+    assert!(error.contains("forced cleanup failure"));
 }
 
 #[test]
