@@ -19,5 +19,5 @@ if [[ -n "${IOT_NANO_TIMESCALE_TEST_URL:-}" ]]; then
     cargo test --manifest-path "$root/Cargo.toml" \
       --package iot-nano-monolith \
       --test e2e_timescale \
-      -- --test-threads=1 "$@"
+      -- --ignored --test-threads=1 "$@"
 fi
