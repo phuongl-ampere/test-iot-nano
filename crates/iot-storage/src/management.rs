@@ -101,6 +101,129 @@ impl From<sqlx::Error> for ManagementDeviceError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagementAsset {
+    pub id: Uuid,
+    pub name: String,
+    pub asset_profile_id: Option<Uuid>,
+    pub parent_asset_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+    pub attributes: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateManagementAsset {
+    pub name: String,
+    pub asset_profile_id: Option<Uuid>,
+    pub parent_asset_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+    pub attributes: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateManagementAsset {
+    pub name: String,
+    pub asset_profile_id: Option<Uuid>,
+    pub parent_asset_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+    pub attributes: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Error)]
+pub enum ManagementAssetError {
+    #[error("invalid asset name")]
+    InvalidName,
+    #[error("asset metadata must be an object")]
+    MetadataMustBeObject,
+    #[error("asset attributes must be an object")]
+    AttributesMustBeObject,
+    #[error("management asset was not found")]
+    AssetNotFound,
+    #[error("asset profile is unavailable: {0}")]
+    AssetProfileUnavailable(Uuid),
+    #[error("parent asset is unavailable: {0}")]
+    ParentAssetUnavailable(Uuid),
+    #[error("an asset cannot be its own parent")]
+    AssetCannotBeOwnParent,
+    #[error("an asset cannot have a descendant as its parent")]
+    AssetCannotHaveDescendantParent,
+    #[error("stored management asset ID is invalid")]
+    InvalidStoredAssetId,
+    #[error("stored management asset references are invalid")]
+    InvalidStoredReferences,
+    #[error("stored management asset metadata is invalid")]
+    InvalidStoredMetadata,
+    #[error("management asset storage operation failed")]
+    Storage {
+        #[source]
+        source: PlatformStoreError,
+    },
+}
+
+impl From<PlatformStoreError> for ManagementAssetError {
+    fn from(source: PlatformStoreError) -> Self {
+        Self::Storage { source }
+    }
+}
+
+impl From<sqlx::Error> for ManagementAssetError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::from(PlatformStoreError::from(source))
+    }
+}
+
+pub trait ManagementAssetRepository: Send + Sync {
+    fn list_management_assets<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementAsset>, ManagementAssetError>> + Send + 'a>>;
+    fn create_management_asset<'a>(
+        &'a self,
+        asset: CreateManagementAsset,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>;
+    fn update_management_asset<'a>(
+        &'a self,
+        asset_id: Uuid,
+        asset: UpdateManagementAsset,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>;
+    fn delete_management_asset<'a>(
+        &'a self,
+        asset_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetError>> + Send + 'a>>;
+}
+
+impl ManagementAssetRepository for PlatformStore {
+    fn list_management_assets<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementAsset>, ManagementAssetError>> + Send + 'a>>
+    {
+        Box::pin(async move { list_management_assets(self).await })
+    }
+
+    fn create_management_asset<'a>(
+        &'a self,
+        asset: CreateManagementAsset,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>
+    {
+        Box::pin(async move { create_management_asset(self, asset).await })
+    }
+
+    fn update_management_asset<'a>(
+        &'a self,
+        asset_id: Uuid,
+        asset: UpdateManagementAsset,
+    ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>
+    {
+        Box::pin(async move { update_management_asset(self, asset_id, asset).await })
+    }
+
+    fn delete_management_asset<'a>(
+        &'a self,
+        asset_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetError>> + Send + 'a>> {
+        Box::pin(async move { delete_management_asset(self, asset_id).await })
+    }
+}
+
 pub trait ManagementDeviceRepository: Send + Sync {
     fn list_management_devices<'a>(
         &'a self,
@@ -327,6 +450,495 @@ impl DeviceTokenRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), DeviceTokenRepositoryError>> + Send + 'a>> {
         Box::pin(async move { revoke_device_token(self, token_id).await })
     }
+}
+
+#[derive(Debug)]
+struct ValidatedManagementAsset {
+    name: String,
+    asset_profile_id: Option<Uuid>,
+    parent_asset_id: Option<Uuid>,
+    metadata: serde_json::Value,
+}
+
+async fn list_management_assets(
+    store: &PlatformStore,
+) -> Result<Vec<ManagementAsset>, ManagementAssetError> {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let rows = sqlx::query(
+                "SELECT id, name, asset_profile_id, parent_asset_id, metadata
+                 FROM assets
+                 ORDER BY name, id",
+            )
+            .fetch_all(store.pool())
+            .await?;
+            rows.into_iter()
+                .map(sqlite_management_asset_from_row)
+                .collect()
+        }
+        PlatformStore::Timescale(pool) => {
+            let rows = sqlx::query(
+                "SELECT id, name, asset_profile_id, parent_asset_id, metadata
+                 FROM assets
+                 ORDER BY name, id",
+            )
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(timescale_management_asset_from_row)
+                .collect()
+        }
+    }
+}
+
+async fn create_management_asset(
+    store: &PlatformStore,
+    asset: CreateManagementAsset,
+) -> Result<ManagementAsset, ManagementAssetError> {
+    let asset = validate_management_asset(
+        asset.name,
+        asset.asset_profile_id,
+        asset.parent_asset_id,
+        asset.metadata,
+        asset.attributes,
+    )?;
+    let asset_id = Uuid::now_v7();
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin().await?;
+            validate_sqlite_asset_references(
+                &mut transaction,
+                asset.asset_profile_id,
+                asset.parent_asset_id,
+            )
+            .await?;
+            sqlx::query(
+                "INSERT INTO assets (id, name, asset_profile_id, parent_asset_id, metadata)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(asset_id.to_string())
+            .bind(asset.name)
+            .bind(asset.asset_profile_id.map(|id| id.to_string()))
+            .bind(asset.parent_asset_id.map(|id| id.to_string()))
+            .bind(asset.metadata.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            validate_timescale_asset_references(
+                &mut transaction,
+                asset.asset_profile_id,
+                asset.parent_asset_id,
+            )
+            .await?;
+            sqlx::query(
+                "INSERT INTO assets (id, name, asset_profile_id, parent_asset_id, metadata)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(asset_id)
+            .bind(asset.name)
+            .bind(asset.asset_profile_id)
+            .bind(asset.parent_asset_id)
+            .bind(Json(asset.metadata))
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        }
+    }
+    management_asset(store, asset_id).await
+}
+
+async fn update_management_asset(
+    store: &PlatformStore,
+    asset_id: Uuid,
+    asset: UpdateManagementAsset,
+) -> Result<ManagementAsset, ManagementAssetError> {
+    let asset = validate_management_asset(
+        asset.name,
+        asset.asset_profile_id,
+        asset.parent_asset_id,
+        asset.metadata,
+        asset.attributes,
+    )?;
+    if asset.parent_asset_id == Some(asset_id) {
+        return Err(ManagementAssetError::AssetCannotBeOwnParent);
+    }
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin().await?;
+            sqlite_require_management_asset(&mut transaction, asset_id).await?;
+            validate_sqlite_asset_references(
+                &mut transaction,
+                asset.asset_profile_id,
+                asset.parent_asset_id,
+            )
+            .await?;
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                if sqlite_asset_is_descendant(&mut transaction, asset_id, parent_asset_id).await? {
+                    return Err(ManagementAssetError::AssetCannotHaveDescendantParent);
+                }
+            }
+            sqlx::query(
+                "UPDATE assets
+                 SET name = ?, asset_profile_id = ?, parent_asset_id = ?, metadata = ?,
+                     updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(asset.name)
+            .bind(asset.asset_profile_id.map(|id| id.to_string()))
+            .bind(asset.parent_asset_id.map(|id| id.to_string()))
+            .bind(asset.metadata.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .bind(asset_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            timescale_require_management_asset(&mut transaction, asset_id).await?;
+            validate_timescale_asset_references(
+                &mut transaction,
+                asset.asset_profile_id,
+                asset.parent_asset_id,
+            )
+            .await?;
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                if timescale_asset_is_descendant(&mut transaction, asset_id, parent_asset_id)
+                    .await?
+                {
+                    return Err(ManagementAssetError::AssetCannotHaveDescendantParent);
+                }
+            }
+            sqlx::query(
+                "UPDATE assets
+                 SET name = $2, asset_profile_id = $3, parent_asset_id = $4, metadata = $5,
+                     updated_at = now()
+                 WHERE id = $1",
+            )
+            .bind(asset_id)
+            .bind(asset.name)
+            .bind(asset.asset_profile_id)
+            .bind(asset.parent_asset_id)
+            .bind(Json(asset.metadata))
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        }
+    }
+    management_asset(store, asset_id).await
+}
+
+async fn delete_management_asset(
+    store: &PlatformStore,
+    asset_id: Uuid,
+) -> Result<(), ManagementAssetError> {
+    let deleted = match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin().await?;
+            sqlite_require_management_asset(&mut transaction, asset_id).await?;
+            sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = ?")
+                .bind(asset_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            let deleted = sqlx::query("DELETE FROM assets WHERE id = ?")
+                .bind(asset_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            transaction.commit().await?;
+            deleted
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            timescale_require_management_asset(&mut transaction, asset_id).await?;
+            sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = $1")
+                .bind(asset_id)
+                .execute(&mut *transaction)
+                .await?;
+            let deleted = sqlx::query("DELETE FROM assets WHERE id = $1")
+                .bind(asset_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            transaction.commit().await?;
+            deleted
+        }
+    };
+    if deleted == 0 {
+        Err(ManagementAssetError::AssetNotFound)
+    } else {
+        Ok(())
+    }
+}
+
+async fn management_asset(
+    store: &PlatformStore,
+    asset_id: Uuid,
+) -> Result<ManagementAsset, ManagementAssetError> {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let row = sqlx::query(
+                "SELECT id, name, asset_profile_id, parent_asset_id, metadata
+                 FROM assets
+                 WHERE id = ?",
+            )
+            .bind(asset_id.to_string())
+            .fetch_optional(store.pool())
+            .await?
+            .ok_or(ManagementAssetError::AssetNotFound)?;
+            sqlite_management_asset_from_row(row)
+        }
+        PlatformStore::Timescale(pool) => {
+            let row = sqlx::query(
+                "SELECT id, name, asset_profile_id, parent_asset_id, metadata
+                 FROM assets
+                 WHERE id = $1",
+            )
+            .bind(asset_id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(ManagementAssetError::AssetNotFound)?;
+            timescale_management_asset_from_row(row)
+        }
+    }
+}
+
+fn sqlite_management_asset_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ManagementAsset, ManagementAssetError> {
+    let metadata: serde_json::Value = serde_json::from_str(&row.try_get::<String, _>("metadata")?)
+        .map_err(|_| ManagementAssetError::InvalidStoredMetadata)?;
+    if !metadata.is_object() {
+        return Err(ManagementAssetError::InvalidStoredMetadata);
+    }
+    Ok(ManagementAsset {
+        id: row
+            .try_get::<String, _>("id")?
+            .parse()
+            .map_err(|_| ManagementAssetError::InvalidStoredAssetId)?,
+        name: row.try_get("name")?,
+        asset_profile_id: row
+            .try_get::<Option<String>, _>("asset_profile_id")?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|_| ManagementAssetError::InvalidStoredReferences)?,
+        parent_asset_id: row
+            .try_get::<Option<String>, _>("parent_asset_id")?
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|_| ManagementAssetError::InvalidStoredReferences)?,
+        attributes: metadata.clone(),
+        metadata,
+    })
+}
+
+fn timescale_management_asset_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<ManagementAsset, ManagementAssetError> {
+    let metadata = row.try_get::<Json<serde_json::Value>, _>("metadata")?.0;
+    if !metadata.is_object() {
+        return Err(ManagementAssetError::InvalidStoredMetadata);
+    }
+    Ok(ManagementAsset {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        asset_profile_id: row.try_get("asset_profile_id")?,
+        parent_asset_id: row.try_get("parent_asset_id")?,
+        attributes: metadata.clone(),
+        metadata,
+    })
+}
+
+fn validate_management_asset(
+    name: String,
+    asset_profile_id: Option<Uuid>,
+    parent_asset_id: Option<Uuid>,
+    metadata: serde_json::Value,
+    attributes: Option<serde_json::Value>,
+) -> Result<ValidatedManagementAsset, ManagementAssetError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 128 {
+        return Err(ManagementAssetError::InvalidName);
+    }
+    let metadata = match attributes {
+        Some(attributes) => validate_asset_attributes(attributes)?,
+        None => validate_asset_metadata(metadata)?,
+    };
+    Ok(ValidatedManagementAsset {
+        name: name.to_owned(),
+        asset_profile_id,
+        parent_asset_id,
+        metadata,
+    })
+}
+
+fn validate_asset_metadata(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, ManagementAssetError> {
+    if value.is_null() {
+        Ok(serde_json::json!({}))
+    } else if value.is_object() {
+        Ok(value)
+    } else {
+        Err(ManagementAssetError::MetadataMustBeObject)
+    }
+}
+
+fn validate_asset_attributes(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, ManagementAssetError> {
+    if value.is_null() {
+        Ok(serde_json::json!({}))
+    } else if value.is_object() {
+        Ok(value)
+    } else {
+        Err(ManagementAssetError::AttributesMustBeObject)
+    }
+}
+
+async fn sqlite_require_management_asset(
+    transaction: &mut Transaction<'_, Sqlite>,
+    asset_id: Uuid,
+) -> Result<(), ManagementAssetError> {
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ?")
+        .bind(asset_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(ManagementAssetError::AssetNotFound)
+    }
+}
+
+async fn timescale_require_management_asset(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+) -> Result<(), ManagementAssetError> {
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = $1 FOR UPDATE")
+        .bind(asset_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(ManagementAssetError::AssetNotFound)
+    }
+}
+
+async fn validate_sqlite_asset_references(
+    transaction: &mut Transaction<'_, Sqlite>,
+    asset_profile_id: Option<Uuid>,
+    parent_asset_id: Option<Uuid>,
+) -> Result<(), ManagementAssetError> {
+    if let Some(asset_profile_id) = asset_profile_id {
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM asset_profiles WHERE id = ?")
+            .bind(asset_profile_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some();
+        if !exists {
+            return Err(ManagementAssetError::AssetProfileUnavailable(
+                asset_profile_id,
+            ));
+        }
+    }
+    if let Some(parent_asset_id) = parent_asset_id {
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ?")
+            .bind(parent_asset_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some();
+        if !exists {
+            return Err(ManagementAssetError::ParentAssetUnavailable(
+                parent_asset_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_timescale_asset_references(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_profile_id: Option<Uuid>,
+    parent_asset_id: Option<Uuid>,
+) -> Result<(), ManagementAssetError> {
+    if let Some(asset_profile_id) = asset_profile_id {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM asset_profiles WHERE id = $1)",
+        )
+        .bind(asset_profile_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !exists {
+            return Err(ManagementAssetError::AssetProfileUnavailable(
+                asset_profile_id,
+            ));
+        }
+    }
+    if let Some(parent_asset_id) = parent_asset_id {
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1)")
+                .bind(parent_asset_id)
+                .fetch_one(&mut **transaction)
+                .await?;
+        if !exists {
+            return Err(ManagementAssetError::ParentAssetUnavailable(
+                parent_asset_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn sqlite_asset_is_descendant(
+    transaction: &mut Transaction<'_, Sqlite>,
+    asset_id: Uuid,
+    candidate_parent_id: Uuid,
+) -> Result<bool, ManagementAssetError> {
+    let descendant = sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE descendants(id) AS (
+             SELECT id FROM assets WHERE parent_asset_id = ?
+             UNION
+             SELECT child.id
+             FROM assets AS child
+             JOIN descendants ON child.parent_asset_id = descendants.id
+         )
+         SELECT 1 FROM descendants WHERE id = ? LIMIT 1",
+    )
+    .bind(asset_id.to_string())
+    .bind(candidate_parent_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some();
+    Ok(descendant)
+}
+
+async fn timescale_asset_is_descendant(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+    candidate_parent_id: Uuid,
+) -> Result<bool, ManagementAssetError> {
+    let descendant = sqlx::query_scalar::<_, bool>(
+        "WITH RECURSIVE descendants(id) AS (
+             SELECT id FROM assets WHERE parent_asset_id = $1
+             UNION
+             SELECT child.id
+             FROM assets AS child
+             JOIN descendants ON child.parent_asset_id = descendants.id
+         )
+         SELECT EXISTS(SELECT 1 FROM descendants WHERE id = $2)",
+    )
+    .bind(asset_id)
+    .bind(candidate_parent_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(descendant)
 }
 
 async fn list_management_devices(
