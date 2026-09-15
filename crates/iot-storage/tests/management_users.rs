@@ -390,6 +390,7 @@ async fn sqlite_management_user_repository_rejects_invalid_stored_roles_and_sche
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_user_repository_matches_sqlite_contract() {
     let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
 
     let created = ManagementUserRepository::create_management_user(&store, user_creation("alice"))
         .await
@@ -457,10 +458,91 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
         ManagementUserError::InvalidGrantedApps
     ));
 
+    let last_admin = ManagementUserRepository::update_management_user(
+        &store,
+        "bob",
+        UpdateManagementUser {
+            default_app: "/apps/powermonitor".to_owned(),
+            granted_apps: vec!["powermonitor".to_owned()],
+            role: Some(ManagementUserRole::Viewer),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(last_admin, ManagementUserError::LastAdministrator));
+
+    sqlx::query(
+        "INSERT INTO users (
+            id, username, password_hash, role, account_class, default_app
+         ) VALUES ($1, 'system', 'stored-password-hash', 'viewer', 'system', '/apps/powermonitor')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .execute(pool)
+    .await
+    .unwrap();
+    let system = ManagementUserRepository::update_management_user(
+        &store,
+        "system",
+        UpdateManagementUser {
+            default_app: "/apps/fleet".to_owned(),
+            granted_apps: vec!["fleet".to_owned()],
+            role: Some(ManagementUserRole::Admin),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(system, ManagementUserError::SystemUserImmutable));
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_management_user_grant() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.app_key = 'blocked' THEN
+                 RAISE EXCEPTION 'blocked management grant';
+             END IF;
+             RETURN NEW;
+         END;
+         $$;
+         CREATE TRIGGER reject_management_user_grant_trigger
+         BEFORE INSERT ON user_app_grants
+         FOR EACH ROW EXECUTE FUNCTION reject_management_user_grant();",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let rollback = ManagementUserRepository::update_management_user(
+        &store,
+        "alice",
+        UpdateManagementUser {
+            default_app: "/apps/powermonitor".to_owned(),
+            granted_apps: vec!["powermonitor".to_owned(), "blocked".to_owned()],
+            role: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(rollback, ManagementUserError::Storage { .. }));
+    let alice_after_rollback = ManagementUserRepository::list_management_users(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|user| user.username == "alice")
+        .unwrap();
+    assert_eq!(alice_after_rollback.role, ManagementUserRole::Viewer);
+    assert_eq!(alice_after_rollback.account_class, AccountClass::User);
+    assert_eq!(alice_after_rollback.default_app, "/apps/fleet");
+    assert_eq!(alice_after_rollback.granted_apps, ["fleet", "reports"]);
+
+    let listed = ManagementUserRepository::list_management_users(&store)
+        .await
+        .unwrap();
     assert_eq!(
-        ManagementUserRepository::list_management_users(&store)
-            .await
-            .unwrap(),
-        [demoted, bob,]
+        listed
+            .iter()
+            .map(|user| user.username.as_str())
+            .collect::<Vec<_>>(),
+        ["alice", "bob", "system"]
     );
+    assert_eq!(listed[0], demoted);
+    assert_eq!(listed[1], bob);
 }

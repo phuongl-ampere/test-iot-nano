@@ -1,12 +1,14 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    CreateManagementAssetProfile, CreateManagementDeviceProfile, ManagementAssetProfileError,
-    ManagementAssetProfileRepository, ManagementDeviceProfileError,
-    ManagementDeviceProfileRepository, PlatformStore, UpdateManagementAssetProfile,
-    UpdateManagementDeviceProfile,
+    CreateManagementAssetProfile, CreateManagementDeviceProfile, ManagementAssetError,
+    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
+    ManagementDeviceError, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
+    ManagementDeviceRepository, PlatformStore, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile,
 };
 use serde_json::json;
-use sqlx::{Connection, PgConnection};
+use sqlx::{Connection, PgConnection, PgPool, types::Json};
+use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
@@ -312,28 +314,294 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
     )
 }
 
+async fn wait_for_timescale_table_lock(pool: &PgPool, table: &str, mode: &str, granted: bool) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let found: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_locks
+                    WHERE locktype = 'relation'
+                      AND relation = $1::regclass
+                      AND mode = $2
+                      AND granted = $3
+                )",
+            )
+            .bind(format!("iot_nano.{table}"))
+            .bind(mode)
+            .bind(granted)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if found {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{table} did not reach {mode} granted={granted}"));
+}
+
+async fn wait_for_timescale_table_wait(pool: &PgPool, table: &str) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_locks
+                    WHERE locktype = 'relation'
+                      AND relation = $1::regclass
+                      AND granted = FALSE
+                )",
+            )
+            .bind(format!("iot_nano.{table}"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{table} did not reach a lock wait"));
+}
+
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_profile_repositories_match_sqlite_contract() {
     let (_lock, store) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
-    let device = ManagementDeviceProfileRepository::create_management_device_profile(
+    let device_z = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
-        device_profile("Timescale device profile"),
+        device_profile("Timescale Z device profile"),
     )
     .await
     .unwrap();
-    let asset = ManagementAssetProfileRepository::create_management_asset_profile(
+    let device_a = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
-        asset_profile("Timescale asset profile"),
+        device_profile("Timescale A device profile"),
     )
     .await
     .unwrap();
+    assert_eq!(
+        ManagementDeviceProfileRepository::list_management_device_profiles(&store)
+            .await
+            .unwrap()
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Timescale A device profile", "Timescale Z device profile"]
+    );
+    let updated_device = ManagementDeviceProfileRepository::update_management_device_profile(
+        &store,
+        device_z.id,
+        UpdateManagementDeviceProfile {
+            name: "Timescale renamed device profile".to_owned(),
+            telemetry_schema: json!({"humidity_pct": {"type": "number"}}),
+            metric_mapping: json!({"humidity_pct": "humidity"}),
+            reporting_settings: json!({"interval_seconds": 300}),
+        },
+    )
+    .await
+    .unwrap();
+    let stored_device_json: Json<serde_json::Value> =
+        sqlx::query_scalar("SELECT telemetry_schema FROM device_profiles WHERE id = $1")
+            .bind(updated_device.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_device_json.0, updated_device.telemetry_schema);
+    assert!(matches!(
+        ManagementDeviceProfileRepository::create_management_device_profile(
+            &store,
+            device_profile("Timescale A device profile"),
+        )
+        .await,
+        Err(ManagementDeviceProfileError::NameConflict(name))
+            if name == "Timescale A device profile"
+    ));
+    assert!(matches!(
+        ManagementDeviceProfileRepository::create_management_device_profile(
+            &store,
+            CreateManagementDeviceProfile {
+                name: "Invalid Timescale device JSON".to_owned(),
+                telemetry_schema: json!([]),
+                metric_mapping: json!({}),
+                reporting_settings: json!({}),
+            },
+        )
+        .await,
+        Err(ManagementDeviceProfileError::TelemetrySchemaMustBeObject)
+    ));
+    assert!(matches!(
+        ManagementDeviceProfileRepository::create_management_device_profile(
+            &store,
+            device_profile(" "),
+        )
+        .await,
+        Err(ManagementDeviceProfileError::InvalidName)
+    ));
+    assert!(matches!(
+        ManagementDeviceProfileRepository::create_management_device_profile(
+            &store,
+            CreateManagementDeviceProfile {
+                name: "Invalid Timescale device mapping".to_owned(),
+                telemetry_schema: json!({}),
+                metric_mapping: json!(null),
+                reporting_settings: json!({}),
+            },
+        )
+        .await,
+        Err(ManagementDeviceProfileError::MetricMappingMustBeObject)
+    ));
+    assert!(matches!(
+        ManagementDeviceProfileRepository::create_management_device_profile(
+            &store,
+            CreateManagementDeviceProfile {
+                name: "Invalid Timescale device reporting".to_owned(),
+                telemetry_schema: json!({}),
+                metric_mapping: json!({}),
+                reporting_settings: json!("hourly"),
+            },
+        )
+        .await,
+        Err(ManagementDeviceProfileError::ReportingSettingsMustBeObject)
+    ));
+    assert!(matches!(
+        ManagementDeviceProfileRepository::update_management_device_profile(
+            &store,
+            Uuid::now_v7(),
+            UpdateManagementDeviceProfile {
+                name: "Missing Timescale device profile".to_owned(),
+                telemetry_schema: json!({}),
+                metric_mapping: json!({}),
+                reporting_settings: json!({}),
+            },
+        )
+        .await,
+        Err(ManagementDeviceProfileError::DeviceProfileNotFound)
+    ));
+    ManagementDeviceProfileRepository::delete_management_device_profile(&store, device_a.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ManagementDeviceProfileRepository::list_management_device_profiles(&store)
+            .await
+            .unwrap(),
+        [updated_device.clone()]
+    );
+
+    let asset_z = ManagementAssetProfileRepository::create_management_asset_profile(
+        &store,
+        asset_profile("Timescale Z asset profile"),
+    )
+    .await
+    .unwrap();
+    let asset_a = ManagementAssetProfileRepository::create_management_asset_profile(
+        &store,
+        asset_profile("Timescale A asset profile"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ManagementAssetProfileRepository::list_management_asset_profiles(&store)
+            .await
+            .unwrap()
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Timescale A asset profile", "Timescale Z asset profile"]
+    );
+    let updated_asset = ManagementAssetProfileRepository::update_management_asset_profile(
+        &store,
+        asset_z.id,
+        UpdateManagementAssetProfile {
+            name: "Timescale renamed asset profile".to_owned(),
+            fields: json!({"floor": {"type": "integer"}}),
+            dashboard_defaults: json!({"layout": "detail"}),
+        },
+    )
+    .await
+    .unwrap();
+    let stored_asset_json: Json<serde_json::Value> =
+        sqlx::query_scalar("SELECT fields FROM asset_profiles WHERE id = $1")
+            .bind(updated_asset.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_asset_json.0, updated_asset.fields);
+    assert!(matches!(
+        ManagementAssetProfileRepository::create_management_asset_profile(
+            &store,
+            asset_profile("Timescale A asset profile"),
+        )
+        .await,
+        Err(ManagementAssetProfileError::NameConflict(name))
+            if name == "Timescale A asset profile"
+    ));
+    assert!(matches!(
+        ManagementAssetProfileRepository::create_management_asset_profile(
+            &store,
+            CreateManagementAssetProfile {
+                name: "Invalid Timescale asset JSON".to_owned(),
+                fields: json!(false),
+                dashboard_defaults: json!({}),
+            },
+        )
+        .await,
+        Err(ManagementAssetProfileError::FieldsMustBeObject)
+    ));
+    assert!(matches!(
+        ManagementAssetProfileRepository::create_management_asset_profile(
+            &store,
+            asset_profile(" "),
+        )
+        .await,
+        Err(ManagementAssetProfileError::InvalidName)
+    ));
+    assert!(matches!(
+        ManagementAssetProfileRepository::create_management_asset_profile(
+            &store,
+            CreateManagementAssetProfile {
+                name: "Invalid Timescale asset dashboard".to_owned(),
+                fields: json!({}),
+                dashboard_defaults: json!(["summary"]),
+            },
+        )
+        .await,
+        Err(ManagementAssetProfileError::DashboardDefaultsMustBeObject)
+    ));
+    assert!(matches!(
+        ManagementAssetProfileRepository::update_management_asset_profile(
+            &store,
+            Uuid::now_v7(),
+            UpdateManagementAssetProfile {
+                name: "Missing Timescale asset profile".to_owned(),
+                fields: json!({}),
+                dashboard_defaults: json!({}),
+            },
+        )
+        .await,
+        Err(ManagementAssetProfileError::AssetProfileNotFound)
+    ));
+    ManagementAssetProfileRepository::delete_management_asset_profile(&store, asset_a.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        ManagementAssetProfileRepository::list_management_asset_profiles(&store)
+            .await
+            .unwrap(),
+        [updated_asset.clone()]
+    );
+
     sqlx::query(
         "INSERT INTO devices (device_id, display_name, device_profile_id)
          VALUES ('timescale-profile-reference-device', 'Profile reference', $1)",
     )
-    .bind(device.id)
+    .bind(updated_device.id)
     .execute(pool)
     .await
     .unwrap();
@@ -342,17 +610,189 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
          VALUES ($1, 'timescale-profile-reference-asset', $2)",
     )
     .bind(Uuid::now_v7())
-    .bind(asset.id)
+    .bind(updated_asset.id)
     .execute(pool)
     .await
     .unwrap();
     assert!(matches!(
-        ManagementDeviceProfileRepository::delete_management_device_profile(&store, device.id)
+        ManagementDeviceProfileRepository::delete_management_device_profile(&store, updated_device.id)
             .await,
-        Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == device.id
+        Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == updated_device.id
     ));
     assert!(matches!(
-        ManagementAssetProfileRepository::delete_management_asset_profile(&store, asset.id).await,
-        Err(ManagementAssetProfileError::AssetProfileInUse(id)) if id == asset.id
+        ManagementAssetProfileRepository::delete_management_asset_profile(&store, updated_asset.id).await,
+        Err(ManagementAssetProfileError::AssetProfileInUse(id)) if id == updated_asset.id
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row_locks() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
+
+    let device_profile = ManagementDeviceProfileRepository::create_management_device_profile(
+        &store,
+        device_profile("Concurrent device profile"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, display_name) VALUES ($1, $2)")
+        .bind("concurrent-profile-device")
+        .bind("Concurrent profile device")
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut device_profile_gate = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN")
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM device_profiles WHERE id = $1 FOR UPDATE")
+        .bind(device_profile.id)
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    let delete_store = store.clone();
+    let mut device_delete = tokio::spawn(async move {
+        ManagementDeviceProfileRepository::delete_management_device_profile(
+            &delete_store,
+            device_profile.id,
+        )
+        .await
+    });
+    wait_for_timescale_table_lock(pool, "devices", "ShareRowExclusiveLock", true).await;
+    let update_store = store.clone();
+    let mut device_update = tokio::spawn(async move {
+        ManagementDeviceRepository::update_management_device(
+            &update_store,
+            "concurrent-profile-device",
+            UpdateManagementDevice {
+                display_name: "Concurrent profile device".to_owned(),
+                asset_id: None,
+                device_profile_id: Some(device_profile.id),
+                attributes: Some(json!({})),
+                topology: None,
+            },
+        )
+        .await
+    });
+    wait_for_timescale_table_wait(pool, "devices").await;
+    let mut device_probe = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut device_probe)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT device_id FROM devices
+         WHERE device_id = 'concurrent-profile-device'
+         FOR UPDATE NOWAIT",
+    )
+    .execute(&mut device_probe)
+    .await
+    .expect("profile assignment must wait on the table lock before locking its device row");
+    sqlx::query("COMMIT")
+        .execute(&mut device_profile_gate)
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), &mut device_delete)
+            .await
+            .expect("device profile deletion deadlocked")
+            .unwrap()
+            .is_ok()
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(2), &mut device_update)
+            .await
+            .expect("device profile assignment deadlocked")
+            .unwrap(),
+        Err(ManagementDeviceError::DeviceProfileUnavailable(id)) if id == device_profile.id
+    ));
+
+    let asset_profile = ManagementAssetProfileRepository::create_management_asset_profile(
+        &store,
+        asset_profile("Concurrent asset profile"),
+    )
+    .await
+    .unwrap();
+    let asset_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO assets (id, name) VALUES ($1, $2)")
+        .bind(asset_id)
+        .bind("Concurrent profile asset")
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut asset_profile_gate = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut asset_profile_gate)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN")
+        .execute(&mut asset_profile_gate)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM asset_profiles WHERE id = $1 FOR UPDATE")
+        .bind(asset_profile.id)
+        .execute(&mut asset_profile_gate)
+        .await
+        .unwrap();
+    let delete_store = store.clone();
+    let mut asset_delete = tokio::spawn(async move {
+        ManagementAssetProfileRepository::delete_management_asset_profile(
+            &delete_store,
+            asset_profile.id,
+        )
+        .await
+    });
+    wait_for_timescale_table_lock(pool, "assets", "ShareRowExclusiveLock", true).await;
+    let update_store = store.clone();
+    let mut asset_update = tokio::spawn(async move {
+        ManagementAssetRepository::update_management_asset(
+            &update_store,
+            asset_id,
+            UpdateManagementAsset {
+                name: "Concurrent profile asset".to_owned(),
+                asset_profile_id: Some(asset_profile.id),
+                parent_asset_id: None,
+                metadata: json!({}),
+                attributes: Some(json!({})),
+            },
+        )
+        .await
+    });
+    wait_for_timescale_table_wait(pool, "assets").await;
+    let mut asset_probe = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut asset_probe)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM assets WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(asset_id)
+        .execute(&mut asset_probe)
+        .await
+        .expect("profile assignment must wait on the table lock before locking its asset row");
+    sqlx::query("COMMIT")
+        .execute(&mut asset_profile_gate)
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), &mut asset_delete)
+            .await
+            .expect("asset profile deletion deadlocked")
+            .unwrap()
+            .is_ok()
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(2), &mut asset_update)
+            .await
+            .expect("asset profile assignment deadlocked")
+            .unwrap(),
+        Err(ManagementAssetError::AssetProfileUnavailable(id)) if id == asset_profile.id
     ));
 }

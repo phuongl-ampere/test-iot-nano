@@ -1606,6 +1606,10 @@ async fn update_management_asset(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            // Match profile deletion before taking hierarchy row locks.
+            sqlx::query("LOCK TABLE assets IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *transaction)
+                .await?;
             lock_timescale_management_asset_update_scope(
                 &mut transaction,
                 asset_id,
@@ -2350,6 +2354,10 @@ async fn update_management_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            // Match profile deletion before taking topology row locks.
+            sqlx::query("LOCK TABLE devices IN SHARE ROW EXCLUSIVE MODE")
+                .execute(&mut *transaction)
+                .await?;
             let current = timescale_topology(&mut transaction, device_id).await?;
             let topology = update.topology.unwrap_or(current.clone());
             validate_timescale_topology(device_id, &current, &topology, &mut transaction).await?;
