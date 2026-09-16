@@ -108,4 +108,19 @@ async fn sqlite_tenant_identity_repository_bootstraps_system_and_creates_tenant_
     .unwrap();
     assert_eq!(tenant.slug, "north");
     assert_eq!(tenant_account.tenant_id, tenant.id);
+
+    let system_credential = TenantIdentityRepository::system_account_credential(&store, "system")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(system_credential.account.id, system.id);
+    assert_eq!(system_credential.password_hash, "system-hash");
+
+    let tenant_credential = TenantIdentityRepository::tenant_account_credential(&store, "north")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tenant_credential.account.id, tenant_account.id);
+    assert_eq!(tenant_credential.tenant.id, tenant.id);
+    assert_eq!(tenant_credential.password_hash, "tenant-hash");
 }

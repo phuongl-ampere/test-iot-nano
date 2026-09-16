@@ -55,8 +55,9 @@ pub use public_api::{
     PublicTelemetry,
 };
 pub use tenant_identity::{
-    AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount, Tenant,
-    TenantAccount, TenantIdentityError, TenantIdentityRepository, TenantStatus,
+    AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount,
+    SystemAccountCredential, Tenant, TenantAccount, TenantAccountCredential, TenantIdentityError,
+    TenantIdentityRepository, TenantStatus,
 };
 
 const SQLITE_SCHEMA: &str = r#"

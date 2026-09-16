@@ -1,5 +1,5 @@
 use serde_json::Value;
-use sqlx::{PgPool, SqlitePool};
+use sqlx::{PgPool, Row, SqlitePool, postgres::PgRow, sqlite::SqliteRow, types::Json};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -60,6 +60,19 @@ pub struct TenantAccount {
     pub credential_version: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemAccountCredential {
+    pub account: SystemAccount,
+    pub password_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TenantAccountCredential {
+    pub account: TenantAccount,
+    pub tenant: Tenant,
+    pub password_hash: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewSystemAccount {
     pub username: String,
@@ -85,6 +98,8 @@ pub enum TenantIdentityError {
     InvalidTenantSlug,
     #[error("password hash is required")]
     EmptyPasswordHash,
+    #[error("stored tenant identity is invalid")]
+    InvalidStoredIdentity,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -166,6 +181,168 @@ impl TenantIdentityRepository {
         }
         Ok((tenant, account))
     }
+
+    pub async fn system_account_credential(
+        store: &PlatformStore,
+        username: &str,
+    ) -> Result<Option<SystemAccountCredential>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let row = sqlx::query(
+                    "SELECT id, username, password_hash
+                     FROM system_accounts
+                     WHERE username = ? AND status = 'active'",
+                )
+                .bind(username)
+                .fetch_optional(&store.pool)
+                .await?;
+                row.map(system_account_credential_from_sqlite).transpose()
+            }
+            PlatformStore::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, username, password_hash
+                     FROM system_accounts
+                     WHERE username = $1 AND status = 'active'",
+                )
+                .bind(username)
+                .fetch_optional(pool)
+                .await?;
+                row.map(system_account_credential_from_postgres).transpose()
+            }
+        }
+    }
+
+    pub async fn tenant_account_credential(
+        store: &PlatformStore,
+        tenant_slug: &str,
+    ) -> Result<Option<TenantAccountCredential>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let row = sqlx::query(
+                    "SELECT
+                        tenant_accounts.id AS account_id,
+                        tenant_accounts.tenant_id AS account_tenant_id,
+                        tenant_accounts.password_hash,
+                        tenant_accounts.credential_version,
+                        tenants.id AS tenant_id,
+                        tenants.slug,
+                        tenants.metadata
+                     FROM tenant_accounts
+                     JOIN tenants ON tenants.id = tenant_accounts.tenant_id
+                     WHERE tenants.slug = ?
+                       AND tenants.status = 'active'
+                       AND tenant_accounts.status = 'active'",
+                )
+                .bind(tenant_slug)
+                .fetch_optional(&store.pool)
+                .await?;
+                row.map(tenant_account_credential_from_sqlite).transpose()
+            }
+            PlatformStore::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT
+                        tenant_accounts.id AS account_id,
+                        tenant_accounts.tenant_id AS account_tenant_id,
+                        tenant_accounts.password_hash,
+                        tenant_accounts.credential_version,
+                        tenants.id AS tenant_id,
+                        tenants.slug,
+                        tenants.metadata
+                     FROM tenant_accounts
+                     JOIN tenants ON tenants.id = tenant_accounts.tenant_id
+                     WHERE tenants.slug = $1
+                       AND tenants.status = 'active'
+                       AND tenant_accounts.status = 'active'",
+                )
+                .bind(tenant_slug)
+                .fetch_optional(pool)
+                .await?;
+                row.map(tenant_account_credential_from_postgres).transpose()
+            }
+        }
+    }
+}
+
+fn system_account_credential_from_sqlite(
+    row: SqliteRow,
+) -> Result<SystemAccountCredential, TenantIdentityError> {
+    Ok(SystemAccountCredential {
+        account: SystemAccount {
+            id: parse_uuid(row.try_get::<String, _>("id")?)?,
+            username: row.try_get("username")?,
+            status: AccountStatus::Active,
+        },
+        password_hash: row.try_get("password_hash")?,
+    })
+}
+
+fn system_account_credential_from_postgres(
+    row: PgRow,
+) -> Result<SystemAccountCredential, TenantIdentityError> {
+    Ok(SystemAccountCredential {
+        account: SystemAccount {
+            id: row.try_get("id")?,
+            username: row.try_get("username")?,
+            status: AccountStatus::Active,
+        },
+        password_hash: row.try_get("password_hash")?,
+    })
+}
+
+fn tenant_account_credential_from_sqlite(
+    row: SqliteRow,
+) -> Result<TenantAccountCredential, TenantIdentityError> {
+    let tenant_id = parse_uuid(row.try_get::<String, _>("tenant_id")?)?;
+    let account_tenant_id = parse_uuid(row.try_get::<String, _>("account_tenant_id")?)?;
+    if tenant_id != account_tenant_id {
+        return Err(TenantIdentityError::InvalidStoredIdentity);
+    }
+    let metadata: String = row.try_get("metadata")?;
+    Ok(TenantAccountCredential {
+        account: TenantAccount {
+            id: parse_uuid(row.try_get::<String, _>("account_id")?)?,
+            tenant_id,
+            status: AccountStatus::Active,
+            credential_version: row.try_get("credential_version")?,
+        },
+        tenant: Tenant {
+            id: tenant_id,
+            slug: row.try_get("slug")?,
+            status: TenantStatus::Active,
+            metadata: serde_json::from_str(&metadata)
+                .map_err(|_| TenantIdentityError::InvalidStoredIdentity)?,
+        },
+        password_hash: row.try_get("password_hash")?,
+    })
+}
+
+fn tenant_account_credential_from_postgres(
+    row: PgRow,
+) -> Result<TenantAccountCredential, TenantIdentityError> {
+    let tenant_id: Uuid = row.try_get("tenant_id")?;
+    let account_tenant_id: Uuid = row.try_get("account_tenant_id")?;
+    if tenant_id != account_tenant_id {
+        return Err(TenantIdentityError::InvalidStoredIdentity);
+    }
+    Ok(TenantAccountCredential {
+        account: TenantAccount {
+            id: row.try_get("account_id")?,
+            tenant_id,
+            status: AccountStatus::Active,
+            credential_version: row.try_get("credential_version")?,
+        },
+        tenant: Tenant {
+            id: tenant_id,
+            slug: row.try_get("slug")?,
+            status: TenantStatus::Active,
+            metadata: row.try_get::<Json<Value>, _>("metadata")?.0,
+        },
+        password_hash: row.try_get("password_hash")?,
+    })
+}
+
+fn parse_uuid(value: String) -> Result<Uuid, TenantIdentityError> {
+    Uuid::parse_str(&value).map_err(|_| TenantIdentityError::InvalidStoredIdentity)
 }
 
 async fn create_sqlite_tenant_with_account(
