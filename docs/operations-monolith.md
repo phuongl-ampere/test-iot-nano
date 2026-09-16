@@ -57,18 +57,19 @@ The platform volume contains platform data. The internal directory is separate
 and contains exactly these monolith-owned state entries:
 
 ```text
-.iot-nano-monolith-state
 stream.sqlite
 mqttd.sqlite
 cache.sqlite
 instance.lock
 ```
 
-`.iot-nano-monolith-state` is the required owner-only marker for a dedicated
-monolith internal-state directory. It establishes that the directory belongs
-to this topology before the process opens the three internal SQLite databases
-or acquires `instance.lock`. Do not delete, replace, or copy the directory
-without this marker.
+The process requires owner-only regular files and rejects undeclared entries,
+unsafe permissions, and symbolic links before it migrates platform storage or
+binds a listener. SQLite may create transient `-wal` and `-shm` journal
+sidecars while a database is open; they are part of the corresponding SQLite
+file, not additional monolith state entries. A valid legacy
+`.iot-nano-monolith-state` marker from an earlier build is removed during the
+first safe restart. Do not create or restore that marker.
 
 Timescale mode requires `IOT_NANO_STORAGE=timescale` and `DATABASE_URL`. It
 uses only the internal-state volume locally; do not set
