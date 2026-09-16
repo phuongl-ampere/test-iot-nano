@@ -33,6 +33,72 @@ fn sqlite_configuration(path: std::path::PathBuf) -> StorageConfiguration {
 }
 
 #[tokio::test]
+async fn sqlite_pre_migration_backup_preserves_the_legacy_source_and_is_reused_on_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let platform_path = directory.path().join("pre-migration.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", platform_path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "PRAGMA journal_mode = DELETE;
+         PRAGMA user_version = 0;
+         CREATE TABLE preserved_before_migration (value TEXT NOT NULL);
+         INSERT INTO preserved_before_migration (value) VALUES ('before-migration');",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+
+    let configuration = sqlite_configuration(platform_path.clone());
+    let first_backup = PlatformStore::backup_sqlite_before_migration(&configuration)
+        .await
+        .unwrap()
+        .expect("legacy SQLite database must be backed up");
+    let second_backup = PlatformStore::backup_sqlite_before_migration(&configuration)
+        .await
+        .unwrap()
+        .expect("failed migration retry must retain the original backup");
+    assert_eq!(first_backup, second_backup);
+
+    let mut source =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rw", platform_path.display()))
+            .await
+            .unwrap();
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut source)
+        .await
+        .unwrap();
+    assert_eq!(journal_mode, "delete");
+
+    let mut backup =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=ro", first_backup.display()))
+            .await
+            .unwrap();
+    let value: String = sqlx::query_scalar("SELECT value FROM preserved_before_migration LIMIT 1")
+        .fetch_one(&mut backup)
+        .await
+        .unwrap();
+    assert_eq!(value, "before-migration");
+}
+
+#[tokio::test]
+async fn sqlite_current_schema_does_not_create_a_pre_migration_backup() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = sqlite_configuration(directory.path().join("current.sqlite"));
+    let store = PlatformStore::open(&configuration).await.unwrap();
+    drop(store);
+
+    assert!(
+        PlatformStore::backup_sqlite_before_migration(&configuration)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_backup_preserves_committed_platform_data() {
     let directory = tempfile::tempdir().unwrap();
     let platform_path = directory.path().join("platform.sqlite");

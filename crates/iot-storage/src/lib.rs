@@ -3,7 +3,13 @@
 mod management;
 mod public_api;
 
-use std::{fs, future::Future, path::PathBuf, pin::Pin, time::Duration};
+use std::{
+    fs,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    time::Duration,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -27,6 +33,8 @@ use thiserror::Error;
 use url::Url;
 
 const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform.sql");
+const SQLITE_PLATFORM_SCHEMA_VERSION: i64 = 1;
+const SET_SQLITE_PLATFORM_SCHEMA_VERSION: &str = "PRAGMA user_version = 1";
 
 pub use management::{
     CreateManagementAsset, CreateManagementAssetProfile, CreateManagementDeviceProfile,
@@ -1435,6 +1443,58 @@ impl PlatformStore {
                 Ok(Self::Timescale(pool))
             }
         }
+    }
+
+    /// Creates a coherent backup before a monolith upgrades an existing SQLite schema.
+    pub async fn backup_sqlite_before_migration(
+        configuration: &StorageConfiguration,
+    ) -> Result<Option<PathBuf>, PlatformStoreError> {
+        if configuration.storage != DatabaseStorage::Sqlite {
+            return Ok(None);
+        }
+        let path = configuration
+            .sqlite_path
+            .as_ref()
+            .ok_or(PlatformStoreError::InvalidConfiguration)?;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SqliteStoreError::Filesystem(error).into()),
+        };
+        if !metadata.is_file() {
+            return Err(SqliteStoreError::InvalidConfiguration.into());
+        }
+        if metadata.len() == 0 {
+            return Ok(None);
+        }
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(sqlite_backup_connect_options(
+                path,
+                configuration.sqlite_busy_timeout_ms,
+            ))
+            .await?;
+        let schema_version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        let backup = if schema_version < SQLITE_PLATFORM_SCHEMA_VERSION {
+            match existing_pre_migration_backup(path, schema_version)? {
+                Some(path) => Some(path),
+                None => Some(
+                    backup_sqlite_pool_with_prefix(
+                        &pool,
+                        path,
+                        &format!("backup-v{schema_version}"),
+                    )
+                    .await?,
+                ),
+            }
+        } else {
+            None
+        };
+        pool.close().await;
+        Ok(backup)
     }
 
     pub fn sqlite_pool(&self) -> Option<&SqlitePool> {
@@ -7051,6 +7111,83 @@ pub struct RetentionResult {
     pub resolved_incident_rows: u64,
 }
 
+fn sqlite_connect_options(
+    path: &Path,
+    busy_timeout_ms: u64,
+    create_if_missing: bool,
+) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(create_if_missing)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_millis(busy_timeout_ms))
+}
+
+fn sqlite_backup_connect_options(path: &Path, busy_timeout_ms: u64) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(Duration::from_millis(busy_timeout_ms))
+}
+
+fn existing_pre_migration_backup(
+    path: &Path,
+    schema_version: i64,
+) -> Result<Option<PathBuf>, SqliteStoreError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SqliteStoreError::InvalidConfiguration)?;
+    let parent = path
+        .parent()
+        .ok_or(SqliteStoreError::InvalidConfiguration)?;
+    let prefix = format!("{file_name}.backup-v{schema_version}-");
+    let mut backups = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+        {
+            backups.push(entry.path());
+        }
+    }
+    backups.sort();
+    Ok(backups.into_iter().next())
+}
+
+async fn backup_sqlite_pool(pool: &SqlitePool, path: &Path) -> Result<PathBuf, SqliteStoreError> {
+    backup_sqlite_pool_with_prefix(pool, path, "backup").await
+}
+
+async fn backup_sqlite_pool_with_prefix(
+    pool: &SqlitePool,
+    path: &Path,
+    prefix: &str,
+) -> Result<PathBuf, SqliteStoreError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SqliteStoreError::InvalidConfiguration)?;
+    let backup_name = format!(
+        "{file_name}.{prefix}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S%fZ")
+    );
+    let backup_path = path.with_file_name(backup_name);
+
+    sqlx::query("VACUUM INTO ?")
+        .bind(backup_path.to_string_lossy().as_ref())
+        .execute(pool)
+        .await?;
+    #[cfg(unix)]
+    fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
+    Ok(backup_path)
+}
+
 impl SqliteStore {
     pub async fn open(configuration: &StorageConfiguration) -> Result<Self, SqliteStoreError> {
         if configuration.storage != DatabaseStorage::Sqlite {
@@ -7069,12 +7206,7 @@ impl SqliteStore {
             #[cfg(unix)]
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_millis(configuration.sqlite_busy_timeout_ms));
+        let options = sqlite_connect_options(path, configuration.sqlite_busy_timeout_ms, true);
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(options)
@@ -7088,6 +7220,9 @@ impl SqliteStore {
         migrate_root_asset_name_uniqueness(&pool).await?;
         migrate_command_outbox_schema(&pool).await?;
         migrate_resource_authorization_schema(&pool).await?;
+        sqlx::query(SET_SQLITE_PLATFORM_SCHEMA_VERSION)
+            .execute(&pool)
+            .await?;
         Ok(Self {
             pool,
             path: path.clone(),
@@ -7099,24 +7234,7 @@ impl SqliteStore {
     }
 
     pub async fn backup(&self) -> Result<PathBuf, SqliteStoreError> {
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(SqliteStoreError::InvalidConfiguration)?;
-        let backup_name = format!(
-            "{file_name}.backup-{}",
-            Utc::now().format("%Y%m%dT%H%M%S%fZ")
-        );
-        let backup_path = self.path.with_file_name(backup_name);
-
-        sqlx::query("VACUUM INTO ?")
-            .bind(backup_path.to_string_lossy().as_ref())
-            .execute(&self.pool)
-            .await?;
-        #[cfg(unix)]
-        fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o600))?;
-        Ok(backup_path)
+        backup_sqlite_pool(&self.pool, &self.path).await
     }
 
     pub async fn enqueue_command(

@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     future::Future,
-    io::{self, Read, Write},
+    io::{self, Read},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -34,6 +34,13 @@ use crate::{
 
 const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
 const INTERNAL_DIRECTORY_MARKER_CONTENT: &[u8] = b"iot-nano-monolith-state-v1\n";
+const INTERNAL_STATE_FILES: [&str; 4] = [
+    "stream.sqlite",
+    "mqttd.sqlite",
+    "cache.sqlite",
+    "instance.lock",
+];
+const INTERNAL_SQLITE_STATE_FILES: [&str; 3] = ["stream.sqlite", "mqttd.sqlite", "cache.sqlite"];
 
 pub struct MonolithRuntime {
     internal_directory: Option<InternalDirectory>,
@@ -58,6 +65,9 @@ impl MonolithRuntime {
         username: &str,
         password: &str,
     ) -> Result<(), BootstrapAdminError> {
+        PlatformStore::backup_sqlite_before_migration(storage)
+            .await
+            .map_err(BootstrapAdminError::PlatformMigration)?;
         let platform = PlatformStore::open(storage)
             .await
             .map_err(BootstrapAdminError::PlatformMigration)?;
@@ -67,6 +77,9 @@ impl MonolithRuntime {
     pub async fn migrate(config: &MonolithConfig) -> Result<(), StartupError> {
         let internal_directory = prepare_internal_directory(&config.internal_dir)?;
         let instance_lock = InstanceLock::acquire_blocking(&internal_directory)?;
+        PlatformStore::backup_sqlite_before_migration(&config.storage)
+            .await
+            .map_err(StartupError::PlatformMigration)?;
         let platform = PlatformStore::open(&config.storage)
             .await
             .map_err(StartupError::PlatformMigration)?;
@@ -82,6 +95,9 @@ impl MonolithRuntime {
         let cancellation = CancellationToken::new();
         let failure_cancellation = CancellationToken::new();
         let http_cancellation = CancellationToken::new();
+        PlatformStore::backup_sqlite_before_migration(&config.storage)
+            .await
+            .map_err(StartupError::PlatformMigration)?;
         let platform = Arc::new(
             PlatformStore::open(&config.storage)
                 .await
@@ -138,6 +154,22 @@ impl MonolithRuntime {
             .await
             .map_err(StartupError::CoreRuntime)?,
         );
+        let readiness = Readiness::default();
+        let token_vault = TokenVault::from_key_material(&config.device_token_vault_key);
+        let management_sessions =
+            ManagementSessionRouter::new(Arc::clone(&platform), token_vault.clone());
+        let browser_session_verifier: Arc<dyn iot_api::OAuthBrowserSessionVerifier> =
+            management_sessions.session_verifier.clone();
+        let public_router = health_router(readiness.clone())
+            .merge(iot_api::public_v1_router(
+                Arc::clone(&platform),
+                token_vault,
+                Arc::new(PlatformCoreFacade::new(Arc::clone(&platform))),
+            ))
+            .merge(iot_api::public_oauth_router_with_browser_session_verifier(
+                Arc::clone(&platform),
+                browser_session_verifier,
+            ));
         let mqtt_cancellation = cancellation.child_token();
         let mut mqtt = match MqttRuntime::start(MqttRuntimeConfig {
             listeners: MqttListenerConfig {
@@ -167,22 +199,6 @@ impl MonolithRuntime {
             }
         };
 
-        let readiness = Readiness::default();
-        let token_vault = TokenVault::from_key_material(&config.device_token_vault_key);
-        let management_sessions =
-            ManagementSessionRouter::new(Arc::clone(&platform), token_vault.clone());
-        let browser_session_verifier: Arc<dyn iot_api::OAuthBrowserSessionVerifier> =
-            management_sessions.session_verifier.clone();
-        let public_router = health_router(readiness.clone())
-            .merge(iot_api::public_v1_router(
-                Arc::clone(&platform),
-                token_vault,
-                Arc::new(PlatformCoreFacade::new(Arc::clone(&platform))),
-            ))
-            .merge(iot_api::public_oauth_router_with_browser_session_verifier(
-                Arc::clone(&platform),
-                browser_session_verifier,
-            ));
         let public_listener = match TcpListener::bind(config.public_http).await {
             Ok(listener) => listener,
             Err(error) => {
@@ -727,6 +743,8 @@ fn prepare_internal_directory(path: &Path) -> Result<InternalDirectory, StartupE
                 format!("internal state path is not a directory: {}", path.display()),
             )));
         }
+        retire_legacy_marker_and_validate_internal_directory(path)
+            .map_err(StartupError::InternalDirectory)?;
         return Ok(InternalDirectory {
             path: path.to_path_buf(),
         });
@@ -804,11 +822,10 @@ fn prepare_internal_directory_unix(path: &Path) -> io::Result<InternalDirectory>
     if created_internal_directory {
         ensure_new_internal_directory(&directory, path, current_uid)?;
         fchmod(&directory, Mode::from(0o700)).map_err(io::Error::from)?;
-        create_internal_directory_marker(&directory, path, current_uid)?;
     } else {
         ensure_reusable_internal_directory(&directory, path, current_uid)?;
-        verify_internal_directory_marker(&directory, path, current_uid)?;
     }
+    retire_legacy_marker_and_validate_internal_directory(&directory, path, current_uid)?;
 
     Ok(InternalDirectory {
         path: path.to_path_buf(),
@@ -900,26 +917,125 @@ fn ensure_reusable_internal_directory(
 }
 
 #[cfg(unix)]
-fn create_internal_directory_marker(
+fn retire_legacy_marker_and_validate_internal_directory(
     directory: &File,
     path: &Path,
     current_uid: rustix::process::RawUid,
 ) -> io::Result<()> {
-    use rustix::fs::{Mode, OFlags, fchmod, openat};
+    let (has_legacy_marker, entries) = declared_internal_state_entries(path)?;
+    for name in entries {
+        validate_existing_internal_state_entry(directory, path, &name, current_uid)?;
+    }
 
-    let marker_path = path.join(INTERNAL_DIRECTORY_MARKER);
-    let marker = openat(
+    if has_legacy_marker {
+        verify_internal_directory_marker(directory, path, current_uid)?;
+        rustix::fs::unlinkat(
+            directory,
+            INTERNAL_DIRECTORY_MARKER,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(io::Error::from)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn retire_legacy_marker_and_validate_internal_directory(path: &Path) -> io::Result<()> {
+    let (has_legacy_marker, _) = declared_internal_state_entries(path)?;
+    if has_legacy_marker {
+        let marker_path = path.join(INTERNAL_DIRECTORY_MARKER);
+        let contents = std::fs::read(&marker_path)?;
+        if contents != INTERNAL_DIRECTORY_MARKER_CONTENT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "internal state marker is invalid: {}",
+                    marker_path.display()
+                ),
+            ));
+        }
+        std::fs::remove_file(marker_path)?;
+    }
+    Ok(())
+}
+
+fn declared_internal_state_entries(path: &Path) -> io::Result<(bool, Vec<String>)> {
+    let mut has_legacy_marker = false;
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "internal state entry is not valid UTF-8: {}",
+                    entry.path().display()
+                ),
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "internal state entry is not a regular file: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+        if name == INTERNAL_DIRECTORY_MARKER {
+            has_legacy_marker = true;
+        } else if is_declared_internal_state_entry(name) {
+            entries.push(name.to_owned());
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "internal state directory contains an undeclared entry: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    Ok((has_legacy_marker, entries))
+}
+
+fn is_declared_internal_state_entry(name: &str) -> bool {
+    INTERNAL_STATE_FILES.contains(&name)
+        || INTERNAL_SQLITE_STATE_FILES
+            .iter()
+            .any(|file| name == format!("{file}-wal") || name == format!("{file}-shm"))
+}
+
+#[cfg(unix)]
+fn validate_existing_internal_state_entry(
+    directory: &File,
+    path: &Path,
+    name: &str,
+    current_uid: rustix::process::RawUid,
+) -> io::Result<()> {
+    use rustix::fs::{Mode, OFlags, fstat, openat};
+
+    let entry_path = path.join(name);
+    let entry = openat(
         directory,
-        INTERNAL_DIRECTORY_MARKER,
-        OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from(0o600),
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
     )
     .map_err(io::Error::from)?;
-    ensure_owned_regular_file(&marker, &marker_path, current_uid)?;
-    fchmod(&marker, Mode::from(0o600)).map_err(io::Error::from)?;
-    let mut marker = File::from(marker);
-    marker.write_all(INTERNAL_DIRECTORY_MARKER_CONTENT)?;
-    marker.sync_all()
+    ensure_owned_regular_file(&entry, &entry_path, current_uid)?;
+    if fstat(&entry).map_err(io::Error::from)?.st_mode as u32 & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "internal state file must retain owner-only permissions: {}",
+                entry_path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

@@ -463,7 +463,7 @@ async fn symlinked_instance_lock_is_rejected_without_following_the_target() {
         Err(error) => error,
     };
 
-    assert!(matches!(error, StartupError::InstanceLock { .. }));
+    assert!(matches!(error, StartupError::InternalDirectory(_)));
     assert_eq!(
         std::fs::read_to_string(&lock_target).unwrap(),
         "do not touch"
@@ -486,7 +486,7 @@ async fn symlinked_instance_lock_is_rejected_without_following_the_target() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn existing_internal_directory_without_monolith_marker_is_rejected_without_mutation() {
+async fn owner_only_existing_internal_directory_is_initialized_without_a_marker() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = Fixture::sqlite().await;
@@ -501,23 +501,30 @@ async fn existing_internal_directory_without_monolith_marker_is_rejected_without
 
     let mut config = fixture.config();
     config.internal_dir = existing.clone();
-    let error = match MonolithRuntime::start(config).await {
-        Ok(_) => panic!("arbitrary existing directory unexpectedly started a runtime"),
-        Err(error) => error,
-    };
+    let mut runtime = MonolithRuntime::start(config).await.unwrap();
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
 
-    assert!(matches!(error, StartupError::InternalDirectory(_)));
     assert_eq!(
         existing.metadata().unwrap().permissions().mode() & 0o777,
         0o700
     );
     assert!(!existing.join(".iot-nano-monolith-state").exists());
-    fixture.assert_configured_addresses_are_unbound().await;
+    for state_file in [
+        "stream.sqlite",
+        "mqttd.sqlite",
+        "cache.sqlite",
+        "instance.lock",
+    ] {
+        assert!(existing.join(state_file).is_file(), "missing {state_file}");
+    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn dedicated_internal_directory_creates_and_reuses_its_monolith_marker() {
+async fn legacy_internal_directory_marker_is_removed_during_reuse() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = Fixture::sqlite().await;
@@ -533,13 +540,13 @@ async fn dedicated_internal_directory_creates_and_reuses_its_monolith_marker() {
     let mut config = fixture.config();
     config.internal_dir = trusted_parent.join("internal");
     let marker = config.internal_dir.join(".iot-nano-monolith-state");
+    std::fs::create_dir(&config.internal_dir).unwrap();
+    std::fs::set_permissions(&config.internal_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&marker, "iot-nano-monolith-state-v1\n").unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let mut first = MonolithRuntime::start(config.clone()).await.unwrap();
-    assert!(marker.is_file());
-    assert_eq!(
-        marker.metadata().unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    assert!(!marker.exists());
     first
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await
@@ -550,6 +557,154 @@ async fn dedicated_internal_directory_creates_and_reuses_its_monolith_marker() {
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn internal_directory_rejects_unknown_files_before_platform_migration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::sqlite().await;
+    let existing = fixture
+        .config
+        .internal_dir
+        .parent()
+        .unwrap()
+        .join("existing-directory");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = existing.join(".iot-nano-monolith-state");
+    std::fs::write(&marker, "iot-nano-monolith-state-v1\n").unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let unexpected = existing.join("unexpected-state");
+    std::fs::write(&unexpected, "do not accept").unwrap();
+    std::fs::set_permissions(&unexpected, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut config = fixture.config();
+    config.internal_dir = existing;
+    let error = match MonolithRuntime::start(config).await {
+        Ok(_) => panic!("unknown internal state unexpectedly started a runtime"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, StartupError::InternalDirectory(_)));
+    assert_eq!(
+        std::fs::read_to_string(unexpected).unwrap(),
+        "do not accept"
+    );
+    assert!(
+        !fixture
+            .config
+            .storage
+            .sqlite_path
+            .as_ref()
+            .unwrap()
+            .exists()
+    );
+    fixture.assert_configured_addresses_are_unbound().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn internal_directory_rejects_declared_symlinks_before_platform_migration() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for state_name in ["stream.sqlite", "stream.sqlite-wal"] {
+        let fixture = Fixture::sqlite().await;
+        let existing = fixture
+            .config
+            .internal_dir
+            .parent()
+            .unwrap()
+            .join(format!("existing-{state_name}"));
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = fixture
+            ._directory
+            .path()
+            .join(format!("target-{state_name}"));
+        std::fs::write(&target, "do not follow").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, existing.join(state_name)).unwrap();
+
+        let mut config = fixture.config();
+        config.internal_dir = existing;
+        let error = match MonolithRuntime::start(config).await {
+            Ok(_) => panic!("symlinked {state_name} unexpectedly started a runtime"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, StartupError::InternalDirectory(_)));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "do not follow");
+        assert!(
+            !fixture
+                .config
+                .storage
+                .sqlite_path
+                .as_ref()
+                .unwrap()
+                .exists()
+        );
+        fixture.assert_configured_addresses_are_unbound().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn internal_directory_rejects_unsafe_declared_file_before_platform_migration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::sqlite().await;
+    let existing = fixture
+        .config
+        .internal_dir
+        .parent()
+        .unwrap()
+        .join("existing-unsafe-mode");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let unsafe_state = existing.join("stream.sqlite");
+    std::fs::write(&unsafe_state, "not owner-only").unwrap();
+    std::fs::set_permissions(&unsafe_state, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut config = fixture.config();
+    config.internal_dir = existing;
+    let error = match MonolithRuntime::start(config).await {
+        Ok(_) => panic!("unsafe internal state unexpectedly started a runtime"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, StartupError::InternalDirectory(_)));
+    assert_eq!(
+        std::fs::read_to_string(unsafe_state).unwrap(),
+        "not owner-only"
+    );
+    assert!(
+        !fixture
+            .config
+            .storage
+            .sqlite_path
+            .as_ref()
+            .unwrap()
+            .exists()
+    );
+    fixture.assert_configured_addresses_are_unbound().await;
+}
+
+#[test]
+fn api_routers_are_prepared_before_mqtt_can_bind_public_ports() {
+    let source = include_str!("../src/runtime.rs");
+    let router_preparation = source
+        .find("let public_router = health_router")
+        .expect("runtime must construct API routers");
+    let mqtt_start = source
+        .find("let mut mqtt = match MqttRuntime::start")
+        .expect("runtime must start MQTTD");
+
+    assert!(
+        router_preparation < mqtt_start,
+        "API routers must be prepared before MQTTD can bind public ports"
+    );
 }
 
 #[cfg(unix)]

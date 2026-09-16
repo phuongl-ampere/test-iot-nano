@@ -179,6 +179,58 @@ async fn migrate_only_waits_for_the_internal_instance_lock_before_migrating_or_b
     fixture.assert_configured_addresses_are_unbound();
 }
 
+#[tokio::test]
+async fn migrate_only_creates_a_sqlite_backup_before_upgrading_an_existing_platform() {
+    let fixture = Fixture::new();
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let platform_path = fixture.config.storage.sqlite_path.as_ref().unwrap();
+    let connection = rusqlite::Connection::open(platform_path).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO devices (device_id) VALUES ('backup-before-upgrade');
+             PRAGMA user_version = 0;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let output = fixture.migration_command().output().unwrap();
+    assert!(
+        output.status.success(),
+        "migrate-only failed instead of preserving a pre-upgrade SQLite backup: {output:?}"
+    );
+
+    let file_name = platform_path.file_name().unwrap().to_str().unwrap();
+    let backups = std::fs::read_dir(platform_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("{file_name}.backup-")))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "expected one pre-upgrade SQLite backup");
+    assert!(backups[0].metadata().unwrap().len() > 0);
+    let backup = rusqlite::Connection::open(&backups[0]).unwrap();
+    let device_id: String = backup
+        .query_row(
+            "SELECT device_id FROM devices WHERE device_id = 'backup-before-upgrade'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(device_id, "backup-before-upgrade");
+
+    fixture.assert_configured_addresses_are_unbound();
+}
+
 fn wait_until_blocked(child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
