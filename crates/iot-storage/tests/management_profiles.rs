@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 mod common;
 
-async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
+async fn sqlite_store() -> (tempfile::TempDir, PlatformStore, Uuid) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
         storage: DatabaseStorage::Sqlite,
@@ -23,7 +23,19 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
-    (directory, store)
+    let tenant_id = seed_tenant(store.sqlite_pool().unwrap(), "management-profiles").await;
+    (directory, store, tenant_id)
+}
+
+async fn seed_tenant(pool: &sqlx::SqlitePool, slug: &str) -> Uuid {
+    let tenant_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, ?, 'active')")
+        .bind(tenant_id.to_string())
+        .bind(slug)
+        .execute(pool)
+        .await
+        .unwrap();
+    tenant_id
 }
 
 fn device_profile(name: &str) -> CreateManagementDeviceProfile {
@@ -45,7 +57,7 @@ fn asset_profile(name: &str) -> CreateManagementAssetProfile {
 
 #[tokio::test]
 async fn sqlite_management_profile_repositories_create_list_update_and_delete() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, _tenant_id) = sqlite_store().await;
 
     let device_z = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
@@ -141,7 +153,7 @@ async fn sqlite_management_profile_repositories_create_list_update_and_delete() 
 
 #[tokio::test]
 async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_references() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let device = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
@@ -201,9 +213,10 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
         Err(ManagementDeviceProfileError::DeviceProfileNotFound)
     ));
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, device_profile_id)
-         VALUES ('profile-reference-device', 'Profile reference', ?)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, device_profile_id)
+         VALUES ('profile-reference-device', ?, 'Profile reference', ?)",
     )
+    .bind(tenant_id.to_string())
     .bind(device.id.to_string())
     .execute(pool)
     .await
@@ -257,10 +270,11 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
         Err(ManagementAssetProfileError::AssetProfileNotFound)
     ));
     sqlx::query(
-        "INSERT INTO assets (id, name, asset_profile_id)
-         VALUES (?, 'profile-reference-asset', ?)",
+        "INSERT INTO assets (id, tenant_id, name, asset_profile_id)
+         VALUES (?, ?, 'profile-reference-asset', ?)",
     )
     .bind(Uuid::now_v7().to_string())
+    .bind(tenant_id.to_string())
     .bind(asset.id.to_string())
     .execute(pool)
     .await
@@ -278,7 +292,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
 
 #[tokio::test]
 async fn sqlite_device_profile_deletion_preserves_active_references_and_clears_soft_deleted_ones() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let active_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
@@ -293,22 +307,25 @@ async fn sqlite_device_profile_deletion_preserves_active_references_and_clears_s
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, device_profile_id)
-         VALUES ('active-profile-reference-device', 'Active profile reference', ?)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, device_profile_id)
+         VALUES ('active-profile-reference-device', ?, 'Active profile reference', ?)",
     )
+    .bind(tenant_id.to_string())
     .bind(active_profile.id.to_string())
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, device_profile_id, deleted_at)
+        "INSERT INTO devices (device_id, tenant_id, display_name, device_profile_id, deleted_at)
          VALUES (
              'soft-deleted-profile-reference-device',
+             ?,
              'Soft-deleted profile reference',
              ?,
              CURRENT_TIMESTAMP
          )",
     )
+    .bind(tenant_id.to_string())
     .bind(deleted_profile.id.to_string())
     .execute(pool)
     .await
@@ -341,7 +358,7 @@ struct TimescaleTestLock {
     _connection: PgConnection,
 }
 
-async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
+async fn timescale_store() -> (TimescaleTestLock, PlatformStore, Uuid) {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
     let mut connection = PgConnection::connect(&database_url).await.unwrap();
@@ -364,11 +381,20 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
     })
     .await
     .unwrap();
+    let tenant_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'management-profiles', 'active')",
+    )
+    .bind(tenant_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     (
         TimescaleTestLock {
             _connection: connection,
         },
         store,
+        tenant_id,
     )
 }
 
@@ -430,7 +456,7 @@ async fn wait_for_timescale_table_wait(pool: &PgPool, table: &str) {
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_profile_repositories_match_sqlite_contract() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let device_z = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
@@ -656,18 +682,20 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     );
 
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, device_profile_id)
-         VALUES ('timescale-profile-reference-device', 'Profile reference', $1)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, device_profile_id)
+         VALUES ('timescale-profile-reference-device', $1, 'Profile reference', $2)",
     )
+    .bind(tenant_id)
     .bind(updated_device.id)
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO assets (id, name, asset_profile_id)
-         VALUES ($1, 'timescale-profile-reference-asset', $2)",
+        "INSERT INTO assets (id, tenant_id, name, asset_profile_id)
+         VALUES ($1, $2, 'timescale-profile-reference-asset', $3)",
     )
     .bind(Uuid::now_v7())
+    .bind(tenant_id)
     .bind(updated_asset.id)
     .execute(pool)
     .await
@@ -686,7 +714,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_device_profile_deletion_handles_active_and_soft_deleted_references() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let active_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
@@ -701,22 +729,25 @@ async fn timescale_device_profile_deletion_handles_active_and_soft_deleted_refer
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, device_profile_id)
-         VALUES ('timescale-active-profile-reference', 'Active profile reference', $1)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, device_profile_id)
+         VALUES ('timescale-active-profile-reference', $1, 'Active profile reference', $2)",
     )
+    .bind(tenant_id)
     .bind(active_profile.id)
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, device_profile_id, deleted_at)
+        "INSERT INTO devices (device_id, tenant_id, display_name, device_profile_id, deleted_at)
          VALUES (
              'timescale-soft-deleted-profile-reference',
-             'Soft-deleted profile reference',
              $1,
+             'Soft-deleted profile reference',
+             $2,
              now()
          )",
     )
+    .bind(tenant_id)
     .bind(deleted_profile.id)
     .execute(pool)
     .await
@@ -748,7 +779,7 @@ async fn timescale_device_profile_deletion_handles_active_and_soft_deleted_refer
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typed_error() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
 
@@ -758,8 +789,9 @@ async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typ
     )
     .await
     .unwrap();
-    sqlx::query("INSERT INTO devices (device_id, display_name) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO devices (device_id, tenant_id, display_name) VALUES ($1, $2, $3)")
         .bind("concurrent-profile-device")
+        .bind(tenant_id)
         .bind("Concurrent profile device")
         .execute(pool)
         .await
@@ -788,9 +820,11 @@ async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typ
     });
     wait_for_timescale_table_lock(pool, "devices", "ShareRowExclusiveLock", true).await;
     let update_store = store.clone();
+    let update_tenant_id = tenant_id;
     let mut device_update = tokio::spawn(async move {
         ManagementDeviceRepository::update_management_device(
             &update_store,
+            update_tenant_id,
             "concurrent-profile-device",
             UpdateManagementDevice {
                 display_name: "Concurrent profile device".to_owned(),
@@ -839,7 +873,7 @@ async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typ
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row_locks() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
 
@@ -849,8 +883,9 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
     )
     .await
     .unwrap();
-    sqlx::query("INSERT INTO devices (device_id, display_name) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO devices (device_id, tenant_id, display_name) VALUES ($1, $2, $3)")
         .bind("concurrent-profile-device")
+        .bind(tenant_id)
         .bind("Concurrent profile device")
         .execute(pool)
         .await
@@ -879,9 +914,11 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
     });
     wait_for_timescale_table_lock(pool, "devices", "ShareRowExclusiveLock", true).await;
     let update_store = store.clone();
+    let update_tenant_id = tenant_id;
     let mut device_update = tokio::spawn(async move {
         ManagementDeviceRepository::update_management_device(
             &update_store,
+            update_tenant_id,
             "concurrent-profile-device",
             UpdateManagementDevice {
                 display_name: "Concurrent profile device".to_owned(),
@@ -933,8 +970,9 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
     .await
     .unwrap();
     let asset_id = Uuid::now_v7();
-    sqlx::query("INSERT INTO assets (id, name) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES ($1, $2, $3)")
         .bind(asset_id)
+        .bind(tenant_id)
         .bind("Concurrent profile asset")
         .execute(pool)
         .await
@@ -963,9 +1001,11 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
     });
     wait_for_timescale_table_lock(pool, "assets", "ShareRowExclusiveLock", true).await;
     let update_store = store.clone();
+    let update_tenant_id = tenant_id;
     let mut asset_update = tokio::spawn(async move {
         ManagementAssetRepository::update_management_asset(
             &update_store,
+            update_tenant_id,
             asset_id,
             UpdateManagementAsset {
                 name: "Concurrent profile asset".to_owned(),
