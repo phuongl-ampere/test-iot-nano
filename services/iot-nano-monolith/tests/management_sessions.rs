@@ -451,6 +451,22 @@ async fn management_login_rate_limits_repeated_invalid_credentials() {
 }
 
 #[tokio::test]
+async fn management_login_rate_limit_does_not_block_another_username_from_the_same_address() {
+    let (_directory, management) = management_session_router().await;
+    let app = management.router;
+
+    for _ in 0..5 {
+        let response = app.clone().oneshot(invalid_login_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app
+        .oneshot(invalid_login_request_for("other-user"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn bootstrap_admin_creates_the_only_initial_user_and_enables_management_login() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
@@ -1671,11 +1687,17 @@ async fn management_provision_device(
 }
 
 fn invalid_login_request() -> Request<Body> {
+    invalid_login_request_for("admin")
+}
+
+fn invalid_login_request_for(username: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/api/auth/login")
         .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))
+        .body(Body::from(
+            json!({ "username": username, "password": "wrong" }).to_string(),
+        ))
         .unwrap()
 }
 

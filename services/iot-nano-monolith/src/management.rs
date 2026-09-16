@@ -1244,7 +1244,13 @@ enum ManagementAuthorization {
 
 #[derive(Default)]
 struct LoginRateLimiter {
-    attempts: HashMap<IpAddr, LoginAttempt>,
+    attempts: HashMap<LoginAttemptKey, LoginAttempt>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct LoginAttemptKey {
+    address: IpAddr,
+    username: String,
 }
 
 struct LoginAttempt {
@@ -1254,10 +1260,10 @@ struct LoginAttempt {
 }
 
 impl LoginRateLimiter {
-    fn reserve(&mut self, address: IpAddr) -> bool {
+    fn reserve(&mut self, key: &LoginAttemptKey) -> bool {
         self.attempts
             .retain(|_, attempt| attempt.started_at.elapsed() < LOGIN_WINDOW);
-        let attempt = self.attempts.entry(address).or_insert(LoginAttempt {
+        let attempt = self.attempts.entry(key.clone()).or_insert(LoginAttempt {
             failures: 0,
             in_flight: 0,
             started_at: Instant::now(),
@@ -1269,15 +1275,15 @@ impl LoginRateLimiter {
         true
     }
 
-    fn record_failure(&mut self, address: IpAddr) {
-        if let Some(attempt) = self.attempts.get_mut(&address) {
+    fn record_failure(&mut self, key: &LoginAttemptKey) {
+        if let Some(attempt) = self.attempts.get_mut(key) {
             attempt.in_flight = attempt.in_flight.saturating_sub(1);
             attempt.failures = attempt.failures.saturating_add(1);
         }
     }
 
-    fn record_success(&mut self, address: IpAddr) {
-        let remove = if let Some(attempt) = self.attempts.get_mut(&address) {
+    fn record_success(&mut self, key: &LoginAttemptKey) {
+        let remove = if let Some(attempt) = self.attempts.get_mut(key) {
             attempt.in_flight = attempt.in_flight.saturating_sub(1);
             attempt.failures = 0;
             attempt.in_flight == 0
@@ -1285,19 +1291,19 @@ impl LoginRateLimiter {
             false
         };
         if remove {
-            self.attempts.remove(&address);
+            self.attempts.remove(key);
         }
     }
 
-    fn release(&mut self, address: IpAddr) {
-        let remove = if let Some(attempt) = self.attempts.get_mut(&address) {
+    fn release(&mut self, key: &LoginAttemptKey) {
+        let remove = if let Some(attempt) = self.attempts.get_mut(key) {
             attempt.in_flight = attempt.in_flight.saturating_sub(1);
             attempt.failures == 0 && attempt.in_flight == 0
         } else {
             false
         };
         if remove {
-            self.attempts.remove(&address);
+            self.attempts.remove(key);
         }
     }
 }
@@ -1453,13 +1459,16 @@ async fn login(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<SessionResponse>), ManagementSessionError> {
-    let address = address.ip();
+    let attempt_key = LoginAttemptKey {
+        address: address.ip(),
+        username: request.username.clone(),
+    };
     let reserved = {
         let mut limiter = state
             .login_limiter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        limiter.reserve(address)
+        limiter.reserve(&attempt_key)
     };
     if !reserved {
         return Err(ManagementSessionError::TooManyRequests);
@@ -1473,7 +1482,7 @@ async fn login(
                     .login_limiter
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record_failure(address);
+                    .record_failure(&attempt_key);
                 return Err(ManagementSessionError::Unauthorized);
             }
             Err(_) => {
@@ -1481,7 +1490,7 @@ async fn login(
                     .login_limiter
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .release(address);
+                    .release(&attempt_key);
                 return Err(ManagementSessionError::Unavailable);
             }
         };
@@ -1500,7 +1509,7 @@ async fn login(
         .login_limiter
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .record_success(address);
+        .record_success(&attempt_key);
     Ok((
         session_cookie_headers(&session_id),
         Json(SessionResponse { user_id }),
@@ -2449,12 +2458,15 @@ mod unit_tests {
     #[test]
     fn login_limiter_reserves_in_flight_attempts_before_authentication() {
         let mut limiter = LoginRateLimiter::default();
-        let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let key = LoginAttemptKey {
+            address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            username: "admin".to_owned(),
+        };
 
         for _ in 0..MAX_LOGIN_FAILURES {
-            assert!(limiter.reserve(address));
+            assert!(limiter.reserve(&key));
         }
-        assert!(!limiter.reserve(address));
+        assert!(!limiter.reserve(&key));
     }
 
     #[tokio::test]

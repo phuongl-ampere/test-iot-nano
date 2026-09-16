@@ -14,7 +14,7 @@ PowerMonitor login form
   -> iot-api POST /api/auth/login
   -> server-only platform session
   -> iot-api /oauth/authorize
-  -> existing PowerMonitor OAuth callback
+  -> BFF exchanges authorization code server-side
   -> dashboard
 ```
 
@@ -28,11 +28,12 @@ There is no separate Platform Login Page in this flow.
 - The BFF reads the platform session from the API response and forwards it
   only in its server-to-server authorization request. It never writes
   `iot_nano_session` to the browser.
-- The existing OAuth callback continues to create the sealed
-  `powermonitor_session` browser cookie. Browser API calls remain unchanged.
+- The POST handoff consumes the authorization code server-side and writes the
+  sealed `powermonitor_session` browser cookie before redirecting to `/`.
+  Browser API calls remain unchanged.
 - Passwords, platform session IDs, client secrets, authorization codes, and
-  access tokens must never appear in client JavaScript, URLs, logs, or UI
-  errors.
+  access tokens from the POST handoff must never appear in client JavaScript,
+  URLs, logs, or UI errors.
 
 ## User Interface
 

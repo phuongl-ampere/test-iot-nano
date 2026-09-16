@@ -22,6 +22,8 @@ export type OAuthToken = {
   expiresIn?: number;
 };
 
+export type PasswordLoginError = "invalid_credentials" | "platform_unavailable";
+
 export function readSession(value: string | undefined): OAuthToken | null {
   if (value === undefined) {
     return null;
@@ -40,24 +42,96 @@ export async function createLoginHandler(input: {
   config: OAuthConfig;
   sealState?: (value: OAuthState) => string;
 }): Promise<Response> {
-  const verifier = randomBytes(32).toString("base64url");
-  const state = randomBytes(32).toString("base64url");
-  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  const authorization = createAuthorizationRequest(input.config);
   const sealState = input.sealState ?? seal;
-  const authorizationUrl = new URL("/oauth/authorize", input.config.platformBaseUrl);
+  input.cookies.set(
+    oauthStateCookieName,
+    sealState({ state: authorization.state, verifier: authorization.verifier }),
+    cookieOptions(300),
+  );
+  return Response.redirect(authorization.url, 307);
+}
 
-  authorizationUrl.search = new URLSearchParams({
-    response_type: "code",
-    client_id: input.config.clientId,
-    redirect_uri: input.config.redirectUri,
-    scope: input.config.scope,
-    state,
-    code_challenge: challenge,
-    code_challenge_method: "S256",
-  }).toString();
+export async function createPasswordLoginHandler(input: {
+  appBaseUrl: string;
+  authBaseUrl: string;
+  config: OAuthConfig;
+  cookies: Pick<OAuthCookies, "set">;
+  exchangeCode?: (input: {
+    code: string;
+    codeVerifier: string;
+    redirectUri: string;
+  }) => Promise<OAuthToken>;
+  fetcher?: typeof fetch;
+  password: string;
+  sealSession?: (value: OAuthToken) => string;
+  username: string;
+}): Promise<Response> {
+  const fetcher = input.fetcher ?? fetch;
+  let loginResponse: Response;
+  try {
+    loginResponse = await fetcher(new URL("/api/auth/login", input.authBaseUrl), {
+      body: JSON.stringify({ username: input.username, password: input.password }),
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+  } catch {
+    return passwordLoginError(input.appBaseUrl, "platform_unavailable");
+  }
 
-  input.cookies.set(oauthStateCookieName, sealState({ state, verifier }), cookieOptions(300));
-  return Response.redirect(authorizationUrl, 307);
+  if (loginResponse.status === 401) {
+    return passwordLoginError(input.appBaseUrl, "invalid_credentials");
+  }
+  if (!loginResponse.ok) {
+    return passwordLoginError(input.appBaseUrl, "platform_unavailable");
+  }
+
+  const platformSession = platformSessionFromSetCookie(loginResponse.headers.get("set-cookie"));
+  if (platformSession === null) {
+    return passwordLoginError(input.appBaseUrl, "platform_unavailable");
+  }
+
+  const authorization = createAuthorizationRequest(input.config);
+  let authorizeResponse: Response;
+  try {
+    authorizeResponse = await fetcher(authorization.url, {
+      cache: "no-store",
+      headers: { cookie: `iot_nano_session=${platformSession}` },
+      redirect: "manual",
+    });
+  } catch {
+    return passwordLoginError(input.appBaseUrl, "platform_unavailable");
+  }
+
+  const authorizationCode = authorizationCodeFromResponse(
+    authorizeResponse,
+    input.config.redirectUri,
+    authorization.state,
+  );
+  if (authorizationCode === null) {
+    return passwordLoginError(input.appBaseUrl, "platform_unavailable");
+  }
+
+  const exchangeCode = input.exchangeCode ?? ((request) => exchangeAuthorizationCode(
+    input.config,
+    request,
+    fetcher,
+  ));
+  let token: OAuthToken;
+  try {
+    token = await exchangeCode({
+      code: authorizationCode,
+      codeVerifier: authorization.verifier,
+      redirectUri: input.config.redirectUri,
+    });
+  } catch {
+    return passwordLoginError(input.appBaseUrl, "platform_unavailable");
+  }
+
+  const sealSession = input.sealSession ?? seal;
+  input.cookies.set(sessionCookieName, sealSession(token), cookieOptions(60 * 60 * 8));
+  return Response.redirect(new URL("/", input.appBaseUrl), 303);
 }
 
 export async function createCallbackHandler(input: {
@@ -163,7 +237,77 @@ export function oauthConfigFromEnvironment(): OAuthConfig {
   };
 }
 
+export function platformAuthBaseUrlFromEnvironment(): string {
+  return required("PLATFORM_AUTH_BASE_URL");
+}
+
 type OAuthState = { state: string; verifier: string };
+
+function createAuthorizationRequest(config: OAuthConfig) {
+  const verifier = randomBytes(32).toString("base64url");
+  const state = randomBytes(32).toString("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  const url = new URL("/oauth/authorize", config.platformBaseUrl);
+
+  url.search = new URLSearchParams({
+    response_type: "code",
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    scope: config.scope,
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  }).toString();
+
+  return { state, url, verifier };
+}
+
+function platformSessionFromSetCookie(value: string | null): string | null {
+  if (value === null) {
+    return null;
+  }
+  const prefix = "iot_nano_session=";
+  const cookie = value.split(";", 1)[0];
+  if (cookie === undefined || !cookie.startsWith(prefix)) {
+    return null;
+  }
+  const session = cookie.slice(prefix.length);
+  return /^[A-Za-z0-9_-]+$/.test(session) ? session : null;
+}
+
+function authorizationCodeFromResponse(
+  response: Response,
+  redirectUri: string,
+  expectedState: string,
+): string | null {
+  if (response.status < 300 || response.status >= 400) {
+    return null;
+  }
+  const location = response.headers.get("location");
+  if (location === null) {
+    return null;
+  }
+  try {
+    const callback = new URL(location);
+    const expected = new URL(redirectUri);
+    if (callback.origin !== expected.origin || callback.pathname !== expected.pathname) {
+      return null;
+    }
+    const code = callback.searchParams.get("code");
+    if (code === null || callback.searchParams.get("state") !== expectedState) {
+      return null;
+    }
+    return code;
+  } catch {
+    return null;
+  }
+}
+
+function passwordLoginError(appBaseUrl: string, error: PasswordLoginError): Response {
+  const redirect = new URL("/", appBaseUrl);
+  redirect.searchParams.set("login_error", error);
+  return Response.redirect(redirect, 303);
+}
 
 function cookieOptions(maxAge: number) {
   return {

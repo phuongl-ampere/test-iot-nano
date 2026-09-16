@@ -36,7 +36,7 @@ describe("PowerMonitor browser entry pages", () => {
   it("renders the login gate for every unauthenticated entry page", async () => {
     hasPowerMonitorSession.mockResolvedValue(false);
 
-    render(await PowerMonitorPage());
+    render(await PowerMonitorPage({ searchParams: Promise.resolve({}) }));
     expect(screen.getByTestId("login-gate")).toBeTruthy();
     expect(screen.queryByTestId("dashboard")).toBeNull();
     cleanup();
@@ -55,7 +55,7 @@ describe("PowerMonitor browser entry pages", () => {
   it("renders the dashboard for an authenticated root page", async () => {
     hasPowerMonitorSession.mockResolvedValue(true);
 
-    render(await PowerMonitorPage());
+    render(await PowerMonitorPage({ searchParams: Promise.resolve({}) }));
 
     expect(screen.getByTestId("dashboard")).toBeTruthy();
     expect(screen.queryByTestId("login-gate")).toBeNull();
