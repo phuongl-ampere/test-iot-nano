@@ -1728,7 +1728,6 @@ dependencies = [
 name = "iot-nano-core"
 version = "0.1.0"
 dependencies = [
- "axum 0.8.9",
  "chrono",
  "device-simulator",
  "fs2",
@@ -1745,7 +1744,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
- "tower",
  "uuid",
 ]
 

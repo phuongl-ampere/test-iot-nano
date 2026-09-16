@@ -2,7 +2,6 @@
 
 mod alert;
 mod command;
-mod control;
 mod metrics;
 mod mqtt;
 mod notification;
@@ -19,7 +18,6 @@ pub use command::{
     CommandTransport as TransportRpcClient, CommandTransportError, PlatformCommandDispatcher,
     SqliteCommandDispatcher, TransportRpcPublishRequest,
 };
-pub use control::{CoreControlState, core_control_router};
 pub use metrics::IngestMetrics;
 pub use mqtt::{
     IngestOutcome, MqttConsumerError, MqttRuntime, MqttRuntimeConfig, MqttRuntimeError,

@@ -6,7 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-axum.workspace = true
 chrono.workspace = true
 iot-core = { path = "../../crates/iot-core" }
 iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
@@ -26,7 +25,6 @@ uuid.workspace = true
 device-simulator = { path = "../../crates/device-simulator" }
 fs2.workspace = true
 tempfile.workspace = true
-tower.workspace = true
 
 [lib]
 name = "iot_nano_core"

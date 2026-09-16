@@ -1159,6 +1159,29 @@ fn runtime_source_has_no_internal_transport_configuration() {
 }
 
 #[test]
+fn core_excludes_legacy_internal_http_control_router() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !manifest_dir.join("src/control.rs").exists(),
+        "legacy internal HTTP control module remains"
+    );
+
+    let library = include_str!("../src/lib.rs");
+    for forbidden in ["mod control;", "CoreControlState", "core_control_router"] {
+        assert!(
+            !library.contains(forbidden),
+            "lib.rs exposes legacy HTTP control surface {forbidden}"
+        );
+    }
+
+    let manifest = include_str!("../Cargo.toml");
+    assert!(
+        !manifest.contains("axum.workspace"),
+        "Core retains a direct Axum dependency"
+    );
+}
+
+#[test]
 fn worker_boundaries_exclude_legacy_http_adapters() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(
