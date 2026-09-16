@@ -2,16 +2,15 @@ use chrono::{DateTime, Utc};
 use iot_core::{DeviceTokenError, device_token_prefix, generate_device_token, hash_device_token};
 use serde::Serialize;
 use thiserror::Error;
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::token_vault::{TokenVault, TokenVaultError};
 use iot_storage::{
     DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken,
-    NewOwnedDeviceToken, PlatformStore,
+    PlatformStore,
 };
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceTokenResponse {
     pub id: Uuid,
     pub device_id: String,
@@ -25,8 +24,6 @@ pub struct DeviceTokenResponse {
 
 #[derive(Debug, Error)]
 pub enum DeviceTokenStoreError {
-    #[error(transparent)]
-    Database(#[from] sqlx::Error),
     #[error(transparent)]
     Token(#[from] DeviceTokenError),
     #[error(transparent)]
@@ -73,83 +70,6 @@ pub async fn create_platform_device_token(
     Err(DeviceTokenStoreError::AllocationFailed)
 }
 
-pub async fn provision_owned_platform_device_token(
-    store: &PlatformStore,
-    vault: &TokenVault,
-    display_name: &str,
-    owner_user_id: Uuid,
-    asset_id: Option<Uuid>,
-) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    for _ in 0..8 {
-        let (token, material) = new_platform_token(vault)?;
-        match DeviceTokenRepository::provision_owned_device_token(
-            store,
-            NewOwnedDeviceToken {
-                display_name: display_name.to_owned(),
-                owner_user_id,
-                asset_id,
-                token: material,
-            },
-        )
-        .await
-        {
-            Ok(record) => return Ok(platform_token_response(record, token)),
-            Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
-            Err(error) => return Err(device_token_repository_error(error)),
-        }
-    }
-    Err(DeviceTokenStoreError::AllocationFailed)
-}
-
-pub async fn list_platform_device_tokens(
-    store: &PlatformStore,
-    device_id: &str,
-) -> Result<Vec<DeviceTokenResponse>, DeviceTokenStoreError> {
-    DeviceTokenRepository::list_device_tokens(store, device_id)
-        .await
-        .map(|records| {
-            records
-                .into_iter()
-                .map(platform_token_history_response)
-                .collect()
-        })
-        .map_err(device_token_repository_error)
-}
-
-pub async fn active_platform_device_token(
-    store: &PlatformStore,
-    token_id: Uuid,
-) -> Result<Option<DeviceTokenRecord>, DeviceTokenStoreError> {
-    DeviceTokenRepository::active_device_token(store, token_id)
-        .await
-        .map_err(device_token_repository_error)
-}
-
-pub async fn rotate_platform_device_token(
-    store: &PlatformStore,
-    vault: &TokenVault,
-    token_id: Uuid,
-) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
-    for _ in 0..8 {
-        let (token, material) = new_platform_token(vault)?;
-        match DeviceTokenRepository::rotate_device_token(store, token_id, material).await {
-            Ok(record) => return Ok(platform_token_response(record, token)),
-            Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
-            Err(error) => return Err(device_token_repository_error(error)),
-        }
-    }
-    Err(DeviceTokenStoreError::AllocationFailed)
-}
-
-pub async fn revoke_platform_device_token(
-    store: &PlatformStore,
-    token_id: Uuid,
-) -> Result<(), DeviceTokenStoreError> {
-    DeviceTokenRepository::revoke_device_token(store, token_id)
-        .await
-        .map_err(device_token_repository_error)
-}
-
 fn new_platform_token(
     vault: &TokenVault,
 ) -> Result<(String, NewDeviceToken), DeviceTokenStoreError> {
@@ -177,18 +97,6 @@ fn platform_token_response(record: DeviceTokenRecord, token: String) -> DeviceTo
         last_used_at: record.last_used_at,
         revoked_at: record.revoked_at,
         token: Some(token),
-    }
-}
-
-fn platform_token_history_response(record: DeviceTokenRecord) -> DeviceTokenResponse {
-    DeviceTokenResponse {
-        id: record.id,
-        device_id: record.device_id,
-        token_prefix: record.token_prefix,
-        created_at: record.created_at,
-        last_used_at: record.last_used_at,
-        revoked_at: record.revoked_at,
-        token: None,
     }
 }
 

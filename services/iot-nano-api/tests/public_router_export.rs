@@ -117,6 +117,7 @@ async fn exported_router() -> (tempfile::TempDir, Router, Arc<RecordingCore>) {
                 "assets:read".to_owned(),
                 "alerts:read".to_owned(),
                 "commands:write".to_owned(),
+                "devices:write".to_owned(),
                 "authorization:read".to_owned(),
                 "telemetry:read".to_owned(),
             ],
@@ -144,6 +145,7 @@ async fn exported_router() -> (tempfile::TempDir, Router, Arc<RecordingCore>) {
                 "assets:read".to_owned(),
                 "alerts:read".to_owned(),
                 "commands:write".to_owned(),
+                "devices:write".to_owned(),
                 "authorization:read".to_owned(),
                 "telemetry:read".to_owned(),
             ],
@@ -211,4 +213,30 @@ async fn exported_public_router_mounts_resources_and_delegates_supplied_ports() 
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].device_id, DEVICE_ID);
     assert_eq!(calls[0].mode, RpcMode::OneWay);
+}
+
+#[tokio::test]
+async fn exported_public_router_rejects_an_unavailable_device_profile() {
+    let (_directory, app, _core) = exported_router().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices")
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "device_id": "task-8-missing-profile-device",
+                        "metadata": {},
+                        "device_profile_id": Uuid::now_v7(),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }

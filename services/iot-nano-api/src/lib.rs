@@ -5,20 +5,14 @@ mod auth;
 mod core_facade;
 mod device_tokens;
 mod oauth;
-mod power_switcher;
-mod powermonitor;
 mod public_v1;
-mod resource_authorization;
-mod routes;
-mod storage;
-mod system_config;
 mod token_vault;
 
 pub use auth::{
     AccountClass, AuthError, AuthenticatedUser, BearerAccessToken, BearerAccessTokenError,
     POWER_MONITOR_APP, Role, authenticate_credentials, authenticate_credentials_sqlite,
-    bootstrap_users, bootstrap_users_sqlite, extract_bearer_access_token, generate_session_id,
-    hash_password, validate_bearer_access_token, validate_password,
+    bootstrap_users_sqlite, extract_bearer_access_token, generate_session_id, hash_password,
+    validate_bearer_access_token, validate_password,
 };
 pub use core_facade::{
     CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
@@ -32,17 +26,5 @@ pub use oauth::{
     OAuthBrowserSessionVerifier, public_oauth_router,
     public_oauth_router_with_browser_session_verifier,
 };
-pub use power_switcher::{
-    POWER_SWITCHER_PROFILE_NAME, bootstrap_power_switcher_profile,
-    bootstrap_power_switcher_profile_sqlite,
-};
 pub use public_v1::public_v1_router;
-pub use routes::{
-    ApiRouters, ApiState, SqliteApiRouters, SqliteApiState, router, routers, sqlite_router,
-    sqlite_routers,
-};
-pub use storage::{ApiSqliteStore, connect_api_database, migrate_api};
-pub use system_config::{
-    HelperSystemConfigurationService, SystemConfigurationService, SystemConfigurationServiceError,
-};
 pub use token_vault::TokenVault;

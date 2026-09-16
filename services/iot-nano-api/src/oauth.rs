@@ -23,10 +23,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{
-    application_registry::{ApplicationRegistry, ApplicationRegistryError},
-    routes::{ApiState, SqliteApiState},
-};
+use crate::application_registry::{ApplicationRegistry, ApplicationRegistryError};
 
 const AUTHORIZATION_CODE_TTL: Duration = Duration::minutes(5);
 const ACCESS_TOKEN_TTL: Duration = Duration::hours(1);
@@ -80,26 +77,6 @@ struct PublicOAuthState {
 trait OAuthState {
     fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<Uuid>;
     fn oauth_store(&self) -> Option<Arc<PlatformStore>>;
-}
-
-impl OAuthState for ApiState {
-    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<Uuid> {
-        ApiState::authenticate_browser_session(self, headers).map(|session| session.user_id)
-    }
-
-    fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
-        ApiState::oauth_store(self)
-    }
-}
-
-impl OAuthState for SqliteApiState {
-    fn authenticate_browser_session(&self, headers: &HeaderMap) -> Option<Uuid> {
-        SqliteApiState::authenticate_browser_session(self, headers).map(|session| session.user_id)
-    }
-
-    fn oauth_store(&self) -> Option<Arc<PlatformStore>> {
-        SqliteApiState::oauth_store(self)
-    }
 }
 
 impl OAuthState for PublicOAuthState {
@@ -229,22 +206,6 @@ impl From<ApplicationRegistryError> for OAuthError {
     }
 }
 
-pub(crate) async fn authorize(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Query(request): Query<AuthorizationRequest>,
-) -> Response {
-    authorize_response(&state, &headers, request).await
-}
-
-pub(crate) async fn sqlite_authorize(
-    State(state): State<SqliteApiState>,
-    headers: HeaderMap,
-    Query(request): Query<AuthorizationRequest>,
-) -> Response {
-    authorize_response(&state, &headers, request).await
-}
-
 async fn public_authorize(
     State(state): State<PublicOAuthState>,
     headers: HeaderMap,
@@ -262,22 +223,6 @@ async fn authorize_response(
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
-}
-
-pub(crate) async fn token(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    form: Result<Form<TokenRequest>, axum::extract::rejection::FormRejection>,
-) -> Response {
-    token_response_for_request(&state, &headers, form).await
-}
-
-pub(crate) async fn sqlite_token(
-    State(state): State<SqliteApiState>,
-    headers: HeaderMap,
-    form: Result<Form<TokenRequest>, axum::extract::rejection::FormRejection>,
-) -> Response {
-    token_response_for_request(&state, &headers, form).await
 }
 
 async fn public_token(

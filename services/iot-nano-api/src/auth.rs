@@ -4,17 +4,13 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
-use axum::{
-    extract::FromRequestParts,
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION, request::Parts},
-};
+use axum::http::{HeaderMap, header::AUTHORIZATION};
 use chrono::{DateTime, Utc};
 use iot_storage::{OAuthRepository, PlatformStoreError};
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use sqlx::{PgPool, Row, SqlitePool};
 use thiserror::Error;
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 const ADMIN_USERNAME: &str = "admin";
@@ -26,7 +22,7 @@ const INITIAL_VIEWER_PASSWORD: &str = "NanoView@1234";
 pub const DEFAULT_APP: &str = "/apps/powermonitor";
 pub const POWER_MONITOR_APP: &str = "powermonitor";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Admin,
@@ -61,7 +57,7 @@ impl FromStr for Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountClass {
     System,
@@ -97,17 +93,6 @@ impl FromStr for AccountClass {
             _ => Err(AuthError::InvalidAccountClass),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct AuthContext {
-    pub user_id: Uuid,
-    pub role: Role,
-    pub account_class: AccountClass,
-    pub username: String,
-    pub default_app: String,
-    pub granted_apps: Vec<String>,
-    pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,44 +158,6 @@ pub struct AuthenticatedUser {
     pub granted_apps: Vec<String>,
 }
 
-pub struct Admin;
-
-impl<S> FromRequestParts<S> for Admin
-where
-    S: Send + Sync,
-{
-    type Rejection = StatusCode;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        match parts.extensions.get::<AuthContext>() {
-            Some(AuthContext {
-                account_class: AccountClass::Admin,
-                ..
-            }) => Ok(Self),
-            _ => Err(StatusCode::FORBIDDEN),
-        }
-    }
-}
-
-pub struct System;
-
-impl<S> FromRequestParts<S> for System
-where
-    S: Send + Sync,
-{
-    type Rejection = StatusCode;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        match parts.extensions.get::<AuthContext>() {
-            Some(AuthContext {
-                account_class: AccountClass::System,
-                ..
-            }) => Ok(Self),
-            _ => Err(StatusCode::FORBIDDEN),
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error(
@@ -258,102 +205,12 @@ pub fn generate_session_id() -> String {
     value
 }
 
-pub fn default_user(username: impl Into<String>, role: Role) -> AuthenticatedUser {
-    AuthenticatedUser {
-        user_id: Uuid::nil(),
-        role,
-        account_class: AccountClass::from_legacy_role(role),
-        username: username.into(),
-        default_app: DEFAULT_APP.to_owned(),
-        granted_apps: vec![POWER_MONITOR_APP.to_owned()],
-    }
-}
-
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
     let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|_| AuthError::Hashing)
-}
-
-pub async fn bootstrap_users(pool: &PgPool) -> Result<(), AuthError> {
-    let mut transaction = pool.begin().await?;
-    let rows = sqlx::query("SELECT role, username FROM users FOR UPDATE")
-        .fetch_all(&mut *transaction)
-        .await?;
-    let bootstrap_defaults = rows.is_empty();
-
-    if bootstrap_defaults {
-        for (role, password) in [
-            (Role::Admin, INITIAL_ADMIN_PASSWORD),
-            (Role::Viewer, INITIAL_VIEWER_PASSWORD),
-        ] {
-            validate_password(password)?;
-            let password_hash = hash_password(password)?;
-            sqlx::query(
-                "INSERT INTO users (username, password_hash, role, account_class, default_app)
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(role.username())
-            .bind(password_hash)
-            .bind(role.as_str())
-            .bind(AccountClass::from_legacy_role(role).as_str())
-            .bind(DEFAULT_APP)
-            .execute(&mut *transaction)
-            .await?;
-        }
-    } else {
-        for row in rows {
-            row.try_get::<String, _>("role")?
-                .parse::<Role>()
-                .map_err(|_| AuthError::IncompleteStoredUsers)?;
-        }
-    }
-    let has_system: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM users WHERE account_class = 'system'
-         )",
-    )
-    .fetch_one(&mut *transaction)
-    .await?;
-    if !has_system {
-        validate_password(INITIAL_SYSTEM_PASSWORD)?;
-        let inserted = sqlx::query(
-            "INSERT INTO users (username, password_hash, role, account_class, default_app)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (username) DO NOTHING",
-        )
-        .bind(SYSTEM_USERNAME)
-        .bind(hash_password(INITIAL_SYSTEM_PASSWORD)?)
-        .bind(Role::Admin.as_str())
-        .bind(AccountClass::System.as_str())
-        .bind(DEFAULT_APP)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected();
-        if inserted != 1 {
-            return Err(AuthError::IncompleteStoredUsers);
-        }
-    }
-
-    if bootstrap_defaults {
-        sqlx::query(
-            "INSERT INTO user_app_grants (user_id, app_key)
-             SELECT id, $1
-             FROM users
-             WHERE username IN ($2, $3)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(POWER_MONITOR_APP)
-        .bind(ADMIN_USERNAME)
-        .bind(VIEWER_USERNAME)
-        .execute(&mut *transaction)
-        .await?;
-    }
-
-    transaction.commit().await?;
-    Ok(())
 }
 
 pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> {
@@ -542,55 +399,4 @@ pub async fn authenticate_credentials_sqlite(
         default_app: row.try_get("default_app")?,
         granted_apps,
     })
-}
-
-pub async fn change_password(
-    pool: &PgPool,
-    username: &str,
-    current_password: &str,
-    new_password: &str,
-) -> Result<(), AuthError> {
-    validate_password(new_password)?;
-    authenticate_credentials(pool, username, current_password).await?;
-    let password_hash = hash_password(new_password)?;
-    let updated = sqlx::query(
-        "UPDATE users
-         SET password_hash = $2, updated_at = now()
-         WHERE username = $1",
-    )
-    .bind(username)
-    .bind(password_hash)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(AuthError::IncompleteStoredUsers)
-    }
-}
-
-pub async fn change_password_sqlite(
-    pool: &SqlitePool,
-    username: &str,
-    current_password: &str,
-    new_password: &str,
-) -> Result<(), AuthError> {
-    validate_password(new_password)?;
-    authenticate_credentials_sqlite(pool, username, current_password).await?;
-    let updated = sqlx::query(
-        "UPDATE users
-         SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE username = ?",
-    )
-    .bind(hash_password(new_password)?)
-    .bind(username)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(AuthError::IncompleteStoredUsers)
-    }
 }

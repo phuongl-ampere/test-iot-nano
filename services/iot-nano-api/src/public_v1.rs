@@ -4,7 +4,8 @@ use axum::{
     Extension, Json, Router,
     body::to_bytes,
     extract::{Path, Query, Request},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use chrono::Utc;
@@ -15,13 +16,12 @@ use iot_storage::{
     PublicPrincipal, PublicResourceGrant, PublicTelemetry, ResourcePermission,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     CoreCommandCreateRequest, CoreFacade, CoreFacadeError, TokenVault,
-    auth::{extract_bearer_access_token, validate_bearer_access_token},
-    routes::PublicApiError,
+    auth::{BearerAccessTokenError, extract_bearer_access_token, validate_bearer_access_token},
 };
 
 #[derive(Clone)]
@@ -97,6 +97,66 @@ where
         token_vault,
         Some(core_facade),
     ))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PublicApiError {
+    BadRequest,
+    Unauthorized,
+    Forbidden,
+    Conflict,
+    Unavailable,
+}
+
+impl From<BearerAccessTokenError> for PublicApiError {
+    fn from(error: BearerAccessTokenError) -> Self {
+        match error {
+            BearerAccessTokenError::Missing | BearerAccessTokenError::Denied => Self::Unauthorized,
+            BearerAccessTokenError::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl IntoResponse for PublicApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::BadRequest => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the request is invalid",
+            ),
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "OAuth bearer authentication is required",
+            ),
+            Self::Forbidden => (
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "the access token is not authorized for this resource",
+            ),
+            Self::Conflict => (
+                StatusCode::CONFLICT,
+                "conflict",
+                "the request conflicts with an existing resource",
+            ),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "the service is temporarily unavailable",
+            ),
+        };
+        (
+            status,
+            Json(json!({
+                "code": code,
+                "message": message,
+                "request_id": Uuid::now_v7().to_string(),
+                "details": Value::Null,
+            })),
+        )
+            .into_response()
+    }
 }
 
 #[derive(Debug, Deserialize)]
