@@ -2,6 +2,7 @@
 
 mod management;
 mod public_api;
+mod tenant_identity;
 
 use std::{
     fs,
@@ -52,6 +53,10 @@ pub use public_api::{
     NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,
     PublicAsset, PublicDevice, PublicDeviceError, PublicPrincipal, PublicResourceGrant,
     PublicTelemetry,
+};
+pub use tenant_identity::{
+    AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount, Tenant,
+    TenantAccount, TenantIdentityError, TenantIdentityRepository, TenantStatus,
 };
 
 const SQLITE_SCHEMA: &str = r#"
@@ -144,6 +149,37 @@ CREATE TABLE IF NOT EXISTS api_access_tokens (
     token_hash TEXT NOT NULL,
     username TEXT NOT NULL,
     password_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS system_accounts (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS system_accounts_one_active_index
+    ON system_accounts (status)
+    WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS tenants (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'deleted')),
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS tenant_accounts (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE RESTRICT,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+    credential_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

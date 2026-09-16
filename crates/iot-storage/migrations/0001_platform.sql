@@ -7,6 +7,37 @@ CREATE TABLE IF NOT EXISTS api_access_tokens (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS api_access_tokens_username_index ON api_access_tokens (username);
 
+CREATE TABLE IF NOT EXISTS system_accounts (
+    id UUID PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS system_accounts_one_active_index
+    ON system_accounts (status)
+    WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS tenants (
+    id UUID PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'deleted')),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS tenant_accounts (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE RESTRICT,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+    credential_version INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT public.uuid_generate_v4(),
     username TEXT NOT NULL UNIQUE,
