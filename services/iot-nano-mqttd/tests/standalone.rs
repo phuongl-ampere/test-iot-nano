@@ -142,8 +142,12 @@ fn standalone_package_installs_with_the_required_privileges_and_no_platform_depe
     assert!(STANDALONE_SERVICE.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
     assert!(!STANDALONE_SERVICE.contains("iot-nano-api.service"));
     assert!(!STANDALONE_SERVICE.contains("iot-nano-stream.service"));
-    assert!(STANDALONE_INSTALLER.contains("cargo build --release --package iot-nano-mqttd"));
-    assert!(STANDALONE_INSTALLER.contains("install -d --owner iot --group iot --mode 0700"));
+    assert!(
+        STANDALONE_INSTALLER.contains("\"$cargo_bin\" build --release --package iot-nano-mqttd")
+    );
+    assert!(
+        STANDALONE_INSTALLER.contains("\"$install_bin\" -d --owner iot --group iot --mode 0700")
+    );
     assert!(STANDALONE_INSTALLER.contains("iot-nano-mqttd-standalone.service"));
     assert!(STANDALONE_INSTALLER.contains("if [ ! -e \"$config_path\" ]; then"));
 }
