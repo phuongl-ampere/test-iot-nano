@@ -1157,3 +1157,35 @@ fn runtime_source_has_no_internal_transport_configuration() {
         assert!(!source.contains(forbidden), "runtime contains {forbidden}");
     }
 }
+
+#[test]
+fn worker_boundaries_exclude_legacy_http_adapters() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !manifest_dir.join("src/stream_consumer.rs").exists(),
+        "legacy HTTP stream adapter remains"
+    );
+
+    for (source_name, source) in [
+        ("lib.rs", include_str!("../src/lib.rs")),
+        ("command.rs", include_str!("../src/command.rs")),
+        ("runtime.rs", include_str!("../src/runtime.rs")),
+    ] {
+        for forbidden in [
+            "HttpStreamConsumer",
+            "HttpTransportRpcClient",
+            "reqwest",
+            "http://",
+            "https://",
+            "x-iot-nano-core-stream-secret",
+            "x-iot-nano-core-mqttd-secret",
+            "read_http_status",
+            "transport_url_parts",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{source_name} contains legacy HTTP boundary {forbidden}"
+            );
+        }
+    }
+}

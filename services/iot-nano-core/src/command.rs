@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration as StdDuration};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use crate::{CommandOutboxRecord, CoreSqliteStore, CoreSqliteStoreError};
 use chrono::{DateTime, Duration, Utc};
@@ -12,18 +12,10 @@ use iot_storage::{
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use thiserror::Error;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    time::timeout,
-};
 use uuid::Uuid;
 
 const COMMAND_LEASE_DURATION: Duration = Duration::seconds(30);
 const COMMAND_RETRY_DELAY: Duration = Duration::seconds(1);
-const TRANSPORT_RPC_PATH: &str = "/internal/rpc/publish";
-const MAX_HTTP_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
-
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TransportRpcPublishRequest {
     pub device_id: String,
@@ -62,94 +54,6 @@ pub enum CommandTransportError {
     Configuration(String),
     #[error("device has no active MQTT session")]
     NoActiveSession,
-    #[error("transport rejected the command: {0}")]
-    Rejected(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpTransportRpcClient {
-    authority: String,
-    host_header: String,
-    request_path: String,
-    secret: String,
-    timeout: StdDuration,
-}
-
-impl HttpTransportRpcClient {
-    pub fn new(
-        base_url: impl Into<String>,
-        secret: impl Into<String>,
-    ) -> Result<Self, CommandTransportError> {
-        let (authority, request_path) = transport_url_parts(&base_url.into())?;
-        let secret = secret.into();
-        if secret.len() < 32
-            || !secret.is_ascii()
-            || secret.bytes().any(|byte| byte.is_ascii_whitespace())
-        {
-            return Err(CommandTransportError::Configuration(
-                "transport secret must be at least 32 ASCII non-whitespace characters".to_owned(),
-            ));
-        }
-        Ok(Self {
-            host_header: authority.clone(),
-            authority,
-            request_path,
-            secret,
-            timeout: StdDuration::from_secs(15),
-        })
-    }
-
-    pub fn with_timeout(mut self, timeout: StdDuration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    async fn publish_request(
-        &self,
-        request: TransportRpcPublishRequest,
-    ) -> Result<(), CommandTransportError> {
-        let body = serde_json::to_vec(&request).map_err(|_| {
-            CommandTransportError::Configuration("request is not serializable".to_owned())
-        })?;
-        let request_head = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-iot-nano-core-mqttd-secret: {}\r\nConnection: close\r\n\r\n",
-            self.request_path,
-            self.host_header,
-            body.len(),
-            self.secret,
-        );
-        let authority = self.authority.clone();
-        let exchange = async {
-            let mut stream = TcpStream::connect(&authority)
-                .await
-                .map_err(|error| CommandTransportError::Unavailable(error.to_string()))?;
-            stream
-                .write_all(request_head.as_bytes())
-                .await
-                .map_err(|error| CommandTransportError::Unavailable(error.to_string()))?;
-            stream
-                .write_all(&body)
-                .await
-                .map_err(|error| CommandTransportError::Unavailable(error.to_string()))?;
-            stream
-                .flush()
-                .await
-                .map_err(|error| CommandTransportError::Unavailable(error.to_string()))?;
-            read_http_status(&mut stream).await
-        };
-        timeout(self.timeout, exchange).await.map_err(|_| {
-            CommandTransportError::Unavailable("transport request timed out".to_owned())
-        })?
-    }
-}
-
-impl CommandTransport for HttpTransportRpcClient {
-    fn publish(
-        &self,
-        request: TransportRpcPublishRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<(), CommandTransportError>> + Send + '_>> {
-        Box::pin(self.publish_request(request))
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -812,80 +716,4 @@ fn postgres_rpc_mode(value: &str) -> Result<RpcMode, sqlx::Error> {
         "two_way" => Ok(RpcMode::TwoWay),
         _ => Err(sqlx::Error::Protocol("command mode is invalid".into())),
     }
-}
-
-async fn read_http_status(stream: &mut TcpStream) -> Result<(), CommandTransportError> {
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 1_024];
-    loop {
-        if response.len() >= MAX_HTTP_RESPONSE_HEADER_BYTES {
-            return Err(CommandTransportError::Unavailable(
-                "transport response headers exceeded the limit".to_owned(),
-            ));
-        }
-        let read = stream
-            .read(&mut buffer)
-            .await
-            .map_err(|error| CommandTransportError::Unavailable(error.to_string()))?;
-        if read == 0 {
-            return Err(CommandTransportError::Unavailable(
-                "transport closed the response before sending headers".to_owned(),
-            ));
-        }
-        response.extend_from_slice(&buffer[..read]);
-        if response.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let response = std::str::from_utf8(&response)
-        .map_err(|_| CommandTransportError::Unavailable("invalid HTTP response".to_owned()))?;
-    let status = response
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .ok_or_else(|| CommandTransportError::Unavailable("invalid HTTP status line".to_owned()))?;
-    match status {
-        204 => Ok(()),
-        503 => Err(CommandTransportError::NoActiveSession),
-        status => Err(CommandTransportError::Rejected(format!(
-            "transport returned HTTP status {status}"
-        ))),
-    }
-}
-
-fn transport_url_parts(base_url: &str) -> Result<(String, String), CommandTransportError> {
-    let Some(rest) = base_url.strip_prefix("http://") else {
-        if let Some((scheme, _)) = base_url.split_once("://") {
-            return Err(CommandTransportError::Configuration(format!(
-                "transport URL scheme {scheme:?} is unsupported"
-            )));
-        }
-        return Err(CommandTransportError::Configuration(
-            "expected an http:// URL".to_owned(),
-        ));
-    };
-    if rest.is_empty()
-        || rest
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        || rest.contains(['?', '#', '@'])
-    {
-        return Err(CommandTransportError::Configuration(
-            "host, port, and optional path are required without query or fragment".to_owned(),
-        ));
-    }
-    let (authority, base_path) = rest.split_once('/').unwrap_or((rest, ""));
-    if authority.is_empty() || !authority.contains(':') {
-        return Err(CommandTransportError::Configuration(
-            "host and port are required".to_owned(),
-        ));
-    }
-    let base_path = base_path.trim_end_matches('/');
-    let request_path = if base_path.is_empty() {
-        TRANSPORT_RPC_PATH.to_owned()
-    } else {
-        format!("/{base_path}{TRANSPORT_RPC_PATH}")
-    };
-    Ok((authority.to_owned(), request_path))
 }

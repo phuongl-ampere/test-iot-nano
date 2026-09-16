@@ -8,7 +8,6 @@ mod mqtt;
 mod notification;
 mod runtime;
 mod storage;
-mod stream_consumer;
 mod stream_port;
 mod writer;
 
@@ -17,8 +16,8 @@ pub use alert::{
 };
 pub use command::{
     CommandDispatchResult, CommandDispatcher, CommandError, CommandTransport,
-    CommandTransport as TransportRpcClient, CommandTransportError, HttpTransportRpcClient,
-    PlatformCommandDispatcher, SqliteCommandDispatcher, TransportRpcPublishRequest,
+    CommandTransport as TransportRpcClient, CommandTransportError, PlatformCommandDispatcher,
+    SqliteCommandDispatcher, TransportRpcPublishRequest,
 };
 pub use control::{CoreControlState, core_control_router};
 pub use metrics::IngestMetrics;
@@ -36,7 +35,6 @@ pub use storage::{
     CommandOutboxRecord, CommandOutboxState, CoreSqliteStore, CoreSqliteStoreError,
     NewCommandOutboxEntry, RetentionResult,
 };
-pub use stream_consumer::{HttpStreamConsumer, HttpStreamConsumerError};
 pub use stream_port::{ClaimedBatch, CoreStreamConsumer};
 pub use writer::{
     FlushResult, PlatformTelemetryWriter, SqliteTelemetryWriter, TelemetryWriter, WriterError,

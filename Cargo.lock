@@ -1737,7 +1737,6 @@ dependencies = [
  "iot-sqldb-common",
  "iot-storage",
  "lettre",
- "reqwest",
  "rumqttc",
  "serde",
  "serde_json",
