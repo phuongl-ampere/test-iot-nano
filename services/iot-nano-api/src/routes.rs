@@ -1,9 +1,7 @@
 use std::{
     collections::HashMap,
-    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
@@ -26,12 +24,11 @@ use iot_core::{
 };
 use iot_storage::{
     AuthorizationRepository, AuthorizationSubject, AuthorizedDeviceSummary, CommandOutboxState,
-    DeviceAuthorizationRepository, ManagementAssetError, ManagementAssetProfileError,
-    ManagementAssetProfileRepository, ManagementAssetRepository, ManagementChildStatus,
-    ManagementDevice as StorageManagementDevice, ManagementDeviceError,
-    ManagementDeviceProfileError, ManagementDeviceProfileRepository, ManagementDeviceRepository,
-    ManagementDeviceTopology, ManagementGatewayStatus, NewCommandOutboxEntry, PlatformStore,
-    PlatformStoreError, SqliteStore, SqliteStoreError, UpdateManagementDevice,
+    ManagementAssetError, ManagementAssetProfileError, ManagementAssetProfileRepository,
+    ManagementAssetRepository, ManagementChildStatus, ManagementDevice as StorageManagementDevice,
+    ManagementDeviceError, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
+    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus,
+    NewCommandOutboxEntry, PlatformStore, SqliteStore, SqliteStoreError, UpdateManagementDevice,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -48,8 +45,8 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
-    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
-    CoreFacadeError, CoreTelemetryBucket, CoreTelemetryQuery, TokenVault,
+    CoreCommandCreateRequest, CoreCommandRecord, CoreFacade, CoreFacadeError, CoreTelemetryBucket,
+    CoreTelemetryQuery, TokenVault,
     auth::{
         AccountClass, Admin, AuthContext, AuthError, AuthenticatedUser, BearerAccessTokenError,
         POWER_MONITOR_APP, Role, System, authenticate_credentials, authenticate_credentials_sqlite,
@@ -60,8 +57,7 @@ use crate::{
         DeviceTokenResponse, DeviceTokenStoreError, active_platform_device_token,
         create_platform_device_token, list_platform_device_tokens,
         provision_owned_platform_device_token, provision_platform_device_token,
-        resolve_platform_active_device_token, revoke_platform_device_token,
-        rotate_platform_device_token,
+        revoke_platform_device_token, rotate_platform_device_token,
     },
     powermonitor::{
         PowerAsset, PowerBucket, PowerDevice, PowerSummary, PowerTelemetryPoint,
@@ -81,104 +77,12 @@ use crate::{
     },
 };
 
-const MQTT_TRANSPORT_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MqttdDeviceTransportSessionRevocation {
-    pub device_id: String,
-    pub token_id: Uuid,
-}
-
-#[derive(Debug, Error)]
-pub enum MqttdDeviceTransportSessionRevokerError {
-    #[error("MQTT transport session revocation request failed")]
-    Request(#[source] reqwest::Error),
-    #[error("MQTT transport session revocation returned HTTP {status}")]
-    UnexpectedStatus { status: u16 },
-    #[error("MQTT transport session revocation is unavailable")]
-    Unavailable,
-}
-
-pub trait MqttdDeviceTransportSessionRevoker: Send + Sync {
-    fn revoke_session(
-        &self,
-        revocation: MqttdDeviceTransportSessionRevocation,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(), MqttdDeviceTransportSessionRevokerError>> + Send + '_>,
-    >;
-}
-
-#[derive(Clone)]
-struct HttpMqttdDeviceTransportSessionRevoker {
-    client: reqwest::Client,
-    control_url: Arc<str>,
-    secret: Arc<str>,
-}
-
-impl HttpMqttdDeviceTransportSessionRevoker {
-    fn new(control_url: Arc<str>, secret: Arc<str>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            control_url,
-            secret,
-        }
-    }
-}
-
-impl MqttdDeviceTransportSessionRevoker for HttpMqttdDeviceTransportSessionRevoker {
-    fn revoke_session(
-        &self,
-        revocation: MqttdDeviceTransportSessionRevocation,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(), MqttdDeviceTransportSessionRevokerError>> + Send + '_>,
-    > {
-        let request = self
-            .client
-            .post(format!(
-                "{}/internal/sessions/revoke",
-                self.control_url.trim_end_matches('/')
-            ))
-            .header("x-iot-nano-api-mqttd-secret", self.secret.as_ref())
-            .json(&revocation)
-            .send();
-        Box::pin(async move {
-            let response = tokio::time::timeout(MQTT_TRANSPORT_REVOCATION_TIMEOUT, request)
-                .await
-                .map_err(|_| MqttdDeviceTransportSessionRevokerError::Unavailable)?
-                .map_err(MqttdDeviceTransportSessionRevokerError::Request)?;
-            if response.status() == reqwest::StatusCode::NO_CONTENT {
-                Ok(())
-            } else {
-                Err(MqttdDeviceTransportSessionRevokerError::UnexpectedStatus {
-                    status: response.status().as_u16(),
-                })
-            }
-        })
-    }
-}
-
-#[derive(Clone)]
-struct NoopMqttdDeviceTransportSessionRevoker;
-
-impl MqttdDeviceTransportSessionRevoker for NoopMqttdDeviceTransportSessionRevoker {
-    fn revoke_session(
-        &self,
-        _revocation: MqttdDeviceTransportSessionRevocation,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(), MqttdDeviceTransportSessionRevokerError>> + Send + '_>,
-    > {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 #[derive(Clone)]
 pub struct ApiState {
     pool: PgPool,
     token_store: Arc<PlatformStore>,
     login_limiter: Arc<Mutex<LoginRateLimiter>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
-    mqttd_device_transport_secret: Option<Arc<str>>,
-    mqttd_device_transport_session_revoker: Arc<dyn MqttdDeviceTransportSessionRevoker>,
     system_configuration: Arc<dyn SystemConfigurationService>,
     token_vault: TokenVault,
     core_facade: Option<Arc<dyn CoreFacade>>,
@@ -191,8 +95,6 @@ pub struct SqliteApiState {
     token_store: Arc<PlatformStore>,
     login_limiter: Arc<Mutex<LoginRateLimiter>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
-    mqttd_device_transport_secret: Option<Arc<str>>,
-    mqttd_device_transport_session_revoker: Arc<dyn MqttdDeviceTransportSessionRevoker>,
     system_configuration: Arc<dyn SystemConfigurationService>,
     token_vault: TokenVault,
     core_facade: Option<Arc<dyn CoreFacade>>,
@@ -218,10 +120,6 @@ impl ApiState {
             token_store,
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            mqttd_device_transport_secret: None,
-            mqttd_device_transport_session_revoker: Arc::new(
-                NoopMqttdDeviceTransportSessionRevoker,
-            ),
             system_configuration: default_system_configuration_service(),
             token_vault: TokenVault::from_key_material("iot-api-default-device-token-vault"),
             core_facade: None,
@@ -234,32 +132,6 @@ impl ApiState {
         system_configuration: Arc<dyn SystemConfigurationService>,
     ) -> Self {
         self.system_configuration = system_configuration;
-        self
-    }
-
-    pub fn with_mqttd_device_transport_secret(mut self, secret: impl AsRef<str>) -> Self {
-        self.mqttd_device_transport_secret = Some(Arc::from(secret.as_ref()));
-        self
-    }
-
-    pub fn with_api_mqttd_control(
-        mut self,
-        control_url: impl AsRef<str>,
-        secret: impl AsRef<str>,
-    ) -> Self {
-        self.mqttd_device_transport_session_revoker =
-            Arc::new(HttpMqttdDeviceTransportSessionRevoker::new(
-                Arc::from(control_url.as_ref()),
-                Arc::from(secret.as_ref()),
-            ));
-        self
-    }
-
-    pub fn with_mqttd_device_transport_session_revoker(
-        mut self,
-        revoker: impl MqttdDeviceTransportSessionRevoker + 'static,
-    ) -> Self {
-        self.mqttd_device_transport_session_revoker = Arc::new(revoker);
         self
     }
 
@@ -301,21 +173,6 @@ impl ApiState {
                 },
             );
         self
-    }
-
-    fn require_mqttd_device_transport_secret(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        let configured = self
-            .mqttd_device_transport_secret
-            .as_deref()
-            .ok_or(ApiError::MqttdDeviceTransportAuthenticationUnavailable)?;
-        let supplied = headers
-            .get("x-iot-nano-mqttd-api-secret")
-            .and_then(|value| value.to_str().ok())
-            .ok_or(ApiError::Unauthorized)?;
-        if !constant_time_equal(configured.as_bytes(), supplied.as_bytes()) {
-            return Err(ApiError::Unauthorized);
-        }
-        Ok(())
     }
 
     fn issue_session(&self, user: AuthenticatedUser) -> String {
@@ -394,10 +251,6 @@ impl SqliteApiState {
             token_store,
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            mqttd_device_transport_secret: None,
-            mqttd_device_transport_session_revoker: Arc::new(
-                NoopMqttdDeviceTransportSessionRevoker,
-            ),
             system_configuration: default_system_configuration_service(),
             token_vault: TokenVault::from_key_material("iot-api-default-device-token-vault"),
             core_facade: None,
@@ -410,32 +263,6 @@ impl SqliteApiState {
         system_configuration: Arc<dyn SystemConfigurationService>,
     ) -> Self {
         self.system_configuration = system_configuration;
-        self
-    }
-
-    pub fn with_mqttd_device_transport_secret(mut self, secret: impl AsRef<str>) -> Self {
-        self.mqttd_device_transport_secret = Some(Arc::from(secret.as_ref()));
-        self
-    }
-
-    pub fn with_api_mqttd_control(
-        mut self,
-        control_url: impl AsRef<str>,
-        secret: impl AsRef<str>,
-    ) -> Self {
-        self.mqttd_device_transport_session_revoker =
-            Arc::new(HttpMqttdDeviceTransportSessionRevoker::new(
-                Arc::from(control_url.as_ref()),
-                Arc::from(secret.as_ref()),
-            ));
-        self
-    }
-
-    pub fn with_mqttd_device_transport_session_revoker(
-        mut self,
-        revoker: impl MqttdDeviceTransportSessionRevoker + 'static,
-    ) -> Self {
-        self.mqttd_device_transport_session_revoker = Arc::new(revoker);
         self
     }
 
@@ -452,21 +279,6 @@ impl SqliteApiState {
     pub fn with_oauth_store(mut self, store: PlatformStore) -> Self {
         self.oauth_store = Some(Arc::new(store));
         self
-    }
-
-    fn require_mqttd_device_transport_secret(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        let configured = self
-            .mqttd_device_transport_secret
-            .as_deref()
-            .ok_or(ApiError::MqttdDeviceTransportAuthenticationUnavailable)?;
-        let supplied = headers
-            .get("x-iot-nano-mqttd-api-secret")
-            .and_then(|value| value.to_str().ok())
-            .ok_or(ApiError::Unauthorized)?;
-        if !constant_time_equal(configured.as_bytes(), supplied.as_bytes()) {
-            return Err(ApiError::Unauthorized);
-        }
-        Ok(())
     }
 
     fn issue_session(&self, user: AuthenticatedUser) -> String {
@@ -564,20 +376,6 @@ fn default_system_configuration_service() -> Arc<dyn SystemConfigurationService>
     Arc::new(HelperSystemConfigurationService::new(PathBuf::from(
         "/usr/local/sbin/iot-admin-helper",
     )))
-}
-
-async fn revoke_mqttd_device_transport_session(
-    revoker: &dyn MqttdDeviceTransportSessionRevoker,
-    device_id: String,
-    token_id: Uuid,
-) -> Result<(), ApiError> {
-    revoker
-        .revoke_session(MqttdDeviceTransportSessionRevocation {
-            device_id,
-            token_id,
-        })
-        .await
-        .map_err(|_| ApiError::MqttdDeviceTransportSessionRevocationUnavailable)
 }
 
 #[derive(Default)]
@@ -1061,24 +859,7 @@ fn public_device_summary(
 }
 
 fn management_router(state: ApiState) -> Router {
-    let management = Router::new()
-        .route("/api/auth/login", post(login))
-        .route(
-            "/internal/mqttd/session-resolution",
-            post(mqttd_device_transport_session_resolution),
-        )
-        .route(
-            "/internal/mqttd/session-authorization",
-            post(mqttd_device_transport_session_authorization),
-        )
-        .route(
-            "/internal/mqttd/gateway-authorization",
-            post(mqttd_gateway_authorization),
-        )
-        .route(
-            "/internal/mqttd/rpc-response",
-            post(mqttd_device_transport_rpc_response),
-        );
+    let management = Router::new().route("/api/auth/login", post(login));
     let protected = Router::new()
         .route("/api/auth/me", get(current_role))
         .route("/api/auth/logout", post(logout))
@@ -1208,10 +989,8 @@ pub fn sqlite_routers(state: SqliteApiState) -> SqliteApiRouters {
 }
 
 pub fn sqlite_router(state: SqliteApiState) -> Router {
-    let SqliteApiRouters { public, management } = sqlite_routers(state.clone());
-    public
-        .merge(management)
-        .merge(sqlite_internal_router(state))
+    let SqliteApiRouters { public, management } = sqlite_routers(state);
+    public.merge(management)
 }
 
 fn sqlite_public_router(state: SqliteApiState) -> Router {
@@ -1361,27 +1140,6 @@ fn sqlite_management_router(state: SqliteApiState) -> Router {
     management
         .merge(protected)
         .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .with_state(state)
-}
-
-fn sqlite_internal_router(state: SqliteApiState) -> Router {
-    Router::new()
-        .route(
-            "/internal/mqttd/session-resolution",
-            post(sqlite_mqttd_device_transport_session_resolution),
-        )
-        .route(
-            "/internal/mqttd/session-authorization",
-            post(sqlite_mqttd_device_transport_session_authorization),
-        )
-        .route(
-            "/internal/mqttd/gateway-authorization",
-            post(sqlite_mqttd_gateway_authorization),
-        )
-        .route(
-            "/internal/mqttd/rpc-response",
-            post(sqlite_mqttd_device_transport_rpc_response),
-        )
         .with_state(state)
 }
 
@@ -3080,24 +2838,10 @@ async fn sqlite_create_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let prior_token_id = list_platform_device_tokens(state.token_store.as_ref(), &device_id)
-        .await
-        .map_err(device_token_error)?
-        .into_iter()
-        .find(|token| token.revoked_at.is_none())
-        .map(|token| token.id);
     let token =
         create_platform_device_token(state.token_store.as_ref(), &state.token_vault, &device_id)
             .await
             .map_err(device_token_error)?;
-    if let Some(prior_token_id) = prior_token_id {
-        revoke_mqttd_device_transport_session(
-            state.mqttd_device_transport_session_revoker.as_ref(),
-            device_id,
-            prior_token_id,
-        )
-        .await?;
-    }
     Ok((StatusCode::CREATED, Json(token)))
 }
 
@@ -3132,12 +2876,6 @@ async fn sqlite_rotate_device_token_handler(
     let token = rotate_platform_device_token(state.token_store.as_ref(), &state.token_vault, id)
         .await
         .map_err(device_token_error)?;
-    revoke_mqttd_device_transport_session(
-        state.mqttd_device_transport_session_revoker.as_ref(),
-        device_id,
-        id,
-    )
-    .await?;
     Ok((StatusCode::CREATED, Json(token)))
 }
 
@@ -3160,161 +2898,7 @@ async fn sqlite_revoke_device_token_handler(
     revoke_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?;
-    revoke_mqttd_device_transport_session(
-        state.mqttd_device_transport_session_revoker.as_ref(),
-        device_id,
-        id,
-    )
-    .await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-async fn sqlite_mqttd_device_transport_session_resolution(
-    State(state): State<SqliteApiState>,
-    headers: HeaderMap,
-    Json(request): Json<MqttdDeviceTransportSessionResolutionRequest>,
-) -> Result<Json<MqttdDeviceTransportSessionResolution>, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    request.validate_client_id()?;
-    if request
-        .password
-        .as_deref()
-        .is_some_and(|password| !password.is_empty())
-    {
-        return Err(ApiError::Unauthorized);
-    }
-    let device =
-        resolve_platform_active_device_token(state.token_store.as_ref(), &request.username)
-            .await
-            .map_err(mqttd_device_token_error)?;
-    if device.gateway_device_id.is_some() {
-        return Err(ApiError::Unauthorized);
-    }
-    Ok(Json(MqttdDeviceTransportSessionResolution {
-        device_id: device.device_id,
-        token_id: device.token_id,
-        is_gateway: device.is_gateway,
-    }))
-}
-
-async fn sqlite_mqttd_device_transport_session_authorization(
-    State(state): State<SqliteApiState>,
-    headers: HeaderMap,
-    Json(request): Json<MqttdDeviceTransportSessionAuthorizationRequest>,
-) -> Result<StatusCode, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    DeviceAuthorizationRepository::authorize_device_session(
-        state.token_store.as_ref(),
-        request.token_id,
-        &request.device_id,
-    )
-    .await
-    .map_err(platform_device_token_error)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn sqlite_mqttd_gateway_authorization(
-    State(state): State<SqliteApiState>,
-    headers: HeaderMap,
-    Json(request): Json<GatewayAuthorizationRequest>,
-) -> Result<Json<GatewayAuthorizationResponse>, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    validate_gateway_authorization_request(&request)?;
-    DeviceAuthorizationRepository::authorize_gateway_token(
-        state.token_store.as_ref(),
-        request.token_id,
-        &request.gateway_device_id,
-        request.child_device_id.as_deref(),
-    )
-    .await
-    .map_err(platform_device_token_error)?;
-    Ok(Json(GatewayAuthorizationResponse::from(request)))
-}
-
-async fn sqlite_mqttd_device_transport_rpc_response(
-    State(state): State<SqliteApiState>,
-    headers: HeaderMap,
-    Json(request): Json<MqttdDeviceTransportRpcResponseRequest>,
-) -> Result<StatusCode, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    DeviceAuthorizationRepository::authorize_device_session(
-        state.token_store.as_ref(),
-        request.token_id,
-        &request.device_id,
-    )
-    .await
-    .map_err(platform_device_token_error)?;
-    let now = Utc::now();
-    if let Some(facade) = &state.core_facade {
-        facade
-            .record_command_response(CoreCommandResponseRequest {
-                command_id: request.command_id,
-                device_id: request.device_id,
-                token_id: request.token_id,
-                response: request.response,
-                responded_at: now,
-            })
-            .await
-            .map_err(core_facade_command_error)?;
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    let response = serde_json::to_string(&request.response).map_err(ApiError::Serialization)?;
-    if state
-        .store
-        .mark_command_responded(
-            &request.command_id.to_string(),
-            &request.device_id,
-            &request.token_id.to_string(),
-            &response,
-            now,
-        )
-        .await
-        .map_err(sqlite_store_error)?
-        .is_some()
-    {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    let expired = sqlx::query(
-        "UPDATE command_outbox AS command
-         SET state = 'expired',
-             lease_until = NULL
-         WHERE command.id = ?
-           AND command.device_id = ?
-           AND command.mode = 'two_way'
-           AND command.state = 'published_to_broker'
-           AND command.expires_at <= ?",
-    )
-    .bind(request.command_id.to_string())
-    .bind(&request.device_id)
-    .bind(now.to_rfc3339())
-    .execute(state.store.pool())
-    .await?
-    .rows_affected();
-    if expired == 1 {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    let idempotent = sqlx::query_scalar::<_, i64>(
-        "SELECT 1
-         FROM command_outbox AS command
-         WHERE command.id = ?
-           AND command.device_id = ?
-           AND command.mode = 'two_way'
-           AND command.state = 'responded'",
-    )
-    .bind(request.command_id.to_string())
-    .bind(&request.device_id)
-    .fetch_optional(state.store.pool())
-    .await?
-    .is_some();
-    if idempotent {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::Conflict(
-            "RPC response does not match an active two-way command".to_owned(),
-        ))
-    }
 }
 
 async fn sqlite_list_devices(
@@ -4298,24 +3882,10 @@ async fn create_device_token_handler(
     {
         return Err(ApiError::Forbidden);
     }
-    let prior_token_id = list_platform_device_tokens(state.token_store.as_ref(), &device_id)
-        .await
-        .map_err(device_token_error)?
-        .into_iter()
-        .find(|token| token.revoked_at.is_none())
-        .map(|token| token.id);
     let token =
         create_platform_device_token(state.token_store.as_ref(), &state.token_vault, &device_id)
             .await
             .map_err(device_token_error)?;
-    if let Some(prior_token_id) = prior_token_id {
-        revoke_mqttd_device_transport_session(
-            state.mqttd_device_transport_session_revoker.as_ref(),
-            device_id,
-            prior_token_id,
-        )
-        .await?;
-    }
     Ok((StatusCode::CREATED, Json(token)))
 }
 
@@ -4373,12 +3943,6 @@ async fn rotate_device_token_handler(
     let token = rotate_platform_device_token(state.token_store.as_ref(), &state.token_vault, id)
         .await
         .map_err(device_token_error)?;
-    revoke_mqttd_device_transport_session(
-        state.mqttd_device_transport_session_revoker.as_ref(),
-        device_id,
-        id,
-    )
-    .await?;
     Ok((StatusCode::CREATED, Json(token)))
 }
 
@@ -4409,12 +3973,6 @@ async fn revoke_device_token_handler(
     revoke_platform_device_token(state.token_store.as_ref(), id)
         .await
         .map_err(device_token_error)?;
-    revoke_mqttd_device_transport_session(
-        state.mqttd_device_transport_session_revoker.as_ref(),
-        device_id,
-        id,
-    )
-    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5969,161 +5527,6 @@ fn system_configuration_error(error: SystemConfigurationServiceError) -> ApiErro
     }
 }
 
-async fn mqttd_device_transport_session_resolution(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(request): Json<MqttdDeviceTransportSessionResolutionRequest>,
-) -> Result<Json<MqttdDeviceTransportSessionResolution>, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    request.validate_client_id()?;
-    if request
-        .password
-        .as_deref()
-        .is_some_and(|password| !password.is_empty())
-    {
-        return Err(ApiError::Unauthorized);
-    }
-    let device =
-        resolve_platform_active_device_token(state.token_store.as_ref(), &request.username)
-            .await
-            .map_err(mqttd_device_token_error)?;
-    if device.gateway_device_id.is_some() {
-        return Err(ApiError::Unauthorized);
-    }
-    Ok(Json(MqttdDeviceTransportSessionResolution {
-        device_id: device.device_id,
-        token_id: device.token_id,
-        is_gateway: device.is_gateway,
-    }))
-}
-
-async fn mqttd_device_transport_session_authorization(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(request): Json<MqttdDeviceTransportSessionAuthorizationRequest>,
-) -> Result<StatusCode, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    DeviceAuthorizationRepository::authorize_device_session(
-        state.token_store.as_ref(),
-        request.token_id,
-        &request.device_id,
-    )
-    .await
-    .map_err(platform_device_token_error)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn mqttd_gateway_authorization(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(request): Json<GatewayAuthorizationRequest>,
-) -> Result<Json<GatewayAuthorizationResponse>, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    validate_gateway_authorization_request(&request)?;
-    DeviceAuthorizationRepository::authorize_gateway_token(
-        state.token_store.as_ref(),
-        request.token_id,
-        &request.gateway_device_id,
-        request.child_device_id.as_deref(),
-    )
-    .await
-    .map_err(platform_device_token_error)?;
-    Ok(Json(GatewayAuthorizationResponse::from(request)))
-}
-
-async fn mqttd_device_transport_rpc_response(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(request): Json<MqttdDeviceTransportRpcResponseRequest>,
-) -> Result<StatusCode, ApiError> {
-    state.require_mqttd_device_transport_secret(&headers)?;
-    DeviceAuthorizationRepository::authorize_device_session(
-        state.token_store.as_ref(),
-        request.token_id,
-        &request.device_id,
-    )
-    .await
-    .map_err(platform_device_token_error)?;
-    let now = Utc::now();
-    if let Some(facade) = &state.core_facade {
-        facade
-            .record_command_response(CoreCommandResponseRequest {
-                command_id: request.command_id,
-                device_id: request.device_id,
-                token_id: request.token_id,
-                response: request.response,
-                responded_at: now,
-            })
-            .await
-            .map_err(core_facade_command_error)?;
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    let response = sqlx::types::Json(request.response);
-    let recorded = sqlx::query(
-        "UPDATE command_outbox AS command
-         SET state = 'responded',
-             response = $1,
-             responded_at = $2,
-             lease_until = NULL
-         WHERE command.id = $3
-           AND command.device_id = $4
-           AND command.mode = 'two_way'
-           AND command.state = 'published_to_broker'
-           AND command.expires_at > $2",
-    )
-    .bind(response)
-    .bind(now)
-    .bind(request.command_id)
-    .bind(&request.device_id)
-    .execute(&state.pool)
-    .await?
-    .rows_affected();
-    if recorded == 1 {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    let expired = sqlx::query(
-        "UPDATE command_outbox AS command
-         SET state = 'expired',
-             lease_until = NULL
-         WHERE command.id = $1
-           AND command.device_id = $2
-           AND command.mode = 'two_way'
-           AND command.state = 'published_to_broker'
-           AND command.expires_at <= $3",
-    )
-    .bind(request.command_id)
-    .bind(&request.device_id)
-    .bind(now)
-    .execute(&state.pool)
-    .await?
-    .rows_affected();
-    if expired == 1 {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    let idempotent = sqlx::query_scalar::<_, i32>(
-        "SELECT 1
-         FROM command_outbox AS command
-         WHERE command.id = $1
-           AND command.device_id = $2
-           AND command.mode = 'two_way'
-           AND command.state = 'responded'",
-    )
-    .bind(request.command_id)
-    .bind(&request.device_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .is_some();
-    if idempotent {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::Conflict(
-            "RPC response does not match an active two-way command".to_owned(),
-        ))
-    }
-}
-
 async fn authenticate_request(
     State(state): State<ApiState>,
     mut request: Request,
@@ -6176,30 +5579,7 @@ fn device_token_error(error: DeviceTokenStoreError) -> ApiError {
         other @ (DeviceTokenStoreError::Token(_)
         | DeviceTokenStoreError::Vault(_)
         | DeviceTokenStoreError::AllocationFailed
-        | DeviceTokenStoreError::PlatformUnavailable
-        | DeviceTokenStoreError::Storage(_)
-        | DeviceTokenStoreError::Platform(_)) => ApiError::DeviceToken(other),
-    }
-}
-
-fn mqttd_device_token_error(error: DeviceTokenStoreError) -> ApiError {
-    match error {
-        DeviceTokenStoreError::Database(error) => ApiError::Database(error),
-        DeviceTokenStoreError::NotFound | DeviceTokenStoreError::Token(_) => ApiError::Unauthorized,
-        DeviceTokenStoreError::GatewayChild => ApiError::Unauthorized,
-        error @ (DeviceTokenStoreError::Vault(_)
-        | DeviceTokenStoreError::AllocationFailed
-        | DeviceTokenStoreError::PlatformUnavailable
-        | DeviceTokenStoreError::Storage(_)
-        | DeviceTokenStoreError::Platform(_)) => ApiError::DeviceToken(error),
-    }
-}
-
-fn platform_device_token_error(error: PlatformStoreError) -> ApiError {
-    if matches!(error, PlatformStoreError::DeviceTokenDenied) {
-        ApiError::Unauthorized
-    } else {
-        ApiError::DeviceToken(DeviceTokenStoreError::Platform(error))
+        | DeviceTokenStoreError::Storage(_)) => ApiError::DeviceToken(other),
     }
 }
 
@@ -7101,92 +6481,6 @@ struct LoginRequest {
 struct ChangePasswordRequest {
     current_password: String,
     new_password: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MqttdDeviceTransportSessionResolutionRequest {
-    client_id: String,
-    username: String,
-    password: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MqttdDeviceTransportSessionAuthorizationRequest {
-    device_id: String,
-    token_id: Uuid,
-}
-
-#[derive(Debug, Deserialize)]
-struct GatewayAuthorizationRequest {
-    gateway_device_id: String,
-    token_id: Uuid,
-    child_device_id: Option<String>,
-    topic: String,
-    event_kind: String,
-}
-
-#[derive(Debug, Serialize)]
-struct GatewayAuthorizationResponse {
-    gateway_device_id: String,
-    token_id: Uuid,
-    child_device_id: Option<String>,
-    topic: String,
-    event_kind: String,
-}
-
-impl From<GatewayAuthorizationRequest> for GatewayAuthorizationResponse {
-    fn from(request: GatewayAuthorizationRequest) -> Self {
-        Self {
-            gateway_device_id: request.gateway_device_id,
-            token_id: request.token_id,
-            child_device_id: request.child_device_id,
-            topic: request.topic,
-            event_kind: request.event_kind,
-        }
-    }
-}
-
-fn validate_gateway_authorization_request(
-    request: &GatewayAuthorizationRequest,
-) -> Result<(), ApiError> {
-    let valid = match request.event_kind.as_str() {
-        "heartbeat" => {
-            request.child_device_id.is_none() && request.topic == "v1/gateways/me/telemetry"
-        }
-        "child_telemetry" => {
-            request.child_device_id.is_some() && request.topic == "v1/gateways/me/telemetry"
-        }
-        "connect" => request.child_device_id.is_some() && request.topic == "v1/gateways/me/connect",
-        "disconnect" => {
-            request.child_device_id.is_some() && request.topic == "v1/gateways/me/disconnect"
-        }
-        _ => false,
-    };
-    valid.then_some(()).ok_or(ApiError::Unauthorized)
-}
-
-#[derive(Debug, Deserialize)]
-struct MqttdDeviceTransportRpcResponseRequest {
-    command_id: Uuid,
-    device_id: String,
-    token_id: Uuid,
-    response: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct MqttdDeviceTransportSessionResolution {
-    device_id: String,
-    token_id: Uuid,
-    is_gateway: bool,
-}
-
-impl MqttdDeviceTransportSessionResolutionRequest {
-    fn validate_client_id(&self) -> Result<(), ApiError> {
-        if self.client_id.is_empty() {
-            return Err(ApiError::BadRequest("client_id is required".to_owned()));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -8193,10 +7487,6 @@ enum ApiError {
     Forbidden,
     #[error("too many failed login attempts")]
     TooManyRequests,
-    #[error("MQTT transport authentication is not configured")]
-    MqttdDeviceTransportAuthenticationUnavailable,
-    #[error("MQTT transport session revocation failed")]
-    MqttdDeviceTransportSessionRevocationUnavailable,
     #[error("core command service is unavailable")]
     CoreCommandUnavailable,
     #[error("device token operation failed")]
@@ -8219,10 +7509,6 @@ impl IntoResponse for ApiError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
-            Self::MqttdDeviceTransportAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::MqttdDeviceTransportSessionRevocationUnavailable => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
             Self::CoreCommandUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::DeviceToken(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::StorageData => StatusCode::INTERNAL_SERVER_ERROR,
@@ -8245,17 +7531,6 @@ fn app_key_from_path(value: &str) -> Option<&str> {
     value
         .strip_prefix("/apps/")
         .filter(|key| is_identifier(key))
-}
-
-fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (left, right) in left.iter().zip(right) {
-        difference |= left ^ right;
-    }
-    difference == 0
 }
 
 fn is_metric_key(value: &str) -> bool {

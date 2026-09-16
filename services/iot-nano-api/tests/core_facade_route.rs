@@ -14,20 +14,15 @@ use iot_api::{
     CoreFacadeError, CoreTelemetryBucket, CoreTelemetryPoint, CoreTelemetryQuery, SqliteApiState,
     bootstrap_users_sqlite, sqlite_router,
 };
-use iot_core::{
-    DatabaseStorage, RpcMode, StorageConfiguration, generate_device_token, hash_device_token,
-};
+use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_storage::SqliteStore;
 use serde_json::json;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const TRANSPORT_SECRET: &str = "transport-secret-must-have-at-least-32";
-
 #[derive(Default)]
 struct CoreCalls {
     created: Vec<CoreCommandCreateRequest>,
-    recorded_responses: Vec<CoreCommandResponseRequest>,
     telemetry_queries: Vec<CoreTelemetryQuery>,
 }
 
@@ -78,17 +73,9 @@ impl CoreFacade for RecordingCoreFacade {
 
     fn record_command_response(
         &self,
-        request: CoreCommandResponseRequest,
+        _request: CoreCommandResponseRequest,
     ) -> Pin<Box<dyn Future<Output = Result<(), CoreFacadeError>> + Send + '_>> {
-        let calls = Arc::clone(&self.calls);
-        Box::pin(async move {
-            calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recorded_responses
-                .push(request);
-            Ok(())
-        })
+        Box::pin(async { Ok(()) })
     }
 
     fn telemetry(
@@ -148,7 +135,7 @@ async fn login_session(app: &axum::Router) -> String {
 }
 
 #[tokio::test]
-async fn sqlite_routes_delegate_command_response_and_telemetry_to_core_facade() {
+async fn sqlite_routes_delegate_commands_and_telemetry_to_core_facade() {
     let directory = tempfile::tempdir().unwrap();
     let store = sqlite_store(directory.path().join("api.db")).await;
     bootstrap_users_sqlite(store.pool()).await.unwrap();
@@ -156,25 +143,9 @@ async fn sqlite_routes_delegate_command_response_and_telemetry_to_core_facade() 
         .execute(store.pool())
         .await
         .unwrap();
-    let token = generate_device_token();
-    let token_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
-         VALUES (?, 'facade-device', ?, ?)",
-    )
-    .bind(token_id.to_string())
-    .bind(&token[..16])
-    .bind(hash_device_token(&token).unwrap())
-    .execute(store.pool())
-    .await
-    .unwrap();
 
     let facade = Arc::new(RecordingCoreFacade::default());
-    let app = sqlite_router(
-        SqliteApiState::new(store)
-            .with_mqttd_device_transport_secret(TRANSPORT_SECRET)
-            .with_core_facade(facade.clone()),
-    );
+    let app = sqlite_router(SqliteApiState::new(store).with_core_facade(facade.clone()));
     let session_id = login_session(&app).await;
 
     let command_response = app
@@ -205,30 +176,6 @@ async fn sqlite_routes_delegate_command_response_and_telemetry_to_core_facade() 
         serde_json::from_slice::<serde_json::Value>(&command_body).unwrap()["state"],
         "queued"
     );
-
-    let command_id = facade.calls().created[0].id;
-    let response_status = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/internal/mqttd/rpc-response")
-                .header("x-iot-nano-mqttd-api-secret", TRANSPORT_SECRET)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    json!({
-                        "command_id": command_id,
-                        "device_id": "facade-device",
-                        "token_id": token_id,
-                        "response": {"ok": true}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response_status.status(), StatusCode::NO_CONTENT);
 
     let telemetry_response = app
         .oneshot(
@@ -262,11 +209,6 @@ async fn sqlite_routes_delegate_command_response_and_telemetry_to_core_facade() 
     assert_eq!(calls.created[0].method, "setRelay");
     assert_eq!(calls.created[0].params, json!({"enabled": true}));
     assert_eq!(calls.created[0].mode, RpcMode::TwoWay);
-    assert_eq!(calls.recorded_responses.len(), 1);
-    assert_eq!(calls.recorded_responses[0].command_id, command_id);
-    assert_eq!(calls.recorded_responses[0].device_id, "facade-device");
-    assert_eq!(calls.recorded_responses[0].token_id, token_id);
-    assert_eq!(calls.recorded_responses[0].response, json!({"ok": true}));
     assert_eq!(calls.telemetry_queries.len(), 1);
     assert_eq!(calls.telemetry_queries[0].device_id, "facade-device");
     assert_eq!(calls.telemetry_queries[0].bucket, CoreTelemetryBucket::Raw);

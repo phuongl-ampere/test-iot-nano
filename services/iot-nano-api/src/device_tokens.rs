@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::token_vault::{TokenVault, TokenVaultError};
 use iot_storage::{
-    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, IdentityRepository,
-    NewDeviceToken, NewOwnedDeviceToken, PlatformStore, PlatformStoreError,
+    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken,
+    NewOwnedDeviceToken, PlatformStore,
 };
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -21,14 +21,6 @@ pub struct DeviceTokenResponse {
     pub revoked_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthenticatedDeviceToken {
-    pub token_id: Uuid,
-    pub device_id: String,
-    pub is_gateway: bool,
-    pub gateway_device_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -45,12 +37,8 @@ pub enum DeviceTokenStoreError {
     GatewayChild,
     #[error("could not allocate a unique device token")]
     AllocationFailed,
-    #[error("platform storage backend is unavailable")]
-    PlatformUnavailable,
     #[error("device token storage operation failed")]
     Storage(#[source] DeviceTokenRepositoryError),
-    #[error("platform token operation failed")]
-    Platform(#[source] PlatformStoreError),
 }
 
 pub async fn provision_platform_device_token(
@@ -162,21 +150,6 @@ pub async fn revoke_platform_device_token(
         .map_err(device_token_repository_error)
 }
 
-pub async fn resolve_platform_active_device_token(
-    store: &PlatformStore,
-    token: &str,
-) -> Result<AuthenticatedDeviceToken, DeviceTokenStoreError> {
-    IdentityRepository::resolve_active_device_token(store, token)
-        .await
-        .map(|token| AuthenticatedDeviceToken {
-            token_id: token.token_id,
-            device_id: token.device_id,
-            is_gateway: token.is_gateway,
-            gateway_device_id: token.gateway_device_id,
-        })
-        .map_err(platform_token_error)
-}
-
 fn new_platform_token(
     vault: &TokenVault,
 ) -> Result<(String, NewDeviceToken), DeviceTokenStoreError> {
@@ -226,13 +199,5 @@ fn device_token_repository_error(error: DeviceTokenRepositoryError) -> DeviceTok
         }
         DeviceTokenRepositoryError::GatewayChild => DeviceTokenStoreError::GatewayChild,
         other => DeviceTokenStoreError::Storage(other),
-    }
-}
-
-fn platform_token_error(error: PlatformStoreError) -> DeviceTokenStoreError {
-    if matches!(error, PlatformStoreError::DeviceTokenDenied) {
-        DeviceTokenStoreError::NotFound
-    } else {
-        DeviceTokenStoreError::Platform(error)
     }
 }

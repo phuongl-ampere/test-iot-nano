@@ -38,9 +38,8 @@ pub use power_switcher::{
 };
 pub use public_v1::public_v1_router;
 pub use routes::{
-    ApiRouters, ApiState, MqttdDeviceTransportSessionRevocation,
-    MqttdDeviceTransportSessionRevoker, MqttdDeviceTransportSessionRevokerError, SqliteApiRouters,
-    SqliteApiState, router, routers, sqlite_router, sqlite_routers,
+    ApiRouters, ApiState, SqliteApiRouters, SqliteApiState, router, routers, sqlite_router,
+    sqlite_routers,
 };
 pub use storage::{ApiSqliteStore, connect_api_database, migrate_api};
 pub use system_config::{

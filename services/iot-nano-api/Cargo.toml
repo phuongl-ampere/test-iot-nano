@@ -14,11 +14,9 @@ base64.workspace = true
 chrono.workspace = true
 iot-core = { path = "../../crates/iot-core" }
 iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
-iot_nano_core = { package = "iot-nano-core", path = "../iot-nano-core" }
 iot-storage = { path = "../../crates/iot-storage" }
 rumqttc.workspace = true
 rand_core.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -32,6 +30,7 @@ utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
 fs2.workspace = true
+iot_nano_core = { package = "iot-nano-core", path = "../iot-nano-core" }
 tempfile.workspace = true
 tower.workspace = true
 
