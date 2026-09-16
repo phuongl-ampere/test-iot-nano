@@ -56,15 +56,20 @@ retired_paths=(
   "$root/scripts/rpc-e2e.py"
   "$root/services/iot-nano-api/src/main.rs"
   "$root/services/iot-nano-api/src/core_client.rs"
+  "$root/services/iot-nano-core/src/main.rs"
   "$root/services/iot-nano-core/src/control.rs"
   "$root/services/iot-nano-core/src/stream_consumer.rs"
+  "$root/services/iot-nano-stream/src/main.rs"
   "$root/services/iot-nano-mqttd/src/main.rs"
   "$root/contracts/internal-api-v1.json"
   "$root/contracts/stream-v1.json"
 )
 
 retired_binary_literal_pattern='iot-nano-(api|core|stream|mqttd)'
-retired_source_pattern='(^|[=:\"[:space:]])/internal/|x-iot-nano-|IOT_NANO_(CORE_URL|STREAM_URL|MQTTD_INTERNAL_URL|MQTTD_API_SECRET|API_MQTTD_SECRET|MQTTD_STREAM_SECRET|CORE_STREAM_SECRET|API_CORE_SECRET|CORE_MQTTD_SECRET)[[:space:]]*[:=]'
+retired_environment_name_pattern='IOT_NANO_(CORE_URL|STREAM_URL|MQTTD_INTERNAL_URL|MQTTD_API_SECRET|API_MQTTD_SECRET|MQTTD_STREAM_SECRET|CORE_STREAM_SECRET|API_CORE_SECRET|CORE_MQTTD_SECRET)'
+retired_source_pattern="(^|[=:\"[:space:]])/internal/|x-iot-nano-|${retired_environment_name_pattern}[[:space:]]*[:=]"
+retired_environment_access_pattern="(^|[^[:alnum:]_])((std::)?env::var(_os)?[[:space:]]*\\([[:space:]]*\\\"${retired_environment_name_pattern}\\\"|env[[:space:]]*=[[:space:]]*\\\"${retired_environment_name_pattern}\\\")"
+retired_internal_url_pattern='https?://(127[.]0[.]0[.]1|localhost|\[::1\])(:[0-9]+)?'
 deployment_files=()
 source_files=()
 
@@ -188,7 +193,7 @@ check_library_binary_targets() {
     fi
   done
 
-  for package in iot-nano-api iot-nano-mqttd; do
+  for package in iot-nano-api iot-nano-core iot-nano-stream iot-nano-mqttd; do
     manifest="$root/services/$package/Cargo.toml"
     rg -q '^autobins[[:space:]]*=[[:space:]]*false$' "$manifest" ||
       fail "library package must disable inferred binaries: $manifest"
@@ -262,6 +267,14 @@ check_library_binary_targets
 check_for_matches \
   'legacy runtime references found in library source paths' \
   "$retired_source_pattern" \
+  "${source_files[@]}"
+check_for_matches \
+  'retired internal environment access found in library source paths' \
+  "$retired_environment_access_pattern" \
+  "${source_files[@]}"
+check_for_matches \
+  'retired internal URL literal found in library source paths' \
+  "$retired_internal_url_pattern" \
   "${source_files[@]}"
 
 for path in "${retired_paths[@]}"; do

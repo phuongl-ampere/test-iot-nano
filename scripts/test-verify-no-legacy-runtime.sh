@@ -53,8 +53,10 @@ retired_paths=(
 retired_source_paths=(
   services/iot-nano-api/src/main.rs
   services/iot-nano-api/src/core_client.rs
+  services/iot-nano-core/src/main.rs
   services/iot-nano-core/src/control.rs
   services/iot-nano-core/src/stream_consumer.rs
+  services/iot-nano-stream/src/main.rs
   services/iot-nano-mqttd/src/main.rs
   contracts/internal-api-v1.json
   contracts/stream-v1.json
@@ -225,8 +227,22 @@ write_fixture_file services/iot-nano-core/src/injected-internal.rs \
 assert_failure_contains 'legacy runtime references found in library source paths'
 populate_fixture
 
+write_fixture_file services/iot-nano-core/src/injected-env.rs \
+  'let _ = std::env::var("IOT_NANO_API_CORE_SECRET");'
+assert_failure_contains 'retired internal environment access found in library source paths'
+populate_fixture
+
+write_fixture_file services/iot-nano-mqttd/src/injected-url.rs \
+  'let _ = "http://127.0.0.1:8081";'
+assert_failure_contains 'retired internal URL literal found in library source paths'
+populate_fixture
+
 write_fixture_file services/iot-nano-api/Cargo.toml $'[package]\nname = "iot-nano-api"\nautobins = false\n\n[[bin]]\nname = "legacy-api"'
 assert_failure_contains 'library package declares a retired binary target'
+populate_fixture
+
+write_fixture_file services/iot-nano-core/Cargo.toml $'[package]\nname = "iot-nano-core"'
+assert_failure_contains 'library package must disable inferred binaries'
 populate_fixture
 
 printf '\n[dev-dependencies]\n%s = { path = "../../services/%s" }\n' \
