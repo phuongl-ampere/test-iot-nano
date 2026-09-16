@@ -2,7 +2,6 @@
 
 mod application_registry;
 mod auth;
-mod core_client;
 mod core_facade;
 mod device_tokens;
 mod oauth;
@@ -21,11 +20,10 @@ pub use auth::{
     bootstrap_users, bootstrap_users_sqlite, extract_bearer_access_token, generate_session_id,
     hash_password, validate_bearer_access_token, validate_password,
 };
-pub use core_client::{
-    CoreClient, CoreClientError, CoreCommandCreateRequest, CoreCommandRecord,
-    CoreCommandResponseRequest, CoreTelemetryBucket, CoreTelemetryPoint,
+pub use core_facade::{
+    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
+    CoreFacadeError, CoreTelemetryBucket, CoreTelemetryPoint, CoreTelemetryQuery,
 };
-pub use core_facade::{CoreFacade, CoreFacadeError, CoreTelemetryQuery};
 pub use device_tokens::{
     DeviceTokenResponse, DeviceTokenStoreError, create_platform_device_token,
     provision_platform_device_token,

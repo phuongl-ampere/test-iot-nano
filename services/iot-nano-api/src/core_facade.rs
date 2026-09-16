@@ -1,13 +1,57 @@
 use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
+use iot_core::RpcMode;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{
-    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreTelemetryBucket,
-    CoreTelemetryPoint,
-};
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreCommandCreateRequest {
+    pub id: Uuid,
+    pub device_id: String,
+    pub method: String,
+    pub params: serde_json::Value,
+    pub mode: RpcMode,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoreCommandResponseRequest {
+    pub command_id: Uuid,
+    pub device_id: String,
+    #[serde(skip_serializing)]
+    pub token_id: Uuid,
+    pub response: serde_json::Value,
+    pub responded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoreCommandRecord {
+    pub id: Uuid,
+    pub device_id: String,
+    pub state: String,
+    pub expires_at: DateTime<Utc>,
+    pub mode: RpcMode,
+    pub response: Option<serde_json::Value>,
+    pub responded_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreTelemetryBucket {
+    Raw,
+    FiveMinutes,
+    OneHour,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoreTelemetryPoint {
+    pub at: DateTime<Utc>,
+    pub temperature_c: Option<f64>,
+    pub humidity_pct: Option<f64>,
+    pub event_count: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct CoreTelemetryQuery {

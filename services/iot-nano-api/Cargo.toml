@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+autobins = false
 
 [dependencies]
 argon2.workspace = true
@@ -11,7 +12,6 @@ aes-gcm.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
-clap.workspace = true
 iot-core = { path = "../../crates/iot-core" }
 iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
 iot_nano_core = { package = "iot-nano-core", path = "../iot-nano-core" }

@@ -1702,7 +1702,6 @@ dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",
- "clap",
  "fs2",
  "iot-core",
  "iot-nano-core",

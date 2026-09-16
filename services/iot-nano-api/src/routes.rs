@@ -48,8 +48,8 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::{
-    CoreClient, CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest,
-    CoreFacade, CoreFacadeError, CoreTelemetryBucket, CoreTelemetryQuery, TokenVault,
+    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
+    CoreFacadeError, CoreTelemetryBucket, CoreTelemetryQuery, TokenVault,
     auth::{
         AccountClass, Admin, AuthContext, AuthError, AuthenticatedUser, BearerAccessTokenError,
         POWER_MONITOR_APP, Role, System, authenticate_credentials, authenticate_credentials_sqlite,
@@ -273,10 +273,6 @@ impl ApiState {
         self
     }
 
-    pub fn with_core_client(self, client: CoreClient) -> Self {
-        self.with_core_facade(Arc::new(client))
-    }
-
     pub fn with_oauth_store(mut self, store: PlatformStore) -> Self {
         self.oauth_store = Some(Arc::new(store));
         self
@@ -451,10 +447,6 @@ impl SqliteApiState {
     pub fn with_core_facade(mut self, facade: Arc<dyn CoreFacade>) -> Self {
         self.core_facade = Some(facade);
         self
-    }
-
-    pub fn with_core_client(self, client: CoreClient) -> Self {
-        self.with_core_facade(Arc::new(client))
     }
 
     pub fn with_oauth_store(mut self, store: PlatformStore) -> Self {
