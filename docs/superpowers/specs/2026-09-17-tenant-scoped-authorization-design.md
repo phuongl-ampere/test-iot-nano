@@ -183,15 +183,18 @@ devices
   tenant_id UUID not null
   owner_user_id UUID not null
   asset_id UUID nullable
+  is_gateway boolean not null default false
+  gateway_device_id UUID nullable
   device-specific fields
   created_at
   updated_at
 
 unique (id, tenant_id)
 index (tenant_id, asset_id)
+index (tenant_id, gateway_device_id)
 ~~~
 
-Containment is the only relation in the first release:
+Containment is the only relation that participates in inherited authorization:
 
 ~~~text
 Asset child.parent_asset_id -> Asset parent.id
@@ -203,10 +206,69 @@ and child record have the same Tenant ID. Storage rejects containment cycles
 and limits containment depth to 64. Each Asset has at most one parent Asset;
 each Device has at most one assigned Asset.
 
-An optional future entity-relations table can model many-to-many descriptive
-relations such as location, dependency, assignment, or association. Those
-relations are never included in authorization unless a future explicit policy
-defines them as authorization scope.
+### Gateway-Child Device Topology
+
+Gateway is a Device capability, not a separate business entity. A gateway may
+carry telemetry or commands for many child Devices. The child points at its
+single active gateway:
+
+~~~text
+Device G
+  is_gateway = true
+  gateway_device_id = null
+
+Device D
+  is_gateway = false
+  gateway_device_id = G.id
+~~~
+
+The gateway and every child must have the same tenant ID. A child cannot point
+to itself, and a gateway cannot itself be a child. Gateway-child topology is
+operational: it authorizes gateway telemetry ingestion and command routing
+using the exact gateway-child pair. It does not imply resource ownership,
+sharing, containment, or inherited user permission.
+
+Sharing a gateway does not automatically share its children. Sharing a child
+does not automatically share its gateway. User access remains defined only by
+ownership and resource permissions.
+
+### Descriptive Device-to-Device Relations
+
+The first release also supports generic, tenant-scoped device-to-device
+relations for real-world cases that are neither containment nor gateway
+topology.
+
+~~~text
+device_relations
+  id UUID primary key
+  tenant_id UUID not null
+  from_device_id UUID not null
+  relation_type text not null
+  to_device_id UUID not null
+  metadata JSON
+  created_by_user_id UUID not null
+  created_at
+  updated_at
+
+unique (tenant_id, from_device_id, relation_type, to_device_id)
+index (tenant_id, from_device_id, relation_type)
+index (tenant_id, to_device_id, relation_type)
+~~~
+
+Relation type is tenant-defined metadata such as paired_with, controls,
+depends_on, or located_near. The storage layer validates an identifier-shaped
+relation type and rejects self-relations. Generic device relations may form a
+graph and do not require an acyclic constraint because authorization never
+traverses them.
+
+Creating, changing, or removing a device relation requires manager or owner
+permission on both endpoint Devices, unless the caller is Tenant Account.
+Descriptive device relations never participate in authorization, command
+routing, telemetry routing, or permission inheritance.
+
+An optional future resource-relations table may extend the same descriptive
+model to Asset-to-Device and Asset-to-Asset many-to-many relations. It follows
+the same rule: descriptive relations do not affect authorization.
 
 ## Resource Permissions
 
@@ -359,6 +421,11 @@ If measurements show a bottleneck for deep trees or very large list queries,
 add an entity-closure table as an optimization without changing permission
 semantics.
 
+Gateway-child checks use the indexed pair of tenant ID and gateway Device ID;
+they do not traverse descriptive device relations. Descriptive
+device-relation reads use either indexed endpoint and never run during normal
+permission checks.
+
 ~~~text
 entity_closure
   tenant_id
@@ -380,10 +447,13 @@ revision before commit.
 3. Tenant Account can only administer its own tenant ID.
 4. User Tenant ID cannot change after creation.
 5. A containment edge cannot cross tenants or create a cycle.
-6. A User Group cannot contain a User from another tenant.
-7. A resource permission cannot target a User, Group, Asset, or Device from
+6. A gateway-child edge cannot cross tenants, point to itself, or make a
+   gateway a child.
+7. A descriptive device relation cannot cross tenants or point to itself.
+8. A User Group cannot contain a User from another tenant.
+9. A resource permission cannot target a User, Group, Asset, or Device from
    another tenant.
-8. Device credentials resolve to exactly one Device and its tenant.
+10. Device credentials resolve to exactly one Device and its tenant.
 
 ## Migration and Rollout
 
@@ -406,14 +476,17 @@ revision before commit.
 2. Add resource permissions and direct User sharing.
 3. Add Group sharing.
 4. Add Asset containment inheritance.
-5. Add permission, membership, ownership, and containment audit events.
+5. Preserve and tenant-scope existing gateway-child topology.
+6. Add descriptive device-to-device relations.
+7. Add permission, membership, ownership, containment, gateway, and relation
+   audit events.
 
 ### Phase 3: Measured Extensions
 
 1. Add group managers when delegation is required.
 2. Add entity closure only after query measurements justify it.
-3. Add descriptive many-to-many relations for real-world cases not represented
-   by containment.
+3. Add descriptive Asset-to-Device and Asset-to-Asset many-to-many relations
+   for real-world cases not represented by containment.
 4. Add custom roles or per-capability permissions only when the three-level
    permission model no longer meets a real product requirement.
 
@@ -436,3 +509,8 @@ Tests must prove:
 11. Viewer cannot mutate, control, share, revoke, or transfer.
 12. List endpoints return only resources authorized for the authenticated User
     and use keyset pagination.
+13. Gateway telemetry and commands require an exact active gateway-child pair
+    in the same tenant.
+14. Gateway-child topology does not grant user access to either endpoint.
+15. Device-to-device relations cannot cross tenants and do not grant user
+    access or affect permission inheritance.
