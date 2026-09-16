@@ -6,7 +6,10 @@ use argon2::{
 };
 use axum::http::{HeaderMap, header::AUTHORIZATION};
 use chrono::{DateTime, Utc};
-use iot_storage::{OAuthRepository, PlatformStoreError};
+use iot_storage::{
+    OAuthRepository, PlatformStore, PlatformStoreError, TenantIdentityError,
+    TenantIdentityRepository,
+};
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
 use sqlx::{PgPool, Row, SqlitePool};
@@ -63,6 +66,21 @@ pub enum AccountClass {
     System,
     Admin,
     User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalKind {
+    System,
+    Tenant,
+    User,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedPrincipal {
+    pub kind: PrincipalKind,
+    pub principal_id: Uuid,
+    pub tenant_id: Option<Uuid>,
 }
 
 impl AccountClass {
@@ -174,6 +192,8 @@ pub enum AuthError {
     InvalidStoredHash,
     #[error("authentication failed")]
     AuthenticationFailed,
+    #[error("tenant identity is unavailable")]
+    TenantIdentity(#[source] TenantIdentityError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error("failed to hash password")]
@@ -211,6 +231,53 @@ pub fn hash_password(password: &str) -> Result<String, AuthError> {
         .hash_password(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|_| AuthError::Hashing)
+}
+
+pub async fn authenticate_system_account(
+    store: &PlatformStore,
+    username: &str,
+    password: &str,
+) -> Result<AuthenticatedPrincipal, AuthError> {
+    let credential = TenantIdentityRepository::system_account_credential(store, username)
+        .await
+        .map_err(AuthError::TenantIdentity)?
+        .ok_or(AuthError::AuthenticationFailed)?;
+    verify_password(password, &credential.password_hash)?;
+    Ok(AuthenticatedPrincipal {
+        kind: PrincipalKind::System,
+        principal_id: credential.account.id,
+        tenant_id: None,
+    })
+}
+
+pub async fn authenticate_tenant_account(
+    store: &PlatformStore,
+    tenant_slug: &str,
+    password: &str,
+) -> Result<AuthenticatedPrincipal, AuthError> {
+    let credential = TenantIdentityRepository::tenant_account_credential(store, tenant_slug)
+        .await
+        .map_err(AuthError::TenantIdentity)?
+        .ok_or(AuthError::AuthenticationFailed)?;
+    verify_password(password, &credential.password_hash)?;
+    Ok(AuthenticatedPrincipal {
+        kind: PrincipalKind::Tenant,
+        principal_id: credential.account.id,
+        tenant_id: Some(credential.tenant.id),
+    })
+}
+
+fn verify_password(password: &str, password_hash: &str) -> Result<(), AuthError> {
+    let password_hash =
+        PasswordHash::new(password_hash).map_err(|_| AuthError::InvalidStoredHash)?;
+    if Argon2::default()
+        .verify_password(password.as_bytes(), &password_hash)
+        .is_ok()
+    {
+        Ok(())
+    } else {
+        Err(AuthError::AuthenticationFailed)
+    }
 }
 
 pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> {
