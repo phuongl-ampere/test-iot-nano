@@ -23,12 +23,24 @@ expected_files=(
   "$root/services/iot-nano-monolith/src/management.rs"
   "$root/services/iot-nano-monolith/src/readiness.rs"
   "$root/services/iot-nano-monolith/src/runtime.rs"
+  "$root/services/iot-nano-api/Cargo.toml"
+  "$root/services/iot-nano-api/src/lib.rs"
+  "$root/services/iot-nano-core/Cargo.toml"
+  "$root/services/iot-nano-core/src/lib.rs"
+  "$root/services/iot-nano-stream/Cargo.toml"
+  "$root/services/iot-nano-stream/src/lib.rs"
+  "$root/services/iot-nano-mqttd/Cargo.toml"
+  "$root/services/iot-nano-mqttd/src/lib.rs"
 )
 expected_directories=(
   "$root/infra"
   "$root/scripts"
   "$root/services/iot-nano-monolith"
   "$root/services/iot-nano-monolith/src"
+  "$root/services/iot-nano-api/src"
+  "$root/services/iot-nano-core/src"
+  "$root/services/iot-nano-stream/src"
+  "$root/services/iot-nano-mqttd/src"
 )
 retired_paths=(
   "$root/infra/dev/api.env"
@@ -42,6 +54,13 @@ retired_paths=(
   "$root/infra/systemd/iot-nano-stream.service"
   "$root/scripts/install-mqttd-standalone.sh"
   "$root/scripts/rpc-e2e.py"
+  "$root/services/iot-nano-api/src/main.rs"
+  "$root/services/iot-nano-api/src/core_client.rs"
+  "$root/services/iot-nano-core/src/control.rs"
+  "$root/services/iot-nano-core/src/stream_consumer.rs"
+  "$root/services/iot-nano-mqttd/src/main.rs"
+  "$root/contracts/internal-api-v1.json"
+  "$root/contracts/stream-v1.json"
 )
 
 retired_binary_literal_pattern='iot-nano-(api|core|stream|mqttd)'
@@ -149,7 +168,32 @@ enumerate_regular_files() {
 
 enumerate_regular_files "$root/infra" deployment
 enumerate_regular_files "$root/scripts" deployment
-enumerate_regular_files "$root/services/iot-nano-monolith/src" source
+for source_directory in \
+  "$root/services/iot-nano-api/src" \
+  "$root/services/iot-nano-core/src" \
+  "$root/services/iot-nano-stream/src" \
+  "$root/services/iot-nano-mqttd/src" \
+  "$root/services/iot-nano-monolith/src"; do
+  enumerate_regular_files "$source_directory" source
+done
+
+check_library_binary_targets() {
+  local package
+  local manifest
+
+  for package in iot-nano-api iot-nano-core iot-nano-stream iot-nano-mqttd; do
+    manifest="$root/services/$package/Cargo.toml"
+    if rg -q '^\[\[bin\]\]' "$manifest"; then
+      fail "library package declares a retired binary target: $manifest"
+    fi
+  done
+
+  for package in iot-nano-api iot-nano-mqttd; do
+    manifest="$root/services/$package/Cargo.toml"
+    rg -q '^autobins[[:space:]]*=[[:space:]]*false$' "$manifest" ||
+      fail "library package must disable inferred binaries: $manifest"
+  done
+}
 
 check_normalized_binary_literals() {
   local path
@@ -214,8 +258,9 @@ check_for_matches() {
 }
 
 check_normalized_binary_literals
+check_library_binary_targets
 check_for_matches \
-  'legacy runtime references found in monolith source paths' \
+  'legacy runtime references found in library source paths' \
   "$retired_source_pattern" \
   "${source_files[@]}"
 

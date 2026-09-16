@@ -26,6 +26,14 @@ expected_files=(
   services/iot-nano-monolith/src/management.rs
   services/iot-nano-monolith/src/readiness.rs
   services/iot-nano-monolith/src/runtime.rs
+  services/iot-nano-api/Cargo.toml
+  services/iot-nano-api/src/lib.rs
+  services/iot-nano-core/Cargo.toml
+  services/iot-nano-core/src/lib.rs
+  services/iot-nano-stream/Cargo.toml
+  services/iot-nano-stream/src/lib.rs
+  services/iot-nano-mqttd/Cargo.toml
+  services/iot-nano-mqttd/src/lib.rs
 )
 
 retired_paths=(
@@ -40,6 +48,16 @@ retired_paths=(
   infra/systemd/iot-nano-stream.service
   scripts/install-mqttd-standalone.sh
   scripts/rpc-e2e.py
+)
+
+retired_source_paths=(
+  services/iot-nano-api/src/main.rs
+  services/iot-nano-api/src/core_client.rs
+  services/iot-nano-core/src/control.rs
+  services/iot-nano-core/src/stream_consumer.rs
+  services/iot-nano-mqttd/src/main.rs
+  contracts/internal-api-v1.json
+  contracts/stream-v1.json
 )
 
 legacy_binary="iot-nano-api"
@@ -150,17 +168,17 @@ populate_fixture
 
 write_fixture_file services/iot-nano-monolith/src/injected-route.rs \
   'const RETIRED: &str = "/internal/v1";'
-assert_failure_contains 'legacy runtime references found in monolith source paths'
+assert_failure_contains 'legacy runtime references found in library source paths'
 populate_fixture
 
 write_fixture_file services/iot-nano-monolith/src/injected-header.rs \
   'const RETIRED: &str = "x-iot-nano-legacy";'
-assert_failure_contains 'legacy runtime references found in monolith source paths'
+assert_failure_contains 'legacy runtime references found in library source paths'
 populate_fixture
 
 write_fixture_file services/iot-nano-monolith/src/injected-env.rs \
   'IOT_NANO_CORE_URL=http://127.0.0.1:8081'
-assert_failure_contains 'legacy runtime references found in monolith source paths'
+assert_failure_contains 'legacy runtime references found in library source paths'
 populate_fixture
 
 printf '%s\n' 'retired command' >"$fixture/retired-command"
@@ -195,6 +213,21 @@ for retired_path in "${retired_paths[@]}"; do
   assert_failure_contains 'retired legacy deployment asset remains'
   populate_fixture
 done
+
+for retired_source_path in "${retired_source_paths[@]}"; do
+  write_fixture_file "$retired_source_path" 'retired source or contract asset'
+  assert_failure_contains 'retired legacy deployment asset remains'
+  populate_fixture
+done
+
+write_fixture_file services/iot-nano-core/src/injected-internal.rs \
+  'const RETIRED: &str = "/internal/core";'
+assert_failure_contains 'legacy runtime references found in library source paths'
+populate_fixture
+
+write_fixture_file services/iot-nano-api/Cargo.toml $'[package]\nname = "iot-nano-api"\nautobins = false\n\n[[bin]]\nname = "legacy-api"'
+assert_failure_contains 'library package declares a retired binary target'
+populate_fixture
 
 printf '\n[dev-dependencies]\n%s = { path = "../../services/%s" }\n' \
   "$legacy_binary" "$legacy_binary" \
