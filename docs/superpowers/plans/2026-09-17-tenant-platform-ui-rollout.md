@@ -4,8 +4,12 @@
 
 ## Decisions
 
-- The built-in Platform UI reuses `web/` (Next.js 16, React 19, TypeScript).
-  No new frontend framework or second platform console is introduced.
+- The built-in Platform UI is rendered inside `iot-nano-monolith` with Axum,
+  Askama compile-time templates, plain CSS, and HTMX only for targeted partial
+  updates. It requires no Node runtime and ships with the monolith binary.
+- Authentication, authorization, navigation, and form validation remain on the
+  server. HTMX is a progressive enhancement, not a client-side authorization
+  layer.
 - One authenticated principal has exactly one account kind:
   `system`, `tenant`, or `user`.
 - `/system` is System Account only; `/tenant` is Tenant Account only; `/app`
@@ -16,6 +20,9 @@
   for richer telemetry, alerts, commands, and controls. This rollout does not
   refactor, add tenant UI to, remove features from, or otherwise adapt
   PowerMonitor. Its current feature set remains unchanged.
+- The existing `web/` Next.js platform console is superseded by the built-in
+  Axum UI. There is no dual UI runtime or compatibility route; remove its
+  platform-console deployment path after built-in route verification passes.
 - This is a development cutover. There is no legacy authorization fallback,
   dual-read/dual-write path, runtime default tenant, compatibility adapter, or
   old role-only route after its replacement is live. Disposable development
@@ -38,6 +45,9 @@
 
 - Implement a post-login router that never exposes a role switcher or System
   navigation to Tenant or User principals.
+- Add a shared Askama base layout and server-rendered account layouts for
+  `/system`, `/tenant`, and `/app`; package CSS and HTMX locally with the
+  monolith binary.
 - Delete superseded role-only client routing and tests once the new contract
   passes.
 
@@ -79,6 +89,8 @@ reference data in another Tenant.
   non-secret configuration status only.
 - `/system` UI: tenant table, tenant lifecycle actions, Tenant Account reset,
   and operational health panels.
+- Use server-rendered tables/forms and HTMX fragments for refresh, mutation
+  results, and validation feedback. Do not add a browser API client.
 - Do not render tenant Devices, Assets, telemetry, Users, or raw deployment
   secrets in this account class.
 
@@ -94,6 +106,8 @@ or `forbidden` for tenant resource APIs.
   Tenant Account's tenant ID.
 - `/tenant` UI: tenant home, Users, Assets, Devices, Profiles, device tokens,
   and tenant settings.
+- Use the same built-in templates and HTMX fragments; Tenant Account
+  authorization is always checked by the handler before rendering or mutation.
 - Tenant Account may only create Users in its own Tenant and cannot access
   `/system` routes or another Tenant's data.
 - Remove old management pages/routes that accept or infer an arbitrary tenant
@@ -109,6 +123,9 @@ and no visibility outside it.
 - `/app` shows only authorized Device and Asset lists.
 - Device/Asset detail shows permitted state, telemetry, and alerts.
 - Viewer actions are read-only; Manager actions expose permitted controls only.
+- Use simple server-rendered resource lists/detail pages. HTMX may refresh a
+  reading, alert, or command state but may not calculate visibility or
+  permission locally.
 - In this phase, owner access is available immediately. Shared-resource rows
   appear after Phase 5 authorization is complete.
 - Do not include tenant lifecycle, user administration, token provisioning,
@@ -160,6 +177,8 @@ gateway traffic is rejected after reassignment.
 - Keep existing PowerMonitor tests unchanged and outside this rollout.
 - Remove superseded schema fields, single-tenant assumptions, old role-only
   routers, stale fixtures, and dead UI code after each replacement passes.
+- Remove the superseded `web/` platform-console build/deployment path after
+  `/system`, `/tenant`, and `/app` pass browser and authorization verification.
 - Keep no runtime fallback for old data, old sessions, or old authorization.
 
 **Exit gate:** Clean development bootstrap creates one System Account, tenants,
@@ -168,8 +187,9 @@ Tenant Accounts, and Users through only the new tenant-aware path.
 ## Parallel Work
 
 - Phase 1 storage/identity is the critical path and must land first.
-- The `web/` shell and static account-specific layouts may be built with mocked
-  contracts during Phase 1, but no real integration lands before Phase 1 exits.
+- The Askama template shell and static account-specific layouts may be built
+  with mocked contracts during Phase 1, but no real integration lands before
+  Phase 1 exits.
 - After Phase 1, System UI, Tenant UI, and `/app` UI can progress in parallel
   against stable server contracts.
 - Phase 5 UI work starts only after permission repository/API semantics are
