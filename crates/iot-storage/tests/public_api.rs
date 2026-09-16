@@ -5,6 +5,7 @@ use iot_storage::{
 };
 use serde_json::json;
 use sqlx::{Connection, PgConnection};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 mod common;
@@ -1027,6 +1028,107 @@ async fn timescale_public_device_permission_requires_an_application_grant() {
         .unwrap(),
         None
     );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_device_assignment_waits_for_asset_manager_grant_lock() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url.clone()),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let owner_id = Uuid::now_v7();
+    let manager_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    let grant_id = Uuid::now_v7();
+    let unique = Uuid::now_v7();
+    let pool = store.timescale_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'unused', 'viewer', 'user'),
+                ($3, $4, 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_id)
+    .bind(format!("timescale-asset-lock-owner-{unique}"))
+    .bind(manager_id)
+    .bind(format!("timescale-asset-lock-manager-{unique}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, name, owner_user_id) VALUES ($1, $2, $3)")
+        .bind(asset_id)
+        .bind(format!("timescale-asset-lock-target-{unique}"))
+        .bind(owner_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_grants
+            (id, resource_type, resource_id, grantee_type, grantee_id, permission)
+         VALUES ($1, 'asset', $2, 'user', $3, 'manager')",
+    )
+    .bind(grant_id)
+    .bind(asset_id.to_string())
+    .bind(manager_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut gate = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut gate).await.unwrap();
+    sqlx::query("SELECT id FROM resource_grants WHERE id = $1 FOR UPDATE")
+        .bind(grant_id)
+        .execute(&mut gate)
+        .await
+        .unwrap();
+
+    let assigning_store = store.clone();
+    let mut assignment = tokio::spawn(async move {
+        PublicApiRepository::create_public_device(
+            &assigning_store,
+            &PublicPrincipal {
+                user_id: Some(manager_id),
+                app_id: format!("timescale-asset-lock-app-{unique}"),
+                account_class: AccountClass::User,
+            },
+            NewPublicDevice {
+                device_id: format!("timescale-asset-lock-device-{unique}"),
+                display_name: None,
+                metadata: json!({}),
+                asset_id: Some(asset_id),
+                device_profile_id: None,
+            },
+        )
+        .await
+    });
+
+    if let Ok(result) = timeout(Duration::from_millis(100), &mut assignment).await {
+        panic!("asset manager grant lock was bypassed: {result:?}");
+    }
+    sqlx::query("COMMIT").execute(&mut gate).await.unwrap();
+    assert!(assignment.await.unwrap().is_ok());
 }
 
 #[tokio::test]

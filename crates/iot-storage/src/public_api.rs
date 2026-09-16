@@ -732,7 +732,8 @@ async fn create_public_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            lock_timescale_public_device_asset_assignment(&mut transaction).await?;
+            lock_timescale_public_device_asset_assignment(&mut transaction, device.asset_id)
+                .await?;
             if let Some(asset_id) = device.asset_id {
                 if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
                     .await?
@@ -816,7 +817,8 @@ async fn update_public_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            lock_timescale_public_device_asset_assignment(&mut transaction).await?;
+            lock_timescale_public_device_asset_assignment(&mut transaction, device.asset_id)
+                .await?;
             if let Some(asset_id) = device.asset_id {
                 if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
                     .await?
@@ -905,10 +907,70 @@ async fn sqlite_public_asset_manager_permission(
 
 async fn lock_timescale_public_device_asset_assignment(
     transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Option<Uuid>,
 ) -> Result<(), PlatformStoreError> {
     sqlx::query("LOCK TABLE devices IN SHARE ROW EXCLUSIVE MODE")
         .execute(&mut **transaction)
         .await?;
+    let Some(asset_id) = asset_id else {
+        return Ok(());
+    };
+
+    // Permission derives from the asset's ancestry and resource rows. Locking
+    // that exact scope prevents revocation or reparenting after authorization.
+    sqlx::query(
+        "WITH RECURSIVE ancestors(id) AS (
+             SELECT $1::uuid
+             UNION
+             SELECT asset.parent_asset_id
+             FROM assets AS asset
+             JOIN ancestors ON asset.id = ancestors.id
+             WHERE asset.parent_asset_id IS NOT NULL
+         )
+         SELECT asset.id
+         FROM assets AS asset
+         JOIN ancestors ON asset.id = ancestors.id
+         FOR SHARE OF asset",
+    )
+    .bind(asset_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "WITH RECURSIVE ancestors(id) AS (
+             SELECT $1::uuid
+             UNION
+             SELECT asset.parent_asset_id
+             FROM assets AS asset
+             JOIN ancestors ON asset.id = ancestors.id
+             WHERE asset.parent_asset_id IS NOT NULL
+         )
+         SELECT share.id
+         FROM resource_shares AS share
+         JOIN ancestors ON share.resource_id = ancestors.id::text
+         WHERE share.resource_type = 'asset'
+         FOR SHARE OF share",
+    )
+    .bind(asset_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "WITH RECURSIVE ancestors(id) AS (
+             SELECT $1::uuid
+             UNION
+             SELECT asset.parent_asset_id
+             FROM assets AS asset
+             JOIN ancestors ON asset.id = ancestors.id
+             WHERE asset.parent_asset_id IS NOT NULL
+         )
+         SELECT resource_grant.id
+         FROM resource_grants AS resource_grant
+         JOIN ancestors ON resource_grant.resource_id = ancestors.id::text
+         WHERE resource_grant.resource_type = 'asset'
+         FOR SHARE OF resource_grant",
+    )
+    .bind(asset_id)
+    .fetch_all(&mut **transaction)
+    .await?;
     Ok(())
 }
 
