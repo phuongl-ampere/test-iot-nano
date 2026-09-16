@@ -18,9 +18,9 @@ use axum::{
 };
 use iot_api::{
     AuthError, DeviceTokenResponse, DeviceTokenStoreError, OAuthBrowserSessionVerifier,
-    POWER_MONITOR_APP, Role, TokenVault, authenticate_credentials, authenticate_credentials_sqlite,
-    create_platform_device_token, generate_session_id, hash_password,
-    provision_platform_device_token, validate_password,
+    POWER_MONITOR_APP, PrincipalKind, Role, TokenVault, authenticate_credentials,
+    authenticate_credentials_sqlite, authenticate_system_account, create_platform_device_token,
+    generate_session_id, hash_password, provision_platform_device_token, validate_password,
 };
 use iot_storage::{
     ApplicationKind, ApplicationRepository, ClientId, CreateManagementAsset,
@@ -31,10 +31,10 @@ use iot_storage::{
     ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
     ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
     ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
-    NewOAuthClientSecret, NewSystemAccount, OAuthRepository, PlatformStore, PlatformStoreError,
-    RedirectUri, SystemAccount, TenantIdentityError, TenantIdentityRepository,
-    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser,
+    NewOAuthClientSecret, NewSystemAccount, NewTenant, NewTenantAccount, OAuthRepository,
+    PlatformStore, PlatformStoreError, RedirectUri, SystemAccount, TenantIdentityError,
+    TenantIdentityRepository, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -235,6 +235,8 @@ impl ManagementSessionRouter {
             .route("/api/auth/login", post(login))
             .route("/api/auth/logout", post(logout))
             .route("/api/auth/me", get(current_session))
+            .route("/api/system/auth/login", post(system_login))
+            .route("/api/system/tenants", post(create_system_tenant))
             .route("/api/management/applications", post(create_application))
             .route(
                 "/api/management/users",
@@ -1011,8 +1013,32 @@ impl ManagementSessionVerifier {
                 sessions.insert(
                     session_id.clone(),
                     Session {
-                        user_id,
+                        user_id: Some(user_id),
+                        system_account_id: None,
                         role: Some(role),
+                        expires_at: Instant::now() + SESSION_TTL,
+                    },
+                );
+                return session_id;
+            }
+        }
+    }
+
+    fn issue_system(&self, system_account_id: Uuid) -> String {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        loop {
+            let session_id = generate_session_id();
+            if !sessions.contains_key(&session_id) {
+                sessions.insert(
+                    session_id.clone(),
+                    Session {
+                        user_id: None,
+                        system_account_id: Some(system_account_id),
+                        role: None,
                         expires_at: Instant::now() + SESSION_TTL,
                     },
                 );
@@ -1055,9 +1081,28 @@ impl ManagementSessionVerifier {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_sessions(&mut sessions);
         for session in sessions.values_mut() {
-            if session.user_id == user_id {
+            if session.user_id == Some(user_id) {
                 session.role = None;
             }
+        }
+    }
+
+    fn system_authorization(&self, headers: &HeaderMap) -> ManagementAuthorization {
+        let Some(session_id) = session_id(headers) else {
+            return ManagementAuthorization::Unauthenticated;
+        };
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        match sessions.get(session_id) {
+            Some(Session {
+                system_account_id: Some(_),
+                ..
+            }) => ManagementAuthorization::System,
+            Some(_) => ManagementAuthorization::Forbidden,
+            None => ManagementAuthorization::Unauthenticated,
         }
     }
 }
@@ -1070,7 +1115,7 @@ impl OAuthBrowserSessionVerifier for ManagementSessionVerifier {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_expired_sessions(&mut sessions);
-        sessions.get(session_id).map(|session| session.user_id)
+        sessions.get(session_id).and_then(|session| session.user_id)
     }
 }
 
@@ -1265,7 +1310,8 @@ struct ManagementAuthorizationTestHooks {
 }
 
 struct Session {
-    user_id: Uuid,
+    user_id: Option<Uuid>,
+    system_account_id: Option<Uuid>,
     role: Option<Role>,
     expires_at: Instant,
 }
@@ -1273,6 +1319,7 @@ struct Session {
 enum ManagementAuthorization {
     Unauthenticated,
     Admin,
+    System,
     Forbidden,
 }
 
@@ -1348,9 +1395,35 @@ struct LoginRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct SystemLoginRequest {
+    username: String,
+    password: String,
+}
+
 #[derive(Serialize)]
 struct SessionResponse {
     user_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct SystemSessionResponse {
+    principal_kind: PrincipalKind,
+    tenant_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
+struct CreateSystemTenantRequest {
+    slug: String,
+    metadata: Value,
+    tenant_account_password: String,
+}
+
+#[derive(Serialize)]
+struct SystemTenantResponse {
+    id: Uuid,
+    slug: String,
+    tenant_account_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -1547,6 +1620,96 @@ async fn login(
     Ok((
         session_cookie_headers(&session_id),
         Json(SessionResponse { user_id }),
+    ))
+}
+
+async fn system_login(
+    State(state): State<ManagementState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<SystemLoginRequest>,
+) -> Result<(HeaderMap, Json<SystemSessionResponse>), ManagementSessionError> {
+    let attempt_key = LoginAttemptKey {
+        address: address.ip(),
+        username: request.username.clone(),
+    };
+    let reserved = {
+        let mut limiter = state
+            .login_limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        limiter.reserve(&attempt_key)
+    };
+    if !reserved {
+        return Err(ManagementSessionError::TooManyRequests);
+    }
+
+    let principal =
+        match authenticate_system_account(&state.store, &request.username, &request.password).await
+        {
+            Ok(principal) => principal,
+            Err(AuthError::AuthenticationFailed) => {
+                state
+                    .login_limiter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record_failure(&attempt_key);
+                return Err(ManagementSessionError::Unauthorized);
+            }
+            Err(_) => {
+                state
+                    .login_limiter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .release(&attempt_key);
+                return Err(ManagementSessionError::Unavailable);
+            }
+        };
+    let session_id = state.session_verifier.issue_system(principal.principal_id);
+    state
+        .login_limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_success(&attempt_key);
+    Ok((
+        session_cookie_headers(&session_id),
+        Json(SystemSessionResponse {
+            principal_kind: PrincipalKind::System,
+            tenant_id: None,
+        }),
+    ))
+}
+
+async fn create_system_tenant(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<(StatusCode, Json<SystemTenantResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: CreateSystemTenantRequest = management_request_json(&state, request).await?;
+    if !request.metadata.is_object() {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    validate_password(&request.tenant_account_password)
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    let password_hash = hash_password(&request.tenant_account_password)
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let (tenant, tenant_account) = TenantIdentityRepository::create_tenant_with_account(
+        state.store.as_ref(),
+        NewTenant {
+            slug: request.slug,
+            metadata: request.metadata,
+        },
+        NewTenantAccount { password_hash },
+    )
+    .await
+    .map_err(system_tenant_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SystemTenantResponse {
+            id: tenant.id,
+            slug: tenant.slug,
+            tenant_account_id: tenant_account.id,
+        }),
     ))
 }
 
@@ -2191,6 +2354,17 @@ fn management_asset_error(error: ManagementAssetError) -> ManagementSessionError
     }
 }
 
+fn system_tenant_error(error: TenantIdentityError) -> ManagementSessionError {
+    match error {
+        TenantIdentityError::InvalidTenantSlug | TenantIdentityError::EmptyPasswordHash => {
+            ManagementSessionError::BadRequest
+        }
+        TenantIdentityError::EmptySystemUsername
+        | TenantIdentityError::InvalidStoredIdentity
+        | TenantIdentityError::Database(_) => ManagementSessionError::Unavailable,
+    }
+}
+
 fn require_management_admin(
     session_verifier: &ManagementSessionVerifier,
     headers: &HeaderMap,
@@ -2198,7 +2372,22 @@ fn require_management_admin(
     match session_verifier.authorization(headers) {
         ManagementAuthorization::Unauthenticated => Err(ManagementSessionError::Unauthorized),
         ManagementAuthorization::Admin => Ok(()),
-        ManagementAuthorization::Forbidden => Err(ManagementSessionError::Forbidden),
+        ManagementAuthorization::System | ManagementAuthorization::Forbidden => {
+            Err(ManagementSessionError::Forbidden)
+        }
+    }
+}
+
+fn require_system_account(
+    session_verifier: &ManagementSessionVerifier,
+    headers: &HeaderMap,
+) -> Result<(), ManagementSessionError> {
+    match session_verifier.system_authorization(headers) {
+        ManagementAuthorization::Unauthenticated => Err(ManagementSessionError::Unauthorized),
+        ManagementAuthorization::System => Ok(()),
+        ManagementAuthorization::Admin | ManagementAuthorization::Forbidden => {
+            Err(ManagementSessionError::Forbidden)
+        }
     }
 }
 
