@@ -1,6 +1,7 @@
 .git
 .codebase-memory
 .superpowers
+.worktrees
 target
 **/node_modules
 **/.next
