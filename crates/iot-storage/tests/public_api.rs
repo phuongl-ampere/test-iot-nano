@@ -1,11 +1,12 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    AccountClass, NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PlatformStore,
-    PublicApiRepository, PublicDeviceError, PublicPrincipal, ResourcePermission,
+    AccountClass, ManagementAssetRepository, NewPublicAsset, NewPublicDevice,
+    NewPublicResourceGrant, PlatformStore, PublicApiRepository, PublicDeviceError, PublicPrincipal,
+    ResourcePermission,
 };
 use serde_json::json;
-use sqlx::{Connection, PgConnection};
-use tokio::time::{Duration, timeout};
+use sqlx::{Connection, PgConnection, PgPool};
+use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
 mod common;
@@ -21,6 +22,65 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     .await
     .unwrap();
     (directory, store)
+}
+
+async fn wait_for_timescale_relation_lock_count(
+    pool: &PgPool,
+    table: &str,
+    mode: &str,
+    at_least: i64,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)
+                 FROM pg_locks
+                 WHERE locktype = 'relation'
+                   AND relation = $1::regclass
+                   AND mode = $2
+                   AND granted",
+            )
+            .bind(format!("iot_nano.{table}"))
+            .bind(mode)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if count >= at_least {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{table} did not reach {mode} count {at_least}"));
+}
+
+async fn timescale_relation_lock_is_held(pool: &PgPool, table: &str, mode: &str) -> bool {
+    timeout(Duration::from_millis(250), async {
+        loop {
+            let held: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM pg_locks
+                    WHERE locktype = 'relation'
+                      AND relation = $1::regclass
+                      AND mode = $2
+                      AND granted
+                )",
+            )
+            .bind(format!("iot_nano.{table}"))
+            .bind(mode)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if held {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 #[tokio::test]
@@ -1180,6 +1240,119 @@ async fn timescale_public_device_create_rejects_an_unavailable_profile_atomicall
     assert!(matches!(
         result,
         Err(PublicDeviceError::DeviceProfileUnavailable(id)) if id == unavailable_profile_id
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_device_assignment_serializes_with_management_asset_deletion() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url.clone()),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let unique = Uuid::now_v7();
+    let owner_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    let pool = store.timescale_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_id)
+    .bind(format!("timescale-asset-delete-owner-{unique}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, name, owner_user_id) VALUES ($1, $2, $3)")
+        .bind(asset_id)
+        .bind(format!("timescale-asset-delete-target-{unique}"))
+        .bind(owner_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let mut gate = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut gate).await.unwrap();
+    sqlx::query("SELECT id FROM assets WHERE id = $1 FOR UPDATE")
+        .bind(asset_id)
+        .execute(&mut gate)
+        .await
+        .unwrap();
+
+    let deleting_store = store.clone();
+    let mut deletion = tokio::spawn(async move {
+        ManagementAssetRepository::delete_management_asset(&deleting_store, asset_id).await
+    });
+    wait_for_timescale_relation_lock_count(pool, "assets", "RowShareLock", 2).await;
+
+    let assigning_store = store.clone();
+    let mut assignment = tokio::spawn(async move {
+        PublicApiRepository::create_public_device(
+            &assigning_store,
+            &PublicPrincipal {
+                user_id: Some(owner_id),
+                app_id: format!("timescale-asset-delete-app-{unique}"),
+                account_class: AccountClass::User,
+            },
+            NewPublicDevice {
+                device_id: format!("timescale-asset-delete-device-{unique}"),
+                display_name: None,
+                metadata: json!({}),
+                asset_id: Some(asset_id),
+                device_profile_id: None,
+            },
+        )
+        .await
+    });
+    wait_for_timescale_relation_lock_count(pool, "assets", "RowShareLock", 3).await;
+    let assignment_locked_devices =
+        timescale_relation_lock_is_held(pool, "devices", "ShareRowExclusiveLock").await;
+    if assignment_locked_devices {
+        assignment.abort();
+        deletion.abort();
+        let _ = assignment.await;
+        let _ = deletion.await;
+        sqlx::query("COMMIT").execute(&mut gate).await.unwrap();
+        panic!("asset assignment locked devices before waiting for the asset");
+    }
+
+    sqlx::query("COMMIT").execute(&mut gate).await.unwrap();
+    let deletion_result = timeout(Duration::from_secs(2), &mut deletion)
+        .await
+        .expect("management asset deletion deadlocked")
+        .unwrap();
+    assert!(
+        deletion_result.is_ok(),
+        "management asset deletion failed: {deletion_result:?}"
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(2), &mut assignment)
+            .await
+            .expect("public device assignment deadlocked")
+            .unwrap(),
+        Err(PublicDeviceError::AssetUnavailable(id)) if id == asset_id
     ));
 }
 

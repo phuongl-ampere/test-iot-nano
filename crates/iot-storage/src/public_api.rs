@@ -970,17 +970,11 @@ async fn lock_timescale_public_device_asset_assignment(
     transaction: &mut Transaction<'_, Postgres>,
     asset_id: Option<Uuid>,
 ) -> Result<(), PlatformStoreError> {
-    sqlx::query("LOCK TABLE devices IN SHARE ROW EXCLUSIVE MODE")
-        .execute(&mut **transaction)
-        .await?;
-    let Some(asset_id) = asset_id else {
-        return Ok(());
-    };
-
-    // Permission derives from the asset's ancestry and resource rows. Locking
-    // that exact scope prevents revocation or reparenting after authorization.
-    sqlx::query(
-        "WITH RECURSIVE ancestors(id) AS (
+    if let Some(asset_id) = asset_id {
+        // Management asset deletion locks the asset before updating devices.
+        // Follow that order so an assignment cannot form an asset/devices cycle.
+        sqlx::query(
+            "WITH RECURSIVE ancestors(id) AS (
              SELECT $1::uuid
              UNION
              SELECT asset.parent_asset_id
@@ -992,12 +986,12 @@ async fn lock_timescale_public_device_asset_assignment(
          FROM assets AS asset
          JOIN ancestors ON asset.id = ancestors.id
          FOR SHARE OF asset",
-    )
-    .bind(asset_id)
-    .fetch_all(&mut **transaction)
-    .await?;
-    sqlx::query(
-        "WITH RECURSIVE ancestors(id) AS (
+        )
+        .bind(asset_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "WITH RECURSIVE ancestors(id) AS (
              SELECT $1::uuid
              UNION
              SELECT asset.parent_asset_id
@@ -1010,12 +1004,12 @@ async fn lock_timescale_public_device_asset_assignment(
          JOIN ancestors ON share.resource_id = ancestors.id::text
          WHERE share.resource_type = 'asset'
          FOR SHARE OF share",
-    )
-    .bind(asset_id)
-    .fetch_all(&mut **transaction)
-    .await?;
-    sqlx::query(
-        "WITH RECURSIVE ancestors(id) AS (
+        )
+        .bind(asset_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        sqlx::query(
+            "WITH RECURSIVE ancestors(id) AS (
              SELECT $1::uuid
              UNION
              SELECT asset.parent_asset_id
@@ -1028,10 +1022,14 @@ async fn lock_timescale_public_device_asset_assignment(
          JOIN ancestors ON resource_grant.resource_id = ancestors.id::text
          WHERE resource_grant.resource_type = 'asset'
          FOR SHARE OF resource_grant",
-    )
-    .bind(asset_id)
-    .fetch_all(&mut **transaction)
-    .await?;
+        )
+        .bind(asset_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+    }
+    sqlx::query("LOCK TABLE devices IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut **transaction)
+        .await?;
     Ok(())
 }
 

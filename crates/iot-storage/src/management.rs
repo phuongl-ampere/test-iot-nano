@@ -1944,7 +1944,7 @@ async fn timescale_require_management_asset(
     transaction: &mut Transaction<'_, Postgres>,
     asset_id: Uuid,
 ) -> Result<(), ManagementAssetError> {
-    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = $1 FOR UPDATE")
+    let exists = sqlx::query_scalar::<_, Uuid>("SELECT id FROM assets WHERE id = $1 FOR UPDATE")
         .bind(asset_id)
         .fetch_optional(&mut **transaction)
         .await?
