@@ -36,6 +36,27 @@ existing tests.
 | `devices.gateway_device_id` is tenant-scoped only indirectly: its FK is `device_id`-only, so a child can reference a gateway from another tenant. The same issue applies to gateway ingest pair checks unless both device tenant IDs are selected/locked. | `crates/iot-storage/src/management.rs` topology validation; `crates/iot-storage/src/lib.rs` gateway authorization/ingest; `services/iot-nano-core/src/writer.rs`; `services/iot-nano-mqttd`. | `crates/iot-storage/tests/device_authorization.rs`, `gateway_ingest.rs`; management device tests; core writer and MQTT gateway tests. |
 | `assets` and `devices` already have required tenant IDs and same-tenant owner/asset FKs, but repository queries are mixed: several management/profile/token paths still select by resource ID alone. | `crates/iot-storage/src/management.rs`, `public_api.rs`; `services/iot-nano-monolith/src/management.rs`; `services/iot-nano-api/src/public_v1.rs`. | `crates/iot-storage/tests/management_assets.rs`, `management_devices.rs`, `public_api.rs`, `resource_authorization.rs`; cross-tenant HTTP tests. |
 
+## Required New Spec Tables
+
+The existing `resource_shares` and `resource_grants` model is not the target
+authorization model. Phase 5 must replace it, rather than merely add tenant
+columns to it, with these tenant-scoped records and constraints:
+
+- `user_groups` and `user_group_members`, with same-tenant owner/member
+  composite foreign keys and a `(tenant_id, user_id, group_id)` membership
+  index.
+- `resource_permissions`, with exactly one User or Group subject, exactly one
+  Asset or Device scope, same-tenant composite foreign keys for every subject,
+  resource, and creator, and active-permission indexes from the approved
+  design.
+- `device_relations`, with tenant-scoped endpoint foreign keys, unique
+  `(tenant_id, from_device_id, relation_type, to_device_id)`, no self-relation,
+  and rejection of the reserved `gateway_child` relation type.
+
+Those replacements also remove the legacy `controller` permission. They are
+scheduled after the base resource/OAuth scope work, because only then can
+effective `owner > manager > viewer > deny` evaluation be safely introduced.
+
 ## Ordered Implementation Slices
 
 1. **Canonical schema and migration gate.** Update both SQLite bootstrap and
