@@ -2808,10 +2808,10 @@ mod unit_tests {
     use tokio::sync::Barrier;
 
     use super::{
-        LoginRateLimiter, LoginRequest, MAX_LOGIN_FAILURES, ManagementAuthorizationTestHooks,
-        ManagementSessionError, ManagementSessionVerifier, ManagementState, authenticate,
-        create_management_user, hash_password, login, require_management_admin,
-        update_management_user,
+        LoginAttemptKey, LoginRateLimiter, LoginRequest, MAX_LOGIN_FAILURES,
+        ManagementAuthorizationTestHooks, ManagementSessionError, ManagementSessionVerifier,
+        ManagementState, authenticate, create_management_user, hash_password, login,
+        require_management_admin, update_management_user,
     };
 
     async fn management_state_with_admin_target(
