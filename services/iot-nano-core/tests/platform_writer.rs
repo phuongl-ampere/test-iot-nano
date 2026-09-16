@@ -1,11 +1,11 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration as StdDuration,
 };
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_nano_core::{CoreStreamConsumer, PlatformTelemetryWriter, WriterError};
 use iot_storage::{
@@ -21,6 +21,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const TOPIC: &str = "iot/v1/devices/direct-1/telemetry";
+static TEST_EPOCH: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 
 #[derive(Clone)]
 struct FakeRepository {
@@ -107,7 +108,7 @@ impl GatewayIngestRepository for FakeRepository {
 }
 
 fn at(seconds: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 13, 10, 0, 0).unwrap() + Duration::seconds(seconds)
+    *TEST_EPOCH + Duration::seconds(seconds)
 }
 
 fn event(device_id: &str, gateway_device_id: Option<&str>, sequence: u64) -> TelemetryEvent {

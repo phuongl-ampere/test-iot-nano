@@ -1,11 +1,11 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration as StdDuration, Instant},
 };
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_nano_core::{AlertError, CoreStreamConsumer, PlatformAlertEvaluator};
 use iot_storage::{
@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 const DEVICE_ID: &str = "esp-000123";
 const TOPIC: &str = "iot/v1/devices/esp-000123/telemetry";
+static TEST_EPOCH: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 
 #[derive(Clone)]
 struct FakeRepository {
@@ -180,7 +181,7 @@ impl StreamPort for AcknowledgementCountingStream {
 }
 
 fn at(seconds: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 13, 10, 0, 0).unwrap() + Duration::seconds(seconds)
+    *TEST_EPOCH + Duration::seconds(seconds)
 }
 
 fn telemetry(value: f64, received_at: DateTime<Utc>) -> TelemetryMessage {
