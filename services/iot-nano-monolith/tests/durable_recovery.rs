@@ -131,7 +131,6 @@ impl ProtocolBroker {
                 max_connections: 32,
                 max_payload_size: 1024 * 1024,
                 max_inflight_count: 16,
-                token_authenticator: None,
                 auth_handler: None,
                 authorization_handler: None,
             },
