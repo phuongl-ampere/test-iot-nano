@@ -561,7 +561,7 @@ async fn update_device(
         },
     )
     .await
-    .map_err(|_| PublicApiError::Unavailable)?
+    .map_err(public_device_error)?
     .ok_or(PublicApiError::Forbidden)?;
     Ok(Json(device_response(device)))
 }
@@ -594,7 +594,9 @@ fn device_response(device: PublicDevice) -> DeviceResponse {
 
 fn public_device_error(error: PublicDeviceError) -> PublicApiError {
     match error {
-        PublicDeviceError::AssetUnavailable(_) => PublicApiError::Conflict,
+        PublicDeviceError::AssetUnavailable(_) | PublicDeviceError::DeviceProfileUnavailable(_) => {
+            PublicApiError::Conflict
+        }
         PublicDeviceError::Storage { .. } => PublicApiError::Unavailable,
     }
 }

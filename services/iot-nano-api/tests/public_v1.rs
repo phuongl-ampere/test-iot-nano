@@ -602,6 +602,63 @@ async fn public_device_asset_assignment_requires_manager_without_listing_or_deta
 }
 
 #[tokio::test]
+async fn public_device_profile_reference_conflicts_are_client_errors() {
+    let (_directory, _store, app) = public_app().await;
+    let write_token = oauth_bearer_token(&app, "devices:write").await;
+    let unavailable_profile_id = Uuid::now_v7();
+
+    let create_conflict = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices")
+                .header(AUTHORIZATION, format!("Bearer {write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"device_id":"public-unavailable-profile-create","metadata":{{}},"device_profile_id":"{unavailable_profile_id}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(create_conflict, StatusCode::CONFLICT, "conflict").await;
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices")
+                .header(AUTHORIZATION, format!("Bearer {write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"device_id":"public-unavailable-profile-update","metadata":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let update_conflict = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/devices/public-unavailable-profile-update")
+                .header(AUTHORIZATION, format!("Bearer {write_token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"device_profile_id":"{unavailable_profile_id}"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_public_error(update_conflict, StatusCode::CONFLICT, "conflict").await;
+}
+
+#[tokio::test]
 async fn public_device_mutations_deny_unknown_and_inaccessible_targets_without_disclosure() {
     let (_directory, store, app) = public_app().await;
     let admin_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")

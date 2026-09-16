@@ -394,6 +394,110 @@ async fn sqlite_public_device_asset_assignment_requires_asset_manager_permission
 }
 
 #[tokio::test]
+async fn sqlite_public_device_create_rejects_an_unavailable_profile_atomically() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let user_id = Uuid::now_v7();
+    let unavailable_profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, 'public-profile-create-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let principal = PublicPrincipal {
+        user_id: Some(user_id),
+        app_id: "public-profile-create-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+
+    let result = PublicApiRepository::create_public_device(
+        &store,
+        &principal,
+        NewPublicDevice {
+            device_id: "public-unavailable-profile-create".to_owned(),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: Some(unavailable_profile_id),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        format!("public device profile is unavailable: {unavailable_profile_id}")
+    );
+    assert!(
+        PublicApiRepository::get_public_device(&store, "public-unavailable-profile-create")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_public_device_update_rejects_an_unavailable_profile_atomically() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let user_id = Uuid::now_v7();
+    let unavailable_profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, 'public-profile-update-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let principal = PublicPrincipal {
+        user_id: Some(user_id),
+        app_id: "public-profile-update-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let device = PublicApiRepository::create_public_device(
+        &store,
+        &principal,
+        NewPublicDevice {
+            device_id: "public-unavailable-profile-update".to_owned(),
+            display_name: Some("original".to_owned()),
+            metadata: json!({"version": 1}),
+            asset_id: None,
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = PublicApiRepository::update_public_device(
+        &store,
+        &principal,
+        &device.device_id,
+        NewPublicDevice {
+            device_id: device.device_id.clone(),
+            display_name: Some("updated".to_owned()),
+            metadata: json!({"version": 2}),
+            asset_id: None,
+            device_profile_id: Some(unavailable_profile_id),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        format!("public device profile is unavailable: {unavailable_profile_id}")
+    );
+    assert_eq!(
+        PublicApiRepository::get_public_device(&store, &device.device_id)
+            .await
+            .unwrap(),
+        Some(device)
+    );
+}
+
+#[tokio::test]
 async fn sqlite_public_device_permission_requires_an_application_grant() {
     let (_directory, store) = sqlite_store().await;
     let owning_application = PublicPrincipal {
@@ -1032,6 +1136,55 @@ async fn timescale_public_device_permission_requires_an_application_grant() {
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_device_create_rejects_an_unavailable_profile_atomically() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let unavailable_profile_id = Uuid::now_v7();
+    let result = PublicApiRepository::create_public_device(
+        &store,
+        &PublicPrincipal {
+            user_id: None,
+            app_id: format!("timescale-unavailable-profile-app-{unavailable_profile_id}"),
+            account_class: AccountClass::User,
+        },
+        NewPublicDevice {
+            device_id: format!("timescale-unavailable-profile-{unavailable_profile_id}"),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: Some(unavailable_profile_id),
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(PublicDeviceError::DeviceProfileUnavailable(id)) if id == unavailable_profile_id
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_public_device_assignment_waits_for_asset_manager_grant_lock() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
@@ -1126,6 +1279,80 @@ async fn timescale_public_device_assignment_waits_for_asset_manager_grant_lock()
 
     if let Ok(result) = timeout(Duration::from_millis(100), &mut assignment).await {
         panic!("asset manager grant lock was bypassed: {result:?}");
+    }
+    sqlx::query("COMMIT").execute(&mut gate).await.unwrap();
+    assert!(assignment.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url.clone()),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let unique = Uuid::now_v7();
+    let device_profile_id = Uuid::now_v7();
+    let pool = store.timescale_pool().unwrap();
+    sqlx::query("INSERT INTO device_profiles (id, name) VALUES ($1, $2)")
+        .bind(device_profile_id)
+        .bind(format!("timescale-device-profile-lock-{unique}"))
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let mut gate = PgConnection::connect(&database_url).await.unwrap();
+    sqlx::query("SET search_path TO iot_nano")
+        .execute(&mut gate)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN").execute(&mut gate).await.unwrap();
+    sqlx::query("SELECT id FROM device_profiles WHERE id = $1 FOR UPDATE")
+        .bind(device_profile_id)
+        .execute(&mut gate)
+        .await
+        .unwrap();
+
+    let assigning_store = store.clone();
+    let mut assignment = tokio::spawn(async move {
+        PublicApiRepository::create_public_device(
+            &assigning_store,
+            &PublicPrincipal {
+                user_id: None,
+                app_id: format!("timescale-device-profile-lock-app-{unique}"),
+                account_class: AccountClass::User,
+            },
+            NewPublicDevice {
+                device_id: format!("timescale-device-profile-lock-device-{unique}"),
+                display_name: None,
+                metadata: json!({}),
+                asset_id: None,
+                device_profile_id: Some(device_profile_id),
+            },
+        )
+        .await
+    });
+
+    if let Ok(result) = timeout(Duration::from_millis(100), &mut assignment).await {
+        panic!("device profile lock was bypassed: {result:?}");
     }
     sqlx::query("COMMIT").execute(&mut gate).await.unwrap();
     assert!(assignment.await.unwrap().is_ok());

@@ -40,6 +40,8 @@ pub struct NewPublicDevice {
 pub enum PublicDeviceError {
     #[error("public device asset is unavailable: {0}")]
     AssetUnavailable(Uuid),
+    #[error("public device profile is unavailable: {0}")]
+    DeviceProfileUnavailable(Uuid),
     #[error("public device storage operation failed")]
     Storage {
         #[source]
@@ -156,7 +158,7 @@ pub trait PublicApiRepository: Send + Sync {
         principal: &'a PublicPrincipal,
         device_id: &'a str,
         device: NewPublicDevice,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PublicDeviceError>> + Send + 'a>>;
     fn delete_public_device<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
@@ -320,7 +322,7 @@ impl PublicApiRepository for PlatformStore {
         principal: &'a PublicPrincipal,
         device_id: &'a str,
         device: NewPublicDevice,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PublicDeviceError>> + Send + 'a>>
     {
         Box::pin(async move { update_public_device(self, principal, device_id, device).await })
     }
@@ -699,6 +701,14 @@ async fn create_public_device(
                     return Err(PublicDeviceError::AssetUnavailable(asset_id));
                 }
             }
+            if let Some(device_profile_id) = device.device_profile_id {
+                if !sqlite_public_device_profile_exists(&mut transaction, device_profile_id).await?
+                {
+                    return Err(PublicDeviceError::DeviceProfileUnavailable(
+                        device_profile_id,
+                    ));
+                }
+            }
             let row = sqlx::query(
                 "INSERT INTO devices (
                     device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
@@ -713,7 +723,10 @@ async fn create_public_device(
             .bind(device.device_profile_id.map(|id| id.to_string()))
             .bind(principal.user_id.map(|id| id.to_string()))
             .fetch_one(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                map_public_device_reference_error(error, device.asset_id, device.device_profile_id)
+            })?;
             let created = sqlite_device_record(row)?;
             if principal.user_id.is_none() {
                 sqlx::query(
@@ -741,6 +754,15 @@ async fn create_public_device(
                     return Err(PublicDeviceError::AssetUnavailable(asset_id));
                 }
             }
+            if let Some(device_profile_id) = device.device_profile_id {
+                if !timescale_public_device_profile_exists(&mut transaction, device_profile_id)
+                    .await?
+                {
+                    return Err(PublicDeviceError::DeviceProfileUnavailable(
+                        device_profile_id,
+                    ));
+                }
+            }
             let row = sqlx::query(
                 "INSERT INTO devices (
                     device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
@@ -755,7 +777,10 @@ async fn create_public_device(
             .bind(device.device_profile_id)
             .bind(principal.user_id)
             .fetch_one(&mut *transaction)
-            .await?;
+            .await
+            .map_err(|error| {
+                map_public_device_reference_error(error, device.asset_id, device.device_profile_id)
+            })?;
             let created = timescale_device_record(row)?;
             if principal.user_id.is_none() {
                 sqlx::query(
@@ -780,7 +805,7 @@ async fn update_public_device(
     principal: &PublicPrincipal,
     device_id: &str,
     device: NewPublicDevice,
-) -> Result<Option<PublicDevice>, PlatformStoreError> {
+) -> Result<Option<PublicDevice>, PublicDeviceError> {
     if !public_device_permission(store, principal, device_id)
         .await?
         .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
@@ -797,6 +822,14 @@ async fn update_public_device(
                     return Ok(None);
                 }
             }
+            if let Some(device_profile_id) = device.device_profile_id {
+                if !sqlite_public_device_profile_exists(&mut transaction, device_profile_id).await?
+                {
+                    return Err(PublicDeviceError::DeviceProfileUnavailable(
+                        device_profile_id,
+                    ));
+                }
+            }
             let updated = sqlx::query(
                 "UPDATE devices
                  SET display_name = ?, metadata = ?, asset_id = ?, device_profile_id = ?
@@ -809,7 +842,10 @@ async fn update_public_device(
             .bind(device.device_profile_id.map(|id| id.to_string()))
             .bind(device_id)
             .fetch_optional(&mut *transaction)
-            .await?
+            .await
+            .map_err(|error| {
+                map_public_device_reference_error(error, device.asset_id, device.device_profile_id)
+            })?
             .map(sqlite_device_record)
             .transpose()?;
             transaction.commit().await?;
@@ -826,6 +862,15 @@ async fn update_public_device(
                     return Ok(None);
                 }
             }
+            if let Some(device_profile_id) = device.device_profile_id {
+                if !timescale_public_device_profile_exists(&mut transaction, device_profile_id)
+                    .await?
+                {
+                    return Err(PublicDeviceError::DeviceProfileUnavailable(
+                        device_profile_id,
+                    ));
+                }
+            }
             let updated = sqlx::query(
                 "UPDATE devices
                  SET display_name = $2, metadata = $3, asset_id = $4, device_profile_id = $5
@@ -838,7 +883,10 @@ async fn update_public_device(
             .bind(device.asset_id)
             .bind(device.device_profile_id)
             .fetch_optional(&mut *transaction)
-            .await?
+            .await
+            .map_err(|error| {
+                map_public_device_reference_error(error, device.asset_id, device.device_profile_id)
+            })?
             .map(timescale_device_record)
             .transpose()?;
             transaction.commit().await?;
@@ -903,6 +951,19 @@ async fn sqlite_public_asset_manager_permission(
     .await?;
     Ok(strongest_share_permission(permissions)
         .is_some_and(|permission| permission.allows(ResourcePermission::Manager)))
+}
+
+async fn sqlite_public_device_profile_exists(
+    transaction: &mut Transaction<'_, Sqlite>,
+    device_profile_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM device_profiles WHERE id = ?")
+            .bind(device_profile_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some(),
+    )
 }
 
 async fn lock_timescale_public_device_asset_assignment(
@@ -1025,6 +1086,41 @@ async fn timescale_public_asset_manager_permission(
     .await?;
     Ok(strongest_share_permission(permissions)
         .is_some_and(|permission| permission.allows(ResourcePermission::Manager)))
+}
+
+async fn timescale_public_device_profile_exists(
+    transaction: &mut Transaction<'_, Postgres>,
+    device_profile_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    Ok(
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM device_profiles WHERE id = $1 FOR KEY SHARE")
+            .bind(device_profile_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some(),
+    )
+}
+
+fn map_public_device_reference_error(
+    error: sqlx::Error,
+    asset_id: Option<Uuid>,
+    device_profile_id: Option<Uuid>,
+) -> PublicDeviceError {
+    let Some(database) = error.as_database_error() else {
+        return PublicDeviceError::from(error);
+    };
+    if database.is_foreign_key_violation() {
+        match (database.constraint(), asset_id, device_profile_id) {
+            (Some("devices_asset_id_fkey"), Some(asset_id), _) => {
+                return PublicDeviceError::AssetUnavailable(asset_id);
+            }
+            (Some("devices_device_profile_id_fkey"), _, Some(device_profile_id)) => {
+                return PublicDeviceError::DeviceProfileUnavailable(device_profile_id);
+            }
+            _ => {}
+        }
+    }
+    PublicDeviceError::from(error)
 }
 
 async fn delete_public_device(
