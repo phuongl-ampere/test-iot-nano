@@ -658,6 +658,44 @@ fn runtime_path_contains_no_internal_http_or_service_secret_boundary() {
     }
 }
 
+#[test]
+fn mqttd_source_contains_no_retired_internal_http_boundary() {
+    for path in [
+        "src/config.rs",
+        "src/lib.rs",
+        "src/management.rs",
+        "src/policy.rs",
+        "src/transport.rs",
+        "Cargo.toml",
+    ] {
+        let source =
+            std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        for forbidden in [
+            "HttpDeviceAuthenticator",
+            "HttpStreamUplinkForwarder",
+            "HttpRpcResponseForwarder",
+            "HttpPolicy",
+            "HttpPolicyRequest",
+            "HttpTokenAuthenticator",
+            "HttpAuthorizationConfig",
+            "DeviceTransportEndpoints",
+            "RuntimeConfigurationError",
+            "SessionResolutionRequest",
+            "InternalRpcPublishRequest",
+            "InternalSessionRevokeRequest",
+            "http_authorization",
+            "reqwest",
+            "/internal/",
+            "x-iot-nano-",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{path} contains retired boundary {forbidden:?}"
+            );
+        }
+    }
+}
+
 async fn start_runtime(
     root: &Path,
     plaintext_address: SocketAddr,

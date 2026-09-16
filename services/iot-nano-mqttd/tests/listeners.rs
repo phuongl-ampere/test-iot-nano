@@ -134,7 +134,6 @@ async fn public_listeners_route_real_mqtt_versions_and_require_tls() {
         max_connections: 100,
         max_payload_size: 1024,
         max_inflight_count: 10,
-        token_authenticator: None,
         auth_handler: None,
         authorization_handler: None,
     })

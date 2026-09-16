@@ -160,14 +160,6 @@ async fn status(State(state): State<ManagementState>) -> impl IntoResponse {
         {
             capabilities.push(crate::Capability::StaticAcl);
         }
-        if state
-            .config
-            .http_authorization
-            .as_ref()
-            .is_some_and(|authorization| authorization.enabled)
-        {
-            capabilities.push(crate::Capability::HttpAuthorization);
-        }
     }
     axum::Json(json!({
         "status": "ok",

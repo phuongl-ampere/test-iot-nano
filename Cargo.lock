@@ -1788,7 +1788,6 @@ dependencies = [
  "iot-core",
  "iot-mqtt-core",
  "iot-nano-stream",
- "reqwest",
  "rumqttc",
  "rusqlite",
  "rustls-pemfile",

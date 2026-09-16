@@ -7,10 +7,9 @@ use axum::{
 use base64::Engine as _;
 use iot_nano_mqttd as iot_mqttd;
 use iot_nano_mqttd::{
-    BrokerFileConfig, Capability, ConfigError, DeviceTransportEndpoints, ListenerConfiguration,
-    ManagementConfig, RuntimeAddressConfiguration, RuntimeConfigurationError,
-    management_router_with_config, management_router_with_config_and_runtime_and_policy,
-    resolve_runtime_configuration,
+    BrokerFileConfig, Capability, ConfigError, ListenerConfiguration, ManagementConfig,
+    RuntimeAddressConfiguration, management_router_with_config,
+    management_router_with_config_and_runtime_and_policy, resolve_runtime_configuration,
 };
 use rumqttd::Transport;
 use tower::ServiceExt;
@@ -108,7 +107,7 @@ fn sqlite_storage_configuration_is_enabled_with_a_database_path() {
 }
 
 #[test]
-fn enabled_policy_configurations_are_complete_and_mutually_exclusive() {
+fn static_acl_configuration_requires_users() {
     let mut static_config = minimal_config();
     static_config.static_acl = Some(iot_mqttd::StaticAclConfig {
         enabled: true,
@@ -135,47 +134,10 @@ fn enabled_policy_configurations_are_complete_and_mutually_exclusive() {
             ..
         })
     ));
-
-    let mut http_config = minimal_config();
-    http_config.http_authorization = Some(iot_mqttd::HttpAuthorizationConfig {
-        enabled: true,
-        url: "http://127.0.0.1:8080/authorize".into(),
-        secret: "authorization-secret".into(),
-        timeout_ms: 100,
-        cache_ttl_seconds: 1,
-        cache_capacity: 8,
-        deny_action: "disconnect".into(),
-    });
-    assert!(http_config.validate().is_ok());
-
-    let mut missing_http_url = http_config.clone();
-    missing_http_url
-        .http_authorization
-        .as_mut()
-        .unwrap()
-        .url
-        .clear();
-    assert!(matches!(
-        missing_http_url.validate(),
-        Err(ConfigError::InvalidValue {
-            field: "http_authorization.url",
-            ..
-        })
-    ));
-
-    let mut both = static_config;
-    both.http_authorization = http_config.http_authorization;
-    assert!(matches!(
-        both.validate(),
-        Err(ConfigError::InvalidValue {
-            field: "policy",
-            ..
-        })
-    ));
 }
 
 #[test]
-fn static_users_and_policy_cache_settings_are_validated() {
+fn static_users_are_validated() {
     let mut duplicate_users = minimal_config();
     duplicate_users.static_acl = Some(iot_mqttd::StaticAclConfig {
         enabled: true,
@@ -230,42 +192,6 @@ fn static_users_and_policy_cache_settings_are_validated() {
         unsupported_action.validate(),
         Err(ConfigError::InvalidValue {
             field: "static_acl.deny_action",
-            ..
-        })
-    ));
-
-    let mut invalid_cache = minimal_config();
-    invalid_cache.http_authorization = Some(iot_mqttd::HttpAuthorizationConfig {
-        enabled: true,
-        url: "http://127.0.0.1:8080/authorize".into(),
-        secret: "authorization-secret".into(),
-        timeout_ms: 100,
-        cache_ttl_seconds: 0,
-        cache_capacity: 0,
-        deny_action: "disconnect".into(),
-    });
-    assert!(matches!(
-        invalid_cache.validate(),
-        Err(ConfigError::InvalidValue {
-            field: "http_authorization.cache_capacity",
-            ..
-        })
-    ));
-
-    invalid_cache
-        .http_authorization
-        .as_mut()
-        .unwrap()
-        .cache_capacity = 8;
-    invalid_cache
-        .http_authorization
-        .as_mut()
-        .unwrap()
-        .cache_ttl_seconds = u64::MAX;
-    assert!(matches!(
-        invalid_cache.validate(),
-        Err(ConfigError::InvalidValue {
-            field: "http_authorization.cache_ttl_seconds",
             ..
         })
     ));
@@ -543,11 +469,7 @@ fn republish_rule_configuration_requires_a_non_looping_topic_mapping() {
 }
 
 #[test]
-fn config_mode_controls_native_device_transport_activation() {
-    let endpoints = DeviceTransportEndpoints {
-        api_base_url: Some("http://api".into()),
-        transport_secret: Some("transport-secret".into()),
-    };
+fn config_mode_controls_native_device_transport_backends() {
     let disabled = resolve_runtime_configuration(
         Some(&minimal_config()),
         RuntimeAddressConfiguration::default(),
@@ -556,11 +478,6 @@ fn config_mode_controls_native_device_transport_activation() {
     assert!(!disabled.device_transport_enabled);
     assert!(disabled.backends.device_v311.is_none());
     assert!(disabled.backends.device_v5.is_none());
-    assert!(
-        disabled
-            .validate_device_transport_endpoints(&endpoints)
-            .is_ok()
-    );
 
     let mut enabled_config = minimal_config();
     enabled_config.device_transport.enabled = true;
@@ -577,17 +494,6 @@ fn config_mode_controls_native_device_transport_activation() {
         resolved.backends.device_v5,
         Some(enabled_config.listeners.device_v5_backend_address)
     );
-    let incomplete_endpoints = DeviceTransportEndpoints {
-        api_base_url: None,
-        transport_secret: None,
-    };
-    let error = resolved
-        .validate_device_transport_endpoints(&incomplete_endpoints)
-        .expect_err("enabled native transport must require endpoint dependencies");
-    assert!(matches!(
-        error,
-        RuntimeConfigurationError::IncompleteDeviceTransportEndpoints
-    ));
 }
 
 #[tokio::test]

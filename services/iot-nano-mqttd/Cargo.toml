@@ -13,7 +13,6 @@ futures-util.workspace = true
 iot-core = { path = "../../crates/iot-core" }
 iot-nano-stream = { path = "../iot-nano-stream" }
 rumqttd = { package = "iot-mqtt-core", path = "vendor/rumqttd" }
-reqwest.workspace = true
 rumqttc.workspace = true
 rusqlite = "0.37.0"
 serde.workspace = true
@@ -21,7 +20,7 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
+tokio-rustls = { workspace = true, features = ["ring"] }
 tokio-util.workspace = true
 rustls-pemfile.workspace = true
 thiserror.workspace = true

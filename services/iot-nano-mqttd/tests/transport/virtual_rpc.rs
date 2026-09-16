@@ -102,7 +102,11 @@ impl UplinkForwarder for FailingUplink {
         _token: &str,
         _message: TransportUplink,
     ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
-        Box::pin(async { Err(TransportError::UplinkRejected(502)) })
+        Box::pin(async {
+            Err(TransportError::StreamAppendFailed(
+                "injected failure".into(),
+            ))
+        })
     }
 }
 
@@ -154,7 +158,7 @@ async fn unregisters_a_subscribed_session_when_uplink_forwarding_fails() {
 
     assert!(matches!(
         server_task.await.unwrap(),
-        Err(TransportError::UplinkRejected(502))
+        Err(TransportError::StreamAppendFailed(message)) if message == "injected failure"
     ));
     assert!(router.active_device("device-a").await.is_none());
 }

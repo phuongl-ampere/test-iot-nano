@@ -16,13 +16,11 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 
-use reqwest::StatusCode;
 use rumqttd::{
     AuthHandler, AuthorizationHandler, BridgeConfig as CoreBridgeConfig, Broker,
     BrokerHandle as CoreBrokerHandle, Config, ConnectionSettings, InProcessBroker,
     InProcessBrokerControl, RouterConfig, ServerSettings, TlsConfig,
 };
-use serde::Serialize;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -43,9 +41,9 @@ mod transport;
 
 pub use config::{
     AclRule, BridgeConfig, BrokerFileConfig, BrokerLimits, Capability, ConfigError,
-    DeviceTransportConfig, HttpAuthorizationConfig, ListenersConfig, ManagementConfig,
-    NativeDeviceProtocol, QuicListenerConfig, RuleConfig, StaticAclConfig, StaticUser,
-    StorageConfig, TcpListenerConfig, TlsListenerConfig, WebSocketListenerConfig,
+    DeviceTransportConfig, ListenersConfig, ManagementConfig, NativeDeviceProtocol,
+    QuicListenerConfig, RuleConfig, StaticAclConfig, StaticUser, StorageConfig, TcpListenerConfig,
+    TlsListenerConfig, WebSocketListenerConfig,
 };
 pub use management::{
     management_router, management_router_with_config, management_router_with_config_and_runtime,
@@ -68,10 +66,9 @@ pub use runtime::{
 };
 pub use storage::SqliteStorage;
 pub use transport::{
-    AuthenticatedDevice, DeviceAuthenticator, HttpDeviceAuthenticator, HttpRpcResponseForwarder,
-    HttpStreamUplinkForwarder, MqttdDeviceTransport, RpcResponseForwarder, RpcSessionRouter,
-    SessionError, SessionRegistration, TransportAuthRequest, TransportError, TransportRpcResponse,
-    TransportUplink, UplinkForwarder,
+    AuthenticatedDevice, DeviceAuthenticator, MqttdDeviceTransport, RpcResponseForwarder,
+    RpcSessionRouter, SessionError, SessionRegistration, TransportAuthRequest, TransportError,
+    TransportRpcResponse, TransportUplink, UplinkForwarder,
 };
 
 pub struct BrokerLifecycleHandle {
@@ -625,20 +622,6 @@ impl Default for RuntimeAddressConfiguration {
 }
 
 #[derive(Debug, Clone)]
-pub struct DeviceTransportEndpoints {
-    pub api_base_url: Option<String>,
-    pub transport_secret: Option<String>,
-}
-
-#[derive(Debug, Error)]
-pub enum RuntimeConfigurationError {
-    #[error(
-        "native device transport is enabled but API, transport secret, ingest webhook URL, and ingest webhook secret are all required"
-    )]
-    IncompleteDeviceTransportEndpoints,
-}
-
-#[derive(Debug, Clone)]
 pub struct ResolvedRuntimeConfiguration {
     pub listener: ListenerConfiguration,
     pub backends: ProtocolBackends,
@@ -646,7 +629,6 @@ pub struct ResolvedRuntimeConfiguration {
     pub device_v5_backend_address: SocketAddr,
     pub device_transport_enabled: bool,
     device_transport_protocol: NativeDeviceProtocol,
-    config_mode: bool,
 }
 
 impl ResolvedRuntimeConfiguration {
@@ -664,30 +646,6 @@ impl ResolvedRuntimeConfiguration {
             ))
         .then_some(self.device_v5_backend_address);
     }
-
-    pub fn device_transport_activation(
-        &self,
-        endpoints: &DeviceTransportEndpoints,
-    ) -> Result<bool, RuntimeConfigurationError> {
-        let complete = endpoints.api_base_url.is_some() && endpoints.transport_secret.is_some();
-        if self.config_mode {
-            if self.device_transport_enabled && !complete {
-                return Err(RuntimeConfigurationError::IncompleteDeviceTransportEndpoints);
-            }
-            return Ok(self.device_transport_enabled);
-        }
-        if !complete && (endpoints.api_base_url.is_some() || endpoints.transport_secret.is_some()) {
-            return Err(RuntimeConfigurationError::IncompleteDeviceTransportEndpoints);
-        }
-        Ok(complete)
-    }
-
-    pub fn validate_device_transport_endpoints(
-        &self,
-        endpoints: &DeviceTransportEndpoints,
-    ) -> Result<(), RuntimeConfigurationError> {
-        self.device_transport_activation(endpoints).map(|_| ())
-    }
 }
 
 pub fn resolve_runtime_configuration(
@@ -700,7 +658,6 @@ pub fn resolve_runtime_configuration(
         device_v5_backend_address,
         device_transport_enabled,
         device_transport_protocol,
-        config_mode,
     ) = match file_config {
         Some(config) => {
             let listener = config.to_listener_configuration()?;
@@ -710,7 +667,6 @@ pub fn resolve_runtime_configuration(
                 config.listeners.device_v5_backend_address,
                 config.device_transport.enabled,
                 config.device_transport.protocol,
-                true,
             )
         }
         None => {
@@ -727,7 +683,6 @@ pub fn resolve_runtime_configuration(
                 max_connections: fallback.max_connections,
                 max_payload_size: fallback.max_payload_size,
                 max_inflight_count: fallback.max_inflight_count,
-                token_authenticator: None,
                 auth_handler: None,
                 authorization_handler: None,
             };
@@ -737,7 +692,6 @@ pub fn resolve_runtime_configuration(
                 fallback.device_v5_backend_address,
                 false,
                 NativeDeviceProtocol::Both,
-                false,
             )
         }
     };
@@ -753,7 +707,6 @@ pub fn resolve_runtime_configuration(
         device_v5_backend_address,
         device_transport_enabled,
         device_transport_protocol,
-        config_mode,
     })
     .map(|mut resolved| {
         resolved.set_device_transport_backends(resolved.device_transport_enabled);
@@ -917,7 +870,6 @@ async fn start_broker_for_public_worker_test() -> BrokerLifecycleHandle {
         max_connections: 32,
         max_payload_size: 1024 * 1024,
         max_inflight_count: 16,
-        token_authenticator: None,
         auth_handler: None,
         authorization_handler: None,
     })
@@ -2431,7 +2383,6 @@ pub struct ListenerConfiguration {
     pub max_connections: usize,
     pub max_payload_size: usize,
     pub max_inflight_count: usize,
-    pub token_authenticator: Option<HttpTokenAuthenticator>,
     pub auth_handler: Option<AuthHandler>,
     pub authorization_handler: Option<AuthorizationHandler>,
 }
@@ -2452,68 +2403,12 @@ impl std::fmt::Debug for ListenerConfiguration {
             .field("max_connections", &self.max_connections)
             .field("max_payload_size", &self.max_payload_size)
             .field("max_inflight_count", &self.max_inflight_count)
-            .field("token_authenticator", &self.token_authenticator.is_some())
             .field("auth_handler", &self.auth_handler.is_some())
             .field(
                 "authorization_handler",
                 &self.authorization_handler.is_some(),
             )
             .finish()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpTokenAuthenticator {
-    client: reqwest::Client,
-    session_resolution_url: String,
-    secret: String,
-}
-
-#[derive(Serialize)]
-struct SessionResolutionRequest<'a> {
-    client_id: &'a str,
-    username: &'a str,
-    password: &'a str,
-}
-
-impl HttpTokenAuthenticator {
-    pub fn new(api_base_url: &str, secret: &str) -> Result<Self, MqttdError> {
-        if secret.len() < 32
-            || !secret.is_ascii()
-            || secret.bytes().any(|value| value.is_ascii_whitespace())
-        {
-            return Err(MqttdError::InvalidTransportSecret);
-        }
-        Ok(Self {
-            client: reqwest::Client::new(),
-            session_resolution_url: format!(
-                "{}/internal/mqttd/session-resolution",
-                api_base_url.trim_end_matches('/')
-            ),
-            secret: secret.to_owned(),
-        })
-    }
-
-    pub async fn authenticate(
-        &self,
-        client_id: String,
-        username: String,
-        password: String,
-    ) -> bool {
-        if username.is_empty() || !password.is_empty() {
-            return false;
-        }
-        self.client
-            .post(&self.session_resolution_url)
-            .header("x-iot-nano-mqttd-api-secret", &self.secret)
-            .json(&SessionResolutionRequest {
-                client_id: &client_id,
-                username: &username,
-                password: &password,
-            })
-            .send()
-            .await
-            .is_ok_and(|response| response.status() == StatusCode::OK)
     }
 }
 
@@ -2525,8 +2420,6 @@ pub enum MqttdError {
     MissingKey(PathBuf),
     #[error("TLS configuration failed")]
     Tls(#[source] Box<dyn std::error::Error + Send + Sync>),
-    #[error("IOT_NANO_MQTTD_API_SECRET must use at least 32 ASCII non-whitespace characters")]
-    InvalidTransportSecret,
     #[error("MQTT public listener worker {worker} failed: {source}")]
     PublicWorkerIo {
         worker: String,
@@ -2566,47 +2459,22 @@ pub fn broker_config(configuration: &ListenerConfiguration) -> Result<Config, Mq
         authorization_handler: configuration.authorization_handler.clone(),
         dynamic_filters: true,
     };
-    let mut v311 = ServerSettings {
+    let v311 = ServerSettings {
         name: "iot-mqttd-v311".to_owned(),
         listen: configuration.v311_backend_address,
         tls: None,
         next_connection_delay_ms: 1,
         connections: connections.clone(),
     };
-    let mut v5 = ServerSettings {
+    let v5 = ServerSettings {
         name: "iot-mqttd-v5".to_owned(),
         listen: configuration.v5_backend_address,
         tls: None,
         next_connection_delay_ms: 1,
         connections: connections.clone(),
     };
-    if configuration.auth_handler.is_none() {
-        if let Some(authenticator) = &configuration.token_authenticator {
-            let v311_authenticator = authenticator.clone();
-            v311.connections
-                .set_auth_handler(move |client_id, username, password| {
-                    let authenticator = v311_authenticator.clone();
-                    async move {
-                        authenticator
-                            .authenticate(client_id, username, password)
-                            .await
-                    }
-                });
-            let v5_authenticator = authenticator.clone();
-            v5.connections
-                .set_auth_handler(move |client_id, username, password| {
-                    let authenticator = v5_authenticator.clone();
-                    async move {
-                        authenticator
-                            .authenticate(client_id, username, password)
-                            .await
-                    }
-                });
-        }
-    }
-
     let ws = configuration.websocket_address.map(|address| {
-        let mut ws = ServerSettings {
+        let ws = ServerSettings {
             name: "iot-mqttd-ws-v311".to_owned(),
             listen: address,
             tls: configuration.websocket_tls.then(|| TlsConfig::Rustls {
@@ -2617,20 +2485,6 @@ pub fn broker_config(configuration: &ListenerConfiguration) -> Result<Config, Mq
             next_connection_delay_ms: 1,
             connections,
         };
-        if configuration.auth_handler.is_none() {
-            if let Some(authenticator) = &configuration.token_authenticator {
-                let authenticator = authenticator.clone();
-                ws.connections
-                    .set_auth_handler(move |client_id, username, password| {
-                        let authenticator = authenticator.clone();
-                        async move {
-                            authenticator
-                                .authenticate(client_id, username, password)
-                                .await
-                        }
-                    });
-            }
-        }
         let mut listeners = HashMap::new();
         listeners.insert("ws-v311".to_owned(), ws);
         listeners

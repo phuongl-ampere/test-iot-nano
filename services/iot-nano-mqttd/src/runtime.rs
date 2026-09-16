@@ -420,7 +420,6 @@ impl MqttRuntime {
                 max_connections: config.listeners.max_connections,
                 max_payload_size: config.listeners.max_payload_size,
                 max_inflight_count: config.listeners.max_inflight_count,
-                token_authenticator: None,
                 auth_handler: None,
                 authorization_handler: None,
             },

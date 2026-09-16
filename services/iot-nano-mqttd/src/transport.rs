@@ -11,15 +11,9 @@ use std::{
     time::Duration,
 };
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    routing::post,
-};
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
-use iot_core::{DeviceTelemetryPayload, GatewayTelemetryPayload, RpcMode, RpcRequest};
+use iot_core::{RpcMode, RpcRequest};
 use iot_nano_stream::StreamPort;
 use rumqttc::v5::mqttbytes::{
     QoS as V5QoS,
@@ -44,7 +38,7 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::ports::{
-    CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization, LocalDeviceAuthenticator,
+    CommandResponsePort, DeviceAuthorizationPort, LocalDeviceAuthenticator,
     LocalRpcResponseForwarder, LocalStreamUplinkForwarder,
 };
 
@@ -502,320 +496,6 @@ pub trait RpcResponseForwarder: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct HttpDeviceAuthenticator {
-    client: reqwest::Client,
-    session_url: String,
-    authorization_url: String,
-    secret: Arc<str>,
-}
-
-impl HttpDeviceAuthenticator {
-    pub fn new(api_base_url: &str, secret: impl AsRef<str>) -> Result<Self, TransportError> {
-        let session_url = format!(
-            "{}/internal/mqttd/session-resolution",
-            api_base_url.trim_end_matches('/')
-        );
-        reqwest::Url::parse(&session_url)
-            .map_err(|error| TransportError::Configuration(error.to_string()))?;
-        let authorization_url = format!(
-            "{}/internal/mqttd/session-authorization",
-            api_base_url.trim_end_matches('/')
-        );
-        Ok(Self {
-            client: reqwest::Client::new(),
-            session_url,
-            authorization_url,
-            secret: Arc::from(secret.as_ref()),
-        })
-    }
-}
-
-impl DeviceAuthenticator for HttpDeviceAuthenticator {
-    fn authenticate(
-        &self,
-        request: TransportAuthRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<AuthenticatedDevice, TransportError>> + Send + '_>>
-    {
-        let client = self.client.clone();
-        let session_url = self.session_url.clone();
-        let secret = Arc::clone(&self.secret);
-        Box::pin(async move {
-            let response = client
-                .post(session_url)
-                .header("x-iot-nano-mqttd-api-secret", secret.as_ref())
-                .json(&request)
-                .send()
-                .await?;
-            if matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ) {
-                return Err(TransportError::Unauthorized);
-            }
-            if !response.status().is_success() {
-                return Err(TransportError::AuthenticationServiceUnavailable(
-                    response.status().as_u16(),
-                ));
-            }
-            response
-                .json::<AuthenticatedDevice>()
-                .await
-                .map_err(Into::into)
-        })
-    }
-
-    fn authorize_session(
-        &self,
-        device: AuthenticatedDevice,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
-        let client = self.client.clone();
-        let authorization_url = self.authorization_url.clone();
-        let secret = Arc::clone(&self.secret);
-        Box::pin(async move {
-            let response = client
-                .post(authorization_url)
-                .header("x-iot-nano-mqttd-api-secret", secret.as_ref())
-                .json(&serde_json::json!({
-                    "device_id": device.device_id,
-                    "token_id": device.token_id,
-                }))
-                .send()
-                .await?;
-            if matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ) {
-                return Err(TransportError::Unauthorized);
-            }
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(TransportError::AuthenticationServiceUnavailable(
-                    response.status().as_u16(),
-                ))
-            }
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct HttpStreamUplinkForwarder {
-    client: reqwest::Client,
-    append_url: String,
-    gateway_append_url: String,
-    gateway_authorization: Option<(String, Arc<str>)>,
-    secret: Arc<str>,
-}
-
-impl HttpStreamUplinkForwarder {
-    pub fn new(stream_base_url: &str, secret: impl AsRef<str>) -> Result<Self, TransportError> {
-        let append_url = format!(
-            "{}/internal/streams/telemetry/append",
-            stream_base_url.trim_end_matches('/')
-        );
-        reqwest::Url::parse(&append_url)
-            .map_err(|error| TransportError::Configuration(error.to_string()))?;
-        Ok(Self {
-            client: reqwest::Client::new(),
-            append_url,
-            gateway_append_url: format!(
-                "{}/internal/streams/gateway/append",
-                stream_base_url.trim_end_matches('/')
-            ),
-            gateway_authorization: None,
-            secret: Arc::from(secret.as_ref()),
-        })
-    }
-
-    pub fn with_gateway_authorization(
-        mut self,
-        api_base_url: &str,
-        secret: impl AsRef<str>,
-    ) -> Result<Self, TransportError> {
-        let url = format!(
-            "{}/internal/mqttd/gateway-authorization",
-            api_base_url.trim_end_matches('/')
-        );
-        reqwest::Url::parse(&url)
-            .map_err(|error| TransportError::Configuration(error.to_string()))?;
-        self.gateway_authorization = Some((url, Arc::from(secret.as_ref())));
-        Ok(self)
-    }
-}
-
-impl UplinkForwarder for HttpStreamUplinkForwarder {
-    fn forward(
-        &self,
-        _token: &str,
-        message: TransportUplink,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
-        let client = self.client.clone();
-        let append_url = self.append_url.clone();
-        let gateway_append_url = self.gateway_append_url.clone();
-        let gateway_authorization = self.gateway_authorization.clone();
-        let secret = Arc::clone(&self.secret);
-        Box::pin(async move {
-            if message.topic == DIRECT_TELEMETRY_TOPIC && !message.device.is_gateway {
-                let payload: DeviceTelemetryPayload = serde_json::from_slice(&message.payload)
-                    .map_err(|_| TransportError::InvalidUplinkPayload)?;
-                let event = payload
-                    .into_event(message.device.device_id.clone())
-                    .map_err(|_| TransportError::InvalidUplinkPayload)?;
-                let topic = format!("iot/v1/devices/{}/telemetry", event.device_id);
-                let response = client
-                    .post(append_url)
-                    .header("x-iot-nano-mqttd-stream-secret", secret.as_ref())
-                    .json(&serde_json::json!({
-                        "topic": topic,
-                        "payload": message.payload,
-                        "event": event,
-                        "received_at": message.received_at,
-                    }))
-                    .send()
-                    .await?;
-                return if response.status().is_success() {
-                    Ok(())
-                } else {
-                    Err(TransportError::UplinkRejected(response.status().as_u16()))
-                };
-            }
-            if !message.device.is_gateway || !GATEWAY_TOPICS.contains(&message.topic.as_str()) {
-                return Err(TransportError::ForbiddenTopic);
-            }
-            let (authorization_url, authorization_secret) =
-                message_gateway_authorization(&gateway_authorization)?;
-            let payload: serde_json::Value = serde_json::from_slice(&message.payload)
-                .map_err(|_| TransportError::InvalidUplinkPayload)?;
-            let event_kind = payload["kind"]
-                .as_str()
-                .ok_or(TransportError::InvalidUplinkPayload)?;
-            let child_device_id = payload["child_device_id"].as_str();
-            let telemetry_event = if event_kind == "child_telemetry" {
-                serde_json::from_slice::<GatewayTelemetryPayload>(&message.payload)
-                    .map_err(|_| TransportError::InvalidUplinkPayload)?
-                    .into_event(message.device.device_id.clone())
-                    .map_err(|_| TransportError::InvalidUplinkPayload)?
-            } else {
-                None
-            };
-            let authorization = client
-                .post(authorization_url)
-                .header("x-iot-nano-mqttd-api-secret", authorization_secret.as_ref())
-                .json(&serde_json::json!({
-                    "gateway_device_id": message.device.device_id,
-                    "token_id": message.device.token_id,
-                    "child_device_id": child_device_id,
-                    "topic": message.topic,
-                    "event_kind": event_kind,
-                }))
-                .send()
-                .await?;
-            if !authorization.status().is_success() {
-                return Err(TransportError::Unauthorized);
-            }
-            let authorization: GatewayAuthorization = authorization
-                .json()
-                .await
-                .map_err(|_| TransportError::Unauthorized)?;
-            if !authorization.matches(&message.device, &message.topic, event_kind, child_device_id)
-            {
-                return Err(TransportError::Unauthorized);
-            }
-            let response = client
-                .post(gateway_append_url)
-                .header("x-iot-nano-mqttd-stream-secret", secret.as_ref())
-                .json(&serde_json::json!({
-                    "topic": format!(
-                        "iot/v1/gateways/{}/events",
-                        authorization.gateway_device_id
-                    ),
-                    "payload": message.payload,
-                    "gateway_event": {
-                        "schema_version": 1,
-                        "gateway_device_id": authorization.gateway_device_id,
-                        "child_device_id": authorization.child_device_id,
-                        "token_id": authorization.token_id,
-                        "session_id": serde_json::Value::Null,
-                        "event_kind": authorization.event_kind,
-                        "event_at": payload["event_at"],
-                        "payload": payload,
-                        "idempotency_key": format!("{}:{}:{}", message.device.device_id, payload["boot_id"], payload["sequence"]),
-                    },
-                    "telemetry_event": telemetry_event,
-                    "received_at": message.received_at,
-                }))
-                .send()
-                .await?;
-            if response.status().is_success() {
-                Ok(())
-            } else {
-                Err(TransportError::UplinkRejected(response.status().as_u16()))
-            }
-        })
-    }
-}
-
-fn message_gateway_authorization(
-    authorization: &Option<(String, Arc<str>)>,
-) -> Result<(String, Arc<str>), TransportError> {
-    authorization.as_ref().cloned().ok_or_else(|| {
-        TransportError::Configuration("gateway authorization is required".to_owned())
-    })
-}
-
-#[derive(Clone)]
-pub struct HttpRpcResponseForwarder {
-    client: reqwest::Client,
-    response_url: String,
-    secret: Arc<str>,
-}
-
-impl HttpRpcResponseForwarder {
-    pub fn new(api_base_url: &str, secret: impl AsRef<str>) -> Result<Self, TransportError> {
-        let response_url = format!(
-            "{}/internal/mqttd/rpc-response",
-            api_base_url.trim_end_matches('/')
-        );
-        reqwest::Url::parse(&response_url)
-            .map_err(|error| TransportError::Configuration(error.to_string()))?;
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|error| TransportError::Configuration(error.to_string()))?,
-            response_url,
-            secret: Arc::from(secret.as_ref()),
-        })
-    }
-}
-
-impl RpcResponseForwarder for HttpRpcResponseForwarder {
-    fn forward_response(
-        &self,
-        response: TransportRpcResponse,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
-        let client = self.client.clone();
-        let response_url = self.response_url.clone();
-        let secret = Arc::clone(&self.secret);
-        Box::pin(async move {
-            let response = client
-                .post(response_url)
-                .header("x-iot-nano-mqttd-api-secret", secret.as_ref())
-                .json(&response)
-                .send()
-                .await?;
-            if response.status() == StatusCode::NO_CONTENT {
-                Ok(())
-            } else {
-                Err(TransportError::RpcResponseRejected(
-                    response.status().as_u16(),
-                ))
-            }
-        })
-    }
-}
-
-#[derive(Clone)]
 struct RejectingRpcResponseForwarder;
 
 impl RpcResponseForwarder for RejectingRpcResponseForwarder {
@@ -841,55 +521,20 @@ pub enum TransportError {
     UnsupportedPacket,
     #[error("MQTT topic is not permitted for this device")]
     ForbiddenTopic,
-    #[error("transport configuration is invalid: {0}")]
-    Configuration(String),
-    #[error("MQTT authentication service returned status {0}")]
-    AuthenticationServiceUnavailable(u16),
     #[error("MQTT authorization port is unavailable: {0}")]
     AuthorizationUnavailable(String),
-    #[error("uplink webhook returned status {0}")]
-    UplinkRejected(u16),
     #[error("durable stream append failed: {0}")]
     StreamAppendFailed(String),
     #[error("uplink payload must be UTF-8 JSON")]
     InvalidUplinkPayload,
     #[error("RPC response payload must be JSON")]
     InvalidRpcResponsePayload,
-    #[error("RPC response callback returned status {0}")]
-    RpcResponseRejected(u16),
     #[error("RPC response callback is not configured")]
     RpcResponseForwarderUnavailable,
     #[error("command response port is unavailable: {0}")]
     CommandResponseUnavailable(String),
     #[error(transparent)]
-    Http(#[from] reqwest::Error),
-    #[error(transparent)]
     Session(#[from] SessionError),
-}
-
-#[derive(Clone)]
-struct InternalRpcState {
-    transport: MqttdDeviceTransport,
-    api_secret: Arc<str>,
-    core_secret: Arc<str>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InternalRpcPublishRequest {
-    device_id: String,
-    id: Uuid,
-    method: String,
-    params: serde_json::Value,
-    issued_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    #[serde(default)]
-    mode: RpcMode,
-}
-
-#[derive(Debug, Deserialize)]
-struct InternalSessionRevokeRequest {
-    device_id: String,
-    token_id: Uuid,
 }
 
 #[derive(Clone)]
@@ -951,36 +596,6 @@ impl MqttdDeviceTransport {
 
     pub fn router(&self) -> RpcSessionRouter {
         self.router.clone()
-    }
-
-    async fn authorize_active_session(
-        &self,
-        device_id: &str,
-    ) -> Result<SessionSnapshot, TransportError> {
-        let snapshot = self
-            .router
-            .active_snapshot(device_id)
-            .await
-            .ok_or(SessionError::DeviceOffline)?;
-        self.authenticator
-            .authorize_session(snapshot.authenticated_device())
-            .await?;
-        Ok(snapshot)
-    }
-
-    pub fn internal_router(
-        &self,
-        api_secret: impl AsRef<str>,
-        core_secret: impl AsRef<str>,
-    ) -> Router {
-        Router::new()
-            .route("/internal/rpc/publish", post(publish_internal_rpc))
-            .route("/internal/sessions/revoke", post(revoke_internal_session))
-            .with_state(InternalRpcState {
-                transport: self.clone(),
-                api_secret: Arc::from(api_secret.as_ref()),
-                core_secret: Arc::from(core_secret.as_ref()),
-            })
     }
 
     pub async fn serve_connection<S>(&self, stream: S) -> Result<(), TransportError>
@@ -1518,88 +1133,4 @@ fn rpc_response_command_id(device: &AuthenticatedDevice, topic: &str) -> Option<
     }
     let command_id = Uuid::parse_str(command_id).ok()?;
     (command_id.get_version_num() == 7).then_some(command_id)
-}
-
-async fn publish_internal_rpc(
-    State(state): State<InternalRpcState>,
-    headers: HeaderMap,
-    Json(request): Json<InternalRpcPublishRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let supplied_secret = headers
-        .get("x-iot-nano-core-mqttd-secret")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if !constant_time_equal(state.core_secret.as_bytes(), supplied_secret.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let rpc = RpcRequest::with_mode(
-        request.id,
-        request.method,
-        request.params,
-        request.issued_at,
-        request.expires_at,
-        request.mode,
-    )
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let snapshot = match state
-        .transport
-        .authorize_active_session(&request.device_id)
-        .await
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return match error {
-                TransportError::Unauthorized => Err(StatusCode::UNAUTHORIZED),
-                TransportError::Session(SessionError::DeviceOffline) => {
-                    Err(StatusCode::SERVICE_UNAVAILABLE)
-                }
-                _ => Err(StatusCode::SERVICE_UNAVAILABLE),
-            };
-        }
-    };
-    match state
-        .transport
-        .router
-        .publish_to_snapshot(&snapshot, rpc)
-        .await
-    {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(SessionError::DeviceOffline) => Err(StatusCode::SERVICE_UNAVAILABLE),
-        Err(SessionError::PublicationTimeout) => Err(StatusCode::GATEWAY_TIMEOUT),
-        Err(SessionError::SessionUnavailable | SessionError::PublicationWaiterUnavailable) => {
-            Err(StatusCode::SERVICE_UNAVAILABLE)
-        }
-        Err(SessionError::AcknowledgementAlreadyConsumed) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-async fn revoke_internal_session(
-    State(state): State<InternalRpcState>,
-    headers: HeaderMap,
-    Json(request): Json<InternalSessionRevokeRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let supplied_secret = headers
-        .get("x-iot-nano-api-mqttd-secret")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if !constant_time_equal(state.api_secret.as_bytes(), supplied_secret.as_bytes()) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    state
-        .transport
-        .router
-        .revoke_session(&request.device_id, request.token_id)
-        .await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (left, right) in left.iter().zip(right) {
-        difference |= left ^ right;
-    }
-    difference == 0
 }

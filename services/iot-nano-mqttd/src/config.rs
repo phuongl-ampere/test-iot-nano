@@ -2,7 +2,6 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize, de::Error as DeError};
@@ -27,8 +26,6 @@ pub struct BrokerFileConfig {
     pub bridges: Vec<BridgeConfig>,
     #[serde(default)]
     pub static_acl: Option<StaticAclConfig>,
-    #[serde(default)]
-    pub http_authorization: Option<HttpAuthorizationConfig>,
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
     #[serde(default)]
@@ -231,25 +228,6 @@ pub struct AclRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HttpAuthorizationConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub secret: String,
-    #[serde(default = "default_http_timeout_ms")]
-    pub timeout_ms: u64,
-    #[serde(default, alias = "cache_ttl")]
-    pub cache_ttl_seconds: u64,
-    #[serde(default = "default_http_cache_capacity")]
-    pub cache_capacity: usize,
-    #[serde(default = "default_policy_deny_action")]
-    pub deny_action: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     #[serde(default)]
     pub name: String,
@@ -315,7 +293,6 @@ pub enum Capability {
     Mqtt5TopicAlias,
     Bridge,
     StaticAcl,
-    HttpAuthorization,
     Rules,
     Mqtt5NativeDeviceTransport,
 }
@@ -333,7 +310,6 @@ impl std::fmt::Display for Capability {
             Self::SqlitePersistence => "sqlite broker persistence",
             Self::Bridge => "mqtt bridge",
             Self::StaticAcl => "static ACL",
-            Self::HttpAuthorization => "HTTP authorization",
             Self::Rules => "rules",
             Self::Mqtt5NativeDeviceTransport => "MQTT 5 native device transport",
         })
@@ -366,7 +342,6 @@ impl Default for BrokerFileConfig {
             storage: StorageConfig::Memory,
             bridges: vec![],
             static_acl: None,
-            http_authorization: None,
             rules: vec![],
             management: ManagementConfig::default(),
             device_transport: DeviceTransportConfig::default(),
@@ -548,16 +523,6 @@ impl BrokerFileConfig {
             }
         }
         let static_acl_enabled = self.static_acl.as_ref().is_some_and(|acl| acl.enabled);
-        let http_authorization_enabled = self
-            .http_authorization
-            .as_ref()
-            .is_some_and(|authorization| authorization.enabled);
-        if static_acl_enabled && http_authorization_enabled {
-            return Err(ConfigError::InvalidValue {
-                field: "policy",
-                message: "static_acl and http_authorization cannot both be enabled",
-            });
-        }
         if static_acl_enabled {
             let acl = self.static_acl.as_ref().expect("enabled static ACL exists");
             if acl.users.is_empty() {
@@ -586,45 +551,6 @@ impl BrokerFileConfig {
                 });
             }
         }
-        if http_authorization_enabled {
-            let authorization = self
-                .http_authorization
-                .as_ref()
-                .expect("enabled HTTP authorization exists");
-            if authorization.url.trim().is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "http_authorization.url",
-                    message: "must not be empty when HTTP authorization is enabled",
-                });
-            }
-            if authorization.secret.trim().is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "http_authorization.secret",
-                    message: "must not be empty when HTTP authorization is enabled",
-                });
-            }
-            if authorization.timeout_ms == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "http_authorization.timeout_ms",
-                    message: "must be greater than zero",
-                });
-            }
-            if authorization.cache_capacity == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "http_authorization.cache_capacity",
-                    message: "must be greater than zero",
-                });
-            }
-            if Instant::now()
-                .checked_add(Duration::from_secs(authorization.cache_ttl_seconds))
-                .is_none()
-            {
-                return Err(ConfigError::InvalidValue {
-                    field: "http_authorization.cache_ttl_seconds",
-                    message: "must be safe to add to Instant",
-                });
-            }
-        }
         if self
             .static_acl
             .as_ref()
@@ -632,16 +558,6 @@ impl BrokerFileConfig {
         {
             return Err(ConfigError::InvalidValue {
                 field: "static_acl.deny_action",
-                message: "only disconnect is supported",
-            });
-        }
-        if self
-            .http_authorization
-            .as_ref()
-            .is_some_and(|authorization| authorization.deny_action != "disconnect")
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "http_authorization.deny_action",
                 message: "only disconnect is supported",
             });
         }
@@ -711,7 +627,6 @@ impl BrokerFileConfig {
             max_connections: self.broker.max_connections,
             max_payload_size: self.broker.max_payload_size,
             max_inflight_count: self.broker.max_inflight_count,
-            token_authenticator: None,
             auth_handler: None,
             authorization_handler: None,
         })
@@ -796,13 +711,6 @@ fn default_certificate_path() -> PathBuf {
 fn default_key_path() -> PathBuf {
     PathBuf::from("server.key")
 }
-fn default_http_timeout_ms() -> u64 {
-    5_000
-}
-
 fn default_policy_deny_action() -> String {
     "disconnect".into()
-}
-fn default_http_cache_capacity() -> usize {
-    1024
 }

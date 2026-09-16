@@ -5,7 +5,6 @@ use async_tungstenite::{
     tokio::connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
-use axum::{Router, http::HeaderMap, routing::post};
 use futures_util::{SinkExt, StreamExt};
 use iot_nano_mqttd as iot_mqttd;
 use iot_nano_mqttd::{
@@ -40,7 +39,6 @@ fn broker_configuration_exposes_plaintext_and_tls_mqtt_listeners() {
         max_connections: 100,
         max_payload_size: 1024,
         max_inflight_count: 10,
-        token_authenticator: None,
         auth_handler: None,
         authorization_handler: None,
     })
@@ -78,7 +76,6 @@ async fn websocket_listener_accepts_a_binary_mqtt311_connect() {
         max_connections: 100,
         max_payload_size: 1024,
         max_inflight_count: 10,
-        token_authenticator: None,
         auth_handler: None,
         authorization_handler: None,
     })
@@ -130,7 +127,6 @@ async fn secure_websocket_listener_accepts_a_binary_mqtt311_connect() {
         max_connections: 100,
         max_payload_size: 1024,
         max_inflight_count: 10,
-        token_authenticator: None,
         auth_handler: None,
         authorization_handler: None,
     })
@@ -346,7 +342,6 @@ async fn broker_startup_binds_released_internal_backend_addresses() {
                 max_connections: 100,
                 max_payload_size: 1024,
                 max_inflight_count: 10,
-                token_authenticator: None,
                 auth_handler: None,
                 authorization_handler: None,
             },
@@ -381,7 +376,6 @@ async fn plaintext_listener_delivers_a_qos_one_publish_to_a_subscriber() {
         max_connections: 100,
         max_payload_size: 1024,
         max_inflight_count: 10,
-        token_authenticator: None,
         auth_handler: None,
         authorization_handler: None,
     })
@@ -424,58 +418,6 @@ async fn plaintext_listener_delivers_a_qos_one_publish_to_a_subscriber() {
         .unwrap();
     publisher_task.abort();
     assert_eq!(&received.unwrap()[..], b"hello");
-}
-
-#[tokio::test]
-async fn token_authenticator_uses_session_resolution_with_an_empty_password() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/internal/mqttd/session-resolution",
-                post(|headers: HeaderMap, body: String| async move {
-                    if headers
-                        .get("x-iot-nano-mqttd-api-secret")
-                        .is_some_and(|value| value == "test-transport-secret-must-have-32")
-                        && body.contains("\"username\":\"iotd_token\"")
-                        && body.contains("\"password\":\"\"")
-                    {
-                        axum::http::StatusCode::OK
-                    } else {
-                        axum::http::StatusCode::UNAUTHORIZED
-                    }
-                }),
-            ),
-        )
-        .await
-        .unwrap();
-    });
-
-    let authenticator = iot_mqttd::HttpTokenAuthenticator::new(
-        &format!("http://{address}"),
-        "test-transport-secret-must-have-32",
-    )
-    .unwrap();
-    assert!(
-        authenticator
-            .authenticate(
-                "device-client".to_owned(),
-                "iotd_token".to_owned(),
-                String::new(),
-            )
-            .await
-    );
-    assert!(
-        !authenticator
-            .authenticate(
-                "device-client".to_owned(),
-                "iotd_token".to_owned(),
-                "not-empty".to_owned(),
-            )
-            .await
-    );
 }
 
 async fn reserve_address() -> SocketAddr {
@@ -527,7 +469,6 @@ fn listener_configuration(
         max_connections: 100,
         max_payload_size: 1024,
         max_inflight_count: 10,
-        token_authenticator: None,
         auth_handler: None,
         authorization_handler: None,
     }
@@ -550,78 +491,4 @@ fn reserve_address_blocking() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
-}
-
-#[tokio::test]
-async fn broker_listener_applies_platform_token_authentication_during_connect() {
-    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let api_address = api_listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            api_listener,
-            Router::new().route(
-                "/internal/mqttd/session-resolution",
-                post(|body: String| async move {
-                    if body.contains("\"username\":\"iotd_allowed\"")
-                        && body.contains("\"password\":\"\"")
-                    {
-                        (axum::http::StatusCode::OK, "{}")
-                    } else {
-                        (axum::http::StatusCode::UNAUTHORIZED, "{}")
-                    }
-                }),
-            ),
-        )
-        .await
-        .unwrap();
-    });
-    let directory = tempfile::tempdir().unwrap();
-    let certificate = directory.path().join("cert.pem");
-    let key = directory.path().join("key.pem");
-    std::fs::write(&certificate, "certificate").unwrap();
-    std::fs::write(&key, "key").unwrap();
-    let token_authenticator = iot_mqttd::HttpTokenAuthenticator::new(
-        &format!("http://{api_address}"),
-        "test-transport-secret-must-have-32",
-    )
-    .unwrap();
-    let _broker = start_broker(ListenerConfiguration {
-        plaintext_address: "127.0.0.1:18987".parse().unwrap(),
-        tls_address: "127.0.0.1:18988".parse().unwrap(),
-        v311_backend_address: "127.0.0.1:18987".parse().unwrap(),
-        v5_backend_address: "127.0.0.1:18988".parse().unwrap(),
-        tls_cert_path: certificate,
-        tls_key_path: key,
-        websocket_address: None,
-        websocket_tls: false,
-        bridge: None,
-        max_connections: 100,
-        max_payload_size: 1024,
-        max_inflight_count: 10,
-        token_authenticator: Some(token_authenticator),
-        auth_handler: None,
-        authorization_handler: None,
-    })
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let mut allowed_options = MqttOptions::new("iot-mqttd-auth-ok", "127.0.0.1", 18987);
-    allowed_options.set_credentials("iotd_allowed", "");
-    let (_, mut allowed_events) = AsyncClient::new(allowed_options, 10);
-    let allowed = tokio::time::timeout(Duration::from_secs(3), allowed_events.poll())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(allowed, Event::Incoming(Packet::ConnAck(_))));
-
-    let mut rejected_options = MqttOptions::new("iot-mqttd-auth-rejected", "127.0.0.1", 18987);
-    rejected_options.set_credentials("iotd_allowed", "not-empty");
-    let (_, mut rejected_events) = AsyncClient::new(rejected_options, 10);
-    assert!(
-        tokio::time::timeout(Duration::from_secs(3), rejected_events.poll())
-            .await
-            .unwrap()
-            .is_err()
-    );
 }
