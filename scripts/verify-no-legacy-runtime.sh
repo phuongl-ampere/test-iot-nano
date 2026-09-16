@@ -38,15 +38,14 @@ retired_paths=(
   "$root/infra/systemd/iot-nano-api.service"
   "$root/infra/systemd/iot-nano-core.service"
   "$root/infra/systemd/iot-nano-mqttd.service"
+  "$root/infra/systemd/iot-nano-mqttd-standalone.service"
   "$root/infra/systemd/iot-nano-stream.service"
+  "$root/scripts/install-mqttd-standalone.sh"
   "$root/scripts/rpc-e2e.py"
 )
 
-standalone_installer_path="$root/scripts/install-mqttd-standalone.sh"
-standalone_unit_path="$root/infra/systemd/iot-nano-mqttd-standalone.service"
 retired_binary_literal_pattern='iot-nano-(api|core|stream|mqttd)'
 retired_source_pattern='(^|[=:\"[:space:]])/internal/|x-iot-nano-|IOT_NANO_(CORE_URL|STREAM_URL|MQTTD_INTERNAL_URL|MQTTD_API_SECRET|API_MQTTD_SECRET|MQTTD_STREAM_SECRET|CORE_STREAM_SECRET|API_CORE_SECRET|CORE_MQTTD_SECRET)[[:space:]]*[:=]'
-standalone_reference_pattern='install-mqttd-standalone\.sh|iot-nano-mqttd-standalone\.service'
 deployment_files=()
 source_files=()
 
@@ -93,7 +92,7 @@ done
 
 is_deployment_excluded() {
   case "$1" in
-    "$standalone_installer_path"|"$standalone_unit_path"|"$root/scripts/stress-local.sh"|"$root/scripts/verify-no-legacy-runtime.sh"|"$root/scripts/test-verify-no-legacy-runtime.sh"|"$root/scripts/verify-failures.sh"|"$root/scripts/verify-monolith-topology.sh"|"$root/scripts/fixtures"/*)
+    "$root/scripts/stress-local.sh"|"$root/scripts/verify-no-legacy-runtime.sh"|"$root/scripts/test-verify-no-legacy-runtime.sh"|"$root/scripts/verify-failures.sh"|"$root/scripts/verify-monolith-topology.sh"|"$root/scripts/fixtures"/*)
       return 0
       ;;
     *) return 1 ;;
@@ -224,8 +223,3 @@ for path in "${retired_paths[@]}"; do
   [[ ! -e "$path" && ! -L "$path" ]] ||
     fail "retired legacy deployment asset remains: $path"
 done
-
-check_for_matches \
-  'standalone MQTTD package referenced by monolith deployment' \
-  "$standalone_reference_pattern" \
-  "${deployment_files[@]}"

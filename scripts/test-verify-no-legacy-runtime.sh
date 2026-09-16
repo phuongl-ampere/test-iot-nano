@@ -4,8 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 verifier="$root/scripts/verify-no-legacy-runtime.sh"
 fixture="$(mktemp -d)"
-installer_fixture=""
-trap 'rm -rf "$fixture" "$installer_fixture"' EXIT
+trap 'rm -rf "$fixture"' EXIT
 
 expected_files=(
   infra/compose.yaml
@@ -37,12 +36,12 @@ retired_paths=(
   infra/systemd/iot-nano-api.service
   infra/systemd/iot-nano-core.service
   infra/systemd/iot-nano-mqttd.service
+  infra/systemd/iot-nano-mqttd-standalone.service
   infra/systemd/iot-nano-stream.service
+  scripts/install-mqttd-standalone.sh
   scripts/rpc-e2e.py
 )
 
-standalone_installer="install-mqttd-standalone.sh"
-standalone_unit="iot-nano-mqttd-standalone.service"
 legacy_binary="iot-nano-api"
 
 copy_file() {
@@ -60,8 +59,6 @@ populate_fixture() {
   for relative_path in "${expected_files[@]}"; do
     copy_file "$relative_path"
   done
-  copy_file "infra/systemd/$standalone_unit"
-  copy_file "scripts/$standalone_installer"
   copy_file scripts/test-verify-no-legacy-runtime.sh
   copy_file scripts/verify-no-legacy-runtime.sh
   copy_file scripts/verify-failures.sh
@@ -112,73 +109,8 @@ permission_mode() {
   fi
 }
 
-assert_log_contains() {
-  local expected_line="$1"
-  local log_path="$2"
-
-  if ! rg -Fqx -- "$expected_line" "$log_path"; then
-    printf 'installer did not request expected privilege command: %s\n' \
-      "$expected_line" >&2
-    exit 1
-  fi
-}
-
-assert_log_excludes() {
-  local unexpected_line="$1"
-  local log_path="$2"
-
-  if rg -Fqx -- "$unexpected_line" "$log_path"; then
-    printf 'installer requested an unexpected privilege command: %s\n' \
-      "$unexpected_line" >&2
-    exit 1
-  fi
-}
-
-create_fake_privilege_command() {
-  local command_name="$1"
-  local command_path="$2/$command_name"
-
-  printf '%s\n' \
-    '#!/usr/bin/env bash' \
-    'set -euo pipefail' \
-    'printf "%s %s\n" "$(basename "$0")" "$*" >>"$FAKE_COMMAND_LOG"' \
-    '[[ "${FAKE_INSTALL_DRY_RUN:-0}" != "1" ]] || exit 0' \
-    'case "$(basename "$0")" in' \
-    '  sudo|fake-sudo)' \
-    '    [[ "${1:-}" == "-v" ]] || "$@"' \
-    '    ;;' \
-    '  getent|id|fake-getent|fake-id)' \
-    '    exit 1' \
-    '    ;;' \
-    '  install|fake-install)' \
-    '    arguments=("$@")' \
-    '    mode=""' \
-    '    for ((index = 0; index < ${#arguments[@]}; index += 1)); do' \
-    '      case "${arguments[index]}" in' \
-    '        --mode) mode="${arguments[index + 1]:-}" ;;' \
-    '        --mode=*) mode="${arguments[index]#--mode=}" ;;' \
-    '      esac' \
-    '    done' \
-    '    if [[ "${1:-}" == "-d" ]]; then' \
-    '      destination="${!#}"' \
-    '      mkdir -p "$destination"' \
-    '    else' \
-    '      destination="${!#}"' \
-    '      source_path="${@: -2:1}"' \
-    '      mkdir -p "$(dirname "$destination")"' \
-    '      cp "$source_path" "$destination"' \
-    '    fi' \
-    '    [[ -z "$mode" ]] || /bin/chmod "$mode" "$destination"' \
-    '    ;;' \
-    '  chmod|fake-chmod)' \
-    '    /bin/chmod "$@"' \
-    '    ;;' \
-    'esac' >"$command_path"
-  chmod 0755 "$command_path"
-}
-
 populate_fixture
-assert_success 'clean monolith fixture with retained standalone assets'
+assert_success 'clean monolith fixture'
 
 write_fixture_file infra/monolith/injected-raw.sh \
   "# retired binary literal\n$legacy_binary --serve"
@@ -208,12 +140,6 @@ populate_fixture
 for e2e_script in scripts/e2e-local.sh scripts/e2e-monolith.sh; do
   printf '\nexec %s --serve\n' "$legacy_binary" >>"$fixture/$e2e_script"
   assert_failure_contains 'retired binary literal found in monolith deployment paths'
-  populate_fixture
-done
-
-for e2e_script in scripts/e2e-local.sh scripts/e2e-monolith.sh; do
-  printf '\n# %s\n' "$standalone_installer" >>"$fixture/$e2e_script"
-  assert_failure_contains 'standalone MQTTD package referenced by monolith deployment'
   populate_fixture
 done
 
@@ -270,149 +196,7 @@ for retired_path in "${retired_paths[@]}"; do
   populate_fixture
 done
 
-printf 'exec "$root/scripts/%s"\n' "$standalone_installer" \
-  >>"$fixture/scripts/install-raspberry-pi.sh"
-assert_failure_contains 'standalone MQTTD package referenced by monolith deployment'
-populate_fixture
-
 printf '\n[dev-dependencies]\n%s = { path = "../../services/%s" }\n' \
   "$legacy_binary" "$legacy_binary" \
   >>"$fixture/services/iot-nano-monolith/Cargo.toml"
 assert_success 'Cargo dependency allowance'
-populate_fixture
-
-installer_fixture="$(mktemp -d)"
-fake_bin="$installer_fixture/bin"
-fake_command_log="$installer_fixture/privilege.log"
-installer_root="$installer_fixture/root"
-template_path="$installer_root/services/iot-nano-mqttd/config/standalone.toml"
-config_path="$installer_fixture/etc/rush-iot-nano/iot-nano-mqttd.toml"
-config_dir="$(dirname "$config_path")"
-state_path="$installer_fixture/var/lib/iot-nano-mqttd"
-service_path="$installer_fixture/etc/systemd/system/iot-nano-mqttd-standalone.service"
-install_path="$installer_fixture/opt/rush-iot-nano"
-mkdir -p \
-  "$fake_bin" \
-  "$(dirname "$template_path")" \
-  "$(dirname "$service_path")" \
-  "$installer_root/infra/systemd" \
-  "$installer_root/target/release"
-cp "$root/services/iot-nano-mqttd/config/standalone.toml" "$template_path"
-cp "$root/infra/systemd/$standalone_unit" \
-  "$installer_root/infra/systemd/$standalone_unit"
-printf '%s\n' 'fake mqttd binary' >"$installer_root/target/release/iot-nano-mqttd"
-for fake_command in \
-  fake-sudo fake-cargo fake-getent fake-id fake-groupadd fake-useradd \
-  fake-install fake-chown fake-chmod fake-systemctl; do
-  create_fake_privilege_command "$fake_command" "$fake_bin"
-done
-for command_name in \
-  sudo cargo getent id groupadd useradd install chown chmod systemctl; do
-  ln -s "fake-$command_name" "$fake_bin/$command_name"
-done
-
-assert_direct_installer_rejects_test_overrides() {
-  local output
-
-  : >"$fake_command_log"
-  if output="$(PATH="$fake_bin:$PATH" \
-    FAKE_COMMAND_LOG="$fake_command_log" \
-    FAKE_INSTALL_DRY_RUN=1 \
-    IOT_NANO_MQTTD_TEST_OVERRIDE=1 \
-    "$root/scripts/$standalone_installer" 2>&1)"; then
-    printf 'executable standalone installer accepted a test override:\n%s\n' \
-      "$output" >&2
-    exit 1
-  fi
-  if [[ "$output" != *'IOT_NANO_MQTTD_'* ]]; then
-    printf 'executable standalone installer rejected an override without an explanation:\n%s\n' \
-      "$output" >&2
-    exit 1
-  fi
-  if [[ -s "$fake_command_log" ]]; then
-    printf 'executable standalone installer ran commands before rejecting a test override\n' >&2
-    exit 1
-  fi
-}
-
-assert_direct_installer_rejects_test_overrides
-
-PATH="$fake_bin:$PATH" \
-  FAKE_COMMAND_LOG="$fake_command_log" \
-  FAKE_INSTALL_DRY_RUN=1 \
-  bash -c 'source "$1"' -- "$root/scripts/$standalone_installer"
-if [[ -s "$fake_command_log" ]]; then
-  printf 'sourcing the standalone installer invoked production commands\n' >&2
-  exit 1
-fi
-
-run_standalone_installer() {
-  PATH="$fake_bin:$PATH" \
-    FAKE_COMMAND_LOG="$fake_command_log" \
-    IOT_NANO_MQTTD_ROOT="$installer_root" \
-    IOT_NANO_MQTTD_CONFIG_DIR="$config_dir" \
-    IOT_NANO_MQTTD_CONFIG_PATH="$config_path" \
-    IOT_NANO_MQTTD_STATE_PATH="$state_path" \
-    IOT_NANO_MQTTD_SERVICE_PATH="$service_path" \
-    IOT_NANO_MQTTD_INSTALL_PATH="$install_path" \
-    IOT_NANO_MQTTD_SUDO_BIN=fake-sudo \
-    IOT_NANO_MQTTD_CARGO_BIN=fake-cargo \
-    IOT_NANO_MQTTD_GETENT_BIN=fake-getent \
-    IOT_NANO_MQTTD_ID_BIN=fake-id \
-    IOT_NANO_MQTTD_GROUPADD_BIN=fake-groupadd \
-    IOT_NANO_MQTTD_USERADD_BIN=fake-useradd \
-    IOT_NANO_MQTTD_INSTALL_BIN=fake-install \
-    IOT_NANO_MQTTD_CHOWN_BIN=fake-chown \
-    IOT_NANO_MQTTD_CHMOD_BIN=fake-chmod \
-    IOT_NANO_MQTTD_SYSTEMCTL_BIN=fake-systemctl \
-    bash -c 'source "$1"; configure_mqttd_installer_for_test; install_mqttd_standalone' -- \
-    "$root/scripts/$standalone_installer" >/dev/null
-}
-
-: >"$fake_command_log"
-run_standalone_installer
-
-assert_log_contains "fake-sudo fake-groupadd --system iot" "$fake_command_log"
-assert_log_contains "fake-groupadd --system iot" "$fake_command_log"
-assert_log_contains "fake-sudo fake-useradd --system --gid iot --home-dir $state_path --shell /usr/sbin/nologin iot" "$fake_command_log"
-assert_log_contains "fake-useradd --system --gid iot --home-dir $state_path --shell /usr/sbin/nologin iot" "$fake_command_log"
-if ! cmp -s "$template_path" "$config_path"; then
-  printf 'standalone installer did not create config from the template\n' >&2
-  exit 1
-fi
-if [[ "$(permission_mode "$config_path")" != "640" ]]; then
-  printf 'standalone installer did not apply 0640 mode to a fresh config\n' >&2
-  exit 1
-fi
-assert_log_contains \
-  "fake-sudo fake-install --owner root --group iot --mode 0640 $template_path $config_path" \
-  "$fake_command_log"
-assert_log_contains \
-  "fake-install --owner root --group iot --mode 0640 $template_path $config_path" \
-  "$fake_command_log"
-assert_log_contains "fake-sudo fake-chown root:iot $config_path" "$fake_command_log"
-assert_log_contains "fake-chown root:iot $config_path" "$fake_command_log"
-assert_log_contains "fake-sudo fake-chmod 0640 $config_path" "$fake_command_log"
-assert_log_contains "fake-chmod 0640 $config_path" "$fake_command_log"
-
-printf '%s\n' 'existing standalone configuration' >"$config_path"
-chmod 0600 "$config_path"
-cp "$config_path" "$installer_fixture/original.toml"
-: >"$fake_command_log"
-run_standalone_installer
-
-if ! cmp -s "$installer_fixture/original.toml" "$config_path"; then
-  printf 'standalone installer changed existing config content\n' >&2
-  exit 1
-fi
-if [[ "$(permission_mode "$config_path")" != "640" ]]; then
-  printf 'standalone installer did not normalize existing config mode\n' >&2
-  exit 1
-fi
-assert_log_excludes \
-  "fake-sudo fake-install --owner root --group iot --mode 0640 $template_path $config_path" \
-  "$fake_command_log"
-assert_log_contains "fake-sudo fake-chown root:iot $config_path" "$fake_command_log"
-assert_log_contains "fake-chown root:iot $config_path" "$fake_command_log"
-assert_log_contains "fake-sudo fake-chmod 0640 $config_path" "$fake_command_log"
-assert_log_contains "fake-chmod 0640 $config_path" "$fake_command_log"
