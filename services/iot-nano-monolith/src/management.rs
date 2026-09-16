@@ -31,7 +31,8 @@ use iot_storage::{
     ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
     ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
     ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
-    NewOAuthClientSecret, OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri,
+    NewOAuthClientSecret, NewSystemAccount, OAuthRepository, PlatformStore, PlatformStoreError,
+    RedirectUri, SystemAccount, TenantIdentityError, TenantIdentityRepository,
     UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
     UpdateManagementDeviceProfile, UpdateManagementUser,
 };
@@ -69,6 +70,39 @@ pub enum BootstrapAdminError {
     Storage(#[source] sqlx::Error),
     #[error("bootstrap admin platform migration failed")]
     PlatformMigration(#[source] PlatformStoreError),
+}
+
+#[derive(Debug, Error)]
+pub enum BootstrapSystemError {
+    #[error(
+        "bootstrap system username must use 3-64 ASCII letters, digits, hyphens, or underscores"
+    )]
+    InvalidUsername,
+    #[error("bootstrap system password is invalid")]
+    InvalidPassword(#[source] AuthError),
+    #[error("bootstrap system identity operation failed")]
+    Identity(#[from] TenantIdentityError),
+}
+
+pub async fn bootstrap_system(
+    store: &PlatformStore,
+    username: &str,
+    password: &str,
+) -> Result<SystemAccount, BootstrapSystemError> {
+    if !is_bootstrap_username(username) {
+        return Err(BootstrapSystemError::InvalidUsername);
+    }
+    validate_password(password).map_err(BootstrapSystemError::InvalidPassword)?;
+    let password_hash = hash_password(password).map_err(BootstrapSystemError::InvalidPassword)?;
+    TenantIdentityRepository::bootstrap_system_account(
+        store,
+        NewSystemAccount {
+            username: username.to_owned(),
+            password_hash,
+        },
+    )
+    .await
+    .map_err(BootstrapSystemError::from)
 }
 
 pub async fn bootstrap_admin(
