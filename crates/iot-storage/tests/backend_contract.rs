@@ -414,9 +414,12 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "oauth_client_secrets",
             "resource_grants",
             "resource_shares",
+            "system_accounts",
             "telemetry",
             "telemetry_rollups_1h",
             "telemetry_rollups_5m",
+            "tenant_accounts",
+            "tenants",
             "user_app_grants",
             "users",
         ]
