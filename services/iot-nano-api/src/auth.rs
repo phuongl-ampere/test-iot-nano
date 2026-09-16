@@ -17,10 +17,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const ADMIN_USERNAME: &str = "admin";
-const SYSTEM_USERNAME: &str = "system";
 const VIEWER_USERNAME: &str = "viewer";
 const INITIAL_ADMIN_PASSWORD: &str = "NanoAdmin@1234";
-const INITIAL_SYSTEM_PASSWORD: &str = "NanoSystem@1234";
 const INITIAL_VIEWER_PASSWORD: &str = "NanoView@1234";
 pub const DEFAULT_APP: &str = "/apps/powermonitor";
 pub const POWER_MONITOR_APP: &str = "powermonitor";
@@ -298,9 +296,13 @@ fn verify_password(password: &str, password_hash: &str) -> Result<(), AuthError>
     }
 }
 
-pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> {
+pub async fn seed_tenant_test_users_sqlite(
+    pool: &SqlitePool,
+    tenant_id: Uuid,
+) -> Result<(), AuthError> {
     let mut transaction = pool.begin().await?;
-    let rows = sqlx::query("SELECT role, username FROM users")
+    let rows = sqlx::query("SELECT role, username FROM users WHERE tenant_id = ?")
+        .bind(tenant_id.to_string())
         .fetch_all(&mut *transaction)
         .await?;
     let bootstrap_defaults = rows.is_empty();
@@ -312,10 +314,11 @@ pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> 
             validate_password(password)?;
             sqlx::query(
                 "INSERT INTO users (
-                    id, username, password_hash, role, account_class, default_app
-                 ) VALUES (?, ?, ?, ?, ?, ?)",
+                    id, tenant_id, username, password_hash, role, account_class, default_app
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::new_v4().to_string())
+            .bind(tenant_id.to_string())
             .bind(role.username())
             .bind(hash_password(password)?)
             .bind(role.as_str())
@@ -325,10 +328,12 @@ pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> 
             .await?;
         }
         for username in [ADMIN_USERNAME, VIEWER_USERNAME] {
-            let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-                .bind(username)
-                .fetch_one(&mut *transaction)
-                .await?;
+            let user_id: String =
+                sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = ? AND username = ?")
+                    .bind(tenant_id.to_string())
+                    .bind(username)
+                    .fetch_one(&mut *transaction)
+                    .await?;
             sqlx::query(
                 "INSERT OR IGNORE INTO user_app_grants (user_id, app_key)
                  VALUES (?, ?)",
@@ -343,33 +348,6 @@ pub async fn bootstrap_users_sqlite(pool: &SqlitePool) -> Result<(), AuthError> 
             row.try_get::<String, _>("role")?
                 .parse::<Role>()
                 .map_err(|_| AuthError::IncompleteStoredUsers)?;
-        }
-    }
-    let has_system: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM users WHERE account_class = 'system'
-         )",
-    )
-    .fetch_one(&mut *transaction)
-    .await?;
-    if !has_system {
-        validate_password(INITIAL_SYSTEM_PASSWORD)?;
-        let inserted = sqlx::query(
-            "INSERT OR IGNORE INTO users (
-                id, username, password_hash, role, account_class, default_app
-             ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(SYSTEM_USERNAME)
-        .bind(hash_password(INITIAL_SYSTEM_PASSWORD)?)
-        .bind(Role::Admin.as_str())
-        .bind(AccountClass::System.as_str())
-        .bind(DEFAULT_APP)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected();
-        if inserted != 1 {
-            return Err(AuthError::IncompleteStoredUsers);
         }
     }
     transaction.commit().await?;

@@ -12,8 +12,8 @@ pub use auth::{
     AccountClass, AuthError, AuthenticatedPrincipal, AuthenticatedUser, BearerAccessToken,
     BearerAccessTokenError, POWER_MONITOR_APP, PrincipalKind, Role, authenticate_credentials,
     authenticate_credentials_sqlite, authenticate_system_account, authenticate_tenant_account,
-    authenticate_user_account, bootstrap_users_sqlite, extract_bearer_access_token,
-    generate_session_id, hash_password, validate_bearer_access_token, validate_password,
+    authenticate_user_account, extract_bearer_access_token, generate_session_id, hash_password,
+    seed_tenant_test_users_sqlite, validate_bearer_access_token, validate_password,
 };
 pub use core_facade::{
     CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,

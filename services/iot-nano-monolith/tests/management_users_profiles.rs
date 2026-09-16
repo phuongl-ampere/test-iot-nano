@@ -9,10 +9,10 @@ use axum::{
         header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
 };
-use iot_api::{TokenVault, bootstrap_users_sqlite};
+use iot_api::{TokenVault, hash_password, seed_tenant_test_users_sqlite};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::ManagementSessionRouter;
-use iot_storage::PlatformStore;
+use iot_storage::{NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -28,7 +28,19 @@ async fn management_router() -> (tempfile::TempDir, Arc<PlatformStore>, axum::Ro
         .await
         .unwrap(),
     );
-    bootstrap_users_sqlite(store.sqlite_pool().unwrap())
+    let (tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "test".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("TenantAccount@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_tenant_test_users_sqlite(store.sqlite_pool().unwrap(), tenant.id)
         .await
         .unwrap();
     let management = ManagementSessionRouter::new(Arc::clone(&store), test_token_vault());

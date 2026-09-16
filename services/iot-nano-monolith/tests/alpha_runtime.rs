@@ -4,10 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use iot_api::bootstrap_users_sqlite;
+use iot_api::{hash_password, seed_tenant_test_users_sqlite};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{MonolithConfig, MonolithRuntime};
-use iot_storage::{ApplicationKind, ApplicationRepository, NewApplication};
+use iot_storage::{
+    ApplicationKind, ApplicationRepository, NewApplication, NewTenant, NewTenantAccount,
+    TenantIdentityRepository,
+};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -199,7 +202,19 @@ async fn alpha_runtime_uses_a_management_session_to_issue_a_public_pkce_code() {
         .await
         .unwrap();
     let store = runtime.platform().unwrap();
-    bootstrap_users_sqlite(store.sqlite_pool().unwrap())
+    let (tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store,
+        NewTenant {
+            slug: "test".to_owned(),
+            metadata: serde_json::json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("TenantAccount@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_tenant_test_users_sqlite(store.sqlite_pool().unwrap(), tenant.id)
         .await
         .unwrap();
     ApplicationRepository::upsert_application(
