@@ -183,8 +183,10 @@ devices
   tenant_id UUID not null
   owner_user_id UUID not null
   asset_id UUID nullable
+  status active | disabled | deleted
   is_gateway boolean not null default false
   gateway_device_id UUID nullable
+  gateway_topology_version integer not null default 0
   device-specific fields
   created_at
   updated_at
@@ -232,6 +234,44 @@ Sharing a gateway does not automatically share its children. Sharing a child
 does not automatically share its gateway. User access remains defined only by
 ownership and resource permissions.
 
+### Gateway Conflict and Lifecycle Rules
+
+Gateway-child topology has exactly one source of truth:
+
+~~~text
+devices.gateway_device_id
+~~~
+
+The generic device-relations table must reject the reserved relation type
+gateway_child. A second topology representation would permit a gateway
+assignment and a descriptive relation to contradict one another.
+
+Gateway topology rules:
+
+1. A child Device has zero or one active gateway; one gateway may have many
+   child Devices.
+2. Gateway and child must be active Devices in the same Tenant.
+3. A User must have manager or owner permission on both gateway and child to
+   create, change, or detach gateway topology. Tenant Account may do this
+   anywhere in its Tenant.
+4. Gateway ownership and child ownership may differ. The topology operation
+   does not transfer ownership or create resource permission for either owner.
+5. Gateway telemetry and gateway-routed commands are accepted only when the
+   submitted gateway-child pair matches the current active topology.
+6. Reassignment from gateway G1 to gateway G2 locks the child topology row,
+   updates the assignment, increments its topology revision, writes an audit
+   event, and commits atomically. Messages from G1 received after commit are
+   rejected.
+7. A gateway with active children cannot be deleted. A caller must detach or
+   reassign every child in the same transaction before deletion.
+8. Detaching a child makes gateway-routed telemetry and commands unavailable
+   for that child until it is assigned to an active gateway again.
+
+Gateway topology does not affect Asset containment. If a gateway and child
+share an Asset scope, an inherited Asset permission may make both visible to a
+User; that result is caused by the Asset permission, never by the gateway
+edge.
+
 ### Descriptive Device-to-Device Relations
 
 The first release also supports generic, tenant-scoped device-to-device
@@ -257,9 +297,9 @@ index (tenant_id, to_device_id, relation_type)
 
 Relation type is tenant-defined metadata such as paired_with, controls,
 depends_on, or located_near. The storage layer validates an identifier-shaped
-relation type and rejects self-relations. Generic device relations may form a
-graph and do not require an acyclic constraint because authorization never
-traverses them.
+relation type, rejects reserved operational relation types, and rejects
+self-relations. Generic device relations may form a graph and do not require
+an acyclic constraint because authorization never traverses them.
 
 Creating, changing, or removing a device relation requires manager or owner
 permission on both endpoint Devices, unless the caller is Tenant Account.
@@ -449,11 +489,13 @@ revision before commit.
 5. A containment edge cannot cross tenants or create a cycle.
 6. A gateway-child edge cannot cross tenants, point to itself, or make a
    gateway a child.
-7. A descriptive device relation cannot cross tenants or point to itself.
-8. A User Group cannot contain a User from another tenant.
-9. A resource permission cannot target a User, Group, Asset, or Device from
+7. Gateway-child topology has no representation in descriptive device
+   relations.
+8. A descriptive device relation cannot cross tenants or point to itself.
+9. A User Group cannot contain a User from another tenant.
+10. A resource permission cannot target a User, Group, Asset, or Device from
    another tenant.
-10. Device credentials resolve to exactly one Device and its tenant.
+11. Device credentials resolve to exactly one Device and its tenant.
 
 ## Migration and Rollout
 
@@ -514,3 +556,8 @@ Tests must prove:
 14. Gateway-child topology does not grant user access to either endpoint.
 15. Device-to-device relations cannot cross tenants and do not grant user
     access or affect permission inheritance.
+16. Reassigning a gateway rejects telemetry and commands from the former
+    gateway after the topology transaction commits.
+17. Deleting a gateway with active children fails until every child is
+    detached or reassigned.
+18. The generic device-relations API rejects the reserved gateway_child type.
