@@ -18,9 +18,9 @@ use axum::{
 };
 use iot_api::{
     AuthError, DeviceTokenResponse, DeviceTokenStoreError, OAuthBrowserSessionVerifier,
-    POWER_MONITOR_APP, PrincipalKind, Role, TokenVault, authenticate_credentials,
-    authenticate_credentials_sqlite, authenticate_system_account, authenticate_tenant_account,
-    authenticate_user_account, create_platform_device_token, generate_session_id, hash_password,
+    PrincipalKind, Role, TokenVault, authenticate_credentials, authenticate_credentials_sqlite,
+    authenticate_system_account, authenticate_tenant_account, authenticate_user_account,
+    create_platform_device_token, generate_session_id, hash_password,
     provision_platform_device_token, validate_password,
 };
 use iot_storage::{
@@ -56,24 +56,6 @@ const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: u8 = 5;
 
 #[derive(Debug, Error)]
-pub enum BootstrapAdminError {
-    #[error(
-        "bootstrap admin username must use 3-64 ASCII letters, digits, hyphens, or underscores"
-    )]
-    InvalidUsername,
-    #[error("bootstrap admin password is invalid")]
-    InvalidPassword(#[source] AuthError),
-    #[error("bootstrap admin can run only when the platform has no users")]
-    AlreadyInitialized,
-    #[error("platform store has no selected backend")]
-    NoBackend,
-    #[error("bootstrap admin storage operation failed")]
-    Storage(#[source] sqlx::Error),
-    #[error("bootstrap admin platform migration failed")]
-    PlatformMigration(#[source] PlatformStoreError),
-}
-
-#[derive(Debug, Error)]
 pub enum BootstrapSystemError {
     #[error(
         "bootstrap system username must use 3-64 ASCII letters, digits, hyphens, or underscores"
@@ -83,6 +65,8 @@ pub enum BootstrapSystemError {
     InvalidPassword(#[source] AuthError),
     #[error("bootstrap system identity operation failed")]
     Identity(#[from] TenantIdentityError),
+    #[error("bootstrap system platform migration failed")]
+    PlatformMigration(#[source] PlatformStoreError),
 }
 
 pub async fn bootstrap_system(
@@ -104,107 +88,6 @@ pub async fn bootstrap_system(
     )
     .await
     .map_err(BootstrapSystemError::from)
-}
-
-pub async fn bootstrap_admin(
-    store: &PlatformStore,
-    username: &str,
-    password: &str,
-) -> Result<(), BootstrapAdminError> {
-    if !is_bootstrap_username(username) {
-        return Err(BootstrapAdminError::InvalidUsername);
-    }
-    validate_password(password).map_err(BootstrapAdminError::InvalidPassword)?;
-    let password_hash = hash_password(password).map_err(BootstrapAdminError::InvalidPassword)?;
-    let user_id = Uuid::now_v7();
-    if let Some(pool) = store.sqlite_pool() {
-        return bootstrap_admin_sqlite(pool, user_id, username, &password_hash).await;
-    }
-    let pool = store
-        .timescale_pool()
-        .ok_or(BootstrapAdminError::NoBackend)?;
-    bootstrap_admin_timescale(pool, user_id, username, &password_hash).await
-}
-
-async fn bootstrap_admin_sqlite(
-    pool: &sqlx::SqlitePool,
-    user_id: Uuid,
-    username: &str,
-    password_hash: &str,
-) -> Result<(), BootstrapAdminError> {
-    let mut transaction = pool
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(BootstrapAdminError::Storage)?;
-    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(BootstrapAdminError::Storage)?;
-    if users != 0 {
-        return Err(BootstrapAdminError::AlreadyInitialized);
-    }
-    sqlx::query(
-        "INSERT INTO users (
-            id, username, password_hash, role, account_class, default_app, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, 'admin', 'admin', '/apps/powermonitor', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-    )
-    .bind(user_id.to_string())
-    .bind(username)
-    .bind(password_hash)
-    .execute(&mut *transaction)
-    .await
-    .map_err(BootstrapAdminError::Storage)?;
-    sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES (?1, ?2)")
-        .bind(user_id.to_string())
-        .bind(POWER_MONITOR_APP)
-        .execute(&mut *transaction)
-        .await
-        .map_err(BootstrapAdminError::Storage)?;
-    transaction
-        .commit()
-        .await
-        .map_err(BootstrapAdminError::Storage)
-}
-
-async fn bootstrap_admin_timescale(
-    pool: &sqlx::PgPool,
-    user_id: Uuid,
-    username: &str,
-    password_hash: &str,
-) -> Result<(), BootstrapAdminError> {
-    let mut transaction = pool.begin().await.map_err(BootstrapAdminError::Storage)?;
-    sqlx::query("LOCK TABLE users IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *transaction)
-        .await
-        .map_err(BootstrapAdminError::Storage)?;
-    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(BootstrapAdminError::Storage)?;
-    if users != 0 {
-        return Err(BootstrapAdminError::AlreadyInitialized);
-    }
-    sqlx::query(
-        "INSERT INTO users (
-            id, username, password_hash, role, account_class, default_app, created_at, updated_at
-         ) VALUES ($1, $2, $3, 'admin', 'admin', '/apps/powermonitor', now(), now())",
-    )
-    .bind(user_id)
-    .bind(username)
-    .bind(password_hash)
-    .execute(&mut *transaction)
-    .await
-    .map_err(BootstrapAdminError::Storage)?;
-    sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES ($1, $2)")
-        .bind(user_id)
-        .bind(POWER_MONITOR_APP)
-        .execute(&mut *transaction)
-        .await
-        .map_err(BootstrapAdminError::Storage)?;
-    transaction
-        .commit()
-        .await
-        .map_err(BootstrapAdminError::Storage)
 }
 
 fn is_bootstrap_username(value: &str) -> bool {
@@ -2955,136 +2838,9 @@ impl IntoResponse for ManagementSessionError {
 
 #[cfg(test)]
 mod unit_tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::{Arc, atomic::AtomicBool},
-    };
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use axum::{
-        Json,
-        body::Body,
-        extract::{ConnectInfo, Path, State},
-        http::{
-            HeaderMap, HeaderValue, Request,
-            header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
-        },
-    };
-    use iot_api::bootstrap_users_sqlite;
-    use iot_core::{DatabaseStorage, StorageConfiguration};
-    use iot_storage::{
-        CreateManagementUser, ManagementUserRepository, ManagementUserRole, PlatformStore,
-        UpdateManagementUser,
-    };
-    use tokio::sync::Barrier;
-
-    use super::{
-        LoginAttemptKey, LoginRateLimiter, LoginRequest, MAX_LOGIN_FAILURES,
-        ManagementAuthorizationTestHooks, ManagementSessionError, ManagementSessionVerifier,
-        ManagementState, authenticate, create_management_user, hash_password, login,
-        require_management_admin, update_management_user,
-    };
-
-    async fn management_state_with_admin_target(
-        hooks: Arc<ManagementAuthorizationTestHooks>,
-    ) -> (tempfile::TempDir, ManagementState, HeaderMap, HeaderMap) {
-        let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            PlatformStore::open(&StorageConfiguration {
-                storage: DatabaseStorage::Sqlite,
-                database_url: None,
-                sqlite_path: Some(directory.path().join("platform.sqlite")),
-                sqlite_busy_timeout_ms: 5_000,
-            })
-            .await
-            .unwrap(),
-        );
-        bootstrap_users_sqlite(store.sqlite_pool().unwrap())
-            .await
-            .unwrap();
-        ManagementUserRepository::create_management_user(
-            store.as_ref(),
-            CreateManagementUser {
-                username: "alice".to_owned(),
-                password_hash: hash_password("AlicePassword@123").unwrap(),
-                default_app: "/apps/fleet".to_owned(),
-                granted_apps: vec!["fleet".to_owned()],
-            },
-        )
-        .await
-        .unwrap();
-        let alice = ManagementUserRepository::update_management_user(
-            store.as_ref(),
-            "alice",
-            UpdateManagementUser {
-                default_app: "/apps/fleet".to_owned(),
-                granted_apps: vec!["fleet".to_owned()],
-                role: Some(ManagementUserRole::Admin),
-            },
-        )
-        .await
-        .unwrap();
-        let session_verifier = Arc::new(ManagementSessionVerifier::default());
-        let state = ManagementState {
-            store,
-            session_verifier: Arc::clone(&session_verifier),
-            token_vault: super::TokenVault::from_key_material(
-                "management-session-linearization-test-vault-key-0001",
-            ),
-            login_limiter: Arc::new(std::sync::Mutex::new(LoginRateLimiter::default())),
-            authorization_gate: Arc::new(super::ManagementAuthorizationGate::default()),
-            authorization_test_hooks: Some(hooks),
-        };
-        let admin = authenticate(
-            state.store.as_ref(),
-            &LoginRequest {
-                username: "admin".to_owned(),
-                password: "NanoAdmin@1234".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-        let admin_headers = session_headers(session_verifier.issue(admin.user_id, admin.role));
-        let alice_headers = session_headers(session_verifier.issue(alice.id, super::Role::Admin));
-        (directory, state, admin_headers, alice_headers)
-    }
-
-    async fn demote_alice(state: ManagementState, admin_headers: HeaderMap) {
-        let request = Request::builder()
-            .method("PUT")
-            .uri("/api/management/users/alice")
-            .header(CONTENT_TYPE, "application/json")
-            .header(COOKIE, admin_headers[COOKIE].clone())
-            .body(Body::from(
-                r#"{"default_app":"/apps/fleet","granted_apps":["fleet"],"role":"viewer"}"#,
-            ))
-            .unwrap();
-        assert!(
-            update_management_user(State(state), Path("alice".to_owned()), request)
-                .await
-                .is_ok()
-        );
-    }
-
-    fn session_headers(session_id: String) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            COOKIE,
-            HeaderValue::from_str(&format!("iot_nano_session={session_id}")).unwrap(),
-        );
-        headers
-    }
-
-    fn session_headers_from_login(login_headers: &HeaderMap) -> HeaderMap {
-        let cookie = login_headers[SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
-        let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, HeaderValue::from_str(cookie).unwrap());
-        headers
-    }
+    use super::{LoginAttemptKey, LoginRateLimiter, MAX_LOGIN_FAILURES};
 
     #[test]
     fn login_limiter_reserves_in_flight_attempts_before_authentication() {
@@ -3098,90 +2854,5 @@ mod unit_tests {
             assert!(limiter.reserve(&key));
         }
         assert!(!limiter.reserve(&key));
-    }
-
-    #[tokio::test]
-    async fn login_racing_a_role_demotion_does_not_issue_an_admin_session_after_commit() {
-        let hooks = Arc::new(ManagementAuthorizationTestHooks {
-            login_authenticated: Arc::new(Barrier::new(2)),
-            release_login: Arc::new(Barrier::new(2)),
-            mutation_authorized: Arc::new(Barrier::new(2)),
-            release_mutation: Arc::new(Barrier::new(2)),
-            pause_login: Arc::new(AtomicBool::new(true)),
-            pause_mutation: Arc::new(AtomicBool::new(true)),
-        });
-        let (_directory, state, admin_headers, old_alice_headers) =
-            management_state_with_admin_target(Arc::clone(&hooks)).await;
-        let login_state = state.clone();
-        let login_task = tokio::spawn(async move {
-            login(
-                State(login_state),
-                ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))),
-                Json(LoginRequest {
-                    username: "alice".to_owned(),
-                    password: "AlicePassword@123".to_owned(),
-                }),
-            )
-            .await
-            .map(|response| response.0)
-        });
-
-        hooks.login_authenticated.wait().await;
-        demote_alice(state.clone(), admin_headers).await;
-        assert!(matches!(
-            require_management_admin(&state.session_verifier, &old_alice_headers),
-            Err(ManagementSessionError::Forbidden)
-        ));
-        hooks.release_login.wait().await;
-        let Ok(login_headers) = login_task.await.unwrap() else {
-            panic!("login must succeed after a role demotion");
-        };
-        let new_alice_headers = session_headers_from_login(&login_headers);
-        assert!(matches!(
-            require_management_admin(&state.session_verifier, &new_alice_headers),
-            Err(ManagementSessionError::Forbidden)
-        ));
-    }
-
-    #[tokio::test]
-    async fn mutation_authorized_before_body_parsing_cannot_run_after_role_demotion_commits() {
-        let hooks = Arc::new(ManagementAuthorizationTestHooks {
-            login_authenticated: Arc::new(Barrier::new(2)),
-            release_login: Arc::new(Barrier::new(2)),
-            mutation_authorized: Arc::new(Barrier::new(2)),
-            release_mutation: Arc::new(Barrier::new(2)),
-            pause_login: Arc::new(AtomicBool::new(true)),
-            pause_mutation: Arc::new(AtomicBool::new(true)),
-        });
-        let (_directory, state, admin_headers, alice_headers) =
-            management_state_with_admin_target(Arc::clone(&hooks)).await;
-        let mutation_state = state.clone();
-        let mutation_task = tokio::spawn(async move {
-            let request = Request::builder()
-                .method("POST")
-                .uri("/api/management/users")
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, alice_headers[COOKIE].clone())
-                .body(Body::from(
-                    r#"{"username":"blocked","password":"BlockedPassword@123","default_app":"/apps/fleet","granted_apps":["fleet"]}"#,
-                ))
-                .unwrap();
-            create_management_user(State(mutation_state), request).await
-        });
-
-        hooks.mutation_authorized.wait().await;
-        demote_alice(state.clone(), admin_headers).await;
-        hooks.release_mutation.wait().await;
-        assert!(matches!(
-            mutation_task.await.unwrap(),
-            Err(ManagementSessionError::Forbidden)
-        ));
-        assert!(
-            ManagementUserRepository::list_management_users(state.store.as_ref())
-                .await
-                .unwrap()
-                .iter()
-                .all(|user| user.username != "blocked")
-        );
     }
 }

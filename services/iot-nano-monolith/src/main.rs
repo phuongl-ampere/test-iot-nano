@@ -11,7 +11,7 @@ struct Arguments {
     #[arg(long)]
     migrate_only: bool,
     #[arg(long, conflicts_with_all = ["config_check", "migrate_only"])]
-    bootstrap_admin: bool,
+    bootstrap_system: bool,
 }
 
 #[tokio::main]
@@ -24,10 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    if arguments.bootstrap_admin {
+    if arguments.bootstrap_system {
         let storage = MonolithConfig::storage_from_env()?;
-        let (username, password) = bootstrap_admin_credentials()?;
-        MonolithRuntime::bootstrap_admin(&storage, &username, &password).await?;
+        let (username, password) = bootstrap_system_credentials()?;
+        MonolithRuntime::bootstrap_system(&storage, &username, &password).await?;
         return Ok(());
     }
 
@@ -63,15 +63,15 @@ fn runtime_exit_result(child_failed: bool) -> io::Result<()> {
     }
 }
 
-fn bootstrap_admin_credentials() -> io::Result<(String, String)> {
-    let username = std::env::var("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME")
+fn bootstrap_system_credentials() -> io::Result<(String, String)> {
+    let username = std::env::var("IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME")
         .ok()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| io::Error::other("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME is required"))?;
-    let password = std::env::var("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD")
+        .ok_or_else(|| io::Error::other("IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME is required"))?;
+    let password = std::env::var("IOT_NANO_BOOTSTRAP_SYSTEM_PASSWORD")
         .ok()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| io::Error::other("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD is required"))?;
+        .ok_or_else(|| io::Error::other("IOT_NANO_BOOTSTRAP_SYSTEM_PASSWORD is required"))?;
     Ok((username, password))
 }
 

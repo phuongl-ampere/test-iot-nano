@@ -349,7 +349,7 @@ fn migrate_only_requires_complete_config_and_prepares_internal_state_without_bin
 }
 
 #[test]
-fn bootstrap_admin_provisions_an_empty_platform_without_binding_listeners() {
+fn bootstrap_system_provisions_an_empty_platform_without_binding_listeners() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let addresses = [
@@ -370,12 +370,12 @@ fn bootstrap_admin_provisions_an_empty_platform_without_binding_listeners() {
         ("IOT_NANO_MANAGEMENT_ADDRESS", &management_address),
         ("IOT_NANO_MQTT_TCP_ADDRESS", &mqtt_tcp_address),
         ("IOT_NANO_MQTT_TLS_ADDRESS", &mqtt_tls_address),
-        ("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME", "initial-admin"),
-        ("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD", "BootstrapAdmin@2026"),
+        ("IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME", "initial-system"),
+        ("IOT_NANO_BOOTSTRAP_SYSTEM_PASSWORD", "SystemAccount@2026"),
     ]);
 
     let output = Command::new(env!("CARGO_BIN_EXE_iot-nano-monolith"))
-        .arg("--bootstrap-admin")
+        .arg("--bootstrap-system")
         .env_clear()
         .envs(configuration)
         .output()

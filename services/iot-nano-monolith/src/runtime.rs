@@ -27,7 +27,7 @@ use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BootstrapAdminError, CacheError, ManagementSessionRouter, MonolithConfig, PersistentCache,
+    BootstrapSystemError, CacheError, ManagementSessionRouter, MonolithConfig, PersistentCache,
     PlatformCommandResponse, PlatformCommandTransport, PlatformCoreFacade,
     PlatformDeviceAuthorization, Readiness,
 };
@@ -60,18 +60,20 @@ pub struct MonolithRuntime {
 }
 
 impl MonolithRuntime {
-    pub async fn bootstrap_admin(
+    pub async fn bootstrap_system(
         storage: &StorageConfiguration,
         username: &str,
         password: &str,
-    ) -> Result<(), BootstrapAdminError> {
+    ) -> Result<(), BootstrapSystemError> {
         PlatformStore::backup_sqlite_before_migration(storage)
             .await
-            .map_err(BootstrapAdminError::PlatformMigration)?;
+            .map_err(BootstrapSystemError::PlatformMigration)?;
         let platform = PlatformStore::open(storage)
             .await
-            .map_err(BootstrapAdminError::PlatformMigration)?;
-        crate::management::bootstrap_admin(&platform, username, password).await
+            .map_err(BootstrapSystemError::PlatformMigration)?;
+        crate::management::bootstrap_system(&platform, username, password)
+            .await
+            .map(|_| ())
     }
 
     pub async fn migrate(config: &MonolithConfig) -> Result<(), StartupError> {
