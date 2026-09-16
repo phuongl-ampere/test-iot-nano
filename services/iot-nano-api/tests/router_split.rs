@@ -6,7 +6,10 @@ use axum::{
     },
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use iot_api::{ApiState, SqliteApiState, bootstrap_users_sqlite, router, routers, sqlite_routers};
+use iot_api::{
+    ApiState, SqliteApiState, bootstrap_users_sqlite, router, routers, sqlite_router,
+    sqlite_routers,
+};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, PlatformStore, SqliteStore,
@@ -108,7 +111,7 @@ async fn management_router_keeps_session_routes_protected() {
 }
 
 #[tokio::test]
-async fn legacy_router_keeps_management_and_internal_routes() {
+async fn legacy_router_keeps_management_routes_without_retired_mqttd_transport_routes() {
     let app = router(test_state());
 
     let management = app
@@ -123,24 +126,73 @@ async fn legacy_router_keeps_management_and_internal_routes() {
         .unwrap();
     assert_eq!(management.status(), StatusCode::UNAUTHORIZED);
 
-    let internal = app
+    for uri in [
+        "/internal/mqttd/session-resolution",
+        "/internal/mqttd/session-authorization",
+        "/internal/mqttd/gateway-authorization",
+        "/internal/mqttd/rpc-response",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{uri} must be retired from the legacy composite router"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_legacy_router_keeps_management_routes_without_retired_mqttd_transport_routes() {
+    let (_directory, state) = sqlite_test_state().await;
+    let app = sqlite_router(state);
+
+    let management = app
+        .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/internal/mqttd/session-resolution")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"client_id":"router-split","username":"unused"}"#,
-                ))
+                .uri("/api/auth/me")
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(
-        internal.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "the legacy internal route must be matched before its unconfigured authentication fails"
-    );
+    assert_eq!(management.status(), StatusCode::UNAUTHORIZED);
+
+    for uri in [
+        "/internal/mqttd/session-resolution",
+        "/internal/mqttd/session-authorization",
+        "/internal/mqttd/gateway-authorization",
+        "/internal/mqttd/rpc-response",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{uri} must be retired from the SQLite composite router"
+        );
+    }
 }
 
 #[tokio::test]
