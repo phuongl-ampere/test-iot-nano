@@ -9,10 +9,10 @@ use axum::{
         header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
 };
-use iot_api::{OAuthBrowserSessionVerifier, TokenVault, bootstrap_users_sqlite};
+use iot_api::{OAuthBrowserSessionVerifier, TokenVault, hash_password};
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_nano_monolith::{BootstrapAdminError, ManagementSessionRouter, bootstrap_admin};
-use iot_storage::PlatformStore;
+use iot_nano_monolith::{ManagementSessionRouter, bootstrap_system};
+use iot_storage::{NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -41,9 +41,7 @@ async fn management_session_router_with_store() -> (
         .await
         .unwrap(),
     );
-    bootstrap_users_sqlite(store.sqlite_pool().unwrap())
-        .await
-        .unwrap();
+    seed_tenant_admin_users(&store).await;
     let management = ManagementSessionRouter::new(Arc::clone(&store), test_token_vault());
     let router = management
         .router
@@ -60,6 +58,50 @@ async fn management_session_router_with_store() -> (
             session_verifier: management.session_verifier,
         },
     )
+}
+
+async fn seed_tenant_admin_users(store: &PlatformStore) {
+    bootstrap_system(store, "system", "SystemAccount@2026")
+        .await
+        .unwrap();
+    let (tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store,
+        NewTenant {
+            slug: "test".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("TenantAccount@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let pool = store.sqlite_pool().unwrap();
+    for (username, password, role, account_class) in [
+        ("admin", "NanoAdmin@1234", "admin", "admin"),
+        ("viewer", "NanoView@1234", "viewer", "user"),
+    ] {
+        let user_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO users (
+                id, tenant_id, username, password_hash, role, account_class, default_app
+             ) VALUES (?, ?, ?, ?, ?, ?, '/apps/powermonitor')",
+        )
+        .bind(&user_id)
+        .bind(tenant.id.to_string())
+        .bind(username)
+        .bind(hash_password(password).unwrap())
+        .bind(role)
+        .bind(account_class)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES (?, 'powermonitor')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -467,7 +509,7 @@ async fn management_login_rate_limit_does_not_block_another_username_from_the_sa
 }
 
 #[tokio::test]
-async fn bootstrap_admin_creates_the_only_initial_user_and_enables_management_login() {
+async fn bootstrap_system_creates_the_only_initial_system_account_and_enables_system_login() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         PlatformStore::open(&StorageConfiguration {
@@ -479,26 +521,14 @@ async fn bootstrap_admin_creates_the_only_initial_user_and_enables_management_lo
         .await
         .unwrap(),
     );
-    bootstrap_admin(&store, "initial-admin", "BootstrapAdmin@2026")
+    bootstrap_system(&store, "initial-system", "SystemAccount@2026")
         .await
         .unwrap();
-    assert!(matches!(
-        bootstrap_admin(&store, "second-admin", "BootstrapAdmin@2026").await,
-        Err(BootstrapAdminError::AlreadyInitialized)
-    ));
-    let grants: Vec<String> = sqlx::query_scalar(
-        "SELECT app_key FROM user_app_grants WHERE user_id = ? ORDER BY app_key",
-    )
-    .bind(
-        sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE username = 'initial-admin'")
-            .fetch_one(store.sqlite_pool().unwrap())
+    assert!(
+        bootstrap_system(&store, "second-system", "SystemAccount@2026")
             .await
-            .unwrap(),
-    )
-    .fetch_all(store.sqlite_pool().unwrap())
-    .await
-    .unwrap();
-    assert_eq!(grants, vec!["powermonitor"]);
+            .is_err()
+    );
 
     let management = ManagementSessionRouter::new(store, test_token_vault());
     let router = management
@@ -511,10 +541,10 @@ async fn bootstrap_admin_creates_the_only_initial_user_and_enables_management_lo
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"username":"initial-admin","password":"BootstrapAdmin@2026"}"#,
+                    r#"{"username":"initial-system","password":"SystemAccount@2026"}"#,
                 ))
                 .unwrap(),
         )
@@ -536,9 +566,7 @@ async fn management_admin_can_register_an_oauth_application() {
         .await
         .unwrap(),
     );
-    bootstrap_admin(&store, "initial-admin", "BootstrapAdmin@2026")
-        .await
-        .unwrap();
+    seed_tenant_admin_users(&store).await;
     let management = ManagementSessionRouter::new(Arc::clone(&store), test_token_vault());
     let router = management
         .router
@@ -554,7 +582,7 @@ async fn management_admin_can_register_an_oauth_application() {
                 .uri("/api/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"username":"initial-admin","password":"BootstrapAdmin@2026"}"#,
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
                 ))
                 .unwrap(),
         )
