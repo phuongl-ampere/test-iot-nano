@@ -57,7 +57,7 @@ pub use public_api::{
 pub use tenant_identity::{
     AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount,
     SystemAccountCredential, Tenant, TenantAccount, TenantAccountCredential, TenantIdentityError,
-    TenantIdentityRepository, TenantStatus,
+    TenantIdentityRepository, TenantStatus, TenantUserCredential,
 };
 
 const SQLITE_SCHEMA: &str = r#"
@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS tenant_accounts (
 
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL,
@@ -195,6 +196,8 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS users_tenant_username_id_index
+    ON users (tenant_id, username, id);
 CREATE TABLE IF NOT EXISTS user_app_grants (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     app_key TEXT NOT NULL,

@@ -73,6 +73,13 @@ pub struct TenantAccountCredential {
     pub password_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantUserCredential {
+    pub user_id: Uuid,
+    pub tenant_id: Uuid,
+    pub password_hash: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewSystemAccount {
     pub username: String,
@@ -260,6 +267,45 @@ impl TenantIdentityRepository {
                 .fetch_optional(pool)
                 .await?;
                 row.map(tenant_account_credential_from_postgres).transpose()
+            }
+        }
+    }
+
+    pub async fn tenant_user_credential(
+        store: &PlatformStore,
+        tenant_slug: &str,
+        username: &str,
+    ) -> Result<Option<TenantUserCredential>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let row = sqlx::query(
+                    "SELECT users.id, users.tenant_id, users.password_hash
+                     FROM users
+                     JOIN tenants ON tenants.id = users.tenant_id
+                     WHERE tenants.slug = ?
+                       AND tenants.status = 'active'
+                       AND users.username = ?",
+                )
+                .bind(tenant_slug)
+                .bind(username)
+                .fetch_optional(&store.pool)
+                .await?;
+                row.map(tenant_user_credential_from_sqlite).transpose()
+            }
+            PlatformStore::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT users.id, users.tenant_id, users.password_hash
+                     FROM users
+                     JOIN tenants ON tenants.id = users.tenant_id
+                     WHERE tenants.slug = $1
+                       AND tenants.status = 'active'
+                       AND users.username = $2",
+                )
+                .bind(tenant_slug)
+                .bind(username)
+                .fetch_optional(pool)
+                .await?;
+                row.map(tenant_user_credential_from_postgres).transpose()
             }
         }
     }
@@ -500,6 +546,26 @@ fn tenant_account_credential_from_postgres(
             status: TenantStatus::Active,
             metadata: row.try_get::<Json<Value>, _>("metadata")?.0,
         },
+        password_hash: row.try_get("password_hash")?,
+    })
+}
+
+fn tenant_user_credential_from_sqlite(
+    row: SqliteRow,
+) -> Result<TenantUserCredential, TenantIdentityError> {
+    Ok(TenantUserCredential {
+        user_id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        tenant_id: parse_uuid(row.try_get::<String, _>("tenant_id")?)?,
+        password_hash: row.try_get("password_hash")?,
+    })
+}
+
+fn tenant_user_credential_from_postgres(
+    row: PgRow,
+) -> Result<TenantUserCredential, TenantIdentityError> {
+    Ok(TenantUserCredential {
+        user_id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
         password_hash: row.try_get("password_hash")?,
     })
 }

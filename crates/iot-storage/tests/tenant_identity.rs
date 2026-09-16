@@ -183,3 +183,37 @@ async fn sqlite_tenant_identity_repository_controls_tenant_and_credential_lifecy
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn sqlite_schema_requires_tenant_id_for_every_user() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let missing_tenant = sqlx::query(
+        "INSERT INTO users (id, username, password_hash, role, account_class, default_app)
+         VALUES (?, ?, ?, 'viewer', 'user', '/app')",
+    )
+    .bind("user-without-tenant")
+    .bind("without-tenant")
+    .bind("hash")
+    .execute(pool)
+    .await;
+    assert!(missing_tenant.is_err());
+
+    sqlx::query("INSERT INTO tenants (id, slug, status, metadata) VALUES (?, ?, 'active', '{}')")
+        .bind("tenant-1")
+        .bind("north")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
+         VALUES (?, ?, ?, ?, 'viewer', 'user', '/app')",
+    )
+    .bind("user-with-tenant")
+    .bind("tenant-1")
+    .bind("with-tenant")
+    .bind("hash")
+    .execute(pool)
+    .await
+    .unwrap();
+}

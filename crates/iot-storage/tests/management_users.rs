@@ -4,11 +4,18 @@ use iot_storage::{
     ManagementUserRole, PlatformStore, UpdateManagementUser,
 };
 use sqlx::{Connection, PgConnection};
+use uuid::Uuid;
 
 mod common;
 
 struct TimescaleTestLock {
     _connection: PgConnection,
+}
+
+const TEST_TENANT_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+fn test_tenant_id() -> Uuid {
+    Uuid::parse_str(TEST_TENANT_ID).unwrap()
 }
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
@@ -19,6 +26,13 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
         sqlite_path: Some(directory.path().join("management-users.sqlite")),
         sqlite_busy_timeout_ms: 5_000,
     })
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata) VALUES (?, 'test', 'active', '{}')",
+    )
+    .bind(TEST_TENANT_ID)
+    .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
     (directory, store)
@@ -47,6 +61,11 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
     })
     .await
     .unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status, metadata) VALUES ($1, 'test', 'active', '{}'::jsonb)")
+        .bind(test_tenant_id())
+        .execute(store.timescale_pool().unwrap())
+        .await
+        .unwrap();
     (
         TimescaleTestLock {
             _connection: connection,
@@ -57,6 +76,7 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
 
 fn user_creation(username: &str) -> CreateManagementUser {
     CreateManagementUser {
+        tenant_id: test_tenant_id(),
         username: username.to_owned(),
         password_hash: "stored-password-hash".to_owned(),
         default_app: "/apps/powermonitor".to_owned(),
@@ -76,7 +96,7 @@ async fn sqlite_management_user_repository_creates_and_lists_users() {
     assert_eq!(created.default_app, "/apps/powermonitor");
     assert_eq!(created.granted_apps, ["fleet", "powermonitor"]);
 
-    let listed = ManagementUserRepository::list_management_users(&store)
+    let listed = ManagementUserRepository::list_management_users(&store, test_tenant_id())
         .await
         .unwrap();
     assert_eq!(listed, [created]);
@@ -91,6 +111,7 @@ async fn sqlite_management_user_repository_updates_a_username_and_replaces_grant
 
     let updated = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -129,6 +150,7 @@ async fn sqlite_management_user_role_changes_update_account_class_atomically() {
 
     let alice = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -143,6 +165,7 @@ async fn sqlite_management_user_role_changes_update_account_class_atomically() {
 
     ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "bob",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -154,6 +177,7 @@ async fn sqlite_management_user_role_changes_update_account_class_atomically() {
     .unwrap();
     let alice = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -181,6 +205,7 @@ async fn sqlite_management_user_repository_rejects_duplicate_granted_apps() {
     let error = ManagementUserRepository::create_management_user(
         &store,
         CreateManagementUser {
+            tenant_id: test_tenant_id(),
             username: "alice".to_owned(),
             password_hash: "stored-password-hash".to_owned(),
             default_app: "/apps/powermonitor".to_owned(),
@@ -232,6 +257,7 @@ async fn sqlite_management_user_repository_returns_typed_input_conflict_and_not_
 
     let missing = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "missing",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -252,16 +278,18 @@ async fn sqlite_management_user_repository_protects_system_and_administrator_inv
     let system_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO users (
-            id, username, password_hash, role, account_class, default_app
-         ) VALUES (?, 'system', 'stored-password-hash', 'admin', 'system', '/apps/powermonitor')",
+            id, tenant_id, username, password_hash, role, account_class, default_app
+         ) VALUES (?, ?, 'system', 'stored-password-hash', 'admin', 'system', '/apps/powermonitor')",
     )
     .bind(system_id.to_string())
+    .bind(TEST_TENANT_ID)
     .execute(pool)
     .await
     .unwrap();
 
     let system_error = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "system",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -281,6 +309,7 @@ async fn sqlite_management_user_repository_protects_system_and_administrator_inv
         .unwrap();
     let alice = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -298,6 +327,7 @@ async fn sqlite_management_user_repository_protects_system_and_administrator_inv
         .unwrap();
     let last_admin = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -322,6 +352,7 @@ async fn sqlite_management_user_repository_protects_system_and_administrator_inv
     .unwrap();
     let storage_error = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -333,12 +364,13 @@ async fn sqlite_management_user_repository_protects_system_and_administrator_inv
     .unwrap_err();
     assert!(matches!(storage_error, ManagementUserError::Storage { .. }));
 
-    let alice_after_failure = ManagementUserRepository::list_management_users(&store)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|user| user.username == "alice")
-        .unwrap();
+    let alice_after_failure =
+        ManagementUserRepository::list_management_users(&store, test_tenant_id())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "alice")
+            .unwrap();
     assert_eq!(alice_after_failure.role, ManagementUserRole::Admin);
     assert_eq!(alice_after_failure.default_app, "/apps/powermonitor");
     assert_eq!(alice_after_failure.granted_apps, ["powermonitor"]);
@@ -352,14 +384,15 @@ async fn sqlite_management_user_repository_rejects_invalid_stored_roles_and_sche
 
     sqlx::query(
         "INSERT INTO users (
-            id, username, password_hash, role, account_class, default_app
-         ) VALUES (?, 'invalid-role', 'stored-password-hash', 'operator', 'user', '/apps/powermonitor')",
+            id, tenant_id, username, password_hash, role, account_class, default_app
+         ) VALUES (?, ?, 'invalid-role', 'stored-password-hash', 'operator', 'user', '/apps/powermonitor')",
     )
     .bind(uuid::Uuid::now_v7().to_string())
+    .bind(TEST_TENANT_ID)
     .execute(pool)
     .await
     .unwrap();
-    let invalid_role = ManagementUserRepository::list_management_users(&store)
+    let invalid_role = ManagementUserRepository::list_management_users(&store, test_tenant_id())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -369,10 +402,11 @@ async fn sqlite_management_user_repository_rejects_invalid_stored_roles_and_sche
 
     let invalid_class = sqlx::query(
         "INSERT INTO users (
-            id, username, password_hash, role, account_class, default_app
-         ) VALUES (?, 'invalid-class', 'stored-password-hash', 'viewer', 'service', '/apps/powermonitor')",
+            id, tenant_id, username, password_hash, role, account_class, default_app
+         ) VALUES (?, ?, 'invalid-class', 'stored-password-hash', 'viewer', 'service', '/apps/powermonitor')",
     )
     .bind(uuid::Uuid::now_v7().to_string())
+    .bind(TEST_TENANT_ID)
     .execute(pool)
     .await
     .unwrap_err();
@@ -397,6 +431,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
 
     let updated = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -416,6 +451,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
         .unwrap();
     let bob = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "bob",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -427,6 +463,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
     .unwrap();
     let demoted = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -441,6 +478,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
 
     let duplicate_apps = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -457,6 +495,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
 
     let last_admin = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "bob",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -470,15 +509,17 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
 
     sqlx::query(
         "INSERT INTO users (
-            id, username, password_hash, role, account_class, default_app
-         ) VALUES ($1, 'system', 'stored-password-hash', 'viewer', 'system', '/apps/powermonitor')",
+            id, tenant_id, username, password_hash, role, account_class, default_app
+         ) VALUES ($1, $2, 'system', 'stored-password-hash', 'viewer', 'system', '/apps/powermonitor')",
     )
     .bind(uuid::Uuid::now_v7())
+    .bind(test_tenant_id())
     .execute(pool)
     .await
     .unwrap();
     let system = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "system",
         UpdateManagementUser {
             default_app: "/apps/fleet".to_owned(),
@@ -509,6 +550,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
     .unwrap();
     let rollback = ManagementUserRepository::update_management_user(
         &store,
+        test_tenant_id(),
         "alice",
         UpdateManagementUser {
             default_app: "/apps/powermonitor".to_owned(),
@@ -519,18 +561,19 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
     .await
     .unwrap_err();
     assert!(matches!(rollback, ManagementUserError::Storage { .. }));
-    let alice_after_rollback = ManagementUserRepository::list_management_users(&store)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|user| user.username == "alice")
-        .unwrap();
+    let alice_after_rollback =
+        ManagementUserRepository::list_management_users(&store, test_tenant_id())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "alice")
+            .unwrap();
     assert_eq!(alice_after_rollback.role, ManagementUserRole::Viewer);
     assert_eq!(alice_after_rollback.account_class, AccountClass::User);
     assert_eq!(alice_after_rollback.default_app, "/apps/fleet");
     assert_eq!(alice_after_rollback.granted_apps, ["fleet", "reports"]);
 
-    let listed = ManagementUserRepository::list_management_users(&store)
+    let listed = ManagementUserRepository::list_management_users(&store, test_tenant_id())
         .await
         .unwrap();
     assert_eq!(

@@ -20,7 +20,7 @@ use iot_api::{
     AuthError, DeviceTokenResponse, DeviceTokenStoreError, OAuthBrowserSessionVerifier,
     POWER_MONITOR_APP, PrincipalKind, Role, TokenVault, authenticate_credentials,
     authenticate_credentials_sqlite, authenticate_system_account, authenticate_tenant_account,
-    create_platform_device_token, generate_session_id, hash_password,
+    authenticate_user_account, create_platform_device_token, generate_session_id, hash_password,
     provision_platform_device_token, validate_password,
 };
 use iot_storage::{
@@ -256,6 +256,8 @@ impl ManagementSessionRouter {
             )
             .route("/api/tenant/auth/login", post(tenant_login))
             .route("/api/tenant/auth/me", get(current_tenant_session))
+            .route("/api/user/auth/login", post(user_login))
+            .route("/api/user/auth/me", get(current_user_session))
             .route("/api/management/applications", post(create_application))
             .route(
                 "/api/management/users",
@@ -1095,6 +1097,31 @@ impl ManagementSessionVerifier {
         }
     }
 
+    fn issue_user(&self, user_id: Uuid, tenant_id: Uuid) -> String {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        loop {
+            let session_id = generate_session_id();
+            if !sessions.contains_key(&session_id) {
+                sessions.insert(
+                    session_id.clone(),
+                    Session {
+                        user_id: Some(user_id),
+                        system_account_id: None,
+                        tenant_account_id: None,
+                        tenant_id: Some(tenant_id),
+                        role: None,
+                        expires_at: Instant::now() + SESSION_TTL,
+                    },
+                );
+                return session_id;
+            }
+        }
+    }
+
     fn revoke(&self, headers: &HeaderMap) {
         let Some(session_id) = session_id(headers) else {
             return;
@@ -1164,6 +1191,20 @@ impl ManagementSessionVerifier {
         let session = sessions.get(session_id)?;
         Some(TenantSession {
             tenant_account_id: session.tenant_account_id?,
+            tenant_id: session.tenant_id?,
+        })
+    }
+
+    fn user_session(&self, headers: &HeaderMap) -> Option<UserSession> {
+        let session_id = session_id(headers)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        let session = sessions.get(session_id)?;
+        Some(UserSession {
+            user_id: session.user_id?,
             tenant_id: session.tenant_id?,
         })
     }
@@ -1395,6 +1436,12 @@ struct TenantSession {
     tenant_id: Uuid,
 }
 
+#[derive(Clone, Copy)]
+struct UserSession {
+    user_id: Uuid,
+    tenant_id: Uuid,
+}
+
 enum ManagementAuthorization {
     Unauthenticated,
     Admin,
@@ -1497,10 +1544,24 @@ struct TenantLoginRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct UserLoginRequest {
+    tenant_slug: String,
+    username: String,
+    password: String,
+}
+
 #[derive(Serialize)]
 struct TenantSessionResponse {
     principal_kind: PrincipalKind,
     tenant_account_id: Uuid,
+    tenant_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct UserSessionResponse {
+    principal_kind: PrincipalKind,
+    user_id: Uuid,
     tenant_id: Uuid,
 }
 
@@ -1854,6 +1915,88 @@ async fn current_tenant_session(
     }))
 }
 
+async fn user_login(
+    State(state): State<ManagementState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<UserLoginRequest>,
+) -> Result<(HeaderMap, Json<UserSessionResponse>), ManagementSessionError> {
+    let attempt_key = LoginAttemptKey {
+        address: address.ip(),
+        username: format!("{}:{}", request.tenant_slug, request.username),
+    };
+    let reserved = {
+        let mut limiter = state
+            .login_limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        limiter.reserve(&attempt_key)
+    };
+    if !reserved {
+        return Err(ManagementSessionError::TooManyRequests);
+    }
+
+    let principal = match authenticate_user_account(
+        &state.store,
+        &request.tenant_slug,
+        &request.username,
+        &request.password,
+    )
+    .await
+    {
+        Ok(principal) => principal,
+        Err(AuthError::AuthenticationFailed) => {
+            state
+                .login_limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record_failure(&attempt_key);
+            return Err(ManagementSessionError::Unauthorized);
+        }
+        Err(_) => {
+            state
+                .login_limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .release(&attempt_key);
+            return Err(ManagementSessionError::Unavailable);
+        }
+    };
+    let tenant_id = principal
+        .tenant_id
+        .ok_or(ManagementSessionError::Unavailable)?;
+    let session_id = state
+        .session_verifier
+        .issue_user(principal.principal_id, tenant_id);
+    state
+        .login_limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record_success(&attempt_key);
+    Ok((
+        session_cookie_headers(&session_id),
+        Json(UserSessionResponse {
+            principal_kind: PrincipalKind::User,
+            user_id: principal.principal_id,
+            tenant_id,
+        }),
+    ))
+}
+
+async fn current_user_session(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<UserSessionResponse>, ManagementSessionError> {
+    let session = state
+        .session_verifier
+        .user_session(&headers)
+        .ok_or(ManagementSessionError::Unauthorized)?;
+    Ok(Json(UserSessionResponse {
+        principal_kind: PrincipalKind::User,
+        user_id: session.user_id,
+        tenant_id: session.tenant_id,
+    }))
+}
+
 async fn create_system_tenant(
     State(state): State<ManagementState>,
     request: Request,
@@ -2052,8 +2195,8 @@ async fn list_management_users(
     State(state): State<ManagementState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ManagementUserResponse>>, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
-    ManagementUserRepository::list_management_users(state.store.as_ref())
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementUserRepository::list_management_users(state.store.as_ref(), tenant.tenant_id)
         .await
         .map(|users| Json(users.into_iter().map(management_user_response).collect()))
         .map_err(management_user_error)
@@ -2064,17 +2207,18 @@ async fn create_management_user(
     request: Request,
 ) -> Result<(StatusCode, Json<ManagementUserResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     #[cfg(test)]
     pause_after_mutation_authorization(&state).await;
     let request: CreateManagementUserRequest = management_request_json(&state, request).await?;
     validate_password(&request.password).map_err(|_| ManagementSessionError::BadRequest)?;
     let password_hash =
         hash_password(&request.password).map_err(|_| ManagementSessionError::BadRequest)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let user = ManagementUserRepository::create_management_user(
         state.store.as_ref(),
         CreateManagementUser {
+            tenant_id: tenant.tenant_id,
             username: request.username,
             password_hash,
             default_app: request.default_app,
@@ -2092,7 +2236,7 @@ async fn update_management_user(
     request: Request,
 ) -> Result<Json<ManagementUserResponse>, ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: UpdateManagementUserRequest = management_request_json(&state, request).await?;
     let role = request
         .role
@@ -2106,9 +2250,10 @@ async fn update_management_user(
     };
     if update.role.is_some() {
         let role_change = state.authorization_gate.begin_role_change().await;
-        require_management_admin(&state.session_verifier, &headers)?;
+        require_tenant_account(&state.session_verifier, &headers)?;
         let user = ManagementUserRepository::update_management_user(
             state.store.as_ref(),
+            tenant.tenant_id,
             &username,
             update,
         )
@@ -2117,11 +2262,15 @@ async fn update_management_user(
         role_change.commit(&state.session_verifier, user.id);
         return Ok(Json(management_user_response(user)));
     }
-    let _lease = authorize_management_mutation(&state, &headers).await?;
-    let user =
-        ManagementUserRepository::update_management_user(state.store.as_ref(), &username, update)
-            .await
-            .map_err(management_user_error)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let user = ManagementUserRepository::update_management_user(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        &username,
+        update,
+    )
+    .await
+    .map_err(management_user_error)?;
     Ok(Json(management_user_response(user)))
 }
 
@@ -2636,6 +2785,27 @@ async fn authorize_management_mutation<'a>(
     let lease = state.authorization_gate.acquire_mutation().await;
     require_management_admin(&state.session_verifier, headers)?;
     Ok(lease)
+}
+
+async fn authorize_tenant_mutation<'a>(
+    state: &'a ManagementState,
+    headers: &HeaderMap,
+) -> Result<ManagementMutationLease<'a>, ManagementSessionError> {
+    let lease = state.authorization_gate.acquire_mutation().await;
+    require_tenant_account(&state.session_verifier, headers)?;
+    Ok(lease)
+}
+
+fn require_tenant_account(
+    session_verifier: &ManagementSessionVerifier,
+    headers: &HeaderMap,
+) -> Result<TenantSession, ManagementSessionError> {
+    if session_id(headers).is_none() {
+        return Err(ManagementSessionError::Unauthorized);
+    }
+    session_verifier
+        .tenant_session(headers)
+        .ok_or(ManagementSessionError::Forbidden)
 }
 
 async fn management_request_json<T>(

@@ -178,13 +178,58 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .unwrap();
     assert_eq!(tenant_me.status(), StatusCode::OK);
 
+    let create_user = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/users")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    r#"{"username":"north-user","password":"NorthUser@2026","default_app":"/apps/powermonitor","granted_apps":["powermonitor"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+
+    let list_users = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/users")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_users.status(), StatusCode::OK);
+
+    let system_users = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/users")
+                .header(COOKIE, &system_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(system_users.status(), StatusCode::FORBIDDEN);
+
     let system_route = router
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/system/tenants")
                 .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, tenant_cookie)
+                .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
                     r#"{"slug":"south","metadata":{},"tenant_account_password":"TenantAccount@2026"}"#,
                 ))
@@ -193,6 +238,135 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .await
         .unwrap();
     assert_eq!(system_route.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() {
+    let (_directory, router) = system_router().await;
+    let system_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"system","password":"SystemAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let system_cookie = system_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let create_tenant = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/tenants")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &system_cookie)
+                .body(Body::from(
+                    r#"{"slug":"north","metadata":{},"tenant_account_password":"TenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_tenant.status(), StatusCode::CREATED);
+    let tenant_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"north","password":"TenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tenant_cookie = tenant_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let create_user = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/users")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    r#"{"username":"north-user","password":"NorthUser@2026","default_app":"/apps/powermonitor","granted_apps":["powermonitor"]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_user.status(), StatusCode::CREATED);
+
+    let user_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/user/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"north","username":"north-user","password":"NorthUser@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_login.status(), StatusCode::OK);
+    let user_cookie = user_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let user_me = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/user/auth/me")
+                .header(COOKIE, &user_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_me.status(), StatusCode::OK);
+
+    let tenant_users = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/users")
+                .header(COOKIE, user_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenant_users.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

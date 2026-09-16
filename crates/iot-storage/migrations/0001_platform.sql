@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS tenant_accounts (
 
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT public.uuid_generate_v4(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL,
@@ -49,6 +50,8 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE users ALTER COLUMN id SET DEFAULT public.uuid_generate_v4();
+CREATE INDEX IF NOT EXISTS users_tenant_username_id_index
+    ON users (tenant_id, username, id);
 
 CREATE TABLE IF NOT EXISTS user_app_grants (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

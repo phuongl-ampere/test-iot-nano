@@ -40,6 +40,7 @@ fn management_user_account_class_for_role(role: ManagementUserRole) -> AccountCl
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagementUser {
     pub id: Uuid,
+    pub tenant_id: Uuid,
     pub username: String,
     pub role: ManagementUserRole,
     pub account_class: AccountClass,
@@ -49,6 +50,7 @@ pub struct ManagementUser {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateManagementUser {
+    pub tenant_id: Uuid,
     pub username: String,
     pub password_hash: String,
     pub default_app: String,
@@ -108,6 +110,7 @@ impl From<sqlx::Error> for ManagementUserError {
 pub trait ManagementUserRepository: Send + Sync {
     fn list_management_users<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementUser>, ManagementUserError>> + Send + 'a>>;
     fn create_management_user<'a>(
         &'a self,
@@ -115,6 +118,7 @@ pub trait ManagementUserRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<ManagementUser, ManagementUserError>> + Send + 'a>>;
     fn update_management_user<'a>(
         &'a self,
+        tenant_id: Uuid,
         username: &'a str,
         user: UpdateManagementUser,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementUser, ManagementUserError>> + Send + 'a>>;
@@ -123,9 +127,10 @@ pub trait ManagementUserRepository: Send + Sync {
 impl ManagementUserRepository for PlatformStore {
     fn list_management_users<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementUser>, ManagementUserError>> + Send + 'a>>
     {
-        Box::pin(async move { list_management_users(self).await })
+        Box::pin(async move { list_management_users(self, tenant_id).await })
     }
 
     fn create_management_user<'a>(
@@ -138,11 +143,12 @@ impl ManagementUserRepository for PlatformStore {
 
     fn update_management_user<'a>(
         &'a self,
+        tenant_id: Uuid,
         username: &'a str,
         user: UpdateManagementUser,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementUser, ManagementUserError>> + Send + 'a>>
     {
-        Box::pin(async move { update_management_user(self, username, user).await })
+        Box::pin(async move { update_management_user(self, tenant_id, username, user).await })
     }
 }
 
@@ -702,14 +708,17 @@ impl ManagementDeviceRepository for PlatformStore {
 
 async fn list_management_users(
     store: &PlatformStore,
+    tenant_id: Uuid,
 ) -> Result<Vec<ManagementUser>, ManagementUserError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let rows = sqlx::query(
-                "SELECT id, username, role, account_class, default_app
+                "SELECT id, tenant_id, username, role, account_class, default_app
                  FROM users
+                 WHERE tenant_id = ?
                  ORDER BY username, id",
             )
+            .bind(tenant_id.to_string())
             .fetch_all(store.pool())
             .await?;
             let mut users = Vec::with_capacity(rows.len());
@@ -720,10 +729,12 @@ async fn list_management_users(
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "SELECT id, username, role, account_class, default_app
+                "SELECT id, tenant_id, username, role, account_class, default_app
                  FROM users
+                 WHERE tenant_id = $1
                  ORDER BY username, id",
             )
+            .bind(tenant_id)
             .fetch_all(pool)
             .await?;
             let mut users = Vec::with_capacity(rows.len());
@@ -741,16 +752,18 @@ async fn create_management_user(
 ) -> Result<ManagementUser, ManagementUserError> {
     let user = validate_new_management_user(user)?;
     let user_id = Uuid::now_v7();
+    let tenant_id = user.tenant_id;
     let username = user.username.clone();
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
             sqlx::query(
                 "INSERT INTO users (
-                    id, username, password_hash, role, account_class, default_app, updated_at
-                 ) VALUES (?, ?, ?, 'viewer', 'user', ?, ?)",
+                    id, tenant_id, username, password_hash, role, account_class, default_app, updated_at
+                 ) VALUES (?, ?, ?, ?, 'viewer', 'user', ?, ?)",
             )
             .bind(user_id.to_string())
+            .bind(tenant_id.to_string())
             .bind(&user.username)
             .bind(user.password_hash)
             .bind(user.default_app)
@@ -771,10 +784,11 @@ async fn create_management_user(
             let mut transaction = pool.begin().await?;
             sqlx::query(
                 "INSERT INTO users (
-                    id, username, password_hash, role, account_class, default_app
-                 ) VALUES ($1, $2, $3, 'viewer', 'user', $4)",
+                    id, tenant_id, username, password_hash, role, account_class, default_app
+                 ) VALUES ($1, $2, $3, $4, 'viewer', 'user', $5)",
             )
             .bind(user_id)
+            .bind(tenant_id)
             .bind(&user.username)
             .bind(user.password_hash)
             .bind(user.default_app)
@@ -791,11 +805,12 @@ async fn create_management_user(
             transaction.commit().await?;
         }
     }
-    management_user(store, user_id).await
+    management_user(store, tenant_id, user_id).await
 }
 
 async fn update_management_user(
     store: &PlatformStore,
+    tenant_id: Uuid,
     username: &str,
     user: UpdateManagementUser,
 ) -> Result<ManagementUser, ManagementUserError> {
@@ -807,9 +822,11 @@ async fn update_management_user(
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
             let (user_id, current_role, account_class) =
-                sqlite_management_user_mutation_target(&mut transaction, username).await?;
+                sqlite_management_user_mutation_target(&mut transaction, tenant_id, username)
+                    .await?;
             protect_management_user_invariants(
                 &mut transaction,
+                tenant_id,
                 username,
                 current_role,
                 account_class,
@@ -820,7 +837,7 @@ async fn update_management_user(
                 "UPDATE users
                  SET default_app = ?, role = COALESCE(?, role),
                      account_class = COALESCE(?, account_class), updated_at = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND tenant_id = ?",
             )
             .bind(&user.default_app)
             .bind(user.role.map(ManagementUserRole::as_str))
@@ -831,6 +848,7 @@ async fn update_management_user(
             )
             .bind(Utc::now().to_rfc3339())
             .bind(user_id.to_string())
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
             sqlx::query("DELETE FROM user_app_grants WHERE user_id = ?")
@@ -859,9 +877,11 @@ async fn update_management_user(
             .execute(&mut *transaction)
             .await?;
             let (user_id, current_role, account_class) =
-                timescale_management_user_mutation_target(&mut transaction, username).await?;
+                timescale_management_user_mutation_target(&mut transaction, tenant_id, username)
+                    .await?;
             protect_timescale_management_user_invariants(
                 &mut transaction,
+                tenant_id,
                 username,
                 current_role,
                 account_class,
@@ -872,7 +892,7 @@ async fn update_management_user(
                 "UPDATE users
                  SET default_app = $2, role = COALESCE($3, role),
                      account_class = COALESCE($4, account_class), updated_at = now()
-                 WHERE id = $1",
+                 WHERE id = $1 AND tenant_id = $5",
             )
             .bind(user_id)
             .bind(&user.default_app)
@@ -882,6 +902,7 @@ async fn update_management_user(
                     .map(management_user_account_class_for_role)
                     .map(AccountClass::as_str),
             )
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
             sqlx::query("DELETE FROM user_app_grants WHERE user_id = $1")
@@ -903,19 +924,21 @@ async fn update_management_user(
             user_id
         }
     };
-    management_user(store, user_id).await
+    management_user(store, tenant_id, user_id).await
 }
 
 async fn sqlite_management_user_mutation_target(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     username: &str,
 ) -> Result<(Uuid, ManagementUserRole, AccountClass), ManagementUserError> {
     let row = sqlx::query(
         "SELECT id, role, account_class
          FROM users
-         WHERE username = ?",
+         WHERE username = ? AND tenant_id = ?",
     )
     .bind(username)
+    .bind(tenant_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(ManagementUserError::UserNotFound)?;
@@ -930,14 +953,16 @@ async fn sqlite_management_user_mutation_target(
 
 async fn timescale_management_user_mutation_target(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     username: &str,
 ) -> Result<(Uuid, ManagementUserRole, AccountClass), ManagementUserError> {
     let row = sqlx::query(
         "SELECT id, role, account_class
          FROM users
-         WHERE username = $1",
+         WHERE username = $1 AND tenant_id = $2",
     )
     .bind(username)
+    .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(ManagementUserError::UserNotFound)?;
@@ -950,29 +975,7 @@ async fn timescale_management_user_mutation_target(
 
 async fn protect_management_user_invariants(
     transaction: &mut Transaction<'_, Sqlite>,
-    username: &str,
-    current_role: ManagementUserRole,
-    account_class: AccountClass,
-    next_role: Option<ManagementUserRole>,
-) -> Result<(), ManagementUserError> {
-    if account_class == AccountClass::System {
-        return Err(ManagementUserError::SystemUserImmutable);
-    }
-    if current_role == ManagementUserRole::Admin && next_role == Some(ManagementUserRole::Viewer) {
-        let remaining_admins: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND username <> ?")
-                .bind(username)
-                .fetch_one(&mut **transaction)
-                .await?;
-        if remaining_admins == 0 {
-            return Err(ManagementUserError::LastAdministrator);
-        }
-    }
-    Ok(())
-}
-
-async fn protect_timescale_management_user_invariants(
-    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     username: &str,
     current_role: ManagementUserRole,
     account_class: AccountClass,
@@ -983,8 +986,37 @@ async fn protect_timescale_management_user_invariants(
     }
     if current_role == ManagementUserRole::Admin && next_role == Some(ManagementUserRole::Viewer) {
         let remaining_admins: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE role = 'admin' AND username <> $1",
+            "SELECT COUNT(*) FROM users
+                 WHERE tenant_id = ? AND role = 'admin' AND username <> ?",
         )
+        .bind(tenant_id.to_string())
+        .bind(username)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if remaining_admins == 0 {
+            return Err(ManagementUserError::LastAdministrator);
+        }
+    }
+    Ok(())
+}
+
+async fn protect_timescale_management_user_invariants(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    username: &str,
+    current_role: ManagementUserRole,
+    account_class: AccountClass,
+    next_role: Option<ManagementUserRole>,
+) -> Result<(), ManagementUserError> {
+    if account_class == AccountClass::System {
+        return Err(ManagementUserError::SystemUserImmutable);
+    }
+    if current_role == ManagementUserRole::Admin && next_role == Some(ManagementUserRole::Viewer) {
+        let remaining_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users
+             WHERE tenant_id = $1 AND role = 'admin' AND username <> $2",
+        )
+        .bind(tenant_id)
         .bind(username)
         .fetch_one(&mut **transaction)
         .await?;
@@ -1060,9 +1092,10 @@ fn map_management_username_conflict(error: sqlx::Error, username: &str) -> Manag
 
 async fn management_user(
     store: &PlatformStore,
+    tenant_id: Uuid,
     user_id: Uuid,
 ) -> Result<ManagementUser, ManagementUserError> {
-    let users = list_management_users(store).await?;
+    let users = list_management_users(store, tenant_id).await?;
     users
         .into_iter()
         .find(|user| user.id == user_id)
@@ -1075,9 +1108,12 @@ async fn sqlite_management_user_from_row(
 ) -> Result<ManagementUser, ManagementUserError> {
     let id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
         .map_err(|_| ManagementUserError::InvalidStoredUserId)?;
+    let tenant_id = Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
+        .map_err(|_| ManagementUserError::InvalidStoredUserId)?;
     let granted_apps = sqlite_management_user_grants(pool, id).await?;
     management_user_from_parts(
         id,
+        tenant_id,
         row.try_get("username")?,
         row.try_get("role")?,
         row.try_get("account_class")?,
@@ -1107,9 +1143,11 @@ async fn timescale_management_user_from_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<ManagementUser, ManagementUserError> {
     let id = row.try_get("id")?;
+    let tenant_id = row.try_get("tenant_id")?;
     let granted_apps = timescale_management_user_grants(pool, id).await?;
     management_user_from_parts(
         id,
+        tenant_id,
         row.try_get("username")?,
         row.try_get("role")?,
         row.try_get("account_class")?,
@@ -1136,6 +1174,7 @@ async fn timescale_management_user_grants(
 
 fn management_user_from_parts(
     id: Uuid,
+    tenant_id: Uuid,
     username: String,
     role: String,
     account_class: String,
@@ -1146,6 +1185,7 @@ fn management_user_from_parts(
     let account_class = management_user_account_class(account_class)?;
     Ok(ManagementUser {
         id,
+        tenant_id,
         username,
         role,
         account_class,

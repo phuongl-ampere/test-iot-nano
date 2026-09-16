@@ -1,6 +1,6 @@
 use iot_api::{
     AuthError, PrincipalKind, authenticate_system_account, authenticate_tenant_account,
-    hash_password,
+    authenticate_user_account, hash_password,
 };
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
@@ -81,4 +81,57 @@ async fn tenant_auth_rejects_invalid_system_or_tenant_credentials() {
         authenticate_tenant_account(&store, "missing", "TenantAccount@2026").await,
         Err(AuthError::AuthenticationFailed)
     ));
+}
+
+#[tokio::test]
+async fn tenant_authenticates_user_only_with_the_matching_tenant_slug() {
+    let (_directory, store) = sqlite_store().await;
+    let (north, _) = TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "north".to_owned(),
+            metadata: serde_json::json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("TenantAccount@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let (south, _) = TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "south".to_owned(),
+            metadata: serde_json::json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("TenantAccount@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let user_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (
+            id, tenant_id, username, password_hash, role, account_class, default_app
+         ) VALUES (?, ?, 'north-user', ?, 'viewer', 'user', '/app')",
+    )
+    .bind(user_id.to_string())
+    .bind(north.id.to_string())
+    .bind(hash_password("NorthUser@2026").unwrap())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    let principal = authenticate_user_account(&store, "north", "north-user", "NorthUser@2026")
+        .await
+        .unwrap();
+    assert_eq!(principal.kind, PrincipalKind::User);
+    assert_eq!(principal.principal_id, user_id);
+    assert_eq!(principal.tenant_id, Some(north.id));
+    assert!(matches!(
+        authenticate_user_account(&store, "south", "north-user", "NorthUser@2026").await,
+        Err(AuthError::AuthenticationFailed)
+    ));
+    assert_ne!(north.id, south.id);
 }

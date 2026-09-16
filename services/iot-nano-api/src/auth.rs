@@ -267,6 +267,24 @@ pub async fn authenticate_tenant_account(
     })
 }
 
+pub async fn authenticate_user_account(
+    store: &PlatformStore,
+    tenant_slug: &str,
+    username: &str,
+    password: &str,
+) -> Result<AuthenticatedPrincipal, AuthError> {
+    let credential = TenantIdentityRepository::tenant_user_credential(store, tenant_slug, username)
+        .await
+        .map_err(AuthError::TenantIdentity)?
+        .ok_or(AuthError::AuthenticationFailed)?;
+    verify_password(password, &credential.password_hash)?;
+    Ok(AuthenticatedPrincipal {
+        kind: PrincipalKind::User,
+        principal_id: credential.user_id,
+        tenant_id: Some(credential.tenant_id),
+    })
+}
+
 fn verify_password(password: &str, password_hash: &str) -> Result<(), AuthError> {
     let password_hash =
         PasswordHash::new(password_hash).map_err(|_| AuthError::InvalidStoredHash)?;
