@@ -38,14 +38,17 @@ describe("PowerMonitor browser entry pages", () => {
 
     render(await PowerMonitorPage());
     expect(screen.getByTestId("login-gate")).toBeTruthy();
+    expect(screen.queryByTestId("dashboard")).toBeNull();
     cleanup();
 
     render(await DeviceDetailPage({ params: Promise.resolve({ deviceId: "device-1" }) }));
     expect(screen.getByTestId("login-gate")).toBeTruthy();
+    expect(screen.queryByTestId("dashboard")).toBeNull();
     cleanup();
 
     render(await AssetDetailPage({ params: Promise.resolve({ assetId: "asset-1" }) }));
     expect(screen.getByTestId("login-gate")).toBeTruthy();
+    expect(screen.queryByTestId("dashboard")).toBeNull();
     expect(hasPowerMonitorSession).toHaveBeenCalledTimes(3);
   });
 
@@ -55,6 +58,7 @@ describe("PowerMonitor browser entry pages", () => {
     render(await PowerMonitorPage());
 
     expect(screen.getByTestId("dashboard")).toBeTruthy();
+    expect(screen.queryByTestId("login-gate")).toBeNull();
   });
 
   it("preserves a device ID for an authenticated detail page", async () => {
@@ -63,6 +67,7 @@ describe("PowerMonitor browser entry pages", () => {
     render(await DeviceDetailPage({ params: Promise.resolve({ deviceId: "device-1" }) }));
 
     expect(screen.getByTestId("dashboard").getAttribute("data-device-id")).toBe("device-1");
+    expect(screen.queryByTestId("login-gate")).toBeNull();
   });
 
   it("preserves an asset ID for an authenticated detail page", async () => {
@@ -71,5 +76,6 @@ describe("PowerMonitor browser entry pages", () => {
     render(await AssetDetailPage({ params: Promise.resolve({ assetId: "asset-1" }) }));
 
     expect(screen.getByTestId("dashboard").getAttribute("data-asset-id")).toBe("asset-1");
+    expect(screen.queryByTestId("login-gate")).toBeNull();
   });
 });

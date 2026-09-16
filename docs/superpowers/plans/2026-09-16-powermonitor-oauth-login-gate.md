@@ -43,7 +43,7 @@ Testing Library, existing OAuth BFF helpers.
 - Produces: PowerMonitorLoginGate, whose primary action targets
   /api/auth/login.
 
-- [ ] **Step 1: Write the failing component test**
+- [x] **Step 1: Write the failing component test**
 
 Create apps/powermonitor/tests/login-gate.test.tsx:
 
@@ -64,7 +64,7 @@ describe("PowerMonitorLoginGate", () => {
 });
 ~~~
 
-- [ ] **Step 2: Run test to verify RED**
+- [x] **Step 2: Run test to verify RED**
 
 Run:
 
@@ -74,7 +74,7 @@ npm --prefix apps/powermonitor test -- login-gate.test.tsx
 
 Expected: FAIL because PowerMonitorLoginGate does not exist.
 
-- [ ] **Step 3: Add the server session helper and login gate**
+- [x] **Step 3: Add the server session helper and login gate**
 
 Create lib/page-session.ts:
 
@@ -107,7 +107,7 @@ export function PowerMonitorLoginGate() {
 }
 ~~~
 
-- [ ] **Step 4: Gate all browser entry pages**
+- [x] **Step 4: Gate all browser entry pages**
 
 Replace each page body with the same server-side branch before rendering the
 existing dashboard:
@@ -120,7 +120,7 @@ if (!(await hasPowerMonitorSession())) {
 
 Preserve initialDeviceId and initialAssetId for authenticated detail pages.
 
-- [ ] **Step 5: Add compact login styles**
+- [x] **Step 5: Add compact login styles**
 
 Append focused CSS:
 
@@ -153,7 +153,7 @@ Append focused CSS:
 }
 ~~~
 
-- [ ] **Step 6: Run focused tests and verify GREEN**
+- [x] **Step 6: Run focused tests and verify GREEN**
 
 Run:
 
@@ -164,7 +164,7 @@ npm --prefix apps/powermonitor test -- oauth-callback.test.ts
 
 Expected: both test files pass.
 
-- [ ] **Step 7: Run package test and production build**
+- [x] **Step 7: Run package test and production build**
 
 Run:
 
@@ -175,7 +175,7 @@ npm --prefix apps/powermonitor run build
 
 Expected: all tests and the production build pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ~~~bash
 git add apps/powermonitor docs/superpowers/plans/2026-09-16-powermonitor-oauth-login-gate.md
