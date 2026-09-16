@@ -194,3 +194,152 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .unwrap();
     assert_eq!(system_route.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() {
+    let (_directory, router) = system_router().await;
+    let system_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"system","password":"SystemAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let system_cookie = system_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let create_tenant = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/tenants")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &system_cookie)
+                .body(Body::from(
+                    r#"{"slug":"north","metadata":{},"tenant_account_password":"TenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_tenant.status(), StatusCode::CREATED);
+
+    let tenant_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"north","password":"TenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tenant_cookie = tenant_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let suspend = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/tenants/north/suspend")
+                .header(COOKIE, &system_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(suspend.status(), StatusCode::NO_CONTENT);
+    let revoked_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/tenant/auth/me")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked_session.status(), StatusCode::UNAUTHORIZED);
+
+    let reactivate = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/tenants/north/reactivate")
+                .header(COOKIE, &system_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reactivate.status(), StatusCode::NO_CONTENT);
+
+    let reset = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/tenants/north/tenant-account/reset")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &system_cookie)
+                .body(Body::from(r#"{"password":"NewTenantAccount@2026"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::NO_CONTENT);
+
+    let old_password = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"north","password":"TenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_password.status(), StatusCode::UNAUTHORIZED);
+
+    let delete = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/tenants/north/delete")
+                .header(COOKIE, system_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+}

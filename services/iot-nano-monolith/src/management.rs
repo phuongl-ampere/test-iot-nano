@@ -238,6 +238,22 @@ impl ManagementSessionRouter {
             .route("/api/auth/me", get(current_session))
             .route("/api/system/auth/login", post(system_login))
             .route("/api/system/tenants", post(create_system_tenant))
+            .route(
+                "/api/system/tenants/{tenant_slug}/suspend",
+                post(suspend_system_tenant),
+            )
+            .route(
+                "/api/system/tenants/{tenant_slug}/reactivate",
+                post(reactivate_system_tenant),
+            )
+            .route(
+                "/api/system/tenants/{tenant_slug}/delete",
+                post(delete_system_tenant),
+            )
+            .route(
+                "/api/system/tenants/{tenant_slug}/tenant-account/reset",
+                post(reset_system_tenant_account),
+            )
             .route("/api/tenant/auth/login", post(tenant_login))
             .route("/api/tenant/auth/me", get(current_tenant_session))
             .route("/api/management/applications", post(create_application))
@@ -1151,6 +1167,15 @@ impl ManagementSessionVerifier {
             tenant_id: session.tenant_id?,
         })
     }
+
+    fn invalidate_tenant(&self, tenant_id: Uuid) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        sessions.retain(|_, session| session.tenant_id != Some(tenant_id));
+    }
 }
 
 impl OAuthBrowserSessionVerifier for ManagementSessionVerifier {
@@ -1484,6 +1509,11 @@ struct CreateSystemTenantRequest {
     slug: String,
     metadata: Value,
     tenant_account_password: String,
+}
+
+#[derive(Deserialize)]
+struct ResetTenantAccountRequest {
+    password: String,
 }
 
 #[derive(Serialize)]
@@ -1856,6 +1886,68 @@ async fn create_system_tenant(
             tenant_account_id: tenant_account.id,
         }),
     ))
+}
+
+async fn suspend_system_tenant(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(tenant_slug): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    require_system_account(&state.session_verifier, &headers)?;
+    let tenant_id = TenantIdentityRepository::suspend_tenant(state.store.as_ref(), &tenant_slug)
+        .await
+        .map_err(system_tenant_error)?;
+    state.session_verifier.invalidate_tenant(tenant_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reactivate_system_tenant(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(tenant_slug): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    require_system_account(&state.session_verifier, &headers)?;
+    TenantIdentityRepository::reactivate_tenant(state.store.as_ref(), &tenant_slug)
+        .await
+        .map_err(system_tenant_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_system_tenant(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(tenant_slug): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    require_system_account(&state.session_verifier, &headers)?;
+    let tenant_id = TenantIdentityRepository::delete_tenant(state.store.as_ref(), &tenant_slug)
+        .await
+        .map_err(system_tenant_error)?;
+    state.session_verifier.invalidate_tenant(tenant_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reset_system_tenant_account(
+    State(state): State<ManagementState>,
+    Path(tenant_slug): Path<String>,
+    request: Request,
+) -> Result<StatusCode, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: ResetTenantAccountRequest = management_request_json(&state, request).await?;
+    validate_password(&request.password).map_err(|_| ManagementSessionError::BadRequest)?;
+    let password_hash =
+        hash_password(&request.password).map_err(|_| ManagementSessionError::Unavailable)?;
+    let tenant_account = TenantIdentityRepository::reset_tenant_account_password(
+        state.store.as_ref(),
+        &tenant_slug,
+        password_hash,
+    )
+    .await
+    .map_err(system_tenant_error)?;
+    state
+        .session_verifier
+        .invalidate_tenant(tenant_account.tenant_id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn logout(

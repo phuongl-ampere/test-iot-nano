@@ -267,53 +267,47 @@ impl TenantIdentityRepository {
     pub async fn suspend_tenant(
         store: &PlatformStore,
         tenant_slug: &str,
-    ) -> Result<(), TenantIdentityError> {
+    ) -> Result<Uuid, TenantIdentityError> {
         update_tenant_status(store, tenant_slug, TenantStatus::Suspended, "active").await
     }
 
     pub async fn reactivate_tenant(
         store: &PlatformStore,
         tenant_slug: &str,
-    ) -> Result<(), TenantIdentityError> {
+    ) -> Result<Uuid, TenantIdentityError> {
         update_tenant_status(store, tenant_slug, TenantStatus::Active, "suspended").await
     }
 
     pub async fn delete_tenant(
         store: &PlatformStore,
         tenant_slug: &str,
-    ) -> Result<(), TenantIdentityError> {
+    ) -> Result<Uuid, TenantIdentityError> {
         match store {
             PlatformStore::Sqlite(store) => {
-                let rows = sqlx::query(
+                let tenant_id = sqlx::query_scalar::<_, String>(
                     "UPDATE tenants
                      SET status = 'deleted', updated_at = CURRENT_TIMESTAMP
-                     WHERE slug = ? AND status <> 'deleted'",
+                     WHERE slug = ? AND status <> 'deleted'
+                     RETURNING id",
                 )
                 .bind(tenant_slug)
-                .execute(&store.pool)
+                .fetch_optional(&store.pool)
                 .await?
-                .rows_affected();
-                if rows == 1 {
-                    Ok(())
-                } else {
-                    Err(TenantIdentityError::TenantLifecycleDenied)
-                }
+                .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+                parse_uuid(tenant_id)
             }
             PlatformStore::Timescale(pool) => {
-                let rows = sqlx::query(
+                let tenant_id = sqlx::query_scalar::<_, Uuid>(
                     "UPDATE tenants
                      SET status = 'deleted', updated_at = now()
-                     WHERE slug = $1 AND status <> 'deleted'",
+                     WHERE slug = $1 AND status <> 'deleted'
+                     RETURNING id",
                 )
                 .bind(tenant_slug)
-                .execute(pool)
+                .fetch_optional(pool)
                 .await?
-                .rows_affected();
-                if rows == 1 {
-                    Ok(())
-                } else {
-                    Err(TenantIdentityError::TenantLifecycleDenied)
-                }
+                .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+                Ok(tenant_id)
             }
         }
     }
@@ -397,43 +391,37 @@ async fn update_tenant_status(
     tenant_slug: &str,
     next: TenantStatus,
     expected_current: &str,
-) -> Result<(), TenantIdentityError> {
+) -> Result<Uuid, TenantIdentityError> {
     match store {
         PlatformStore::Sqlite(store) => {
-            let rows = sqlx::query(
+            let tenant_id = sqlx::query_scalar::<_, String>(
                 "UPDATE tenants
                  SET status = ?, updated_at = CURRENT_TIMESTAMP
-                 WHERE slug = ? AND status = ?",
+                 WHERE slug = ? AND status = ?
+                 RETURNING id",
             )
             .bind(next.as_str())
             .bind(tenant_slug)
             .bind(expected_current)
-            .execute(&store.pool)
+            .fetch_optional(&store.pool)
             .await?
-            .rows_affected();
-            if rows == 1 {
-                Ok(())
-            } else {
-                Err(TenantIdentityError::TenantLifecycleDenied)
-            }
+            .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+            parse_uuid(tenant_id)
         }
         PlatformStore::Timescale(pool) => {
-            let rows = sqlx::query(
+            let tenant_id = sqlx::query_scalar::<_, Uuid>(
                 "UPDATE tenants
                  SET status = $1, updated_at = now()
-                 WHERE slug = $2 AND status = $3",
+                 WHERE slug = $2 AND status = $3
+                 RETURNING id",
             )
             .bind(next.as_str())
             .bind(tenant_slug)
             .bind(expected_current)
-            .execute(pool)
+            .fetch_optional(pool)
             .await?
-            .rows_affected();
-            if rows == 1 {
-                Ok(())
-            } else {
-                Err(TenantIdentityError::TenantLifecycleDenied)
-            }
+            .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+            Ok(tenant_id)
         }
     }
 }
