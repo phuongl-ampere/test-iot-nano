@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 mod common;
 
-async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
+async fn sqlite_store() -> (tempfile::TempDir, PlatformStore, Uuid) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
         storage: DatabaseStorage::Sqlite,
@@ -23,7 +23,19 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
-    (directory, store)
+    let tenant_id = seed_tenant(store.sqlite_pool().unwrap(), "management-assets").await;
+    (directory, store, tenant_id)
+}
+
+async fn seed_tenant(pool: &sqlx::SqlitePool, slug: &str) -> Uuid {
+    let tenant_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, ?, 'active')")
+        .bind(tenant_id.to_string())
+        .bind(slug)
+        .execute(pool)
+        .await
+        .unwrap();
+    tenant_id
 }
 
 fn asset_mutation(
@@ -55,8 +67,62 @@ fn asset_update(
 }
 
 #[tokio::test]
+async fn sqlite_management_assets_reject_cross_tenant_lookup_mutation_and_parent_references() {
+    let (_directory, store, _default_tenant_id) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_a = seed_tenant(pool, "asset-tenant-a").await;
+    let tenant_b = seed_tenant(pool, "asset-tenant-b").await;
+    let tenant_b_asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, metadata) VALUES (?, ?, 'tenant-b asset', '{}')",
+    )
+    .bind(tenant_b_asset_id.to_string())
+    .bind(tenant_b.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        ManagementAssetRepository::list_management_assets(&store, tenant_a)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        ManagementAssetRepository::update_management_asset(
+            &store,
+            tenant_a,
+            tenant_b_asset_id,
+            UpdateManagementAsset {
+                name: "renamed".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+                attributes: None,
+            },
+        )
+        .await,
+        Err(ManagementAssetError::AssetNotFound)
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::delete_management_asset(&store, tenant_a, tenant_b_asset_id)
+            .await,
+        Err(ManagementAssetError::AssetNotFound)
+    ));
+    assert!(matches!(
+        ManagementAssetRepository::create_management_asset(
+            &store,
+            tenant_a,
+            asset_mutation("cross-tenant child", None, Some(tenant_b_asset_id)),
+        )
+        .await,
+        Err(ManagementAssetError::ParentAssetUnavailable(id)) if id == tenant_b_asset_id
+    ));
+}
+
+#[tokio::test]
 async fn sqlite_management_asset_repository_creates_lists_updates_and_deletes_assets() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let profile_id = Uuid::now_v7();
     sqlx::query(
@@ -70,6 +136,7 @@ async fn sqlite_management_asset_repository_creates_lists_updates_and_deletes_as
 
     let parent = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Parent asset", Some(profile_id), None),
     )
     .await
@@ -81,20 +148,22 @@ async fn sqlite_management_asset_repository_creates_lists_updates_and_deletes_as
 
     let child = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Child asset", None, Some(parent.id)),
     )
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, asset_id)
-         VALUES ('management-asset-device', 'Asset device', ?)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
+         VALUES ('management-asset-device', ?, 'Asset device', ?)",
     )
+    .bind(tenant_id.to_string())
     .bind(parent.id.to_string())
     .execute(pool)
     .await
     .unwrap();
 
-    let listed = ManagementAssetRepository::list_management_assets(&store)
+    let listed = ManagementAssetRepository::list_management_assets(&store, tenant_id)
         .await
         .unwrap();
     assert_eq!(
@@ -107,6 +176,7 @@ async fn sqlite_management_asset_repository_creates_lists_updates_and_deletes_as
 
     let updated = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         child.id,
         UpdateManagementAsset {
             name: "Renamed child asset".to_owned(),
@@ -123,13 +193,13 @@ async fn sqlite_management_asset_repository_creates_lists_updates_and_deletes_as
     assert_eq!(updated.metadata, json!({}));
     assert_eq!(updated.attributes, json!({}));
 
-    ManagementAssetRepository::delete_management_asset(&store, parent.id)
+    ManagementAssetRepository::delete_management_asset(&store, tenant_id, parent.id)
         .await
         .unwrap();
     let mut detached_child = updated.clone();
     detached_child.parent_asset_id = None;
     assert_eq!(
-        ManagementAssetRepository::list_management_assets(&store)
+        ManagementAssetRepository::list_management_assets(&store, tenant_id)
             .await
             .unwrap(),
         [detached_child]
@@ -155,29 +225,35 @@ async fn sqlite_management_asset_repository_creates_lists_updates_and_deletes_as
 
 #[tokio::test]
 async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let root = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Root asset", None, None),
     )
     .await
     .unwrap();
     let child = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Child asset", None, Some(root.id)),
     )
     .await
     .unwrap();
 
-    let invalid_name =
-        ManagementAssetRepository::create_management_asset(&store, asset_mutation(" ", None, None))
-            .await
-            .unwrap_err();
+    let invalid_name = ManagementAssetRepository::create_management_asset(
+        &store,
+        tenant_id,
+        asset_mutation(" ", None, None),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(invalid_name, ManagementAssetError::InvalidName));
 
     let invalid_metadata = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         CreateManagementAsset {
             name: "Invalid metadata".to_owned(),
             asset_profile_id: None,
@@ -195,6 +271,7 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
 
     let invalid_attributes = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         CreateManagementAsset {
             name: "Invalid attributes".to_owned(),
             asset_profile_id: None,
@@ -212,6 +289,7 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
 
     let unavailable_profile = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Missing profile", Some(Uuid::now_v7()), None),
     )
     .await
@@ -223,6 +301,7 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
 
     let unavailable_parent = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Missing parent", None, Some(Uuid::now_v7())),
     )
     .await
@@ -234,6 +313,7 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
 
     let own_parent = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         root.id,
         UpdateManagementAsset {
             name: root.name.clone(),
@@ -252,6 +332,7 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
 
     let descendant_parent = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         root.id,
         UpdateManagementAsset {
             name: root.name,
@@ -270,15 +351,16 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
 
     let dangling_asset_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, asset_id)
-         VALUES ('dangling-management-asset-device', 'Dangling asset device', ?)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
+         VALUES ('dangling-management-asset-device', ?, 'Dangling asset device', ?)",
     )
+    .bind(tenant_id.to_string())
     .bind(dangling_asset_id.to_string())
     .execute(pool)
     .await
     .unwrap();
     let missing_asset =
-        ManagementAssetRepository::delete_management_asset(&store, dangling_asset_id)
+        ManagementAssetRepository::delete_management_asset(&store, tenant_id, dangling_asset_id)
             .await
             .unwrap_err();
     assert!(matches!(missing_asset, ManagementAssetError::AssetNotFound));
@@ -303,21 +385,24 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
 
 #[tokio::test]
 async fn sqlite_management_asset_repository_maps_sibling_name_conflicts_to_domain_errors() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let parent = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Conflict parent", None, None),
     )
     .await
     .unwrap();
     let first = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Duplicate sibling", None, Some(parent.id)),
     )
     .await
     .unwrap();
     let second = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Other sibling", None, Some(parent.id)),
     )
     .await
@@ -325,6 +410,7 @@ async fn sqlite_management_asset_repository_maps_sibling_name_conflicts_to_domai
 
     let create_conflict = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Duplicate sibling", None, Some(parent.id)),
     )
     .await
@@ -339,6 +425,7 @@ async fn sqlite_management_asset_repository_maps_sibling_name_conflicts_to_domai
 
     let update_conflict = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         second.id,
         asset_update(&second, &first.name, Some(parent.id)),
     )
@@ -355,15 +442,17 @@ async fn sqlite_management_asset_repository_maps_sibling_name_conflicts_to_domai
 
 #[tokio::test]
 async fn sqlite_management_asset_repository_maps_root_name_conflicts_to_domain_errors() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let first = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Duplicate root", None, None),
     )
     .await
     .unwrap();
     let second = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Other root", None, None),
     )
     .await
@@ -371,6 +460,7 @@ async fn sqlite_management_asset_repository_maps_root_name_conflicts_to_domain_e
 
     let create_conflict = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation(&first.name, None, None),
     )
     .await
@@ -385,6 +475,7 @@ async fn sqlite_management_asset_repository_maps_root_name_conflicts_to_domain_e
 
     let update_conflict = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         second.id,
         asset_update(&second, &first.name, None),
     )
@@ -401,36 +492,40 @@ async fn sqlite_management_asset_repository_maps_root_name_conflicts_to_domain_e
 
 #[tokio::test]
 async fn sqlite_management_asset_delete_rejects_child_root_name_collisions_before_mutating() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let existing_root = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Promoted child", None, None),
     )
     .await
     .unwrap();
     let parent = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Delete conflict parent", None, None),
     )
     .await
     .unwrap();
     let child = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation(&existing_root.name, None, Some(parent.id)),
     )
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, asset_id)
-         VALUES ('delete-conflict-device', 'Delete conflict device', ?)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
+         VALUES ('delete-conflict-device', ?, 'Delete conflict device', ?)",
     )
+    .bind(tenant_id.to_string())
     .bind(parent.id.to_string())
     .execute(pool)
     .await
     .unwrap();
 
-    let error = ManagementAssetRepository::delete_management_asset(&store, parent.id)
+    let error = ManagementAssetRepository::delete_management_asset(&store, tenant_id, parent.id)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -471,7 +566,7 @@ struct TimescaleTestLock {
     _connection: PgConnection,
 }
 
-async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
+async fn timescale_store() -> (TimescaleTestLock, PlatformStore, Uuid) {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
     let mut connection = PgConnection::connect(&database_url).await.unwrap();
@@ -494,18 +589,27 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
     })
     .await
     .unwrap();
+    let tenant_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'management-assets', 'active')",
+    )
+    .bind(tenant_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     (
         TimescaleTestLock {
             _connection: connection,
         },
         store,
+        tenant_id,
     )
 }
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_asset_repository_matches_sqlite_contract() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let profile_id = Uuid::now_v7();
     sqlx::query(
@@ -519,20 +623,23 @@ async fn timescale_management_asset_repository_matches_sqlite_contract() {
 
     let parent = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Timescale parent asset", Some(profile_id), None),
     )
     .await
     .unwrap();
     let child = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Timescale child asset", None, Some(parent.id)),
     )
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, asset_id)
-         VALUES ('timescale-management-asset-device', 'Asset device', $1)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
+         VALUES ('timescale-management-asset-device', $1, 'Asset device', $2)",
     )
+    .bind(tenant_id)
     .bind(parent.id)
     .execute(pool)
     .await
@@ -540,6 +647,7 @@ async fn timescale_management_asset_repository_matches_sqlite_contract() {
 
     let cycle = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         parent.id,
         UpdateManagementAsset {
             name: parent.name.clone(),
@@ -556,10 +664,10 @@ async fn timescale_management_asset_repository_matches_sqlite_contract() {
         ManagementAssetError::AssetCannotHaveDescendantParent
     ));
 
-    ManagementAssetRepository::delete_management_asset(&store, parent.id)
+    ManagementAssetRepository::delete_management_asset(&store, tenant_id, parent.id)
         .await
         .unwrap();
-    let child = ManagementAssetRepository::list_management_assets(&store)
+    let child = ManagementAssetRepository::list_management_assets(&store, tenant_id)
         .await
         .unwrap()
         .into_iter()
@@ -580,7 +688,7 @@ async fn timescale_management_asset_repository_matches_sqlite_contract() {
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_asset_repository_covers_crud_validation_and_references() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let profile_id = Uuid::now_v7();
     sqlx::query(
@@ -594,6 +702,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
 
     let parent = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Expanded Timescale parent", Some(profile_id), None),
     )
     .await
@@ -605,12 +714,13 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
 
     let child = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Expanded Timescale child", None, Some(parent.id)),
     )
     .await
     .unwrap();
     assert_eq!(
-        ManagementAssetRepository::list_management_assets(&store)
+        ManagementAssetRepository::list_management_assets(&store, tenant_id)
             .await
             .unwrap()
             .into_iter()
@@ -621,6 +731,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
 
     let updated_child = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         child.id,
         UpdateManagementAsset {
             name: "Expanded Timescale child".to_owned(),
@@ -638,6 +749,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
 
     let sibling_conflict = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Expanded Timescale child", None, Some(parent.id)),
     )
     .await
@@ -653,6 +765,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::create_management_asset(
             &store,
+            tenant_id,
             asset_mutation(" ", None, None),
         )
         .await,
@@ -661,6 +774,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::create_management_asset(
             &store,
+            tenant_id,
             CreateManagementAsset {
                 name: "Invalid Timescale metadata".to_owned(),
                 asset_profile_id: None,
@@ -675,6 +789,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::create_management_asset(
             &store,
+            tenant_id,
             CreateManagementAsset {
                 name: "Invalid Timescale attributes".to_owned(),
                 asset_profile_id: None,
@@ -689,6 +804,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::create_management_asset(
             &store,
+            tenant_id,
             asset_mutation("Missing Timescale profile", Some(Uuid::now_v7()), None),
         )
         .await,
@@ -697,6 +813,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::create_management_asset(
             &store,
+            tenant_id,
             asset_mutation("Missing Timescale parent", None, Some(Uuid::now_v7())),
         )
         .await,
@@ -705,6 +822,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::update_management_asset(
             &store,
+            tenant_id,
             parent.id,
             asset_update(&parent, &parent.name, Some(parent.id)),
         )
@@ -714,6 +832,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     assert!(matches!(
         ManagementAssetRepository::update_management_asset(
             &store,
+            tenant_id,
             parent.id,
             asset_update(&parent, &parent.name, Some(updated_child.id)),
         )
@@ -722,17 +841,18 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     ));
 
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, asset_id)
-         VALUES ('expanded-timescale-management-asset-device', 'Asset device', $1)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
+         VALUES ('expanded-timescale-management-asset-device', $1, 'Asset device', $2)",
     )
+    .bind(tenant_id)
     .bind(parent.id)
     .execute(pool)
     .await
     .unwrap();
-    ManagementAssetRepository::delete_management_asset(&store, parent.id)
+    ManagementAssetRepository::delete_management_asset(&store, tenant_id, parent.id)
         .await
         .unwrap();
-    let detached_child = ManagementAssetRepository::list_management_assets(&store)
+    let detached_child = ManagementAssetRepository::list_management_assets(&store, tenant_id)
         .await
         .unwrap()
         .into_iter()
@@ -750,7 +870,7 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
         None
     );
     assert!(matches!(
-        ManagementAssetRepository::delete_management_asset(&store, Uuid::now_v7()).await,
+        ManagementAssetRepository::delete_management_asset(&store, tenant_id, Uuid::now_v7()).await,
         Err(ManagementAssetError::AssetNotFound)
     ));
 }
@@ -758,15 +878,17 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_asset_repository_maps_root_name_conflicts_to_domain_errors() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let first = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Duplicate Timescale root", None, None),
     )
     .await
     .unwrap();
     let second = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Other Timescale root", None, None),
     )
     .await
@@ -774,6 +896,7 @@ async fn timescale_management_asset_repository_maps_root_name_conflicts_to_domai
 
     let create_conflict = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation(&first.name, None, None),
     )
     .await
@@ -788,6 +911,7 @@ async fn timescale_management_asset_repository_maps_root_name_conflicts_to_domai
 
     let update_conflict = ManagementAssetRepository::update_management_asset(
         &store,
+        tenant_id,
         second.id,
         asset_update(&second, &first.name, None),
     )
@@ -805,36 +929,40 @@ async fn timescale_management_asset_repository_maps_root_name_conflicts_to_domai
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_asset_delete_rejects_child_root_name_collisions_before_mutating() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let existing_root = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Promoted Timescale child", None, None),
     )
     .await
     .unwrap();
     let parent = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Timescale delete conflict parent", None, None),
     )
     .await
     .unwrap();
     let child = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation(&existing_root.name, None, Some(parent.id)),
     )
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, asset_id)
-         VALUES ('timescale-delete-conflict-device', 'Delete conflict device', $1)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
+         VALUES ('timescale-delete-conflict-device', $1, 'Delete conflict device', $2)",
     )
+    .bind(tenant_id)
     .bind(parent.id)
     .execute(pool)
     .await
     .unwrap();
 
-    let error = ManagementAssetRepository::delete_management_asset(&store, parent.id)
+    let error = ManagementAssetRepository::delete_management_asset(&store, tenant_id, parent.id)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -888,16 +1016,18 @@ async fn waiting_asset_update_barrier_count(pool: &PgPool) -> i64 {
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_reciprocal_parent_updates_do_not_create_a_cycle() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let first = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Concurrent first", None, None),
     )
     .await
     .unwrap();
     let second = ManagementAssetRepository::create_management_asset(
         &store,
+        tenant_id,
         asset_mutation("Concurrent second", None, None),
     )
     .await
@@ -930,22 +1060,26 @@ async fn timescale_reciprocal_parent_updates_do_not_create_a_cycle() {
 
     let barrier = std::sync::Arc::new(Barrier::new(3));
     let first_store = store.clone();
+    let first_tenant_id = tenant_id;
     let first_barrier = std::sync::Arc::clone(&barrier);
     let first_update = tokio::spawn(async move {
         first_barrier.wait().await;
         ManagementAssetRepository::update_management_asset(
             &first_store,
+            first_tenant_id,
             first_id,
             asset_update(&first, &first.name, Some(second_id)),
         )
         .await
     });
     let second_store = store.clone();
+    let second_tenant_id = tenant_id;
     let second_barrier = std::sync::Arc::clone(&barrier);
     let second_update = tokio::spawn(async move {
         second_barrier.wait().await;
         ManagementAssetRepository::update_management_asset(
             &second_store,
+            second_tenant_id,
             second_id,
             asset_update(&second, &second.name, Some(first_id)),
         )
@@ -996,7 +1130,7 @@ async fn timescale_reciprocal_parent_updates_do_not_create_a_cycle() {
         )
     }));
 
-    let assets = ManagementAssetRepository::list_management_assets(&store)
+    let assets = ManagementAssetRepository::list_management_assets(&store, tenant_id)
         .await
         .unwrap();
     let first_parent = assets

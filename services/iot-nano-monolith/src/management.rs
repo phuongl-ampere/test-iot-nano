@@ -2333,8 +2333,8 @@ async fn list_management_devices(
     State(state): State<ManagementState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ManagementDeviceResponse>>, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
-    ManagementDeviceRepository::list_management_devices(state.store.as_ref())
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
         .await
         .map(|devices| {
             Json(
@@ -2353,11 +2353,12 @@ async fn update_management_device(
     request: Request,
 ) -> Result<Json<ManagementDeviceResponse>, ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: UpdateManagementDeviceRequest = management_request_json(&state, request).await?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let device = ManagementDeviceRepository::update_management_device(
         state.store.as_ref(),
+        tenant.tenant_id,
         &device_id,
         UpdateManagementDevice {
             display_name: request.display_name,
@@ -2380,11 +2381,15 @@ async fn delete_management_device(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
-    ManagementDeviceRepository::delete_management_device(state.store.as_ref(), &device_id)
-        .await
-        .map_err(management_device_error)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    ManagementDeviceRepository::delete_management_device(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        &device_id,
+    )
+    .await
+    .map_err(management_device_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2392,8 +2397,8 @@ async fn list_management_assets(
     State(state): State<ManagementState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ManagementAssetResponse>>, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
-    ManagementAssetRepository::list_management_assets(state.store.as_ref())
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementAssetRepository::list_management_assets(state.store.as_ref(), tenant.tenant_id)
         .await
         .map(|assets| Json(assets.into_iter().map(management_asset_response).collect()))
         .map_err(management_asset_error)
@@ -2404,11 +2409,12 @@ async fn create_management_asset(
     request: Request,
 ) -> Result<(StatusCode, Json<ManagementAssetResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ManagementAssetRequest = management_request_json(&state, request).await?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let asset = ManagementAssetRepository::create_management_asset(
         state.store.as_ref(),
+        tenant.tenant_id,
         CreateManagementAsset {
             name: request.name,
             asset_profile_id: request.asset_profile_id,
@@ -2428,12 +2434,13 @@ async fn update_management_asset(
     request: Request,
 ) -> Result<Json<ManagementAssetResponse>, ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let asset_id = Uuid::parse_str(&asset_id).map_err(|_| ManagementSessionError::BadRequest)?;
     let request: ManagementAssetRequest = management_request_json(&state, request).await?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let asset = ManagementAssetRepository::update_management_asset(
         state.store.as_ref(),
+        tenant.tenant_id,
         asset_id,
         UpdateManagementAsset {
             name: request.name,
@@ -2453,12 +2460,16 @@ async fn delete_management_asset(
     headers: HeaderMap,
     Path(asset_id): Path<String>,
 ) -> Result<StatusCode, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let asset_id = Uuid::parse_str(&asset_id).map_err(|_| ManagementSessionError::BadRequest)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
-    ManagementAssetRepository::delete_management_asset(state.store.as_ref(), asset_id)
-        .await
-        .map_err(management_asset_error)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    ManagementAssetRepository::delete_management_asset(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        asset_id,
+    )
+    .await
+    .map_err(management_asset_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

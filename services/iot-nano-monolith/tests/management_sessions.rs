@@ -938,7 +938,7 @@ async fn management_admin_manages_devices_through_the_typed_storage_port() {
 }
 
 #[tokio::test]
-async fn management_admin_manages_assets_through_the_typed_storage_port() {
+async fn tenant_account_manages_assets_through_the_typed_storage_port() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
     let login = router
@@ -946,10 +946,10 @@ async fn management_admin_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                    r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
                 ))
                 .unwrap(),
         )

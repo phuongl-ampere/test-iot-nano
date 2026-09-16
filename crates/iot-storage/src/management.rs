@@ -614,18 +614,22 @@ impl From<sqlx::Error> for ManagementAssetError {
 pub trait ManagementAssetRepository: Send + Sync {
     fn list_management_assets<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementAsset>, ManagementAssetError>> + Send + 'a>>;
     fn create_management_asset<'a>(
         &'a self,
+        tenant_id: Uuid,
         asset: CreateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>;
     fn update_management_asset<'a>(
         &'a self,
+        tenant_id: Uuid,
         asset_id: Uuid,
         asset: UpdateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>;
     fn delete_management_asset<'a>(
         &'a self,
+        tenant_id: Uuid,
         asset_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetError>> + Send + 'a>>;
 }
@@ -633,49 +637,56 @@ pub trait ManagementAssetRepository: Send + Sync {
 impl ManagementAssetRepository for PlatformStore {
     fn list_management_assets<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementAsset>, ManagementAssetError>> + Send + 'a>>
     {
-        Box::pin(async move { list_management_assets(self).await })
+        Box::pin(async move { list_management_assets(self, tenant_id).await })
     }
 
     fn create_management_asset<'a>(
         &'a self,
+        tenant_id: Uuid,
         asset: CreateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>
     {
-        Box::pin(async move { create_management_asset(self, asset).await })
+        Box::pin(async move { create_management_asset(self, tenant_id, asset).await })
     }
 
     fn update_management_asset<'a>(
         &'a self,
+        tenant_id: Uuid,
         asset_id: Uuid,
         asset: UpdateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>
     {
-        Box::pin(async move { update_management_asset(self, asset_id, asset).await })
+        Box::pin(async move { update_management_asset(self, tenant_id, asset_id, asset).await })
     }
 
     fn delete_management_asset<'a>(
         &'a self,
+        tenant_id: Uuid,
         asset_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetError>> + Send + 'a>> {
-        Box::pin(async move { delete_management_asset(self, asset_id).await })
+        Box::pin(async move { delete_management_asset(self, tenant_id, asset_id).await })
     }
 }
 
 pub trait ManagementDeviceRepository: Send + Sync {
     fn list_management_devices<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<
         Box<dyn Future<Output = Result<Vec<ManagementDevice>, ManagementDeviceError>> + Send + 'a>,
     >;
     fn update_management_device<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
         update: UpdateManagementDevice,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementDevice, ManagementDeviceError>> + Send + 'a>>;
     fn delete_management_device<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementDeviceError>> + Send + 'a>>;
 }
@@ -683,26 +694,29 @@ pub trait ManagementDeviceRepository: Send + Sync {
 impl ManagementDeviceRepository for PlatformStore {
     fn list_management_devices<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<
         Box<dyn Future<Output = Result<Vec<ManagementDevice>, ManagementDeviceError>> + Send + 'a>,
     > {
-        Box::pin(async move { list_management_devices(self).await })
+        Box::pin(async move { list_management_devices(self, tenant_id).await })
     }
 
     fn update_management_device<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
         update: UpdateManagementDevice,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementDevice, ManagementDeviceError>> + Send + 'a>>
     {
-        Box::pin(async move { update_management_device(self, device_id, update).await })
+        Box::pin(async move { update_management_device(self, tenant_id, device_id, update).await })
     }
 
     fn delete_management_device<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementDeviceError>> + Send + 'a>> {
-        Box::pin(async move { delete_management_device(self, device_id).await })
+        Box::pin(async move { delete_management_device(self, tenant_id, device_id).await })
     }
 }
 
@@ -1485,14 +1499,17 @@ struct ValidatedManagementAsset {
 
 async fn list_management_assets(
     store: &PlatformStore,
+    tenant_id: Uuid,
 ) -> Result<Vec<ManagementAsset>, ManagementAssetError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let rows = sqlx::query(
                 "SELECT id, name, asset_profile_id, parent_asset_id, metadata
                  FROM assets
+                 WHERE tenant_id = ?
                  ORDER BY name, id",
             )
+            .bind(tenant_id.to_string())
             .fetch_all(store.pool())
             .await?;
             rows.into_iter()
@@ -1503,8 +1520,10 @@ async fn list_management_assets(
             let rows = sqlx::query(
                 "SELECT id, name, asset_profile_id, parent_asset_id, metadata
                  FROM assets
+                 WHERE tenant_id = $1
                  ORDER BY name, id",
             )
+            .bind(tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter()
@@ -1516,6 +1535,7 @@ async fn list_management_assets(
 
 async fn create_management_asset(
     store: &PlatformStore,
+    tenant_id: Uuid,
     asset: CreateManagementAsset,
 ) -> Result<ManagementAsset, ManagementAssetError> {
     let asset = validate_management_asset(
@@ -1533,15 +1553,17 @@ async fn create_management_asset(
             let mut transaction = store.pool().begin().await?;
             validate_sqlite_asset_references(
                 &mut transaction,
+                tenant_id,
                 asset.asset_profile_id,
                 asset.parent_asset_id,
             )
             .await?;
             sqlx::query(
-                "INSERT INTO assets (id, name, asset_profile_id, parent_asset_id, metadata)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO assets (id, tenant_id, name, asset_profile_id, parent_asset_id, metadata)
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(asset_id.to_string())
+            .bind(tenant_id.to_string())
             .bind(asset.name)
             .bind(asset.asset_profile_id.map(|id| id.to_string()))
             .bind(asset.parent_asset_id.map(|id| id.to_string()))
@@ -1561,15 +1583,17 @@ async fn create_management_asset(
             let mut transaction = pool.begin().await?;
             validate_timescale_asset_references(
                 &mut transaction,
+                tenant_id,
                 asset.asset_profile_id,
                 asset.parent_asset_id,
             )
             .await?;
             sqlx::query(
-                "INSERT INTO assets (id, name, asset_profile_id, parent_asset_id, metadata)
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO assets (id, tenant_id, name, asset_profile_id, parent_asset_id, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(asset_id)
+            .bind(tenant_id)
             .bind(asset.name)
             .bind(asset.asset_profile_id)
             .bind(asset.parent_asset_id)
@@ -1586,11 +1610,12 @@ async fn create_management_asset(
             transaction.commit().await?;
         }
     }
-    management_asset(store, asset_id).await
+    management_asset(store, tenant_id, asset_id).await
 }
 
 async fn update_management_asset(
     store: &PlatformStore,
+    tenant_id: Uuid,
     asset_id: Uuid,
     asset: UpdateManagementAsset,
 ) -> Result<ManagementAsset, ManagementAssetError> {
@@ -1609,15 +1634,23 @@ async fn update_management_asset(
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
-            sqlite_require_management_asset(&mut transaction, asset_id).await?;
+            sqlite_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
             validate_sqlite_asset_references(
                 &mut transaction,
+                tenant_id,
                 asset.asset_profile_id,
                 asset.parent_asset_id,
             )
             .await?;
             if let Some(parent_asset_id) = asset.parent_asset_id {
-                if sqlite_asset_is_descendant(&mut transaction, asset_id, parent_asset_id).await? {
+                if sqlite_asset_is_descendant(
+                    &mut transaction,
+                    tenant_id,
+                    asset_id,
+                    parent_asset_id,
+                )
+                .await?
+                {
                     return Err(ManagementAssetError::AssetCannotHaveDescendantParent);
                 }
             }
@@ -1625,7 +1658,7 @@ async fn update_management_asset(
                 "UPDATE assets
                  SET name = ?, asset_profile_id = ?, parent_asset_id = ?, metadata = ?,
                      updated_at = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND tenant_id = ?",
             )
             .bind(asset.name)
             .bind(asset.asset_profile_id.map(|id| id.to_string()))
@@ -1633,6 +1666,7 @@ async fn update_management_asset(
             .bind(asset.metadata.to_string())
             .bind(Utc::now().to_rfc3339())
             .bind(asset_id.to_string())
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await
             .map_err(|error| {
@@ -1652,20 +1686,27 @@ async fn update_management_asset(
                 .await?;
             lock_timescale_management_asset_update_scope(
                 &mut transaction,
+                tenant_id,
                 asset_id,
                 asset.parent_asset_id,
             )
             .await?;
-            timescale_require_management_asset(&mut transaction, asset_id).await?;
+            timescale_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
             validate_timescale_asset_references(
                 &mut transaction,
+                tenant_id,
                 asset.asset_profile_id,
                 asset.parent_asset_id,
             )
             .await?;
             if let Some(parent_asset_id) = asset.parent_asset_id {
-                if timescale_asset_is_descendant(&mut transaction, asset_id, parent_asset_id)
-                    .await?
+                if timescale_asset_is_descendant(
+                    &mut transaction,
+                    tenant_id,
+                    asset_id,
+                    parent_asset_id,
+                )
+                .await?
                 {
                     return Err(ManagementAssetError::AssetCannotHaveDescendantParent);
                 }
@@ -1674,13 +1715,14 @@ async fn update_management_asset(
                 "UPDATE assets
                  SET name = $2, asset_profile_id = $3, parent_asset_id = $4, metadata = $5,
                      updated_at = now()
-                 WHERE id = $1",
+                 WHERE id = $1 AND tenant_id = $6",
             )
             .bind(asset_id)
             .bind(asset.name)
             .bind(asset.asset_profile_id)
             .bind(asset.parent_asset_id)
             .bind(Json(asset.metadata))
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await
             .map_err(|error| {
@@ -1693,31 +1735,35 @@ async fn update_management_asset(
             transaction.commit().await?;
         }
     }
-    management_asset(store, asset_id).await
+    management_asset(store, tenant_id, asset_id).await
 }
 
 async fn delete_management_asset(
     store: &PlatformStore,
+    tenant_id: Uuid,
     asset_id: Uuid,
 ) -> Result<(), ManagementAssetError> {
     let deleted = match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
-            sqlite_require_management_asset(&mut transaction, asset_id).await?;
+            sqlite_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
             if let Some(name) =
-                sqlite_promoted_asset_root_name_conflict(&mut transaction, asset_id).await?
+                sqlite_promoted_asset_root_name_conflict(&mut transaction, tenant_id, asset_id)
+                    .await?
             {
                 return Err(ManagementAssetError::SiblingNameConflict {
                     name,
                     parent_asset_id: None,
                 });
             }
-            sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = ?")
+            sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = ? AND tenant_id = ?")
                 .bind(asset_id.to_string())
+                .bind(tenant_id.to_string())
                 .execute(&mut *transaction)
                 .await?;
-            let deleted = sqlx::query("DELETE FROM assets WHERE id = ?")
+            let deleted = sqlx::query("DELETE FROM assets WHERE id = ? AND tenant_id = ?")
                 .bind(asset_id.to_string())
+                .bind(tenant_id.to_string())
                 .execute(&mut *transaction)
                 .await?
                 .rows_affected();
@@ -1726,21 +1772,26 @@ async fn delete_management_asset(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            timescale_require_management_asset(&mut transaction, asset_id).await?;
+            timescale_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
             if let Some(name) =
-                timescale_promoted_asset_root_name_conflict(&mut transaction, asset_id).await?
+                timescale_promoted_asset_root_name_conflict(&mut transaction, tenant_id, asset_id)
+                    .await?
             {
                 return Err(ManagementAssetError::SiblingNameConflict {
                     name,
                     parent_asset_id: None,
                 });
             }
-            sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = $1")
+            sqlx::query(
+                "UPDATE devices SET asset_id = NULL WHERE asset_id = $1 AND tenant_id = $2",
+            )
+            .bind(asset_id)
+            .bind(tenant_id)
+            .execute(&mut *transaction)
+            .await?;
+            let deleted = sqlx::query("DELETE FROM assets WHERE id = $1 AND tenant_id = $2")
                 .bind(asset_id)
-                .execute(&mut *transaction)
-                .await?;
-            let deleted = sqlx::query("DELETE FROM assets WHERE id = $1")
-                .bind(asset_id)
+                .bind(tenant_id)
                 .execute(&mut *transaction)
                 .await?
                 .rows_affected();
@@ -1757,6 +1808,7 @@ async fn delete_management_asset(
 
 async fn sqlite_promoted_asset_root_name_conflict(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     asset_id: Uuid,
 ) -> Result<Option<String>, ManagementAssetError> {
     sqlx::query_scalar(
@@ -1764,14 +1816,16 @@ async fn sqlite_promoted_asset_root_name_conflict(
          FROM assets AS child
          JOIN assets AS root
            ON root.name = child.name
+          AND root.tenant_id = child.tenant_id
           AND root.parent_asset_id IS NULL
           AND root.id <> ?
-         WHERE child.parent_asset_id = ?
+         WHERE child.parent_asset_id = ? AND child.tenant_id = ?
          ORDER BY child.name, child.id
          LIMIT 1",
     )
     .bind(asset_id.to_string())
     .bind(asset_id.to_string())
+    .bind(tenant_id.to_string())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(ManagementAssetError::from)
@@ -1779,6 +1833,7 @@ async fn sqlite_promoted_asset_root_name_conflict(
 
 async fn timescale_promoted_asset_root_name_conflict(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     asset_id: Uuid,
 ) -> Result<Option<String>, ManagementAssetError> {
     sqlx::query_scalar(
@@ -1786,13 +1841,15 @@ async fn timescale_promoted_asset_root_name_conflict(
          FROM assets AS child
          JOIN assets AS root
            ON root.name = child.name
+          AND root.tenant_id = child.tenant_id
           AND root.parent_asset_id IS NULL
           AND root.id <> $1
-         WHERE child.parent_asset_id = $1
+         WHERE child.parent_asset_id = $1 AND child.tenant_id = $2
          ORDER BY child.name, child.id
          LIMIT 1",
     )
     .bind(asset_id)
+    .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(ManagementAssetError::from)
@@ -1800,6 +1857,7 @@ async fn timescale_promoted_asset_root_name_conflict(
 
 async fn management_asset(
     store: &PlatformStore,
+    tenant_id: Uuid,
     asset_id: Uuid,
 ) -> Result<ManagementAsset, ManagementAssetError> {
     match store {
@@ -1807,9 +1865,10 @@ async fn management_asset(
             let row = sqlx::query(
                 "SELECT id, name, asset_profile_id, parent_asset_id, metadata
                  FROM assets
-                 WHERE id = ?",
+                 WHERE id = ? AND tenant_id = ?",
             )
             .bind(asset_id.to_string())
+            .bind(tenant_id.to_string())
             .fetch_optional(store.pool())
             .await?
             .ok_or(ManagementAssetError::AssetNotFound)?;
@@ -1819,9 +1878,10 @@ async fn management_asset(
             let row = sqlx::query(
                 "SELECT id, name, asset_profile_id, parent_asset_id, metadata
                  FROM assets
-                 WHERE id = $1",
+                 WHERE id = $1 AND tenant_id = $2",
             )
             .bind(asset_id)
+            .bind(tenant_id)
             .fetch_optional(pool)
             .await?
             .ok_or(ManagementAssetError::AssetNotFound)?;
@@ -1966,13 +2026,16 @@ fn validate_asset_attributes(
 
 async fn sqlite_require_management_asset(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     asset_id: Uuid,
 ) -> Result<(), ManagementAssetError> {
-    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ?")
-        .bind(asset_id.to_string())
-        .fetch_optional(&mut **transaction)
-        .await?
-        .is_some();
+    let exists =
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?")
+            .bind(asset_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some();
     if exists {
         Ok(())
     } else {
@@ -1982,13 +2045,17 @@ async fn sqlite_require_management_asset(
 
 async fn timescale_require_management_asset(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     asset_id: Uuid,
 ) -> Result<(), ManagementAssetError> {
-    let exists = sqlx::query_scalar::<_, Uuid>("SELECT id FROM assets WHERE id = $1 FOR UPDATE")
-        .bind(asset_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .is_some();
+    let exists = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM assets WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+    )
+    .bind(asset_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some();
     if exists {
         Ok(())
     } else {
@@ -1998,6 +2065,7 @@ async fn timescale_require_management_asset(
 
 async fn lock_timescale_management_asset_update_scope(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     asset_id: Uuid,
     proposed_parent_asset_id: Option<Uuid>,
 ) -> Result<(), ManagementAssetError> {
@@ -2005,9 +2073,9 @@ async fn lock_timescale_management_asset_update_scope(
     // serializes reciprocal reparenting before validation sees a stale hierarchy.
     sqlx::query_scalar::<_, Uuid>(
         "WITH RECURSIVE roots(id) AS (
-             SELECT id FROM assets WHERE id = $1
+             SELECT id FROM assets WHERE id = $1 AND tenant_id = $3
              UNION
-             SELECT id FROM assets WHERE id = $2
+             SELECT id FROM assets WHERE id = $2 AND tenant_id = $3
          ),
          ancestors(id) AS (
              SELECT id FROM roots
@@ -2015,7 +2083,7 @@ async fn lock_timescale_management_asset_update_scope(
              SELECT asset.parent_asset_id
              FROM assets AS asset
              JOIN ancestors ON asset.id = ancestors.id
-             WHERE asset.parent_asset_id IS NOT NULL
+             WHERE asset.parent_asset_id IS NOT NULL AND asset.tenant_id = $3
          ),
          descendants(id) AS (
              SELECT id FROM roots
@@ -2023,10 +2091,11 @@ async fn lock_timescale_management_asset_update_scope(
              SELECT child.id
              FROM assets AS child
              JOIN descendants ON child.parent_asset_id = descendants.id
+             WHERE child.tenant_id = $3
          )
          SELECT asset.id
          FROM assets AS asset
-         WHERE asset.id IN (
+         WHERE asset.tenant_id = $3 AND asset.id IN (
              SELECT id FROM ancestors
              UNION
              SELECT id FROM descendants
@@ -2036,6 +2105,7 @@ async fn lock_timescale_management_asset_update_scope(
     )
     .bind(asset_id)
     .bind(proposed_parent_asset_id)
+    .bind(tenant_id)
     .fetch_all(&mut **transaction)
     .await?;
     Ok(())
@@ -2043,6 +2113,7 @@ async fn lock_timescale_management_asset_update_scope(
 
 async fn validate_sqlite_asset_references(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     asset_profile_id: Option<Uuid>,
     parent_asset_id: Option<Uuid>,
 ) -> Result<(), ManagementAssetError> {
@@ -2059,11 +2130,13 @@ async fn validate_sqlite_asset_references(
         }
     }
     if let Some(parent_asset_id) = parent_asset_id {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ?")
-            .bind(parent_asset_id.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some();
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?")
+                .bind(parent_asset_id.to_string())
+                .bind(tenant_id.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?
+                .is_some();
         if !exists {
             return Err(ManagementAssetError::ParentAssetUnavailable(
                 parent_asset_id,
@@ -2075,6 +2148,7 @@ async fn validate_sqlite_asset_references(
 
 async fn validate_timescale_asset_references(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     asset_profile_id: Option<Uuid>,
     parent_asset_id: Option<Uuid>,
 ) -> Result<(), ManagementAssetError> {
@@ -2092,11 +2166,13 @@ async fn validate_timescale_asset_references(
         }
     }
     if let Some(parent_asset_id) = parent_asset_id {
-        let exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1)")
-                .bind(parent_asset_id)
-                .fetch_one(&mut **transaction)
-                .await?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(parent_asset_id)
+        .bind(tenant_id)
+        .fetch_one(&mut **transaction)
+        .await?;
         if !exists {
             return Err(ManagementAssetError::ParentAssetUnavailable(
                 parent_asset_id,
@@ -2108,20 +2184,24 @@ async fn validate_timescale_asset_references(
 
 async fn sqlite_asset_is_descendant(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     asset_id: Uuid,
     candidate_parent_id: Uuid,
 ) -> Result<bool, ManagementAssetError> {
     let descendant = sqlx::query_scalar::<_, i64>(
         "WITH RECURSIVE descendants(id) AS (
-             SELECT id FROM assets WHERE parent_asset_id = ?
+             SELECT id FROM assets WHERE parent_asset_id = ? AND tenant_id = ?
              UNION
              SELECT child.id
              FROM assets AS child
              JOIN descendants ON child.parent_asset_id = descendants.id
+             WHERE child.tenant_id = ?
          )
          SELECT 1 FROM descendants WHERE id = ? LIMIT 1",
     )
     .bind(asset_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
     .bind(candidate_parent_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
@@ -2131,21 +2211,24 @@ async fn sqlite_asset_is_descendant(
 
 async fn timescale_asset_is_descendant(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     asset_id: Uuid,
     candidate_parent_id: Uuid,
 ) -> Result<bool, ManagementAssetError> {
     let descendant = sqlx::query_scalar::<_, bool>(
         "WITH RECURSIVE descendants(id) AS (
-             SELECT id FROM assets WHERE parent_asset_id = $1
+             SELECT id FROM assets WHERE parent_asset_id = $1 AND tenant_id = $3
              UNION
              SELECT child.id
              FROM assets AS child
              JOIN descendants ON child.parent_asset_id = descendants.id
+             WHERE child.tenant_id = $3
          )
          SELECT EXISTS(SELECT 1 FROM descendants WHERE id = $2)",
     )
     .bind(asset_id)
     .bind(candidate_parent_id)
+    .bind(tenant_id)
     .fetch_one(&mut **transaction)
     .await?;
     Ok(descendant)
@@ -2153,6 +2236,7 @@ async fn timescale_asset_is_descendant(
 
 async fn list_management_devices(
     store: &PlatformStore,
+    tenant_id: Uuid,
 ) -> Result<Vec<ManagementDevice>, ManagementDeviceError> {
     match store {
         PlatformStore::Sqlite(store) => {
@@ -2160,9 +2244,10 @@ async fn list_management_devices(
                 "SELECT device_id, display_name, asset_id, device_profile_id, metadata, last_seen_at,
                         is_gateway, gateway_device_id, gateway_last_read_at, gateway_read_quality
                  FROM devices
-                 WHERE deleted_at IS NULL
+                 WHERE tenant_id = ? AND deleted_at IS NULL
                  ORDER BY device_id",
             )
+            .bind(tenant_id.to_string())
             .fetch_all(store.pool())
             .await?;
             rows.into_iter()
@@ -2177,9 +2262,10 @@ async fn list_management_devices(
                  FROM devices AS d
                  LEFT JOIN device_runtime_state AS runtime
                    ON runtime.device_id = d.device_id
-                 WHERE d.deleted_at IS NULL
+                 WHERE d.tenant_id = $1 AND d.deleted_at IS NULL
                  ORDER BY d.device_id",
             )
+            .bind(tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter()
@@ -2191,6 +2277,7 @@ async fn list_management_devices(
 
 async fn management_device(
     store: &PlatformStore,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<ManagementDevice, ManagementDeviceError> {
     match store {
@@ -2199,9 +2286,10 @@ async fn management_device(
                 "SELECT device_id, display_name, asset_id, device_profile_id, metadata, last_seen_at,
                         is_gateway, gateway_device_id, gateway_last_read_at, gateway_read_quality
                  FROM devices
-                 WHERE device_id = ? AND deleted_at IS NULL",
+                 WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
             )
             .bind(device_id)
+            .bind(tenant_id.to_string())
             .fetch_optional(store.pool())
             .await?
             .ok_or(ManagementDeviceError::DeviceNotFound)?;
@@ -2215,9 +2303,10 @@ async fn management_device(
                  FROM devices AS d
                  LEFT JOIN device_runtime_state AS runtime
                    ON runtime.device_id = d.device_id
-                 WHERE d.device_id = $1 AND d.deleted_at IS NULL",
+                 WHERE d.device_id = $1 AND d.tenant_id = $2 AND d.deleted_at IS NULL",
             )
             .bind(device_id)
+            .bind(tenant_id)
             .fetch_optional(pool)
             .await?
             .ok_or(ManagementDeviceError::DeviceNotFound)?;
@@ -2349,6 +2438,7 @@ fn sqlite_timestamp(value: Option<String>) -> Result<Option<DateTime<Utc>>, Mana
 
 async fn update_management_device(
     store: &PlatformStore,
+    tenant_id: Uuid,
     device_id: &str,
     update: UpdateManagementDevice,
 ) -> Result<ManagementDevice, ManagementDeviceError> {
@@ -2359,16 +2449,22 @@ async fn update_management_device(
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
-            let current = sqlite_topology(&mut transaction, device_id).await?;
+            let current = sqlite_topology(&mut transaction, tenant_id, device_id).await?;
             let topology = update.topology.unwrap_or(current.clone());
-            validate_sqlite_topology(device_id, &current, &topology, &mut transaction).await?;
-            validate_sqlite_references(&mut transaction, update.asset_id, update.device_profile_id)
+            validate_sqlite_topology(tenant_id, device_id, &current, &topology, &mut transaction)
                 .await?;
+            validate_sqlite_references(
+                &mut transaction,
+                tenant_id,
+                update.asset_id,
+                update.device_profile_id,
+            )
+            .await?;
             sqlx::query(
                 "UPDATE devices
                  SET display_name = ?, asset_id = ?, device_profile_id = ?,
                      metadata = COALESCE(?, metadata), is_gateway = ?, gateway_device_id = ?
-                 WHERE device_id = ? AND deleted_at IS NULL",
+                 WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
             )
             .bind(display_name)
             .bind(update.asset_id.map(|id| id.to_string()))
@@ -2377,6 +2473,7 @@ async fn update_management_device(
             .bind(i64::from(topology.is_gateway))
             .bind(&topology.gateway_device_id)
             .bind(device_id)
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
             if topology.gateway_device_id.is_some() {
@@ -2398,11 +2495,19 @@ async fn update_management_device(
             sqlx::query("LOCK TABLE devices IN SHARE ROW EXCLUSIVE MODE")
                 .execute(&mut *transaction)
                 .await?;
-            let current = timescale_topology(&mut transaction, device_id).await?;
+            let current = timescale_topology(&mut transaction, tenant_id, device_id).await?;
             let topology = update.topology.unwrap_or(current.clone());
-            validate_timescale_topology(device_id, &current, &topology, &mut transaction).await?;
+            validate_timescale_topology(
+                tenant_id,
+                device_id,
+                &current,
+                &topology,
+                &mut transaction,
+            )
+            .await?;
             validate_timescale_references(
                 &mut transaction,
+                tenant_id,
                 update.asset_id,
                 update.device_profile_id,
             )
@@ -2411,7 +2516,7 @@ async fn update_management_device(
                 "UPDATE devices
                  SET display_name = $2, asset_id = $3, device_profile_id = $4,
                      metadata = COALESCE($5, metadata), is_gateway = $6, gateway_device_id = $7
-                 WHERE device_id = $1 AND deleted_at IS NULL",
+                 WHERE device_id = $1 AND tenant_id = $8 AND deleted_at IS NULL",
             )
             .bind(device_id)
             .bind(display_name)
@@ -2420,6 +2525,7 @@ async fn update_management_device(
             .bind(attributes.map(Json))
             .bind(topology.is_gateway)
             .bind(&topology.gateway_device_id)
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
             if topology.gateway_device_id.is_some() {
@@ -2435,26 +2541,28 @@ async fn update_management_device(
             transaction.commit().await?;
         }
     }
-    management_device(store, device_id).await
+    management_device(store, tenant_id, device_id).await
 }
 
 async fn delete_management_device(
     store: &PlatformStore,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<(), ManagementDeviceError> {
     validate_device_id(device_id)?;
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
-            if sqlite_has_children(&mut transaction, device_id).await? {
+            if sqlite_has_children(&mut transaction, tenant_id, device_id).await? {
                 return Err(ManagementDeviceError::GatewayHasChildren);
             }
             let deleted = sqlx::query(
                 "UPDATE devices SET deleted_at = ?
-                 WHERE device_id = ? AND deleted_at IS NULL",
+                 WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
             )
             .bind(Utc::now().to_rfc3339())
             .bind(device_id)
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?
             .rows_affected();
@@ -2473,14 +2581,15 @@ async fn delete_management_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            if timescale_has_children(&mut transaction, device_id).await? {
+            if timescale_has_children(&mut transaction, tenant_id, device_id).await? {
                 return Err(ManagementDeviceError::GatewayHasChildren);
             }
             let deleted = sqlx::query(
                 "UPDATE devices SET deleted_at = now()
-                 WHERE device_id = $1 AND deleted_at IS NULL",
+                 WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
             )
             .bind(device_id)
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await?
             .rows_affected();
@@ -2540,14 +2649,16 @@ fn validate_attributes(
 
 async fn sqlite_topology(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<ManagementDeviceTopology, ManagementDeviceError> {
     let row = sqlx::query(
         "SELECT is_gateway, gateway_device_id
          FROM devices
-         WHERE device_id = ? AND deleted_at IS NULL",
+         WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
     )
     .bind(device_id)
+    .bind(tenant_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(ManagementDeviceError::DeviceNotFound)?;
@@ -2559,15 +2670,17 @@ async fn sqlite_topology(
 
 async fn timescale_topology(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<ManagementDeviceTopology, ManagementDeviceError> {
     let row = sqlx::query(
         "SELECT is_gateway, gateway_device_id
          FROM devices
-         WHERE device_id = $1 AND deleted_at IS NULL
+         WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
          FOR UPDATE",
     )
     .bind(device_id)
+    .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(ManagementDeviceError::DeviceNotFound)?;
@@ -2579,14 +2692,16 @@ async fn timescale_topology(
 
 async fn sqlite_has_children(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<bool, ManagementDeviceError> {
     Ok(sqlx::query(
         "SELECT 1 FROM devices
-         WHERE gateway_device_id = ? AND deleted_at IS NULL
+         WHERE gateway_device_id = ? AND tenant_id = ? AND deleted_at IS NULL
          LIMIT 1",
     )
     .bind(device_id)
+    .bind(tenant_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
     .is_some())
@@ -2594,20 +2709,23 @@ async fn sqlite_has_children(
 
 async fn timescale_has_children(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<bool, ManagementDeviceError> {
     Ok(sqlx::query(
         "SELECT 1 FROM devices
-         WHERE gateway_device_id = $1 AND deleted_at IS NULL
+         WHERE gateway_device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
          FOR UPDATE",
     )
     .bind(device_id)
+    .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await?
     .is_some())
 }
 
 async fn validate_sqlite_topology(
+    tenant_id: Uuid,
     device_id: &str,
     current: &ManagementDeviceTopology,
     topology: &ManagementDeviceTopology,
@@ -2621,16 +2739,17 @@ async fn validate_sqlite_topology(
     }
     if current.is_gateway
         && !topology.is_gateway
-        && sqlite_has_children(transaction, device_id).await?
+        && sqlite_has_children(transaction, tenant_id, device_id).await?
     {
         return Err(ManagementDeviceError::GatewayHasChildren);
     }
     if let Some(gateway_device_id) = topology.gateway_device_id.as_deref() {
         let is_gateway = sqlx::query_scalar::<_, i64>(
             "SELECT is_gateway FROM devices
-             WHERE device_id = ? AND deleted_at IS NULL",
+             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
         )
         .bind(gateway_device_id)
+        .bind(tenant_id.to_string())
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or(ManagementDeviceError::GatewayUnavailable)?;
@@ -2642,6 +2761,7 @@ async fn validate_sqlite_topology(
 }
 
 async fn validate_timescale_topology(
+    tenant_id: Uuid,
     device_id: &str,
     current: &ManagementDeviceTopology,
     topology: &ManagementDeviceTopology,
@@ -2655,17 +2775,18 @@ async fn validate_timescale_topology(
     }
     if current.is_gateway
         && !topology.is_gateway
-        && timescale_has_children(transaction, device_id).await?
+        && timescale_has_children(transaction, tenant_id, device_id).await?
     {
         return Err(ManagementDeviceError::GatewayHasChildren);
     }
     if let Some(gateway_device_id) = topology.gateway_device_id.as_deref() {
         let is_gateway = sqlx::query_scalar::<_, bool>(
             "SELECT is_gateway FROM devices
-             WHERE device_id = $1 AND deleted_at IS NULL
+             WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
              FOR UPDATE",
         )
         .bind(gateway_device_id)
+        .bind(tenant_id)
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or(ManagementDeviceError::GatewayUnavailable)?;
@@ -2678,15 +2799,18 @@ async fn validate_timescale_topology(
 
 async fn validate_sqlite_references(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     asset_id: Option<Uuid>,
     device_profile_id: Option<Uuid>,
 ) -> Result<(), ManagementDeviceError> {
     if let Some(asset_id) = asset_id {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ?")
-            .bind(asset_id.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some();
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?")
+                .bind(asset_id.to_string())
+                .bind(tenant_id.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?
+                .is_some();
         if !exists {
             return Err(ManagementDeviceError::AssetUnavailable(asset_id));
         }
@@ -2708,15 +2832,18 @@ async fn validate_sqlite_references(
 
 async fn validate_timescale_references(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     asset_id: Option<Uuid>,
     device_profile_id: Option<Uuid>,
 ) -> Result<(), ManagementDeviceError> {
     if let Some(asset_id) = asset_id {
-        let exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1)")
-                .bind(asset_id)
-                .fetch_one(&mut **transaction)
-                .await?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(asset_id)
+        .bind(tenant_id)
+        .fetch_one(&mut **transaction)
+        .await?;
         if !exists {
             return Err(ManagementDeviceError::AssetUnavailable(asset_id));
         }

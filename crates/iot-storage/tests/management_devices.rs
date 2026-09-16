@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 mod common;
 
-async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
+async fn sqlite_store() -> (tempfile::TempDir, PlatformStore, Uuid) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
         storage: DatabaseStorage::Sqlite,
@@ -20,18 +20,31 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
-    (directory, store)
+    let tenant_id = seed_tenant(store.sqlite_pool().unwrap(), "management-devices").await;
+    (directory, store, tenant_id)
 }
 
-async fn seed_management_devices(store: &PlatformStore) -> (Uuid, Uuid) {
+async fn seed_tenant(pool: &sqlx::SqlitePool, slug: &str) -> Uuid {
+    let tenant_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, ?, 'active')")
+        .bind(tenant_id.to_string())
+        .bind(slug)
+        .execute(pool)
+        .await
+        .unwrap();
+    tenant_id
+}
+
+async fn seed_management_devices(store: &PlatformStore, tenant_id: Uuid) -> (Uuid, Uuid) {
     let pool = store.sqlite_pool().unwrap();
     let asset_id = Uuid::now_v7();
     let device_profile_id = Uuid::now_v7();
     let now = Utc::now().to_rfc3339();
     let ten_minutes_ago = (Utc::now() - Duration::minutes(10)).to_rfc3339();
 
-    sqlx::query("INSERT INTO assets (id, name) VALUES (?, 'management asset')")
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'management asset')")
         .bind(asset_id.to_string())
+        .bind(tenant_id.to_string())
         .execute(pool)
         .await
         .unwrap();
@@ -42,16 +55,20 @@ async fn seed_management_devices(store: &PlatformStore) -> (Uuid, Uuid) {
         .unwrap();
     sqlx::query(
         "INSERT INTO devices (
-             device_id, display_name, metadata, last_seen_at, is_gateway
+             device_id, tenant_id, display_name, metadata, last_seen_at, is_gateway
          ) VALUES
-             ('management-gateway', 'Gateway', '{}', ?, 1),
-             ('management-child', 'Child', '{}', ?, 0),
-             ('management-direct', 'Direct', '{}', ?, 0),
-             ('management-deleted', 'Deleted', '{}', ?, 0)",
+             ('management-gateway', ?, 'Gateway', '{}', ?, 1),
+             ('management-child', ?, 'Child', '{}', ?, 0),
+             ('management-direct', ?, 'Direct', '{}', ?, 0),
+             ('management-deleted', ?, 'Deleted', '{}', NULL, 0)",
     )
+    .bind(tenant_id.to_string())
     .bind(&now)
+    .bind(tenant_id.to_string())
     .bind(&now)
+    .bind(tenant_id.to_string())
     .bind(&ten_minutes_ago)
+    .bind(tenant_id.to_string())
     .execute(pool)
     .await
     .unwrap();
@@ -89,11 +106,112 @@ async fn seed_management_devices(store: &PlatformStore) -> (Uuid, Uuid) {
     (asset_id, device_profile_id)
 }
 
+#[tokio::test]
+async fn sqlite_management_devices_reject_cross_tenant_lookup_mutation_and_asset_references() {
+    let (_directory, store, _default_tenant_id) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_a = seed_tenant(pool, "device-tenant-a").await;
+    let tenant_b = seed_tenant(pool, "device-tenant-b").await;
+    let tenant_b_asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, metadata) VALUES (?, ?, 'tenant-b asset', '{}')",
+    )
+    .bind(tenant_b_asset_id.to_string())
+    .bind(tenant_b.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, metadata, is_gateway)
+         VALUES ('tenant-b-gateway', ?, 'Tenant B gateway', '{}', 1)",
+    )
+    .bind(tenant_b.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, metadata)
+         VALUES ('tenant-a-device', ?, 'Tenant A', '{}'),
+                ('tenant-b-device', ?, 'Tenant B', '{}')",
+    )
+    .bind(tenant_a.to_string())
+    .bind(tenant_b.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ManagementDeviceRepository::list_management_devices(&store, tenant_a)
+            .await
+            .unwrap()
+            .iter()
+            .map(|device| device.device_id.as_str())
+            .collect::<Vec<_>>(),
+        ["tenant-a-device"]
+    );
+    assert!(matches!(
+        ManagementDeviceRepository::update_management_device(
+            &store,
+            tenant_a,
+            "tenant-b-device",
+            UpdateManagementDevice {
+                display_name: "Changed".to_owned(),
+                asset_id: None,
+                device_profile_id: None,
+                attributes: None,
+                topology: None,
+            },
+        )
+        .await,
+        Err(ManagementDeviceError::DeviceNotFound)
+    ));
+    assert!(matches!(
+        ManagementDeviceRepository::delete_management_device(&store, tenant_a, "tenant-b-device")
+            .await,
+        Err(ManagementDeviceError::DeviceNotFound)
+    ));
+    assert!(matches!(
+        ManagementDeviceRepository::update_management_device(
+            &store,
+            tenant_a,
+            "tenant-a-device",
+            UpdateManagementDevice {
+                display_name: "Tenant A".to_owned(),
+                asset_id: Some(tenant_b_asset_id),
+                device_profile_id: None,
+                attributes: None,
+                topology: None,
+            },
+        )
+        .await,
+        Err(ManagementDeviceError::AssetUnavailable(id)) if id == tenant_b_asset_id
+    ));
+    assert!(matches!(
+        ManagementDeviceRepository::update_management_device(
+            &store,
+            tenant_a,
+            "tenant-a-device",
+            UpdateManagementDevice {
+                display_name: "Tenant A".to_owned(),
+                asset_id: None,
+                device_profile_id: None,
+                attributes: None,
+                topology: Some(ManagementDeviceTopology {
+                    is_gateway: false,
+                    gateway_device_id: Some("tenant-b-gateway".to_owned()),
+                }),
+            },
+        )
+        .await,
+        Err(ManagementDeviceError::GatewayUnavailable)
+    ));
+}
+
 struct TimescaleTestLock {
     _connection: PgConnection,
 }
 
-async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
+async fn timescale_store() -> (TimescaleTestLock, PlatformStore, Uuid) {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
     let mut connection = PgConnection::connect(&database_url).await.unwrap();
@@ -116,20 +234,29 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
     })
     .await
     .unwrap();
+    let tenant_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'management-devices', 'active')",
+    )
+    .bind(tenant_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     (
         TimescaleTestLock {
             _connection: connection,
         },
         store,
+        tenant_id,
     )
 }
 
 #[tokio::test]
 async fn sqlite_management_device_repository_updates_lists_and_soft_deletes_devices() {
-    let (_directory, store) = sqlite_store().await;
-    let (asset_id, device_profile_id) = seed_management_devices(&store).await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
+    let (asset_id, device_profile_id) = seed_management_devices(&store, tenant_id).await;
 
-    let devices = ManagementDeviceRepository::list_management_devices(&store)
+    let devices = ManagementDeviceRepository::list_management_devices(&store, tenant_id)
         .await
         .unwrap();
     assert_eq!(
@@ -162,6 +289,7 @@ async fn sqlite_management_device_repository_updates_lists_and_soft_deletes_devi
 
     let updated = ManagementDeviceRepository::update_management_device(
         &store,
+        tenant_id,
         "management-direct",
         UpdateManagementDevice {
             display_name: "Renamed direct".to_owned(),
@@ -201,11 +329,11 @@ async fn sqlite_management_device_repository_updates_lists_and_soft_deletes_devi
         .is_some()
     );
 
-    ManagementDeviceRepository::delete_management_device(&store, "management-child")
+    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "management-child")
         .await
         .unwrap();
     assert!(
-        ManagementDeviceRepository::list_management_devices(&store)
+        ManagementDeviceRepository::list_management_devices(&store, tenant_id)
             .await
             .unwrap()
             .iter()
@@ -224,11 +352,12 @@ async fn sqlite_management_device_repository_updates_lists_and_soft_deletes_devi
 
 #[tokio::test]
 async fn sqlite_management_device_repository_returns_typed_validation_errors() {
-    let (_directory, store) = sqlite_store().await;
-    seed_management_devices(&store).await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
+    seed_management_devices(&store, tenant_id).await;
 
     let scalar_attributes = ManagementDeviceRepository::update_management_device(
         &store,
+        tenant_id,
         "management-direct",
         UpdateManagementDevice {
             display_name: "Direct".to_owned(),
@@ -247,6 +376,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
 
     let missing_asset = ManagementDeviceRepository::update_management_device(
         &store,
+        tenant_id,
         "management-direct",
         UpdateManagementDevice {
             display_name: "Direct".to_owned(),
@@ -265,6 +395,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
 
     let demote_gateway = ManagementDeviceRepository::update_management_device(
         &store,
+        tenant_id,
         "management-gateway",
         UpdateManagementDevice {
             display_name: "Gateway".to_owned(),
@@ -284,10 +415,13 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
         ManagementDeviceError::GatewayHasChildren
     ));
 
-    let delete_gateway =
-        ManagementDeviceRepository::delete_management_device(&store, "management-gateway")
-            .await
-            .unwrap_err();
+    let delete_gateway = ManagementDeviceRepository::delete_management_device(
+        &store,
+        tenant_id,
+        "management-gateway",
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(
         delete_gateway,
         ManagementDeviceError::GatewayHasChildren
@@ -295,6 +429,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
 
     let non_gateway_parent = ManagementDeviceRepository::update_management_device(
         &store,
+        tenant_id,
         "management-direct",
         UpdateManagementDevice {
             display_name: "Direct".to_owned(),
@@ -317,19 +452,20 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
 
 #[tokio::test]
 async fn sqlite_management_device_health_uses_the_five_minute_online_window() {
-    let (_directory, store) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let recently_seen = (Utc::now() - Duration::minutes(3)).to_rfc3339();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, last_seen_at)
-         VALUES ('management-recent', 'Recently seen', ?)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, last_seen_at)
+         VALUES ('management-recent', ?, 'Recently seen', ?)",
     )
+    .bind(tenant_id.to_string())
     .bind(recently_seen)
     .execute(pool)
     .await
     .unwrap();
 
-    let device = ManagementDeviceRepository::list_management_devices(&store)
+    let device = ManagementDeviceRepository::list_management_devices(&store, tenant_id)
         .await
         .unwrap()
         .into_iter()
@@ -341,22 +477,27 @@ async fn sqlite_management_device_health_uses_the_five_minute_online_window() {
 #[test]
 fn timescale_management_reference_validation_uses_boolean_exists_queries() {
     let source = include_str!("../src/management.rs");
-    assert!(source.contains("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1)"));
+    assert!(
+        source.contains("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)")
+    );
     assert!(source.contains("SELECT EXISTS(SELECT 1 FROM device_profiles WHERE id = $1)"));
 }
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_device_repository_matches_sqlite_contract() {
-    let (_lock, store) = timescale_store().await;
+    let (_lock, store, tenant_id) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
     let asset_id = Uuid::now_v7();
     let device_profile_id = Uuid::now_v7();
-    sqlx::query("INSERT INTO assets (id, name) VALUES ($1, 'timescale management asset')")
-        .bind(asset_id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name) VALUES ($1, $2, 'timescale management asset')",
+    )
+    .bind(asset_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO device_profiles (id, name)
          VALUES ($1, 'timescale management profile')",
@@ -366,13 +507,14 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, display_name, is_gateway) VALUES
-             ('management-gateway', 'Gateway', TRUE),
-             ('management-child', 'Child', FALSE),
-             ('management-direct', 'Direct', FALSE),
-             ('management-recent', 'Recently seen', FALSE),
-             ('management-deleted', 'Deleted', FALSE)",
+        "INSERT INTO devices (device_id, tenant_id, display_name, is_gateway) VALUES
+             ('management-gateway', $1, 'Gateway', TRUE),
+             ('management-child', $1, 'Child', FALSE),
+             ('management-direct', $1, 'Direct', FALSE),
+             ('management-recent', $1, 'Recently seen', FALSE),
+             ('management-deleted', $1, 'Deleted', FALSE)",
     )
+    .bind(tenant_id)
     .execute(pool)
     .await
     .unwrap();
@@ -399,7 +541,7 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
         .await
         .unwrap();
 
-    let listed = ManagementDeviceRepository::list_management_devices(&store)
+    let listed = ManagementDeviceRepository::list_management_devices(&store, tenant_id)
         .await
         .unwrap();
     assert_eq!(listed.len(), 4);
@@ -423,6 +565,7 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
 
     let updated = ManagementDeviceRepository::update_management_device(
         &store,
+        tenant_id,
         "management-direct",
         UpdateManagementDevice {
             display_name: "Renamed direct".to_owned(),
@@ -445,11 +588,11 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
         Some(ManagementChildStatus::Unavailable)
     );
 
-    ManagementDeviceRepository::delete_management_device(&store, "management-child")
+    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "management-child")
         .await
         .unwrap();
     assert!(
-        ManagementDeviceRepository::list_management_devices(&store)
+        ManagementDeviceRepository::list_management_devices(&store, tenant_id)
             .await
             .unwrap()
             .iter()
