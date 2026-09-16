@@ -586,6 +586,33 @@ button:disabled {
   font-size: 12px;
 }
 
+.powermonitor-login {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+}
+
+.powermonitor-login-panel {
+  width: min(100%, 420px);
+  padding: 32px;
+  border: 1px solid #c7d8da;
+  border-radius: 6px;
+  background: #f7fbfb;
+}
+
+.powermonitor-login-action {
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  padding: 10px 14px;
+  border-radius: 5px;
+  background: #167b83;
+  color: #fff;
+  font-weight: 700;
+  text-decoration: none;
+}
+
 @media (max-width: 760px) {
   .powermonitor-shell {
     grid-template-columns: 1fr;
