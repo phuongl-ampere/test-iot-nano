@@ -11,7 +11,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS api_access_tokens_username_index
     ON api_access_tokens (username);
 
 CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT public.uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL,
@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE users
-    ALTER COLUMN id SET DEFAULT public.uuid_generate_v4();
+    ALTER COLUMN id SET DEFAULT uuid_generate_v4();
 
 CREATE TABLE IF NOT EXISTS user_app_grants (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

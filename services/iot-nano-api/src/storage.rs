@@ -58,7 +58,7 @@ pub async fn migrate_api(pool: &PgPool) -> Result<(), sqlx::Error> {
         .await?;
     let mut connection = pool.acquire().await?;
     connection
-        .execute("SET search_path TO iot_nano_api")
+        .execute("SET search_path TO iot_nano_api, public")
         .await?;
     sqlx::raw_sql(API_POSTGRES_SCHEMA)
         .execute(&mut *connection)
@@ -71,7 +71,7 @@ pub async fn connect_api_database(database_url: &str) -> Result<PgPool, sqlx::Er
         .after_connect(|connection, _| {
             Box::pin(async move {
                 connection
-                    .execute("SET search_path TO iot_nano_api")
+                    .execute("SET search_path TO iot_nano_api, public")
                     .await?;
                 Ok(())
             })
