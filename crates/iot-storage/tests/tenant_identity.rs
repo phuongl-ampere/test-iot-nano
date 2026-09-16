@@ -124,3 +124,62 @@ async fn sqlite_tenant_identity_repository_bootstraps_system_and_creates_tenant_
     assert_eq!(tenant_credential.tenant.id, tenant.id);
     assert_eq!(tenant_credential.password_hash, "tenant-hash");
 }
+
+#[tokio::test]
+async fn sqlite_tenant_identity_repository_controls_tenant_and_credential_lifecycle() {
+    let (_directory, store) = sqlite_store().await;
+    let (tenant, tenant_account) = TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "north".to_owned(),
+            metadata: serde_json::json!({}),
+        },
+        NewTenantAccount {
+            password_hash: "original-hash".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    TenantIdentityRepository::suspend_tenant(&store, "north")
+        .await
+        .unwrap();
+    assert!(
+        TenantIdentityRepository::tenant_account_credential(&store, "north")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    TenantIdentityRepository::reactivate_tenant(&store, "north")
+        .await
+        .unwrap();
+    let reset = TenantIdentityRepository::reset_tenant_account_password(
+        &store,
+        "north",
+        "replacement-hash".to_owned(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reset.id, tenant_account.id);
+    assert_eq!(reset.tenant_id, tenant.id);
+    assert_eq!(reset.credential_version, 2);
+    assert_eq!(
+        TenantIdentityRepository::tenant_account_credential(&store, "north")
+            .await
+            .unwrap()
+            .unwrap()
+            .password_hash,
+        "replacement-hash"
+    );
+
+    TenantIdentityRepository::delete_tenant(&store, "north")
+        .await
+        .unwrap();
+    assert!(
+        TenantIdentityRepository::tenant_account_credential(&store, "north")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

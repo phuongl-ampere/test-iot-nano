@@ -2504,6 +2504,7 @@ fn system_tenant_error(error: TenantIdentityError) -> ManagementSessionError {
         TenantIdentityError::InvalidTenantSlug | TenantIdentityError::EmptyPasswordHash => {
             ManagementSessionError::BadRequest
         }
+        TenantIdentityError::TenantLifecycleDenied => ManagementSessionError::Conflict,
         TenantIdentityError::EmptySystemUsername
         | TenantIdentityError::InvalidStoredIdentity
         | TenantIdentityError::Database(_) => ManagementSessionError::Unavailable,

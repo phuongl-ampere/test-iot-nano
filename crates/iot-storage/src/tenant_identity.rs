@@ -100,6 +100,8 @@ pub enum TenantIdentityError {
     EmptyPasswordHash,
     #[error("stored tenant identity is invalid")]
     InvalidStoredIdentity,
+    #[error("tenant was not found or cannot make the requested lifecycle transition")]
+    TenantLifecycleDenied,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -261,6 +263,179 @@ impl TenantIdentityRepository {
             }
         }
     }
+
+    pub async fn suspend_tenant(
+        store: &PlatformStore,
+        tenant_slug: &str,
+    ) -> Result<(), TenantIdentityError> {
+        update_tenant_status(store, tenant_slug, TenantStatus::Suspended, "active").await
+    }
+
+    pub async fn reactivate_tenant(
+        store: &PlatformStore,
+        tenant_slug: &str,
+    ) -> Result<(), TenantIdentityError> {
+        update_tenant_status(store, tenant_slug, TenantStatus::Active, "suspended").await
+    }
+
+    pub async fn delete_tenant(
+        store: &PlatformStore,
+        tenant_slug: &str,
+    ) -> Result<(), TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let rows = sqlx::query(
+                    "UPDATE tenants
+                     SET status = 'deleted', updated_at = CURRENT_TIMESTAMP
+                     WHERE slug = ? AND status <> 'deleted'",
+                )
+                .bind(tenant_slug)
+                .execute(&store.pool)
+                .await?
+                .rows_affected();
+                if rows == 1 {
+                    Ok(())
+                } else {
+                    Err(TenantIdentityError::TenantLifecycleDenied)
+                }
+            }
+            PlatformStore::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "UPDATE tenants
+                     SET status = 'deleted', updated_at = now()
+                     WHERE slug = $1 AND status <> 'deleted'",
+                )
+                .bind(tenant_slug)
+                .execute(pool)
+                .await?
+                .rows_affected();
+                if rows == 1 {
+                    Ok(())
+                } else {
+                    Err(TenantIdentityError::TenantLifecycleDenied)
+                }
+            }
+        }
+    }
+
+    pub async fn reset_tenant_account_password(
+        store: &PlatformStore,
+        tenant_slug: &str,
+        password_hash: String,
+    ) -> Result<TenantAccount, TenantIdentityError> {
+        if password_hash.is_empty() {
+            return Err(TenantIdentityError::EmptyPasswordHash);
+        }
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let mut transaction = store.pool.begin().await?;
+                let row = sqlx::query(
+                    "SELECT tenant_accounts.id, tenant_accounts.tenant_id, tenant_accounts.status,
+                            tenant_accounts.credential_version
+                     FROM tenant_accounts
+                     JOIN tenants ON tenants.id = tenant_accounts.tenant_id
+                     WHERE tenants.slug = ? AND tenants.status <> 'deleted'",
+                )
+                .bind(tenant_slug)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+                let account = tenant_account_from_sqlite(row)?;
+                sqlx::query(
+                    "UPDATE tenant_accounts
+                     SET password_hash = ?, credential_version = credential_version + 1,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?",
+                )
+                .bind(password_hash)
+                .bind(account.id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                Ok(TenantAccount {
+                    credential_version: account.credential_version + 1,
+                    ..account
+                })
+            }
+            PlatformStore::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                let row = sqlx::query(
+                    "SELECT tenant_accounts.id, tenant_accounts.tenant_id, tenant_accounts.status,
+                            tenant_accounts.credential_version
+                     FROM tenant_accounts
+                     JOIN tenants ON tenants.id = tenant_accounts.tenant_id
+                     WHERE tenants.slug = $1 AND tenants.status <> 'deleted'
+                     FOR UPDATE OF tenant_accounts",
+                )
+                .bind(tenant_slug)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+                let account = tenant_account_from_postgres(row)?;
+                sqlx::query(
+                    "UPDATE tenant_accounts
+                     SET password_hash = $1, credential_version = credential_version + 1,
+                         updated_at = now()
+                     WHERE id = $2",
+                )
+                .bind(password_hash)
+                .bind(account.id)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                Ok(TenantAccount {
+                    credential_version: account.credential_version + 1,
+                    ..account
+                })
+            }
+        }
+    }
+}
+
+async fn update_tenant_status(
+    store: &PlatformStore,
+    tenant_slug: &str,
+    next: TenantStatus,
+    expected_current: &str,
+) -> Result<(), TenantIdentityError> {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let rows = sqlx::query(
+                "UPDATE tenants
+                 SET status = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE slug = ? AND status = ?",
+            )
+            .bind(next.as_str())
+            .bind(tenant_slug)
+            .bind(expected_current)
+            .execute(&store.pool)
+            .await?
+            .rows_affected();
+            if rows == 1 {
+                Ok(())
+            } else {
+                Err(TenantIdentityError::TenantLifecycleDenied)
+            }
+        }
+        PlatformStore::Timescale(pool) => {
+            let rows = sqlx::query(
+                "UPDATE tenants
+                 SET status = $1, updated_at = now()
+                 WHERE slug = $2 AND status = $3",
+            )
+            .bind(next.as_str())
+            .bind(tenant_slug)
+            .bind(expected_current)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            if rows == 1 {
+                Ok(())
+            } else {
+                Err(TenantIdentityError::TenantLifecycleDenied)
+            }
+        }
+    }
 }
 
 fn system_account_credential_from_sqlite(
@@ -339,6 +514,32 @@ fn tenant_account_credential_from_postgres(
         },
         password_hash: row.try_get("password_hash")?,
     })
+}
+
+fn tenant_account_from_sqlite(row: SqliteRow) -> Result<TenantAccount, TenantIdentityError> {
+    Ok(TenantAccount {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        tenant_id: parse_uuid(row.try_get::<String, _>("tenant_id")?)?,
+        status: account_status_from_str(&row.try_get::<String, _>("status")?)?,
+        credential_version: row.try_get("credential_version")?,
+    })
+}
+
+fn tenant_account_from_postgres(row: PgRow) -> Result<TenantAccount, TenantIdentityError> {
+    Ok(TenantAccount {
+        id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
+        status: account_status_from_str(&row.try_get::<String, _>("status")?)?,
+        credential_version: row.try_get("credential_version")?,
+    })
+}
+
+fn account_status_from_str(value: &str) -> Result<AccountStatus, TenantIdentityError> {
+    match value {
+        "active" => Ok(AccountStatus::Active),
+        "disabled" => Ok(AccountStatus::Disabled),
+        _ => Err(TenantIdentityError::InvalidStoredIdentity),
+    }
 }
 
 fn parse_uuid(value: String) -> Result<Uuid, TenantIdentityError> {
