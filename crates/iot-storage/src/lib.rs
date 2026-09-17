@@ -7718,33 +7718,6 @@ async fn pre_tenant_platform_sqlite_table(
     Ok(None)
 }
 
-async fn reject_pre_tenant_platform_sqlite(
-    path: &Path,
-    busy_timeout_ms: u64,
-) -> Result<(), SqliteStoreError> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(SqliteStoreError::Filesystem(error)),
-    };
-    if !metadata.is_file() {
-        return Err(SqliteStoreError::InvalidConfiguration);
-    }
-    if metadata.len() == 0 {
-        return Ok(());
-    }
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(sqlite_backup_connect_options(path, busy_timeout_ms))
-        .await?;
-    let table = pre_tenant_platform_sqlite_table(&pool).await;
-    pool.close().await;
-    if let Some(table) = table? {
-        return Err(SqliteStoreError::ResetRequired { table });
-    }
-    Ok(())
-}
-
 async fn pre_tenant_platform_timescale_table(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<Option<String>, sqlx::Error> {
