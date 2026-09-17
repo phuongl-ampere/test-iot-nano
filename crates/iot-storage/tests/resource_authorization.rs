@@ -1,7 +1,12 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_storage::{AccountClass, AuthorizationSubject, PlatformStore, ResourcePermission};
-use sqlx::SqlitePool;
+use iot_storage::{
+    AccountClass, AuthorizationSubject, ManagementDeviceRepository, PlatformStore, ResourceAccess,
+    ResourceAccessSource, ResourcePermission, UpdateManagementDevice,
+};
+use sqlx::{Connection, PgConnection, PgPool, SqlitePool};
 use uuid::Uuid;
+
+mod common;
 
 const TENANT_A: Uuid = Uuid::from_u128(1);
 const TENANT_B: Uuid = Uuid::from_u128(2);
@@ -13,6 +18,8 @@ const GROUP_A: Uuid = Uuid::from_u128(30);
 const ROOT_ASSET_A: Uuid = Uuid::from_u128(40);
 const CHILD_ASSET_A: Uuid = Uuid::from_u128(41);
 const DEPTH_LEAF_ASSET_A: Uuid = Uuid::from_u128(50);
+const LIST_ROOT_ASSET_A: Uuid = Uuid::from_u128(60);
+const LIST_CHILD_ASSET_A: Uuid = Uuid::from_u128(61);
 
 const DIRECT_DEVICE_A: &str = "device-direct-a";
 const GROUP_DEVICE_A: &str = "device-group-a";
@@ -22,6 +29,10 @@ const OWNED_DEVICE_A: &str = "device-owned-a";
 const UNSHARED_DEVICE_A: &str = "device-unshared-a";
 const DEVICE_B: &str = "device-b";
 const DEPTH_DEVICE_A: &str = "device-depth-a";
+const LIST_DIRECT_DEVICE_A: &str = "list-a-direct";
+const LIST_GROUP_DEVICE_A: &str = "list-b-group";
+const LIST_INHERITED_DEVICE_A: &str = "list-c-inherited";
+const LIST_MOVED_DEVICE_A: &str = "list-d-moved";
 
 fn subject(user_id: Uuid, tenant_id: Uuid, account_class: AccountClass) -> AuthorizationSubject {
     AuthorizationSubject {
@@ -29,6 +40,10 @@ fn subject(user_id: Uuid, tenant_id: Uuid, account_class: AccountClass) -> Autho
         tenant_id,
         account_class,
     }
+}
+
+fn access(permission: ResourcePermission, source: ResourceAccessSource) -> ResourceAccess {
+    ResourceAccess { permission, source }
 }
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
@@ -299,12 +314,13 @@ async fn sqlite_inherits_asset_permission_for_assets_and_devices() {
         None,
     )
     .await;
+    insert_group_member(pool, TENANT_A, GROUP_A, OTHER_USER_A, USER_A).await;
     insert_permission(
         pool,
-        "inherited-manager",
+        "inherited-group-manager",
         TENANT_A,
-        Some(USER_A),
         None,
+        Some(GROUP_A),
         Some(ROOT_ASSET_A),
         None,
         ResourcePermission::Manager,
@@ -326,6 +342,194 @@ async fn sqlite_inherits_asset_permission_for_assets_and_devices() {
         Some(ResourcePermission::Manager),
     )
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_authorized_device_list_tracks_effective_access_across_a_move() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_identities(pool).await;
+    insert_asset(
+        pool,
+        LIST_ROOT_ASSET_A,
+        TENANT_A,
+        "list-root",
+        None,
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        LIST_CHILD_ASSET_A,
+        TENANT_A,
+        "list-child",
+        Some(LIST_ROOT_ASSET_A),
+        None,
+    )
+    .await;
+    for device_id in [LIST_DIRECT_DEVICE_A, LIST_GROUP_DEVICE_A] {
+        insert_device(pool, device_id, TENANT_A, None, None).await;
+    }
+    for device_id in [LIST_INHERITED_DEVICE_A, LIST_MOVED_DEVICE_A] {
+        insert_device(pool, device_id, TENANT_A, Some(LIST_CHILD_ASSET_A), None).await;
+    }
+    insert_group_member(pool, TENANT_A, GROUP_A, OTHER_USER_A, USER_A).await;
+    insert_permission(
+        pool,
+        "list-direct-user-manager",
+        TENANT_A,
+        Some(USER_A),
+        None,
+        None,
+        Some(LIST_DIRECT_DEVICE_A),
+        ResourcePermission::Manager,
+        false,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+    insert_permission(
+        pool,
+        "list-direct-group-viewer",
+        TENANT_A,
+        None,
+        Some(GROUP_A),
+        None,
+        Some(LIST_GROUP_DEVICE_A),
+        ResourcePermission::Viewer,
+        false,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+    insert_permission(
+        pool,
+        "list-inherited-group-manager",
+        TENANT_A,
+        None,
+        Some(GROUP_A),
+        Some(LIST_ROOT_ASSET_A),
+        None,
+        ResourcePermission::Manager,
+        true,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+    insert_permission(
+        pool,
+        "list-moved-direct-viewer",
+        TENANT_A,
+        Some(USER_A),
+        None,
+        None,
+        Some(LIST_MOVED_DEVICE_A),
+        ResourcePermission::Viewer,
+        false,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+
+    let user = subject(USER_A, TENANT_A, AccountClass::User);
+    let first_page = store.list_authorized_devices(&user, None, 2).await.unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|entry| (entry.device_id.as_str(), entry.access))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                LIST_DIRECT_DEVICE_A,
+                access(
+                    ResourcePermission::Manager,
+                    ResourceAccessSource::DirectUser
+                ),
+            ),
+            (
+                LIST_GROUP_DEVICE_A,
+                access(ResourcePermission::Viewer, ResourceAccessSource::Group),
+            ),
+        ]
+    );
+    let second_page = store
+        .list_authorized_devices(&user, Some(LIST_GROUP_DEVICE_A), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|entry| (entry.device_id.as_str(), entry.access))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                LIST_INHERITED_DEVICE_A,
+                access(
+                    ResourcePermission::Manager,
+                    ResourceAccessSource::InheritedGroup,
+                ),
+            ),
+            (
+                LIST_MOVED_DEVICE_A,
+                access(
+                    ResourcePermission::Manager,
+                    ResourceAccessSource::InheritedGroup,
+                ),
+            ),
+        ]
+    );
+    assert_eq!(
+        store
+            .authorized_device(&user, LIST_MOVED_DEVICE_A)
+            .await
+            .unwrap()
+            .map(|device| device.device_id),
+        Some(LIST_MOVED_DEVICE_A.to_owned())
+    );
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        TENANT_A,
+        LIST_MOVED_DEVICE_A,
+        UpdateManagementDevice {
+            display_name: "moved device".to_owned(),
+            asset_id: None,
+            device_profile_id: None,
+            attributes: None,
+            topology: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_device_permission(
+        &store,
+        &user,
+        LIST_MOVED_DEVICE_A,
+        Some(ResourcePermission::Viewer),
+    )
+    .await;
+    assert_eq!(
+        store
+            .list_authorized_devices(&user, Some(LIST_INHERITED_DEVICE_A), 2)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.device_id.as_str(), entry.access))
+            .collect::<Vec<_>>(),
+        vec![(
+            LIST_MOVED_DEVICE_A,
+            access(ResourcePermission::Viewer, ResourceAccessSource::DirectUser),
+        )]
+    );
+    assert_eq!(
+        store
+            .authorized_device(&user, LIST_MOVED_DEVICE_A)
+            .await
+            .unwrap()
+            .map(|device| device.device_id),
+        Some(LIST_MOVED_DEVICE_A.to_owned())
+    );
 }
 
 #[tokio::test]
@@ -422,6 +626,8 @@ async fn sqlite_limits_asset_inheritance_to_64_ancestors() {
     let pool = store.sqlite_pool().unwrap();
     seed_identities(pool).await;
 
+    // Deliberately construct a 65th ancestor so the resolver's explicit 64-hop
+    // boundary is covered; normal authorization tests do not need this raw tree.
     for depth in (1..=65_u128).rev() {
         let parent_asset_id = (depth < 65).then(|| ancestor_asset_id(depth + 1));
         insert_asset(
@@ -494,4 +700,251 @@ async fn sqlite_limits_asset_inheritance_to_64_ancestors() {
         None,
     )
     .await;
+}
+
+struct TimescaleTestLock {
+    _connection: PgConnection,
+}
+
+async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    common::reset_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    (
+        TimescaleTestLock {
+            _connection: connection,
+        },
+        store,
+    )
+}
+
+async fn seed_timescale_identities(pool: &PgPool) {
+    for (tenant_id, slug) in [(TENANT_A, "tenant-a"), (TENANT_B, "tenant-b")] {
+        sqlx::query("INSERT INTO tenants (id, slug, status) VALUES ($1, $2, 'active')")
+            .bind(tenant_id)
+            .bind(slug)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    for (user_id, tenant_id, username, account_class) in [
+        (USER_A, TENANT_A, "user-a", AccountClass::User),
+        (OTHER_USER_A, TENANT_A, "other-user-a", AccountClass::User),
+        (
+            LEGACY_ADMIN_A,
+            TENANT_A,
+            "legacy-admin-a",
+            AccountClass::Admin,
+        ),
+        (USER_B, TENANT_B, "user-b", AccountClass::User),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+             VALUES ($1, $2, $3, 'unused', 'viewer', $4)",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(username)
+        .bind(account_class.as_str())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+async fn insert_timescale_asset(
+    pool: &PgPool,
+    asset_id: Uuid,
+    tenant_id: Uuid,
+    name: &str,
+    parent_asset_id: Option<Uuid>,
+    owner_user_id: Option<Uuid>,
+) {
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, parent_asset_id, owner_user_id)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(asset_id)
+    .bind(tenant_id)
+    .bind(name)
+    .bind(parent_asset_id)
+    .bind(owner_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_timescale_device(
+    pool: &PgPool,
+    device_id: &str,
+    tenant_id: Uuid,
+    asset_id: Option<Uuid>,
+    owner_user_id: Option<Uuid>,
+) {
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, asset_id, owner_user_id)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(device_id)
+    .bind(tenant_id)
+    .bind(asset_id)
+    .bind(owner_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_timescale_group_member(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    group_id: Uuid,
+    owner_user_id: Uuid,
+    user_id: Uuid,
+) {
+    sqlx::query(
+        "INSERT INTO user_groups (id, tenant_id, owner_user_id, name)
+         VALUES ($1, $2, $3, 'operators')",
+    )
+    .bind(group_id)
+    .bind(tenant_id)
+    .bind(owner_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO user_group_members (tenant_id, group_id, user_id)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(tenant_id)
+    .bind(group_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_timescale_group_asset_permission(
+    pool: &PgPool,
+    permission_id: Uuid,
+    tenant_id: Uuid,
+    group_id: Uuid,
+    asset_id: Uuid,
+    created_by_user_id: Uuid,
+) {
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_group_id, asset_id, permission, inherit_children,
+            created_by_user_id
+         ) VALUES ($1, $2, $3, $4, 'manager', TRUE, $5)",
+    )
+    .bind(permission_id)
+    .bind(tenant_id)
+    .bind(group_id)
+    .bind(asset_id)
+    .bind(created_by_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_group_inheritance_is_recursive_and_tenant_scoped() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    seed_timescale_identities(pool).await;
+    insert_timescale_asset(
+        pool,
+        ROOT_ASSET_A,
+        TENANT_A,
+        "root",
+        None,
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_timescale_asset(
+        pool,
+        CHILD_ASSET_A,
+        TENANT_A,
+        "child",
+        Some(ROOT_ASSET_A),
+        None,
+    )
+    .await;
+    insert_timescale_device(
+        pool,
+        INHERITED_DEVICE_A,
+        TENANT_A,
+        Some(CHILD_ASSET_A),
+        None,
+    )
+    .await;
+    insert_timescale_device(pool, DEVICE_B, TENANT_B, None, Some(USER_B)).await;
+    insert_timescale_group_member(pool, TENANT_A, GROUP_A, OTHER_USER_A, USER_A).await;
+    insert_timescale_group_asset_permission(
+        pool,
+        Uuid::from_u128(100),
+        TENANT_A,
+        GROUP_A,
+        ROOT_ASSET_A,
+        OTHER_USER_A,
+    )
+    .await;
+
+    let user = subject(USER_A, TENANT_A, AccountClass::User);
+    assert_eq!(
+        store.asset_permission(&user, CHILD_ASSET_A).await.unwrap(),
+        Some(ResourcePermission::Manager)
+    );
+    assert_device_permission(
+        &store,
+        &user,
+        INHERITED_DEVICE_A,
+        Some(ResourcePermission::Manager),
+    )
+    .await;
+    assert_device_permission(&store, &user, DEVICE_B, None).await;
+    assert_eq!(
+        store
+            .list_authorized_devices(&user, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.device_id.as_str(), entry.access))
+            .collect::<Vec<_>>(),
+        vec![(
+            INHERITED_DEVICE_A,
+            access(
+                ResourcePermission::Manager,
+                ResourceAccessSource::InheritedGroup,
+            ),
+        )]
+    );
+    assert_eq!(
+        store
+            .authorized_device(&user, INHERITED_DEVICE_A)
+            .await
+            .unwrap()
+            .map(|device| device.device_id),
+        Some(INHERITED_DEVICE_A.to_owned())
+    );
 }
