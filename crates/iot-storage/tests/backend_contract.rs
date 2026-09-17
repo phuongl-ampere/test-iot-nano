@@ -613,6 +613,7 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
         user_groups_sql
             .contains("tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT")
     );
+    assert!(user_groups_sql.contains("UNIQUE (id, tenant_id)"));
     assert!(user_groups_sql.contains("FOREIGN KEY (owner_user_id, tenant_id)"));
     assert!(user_groups_sql.contains("REFERENCES users(id, tenant_id) ON DELETE RESTRICT"));
 
@@ -640,6 +641,13 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
         resource_permissions_sql
             .contains("tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT")
     );
+    assert!(
+        resource_permissions_sql
+            .contains("permission TEXT NOT NULL CHECK (permission IN ('viewer', 'manager'))")
+    );
+    assert!(resource_permissions_sql.contains(
+        "inherit_children INTEGER NOT NULL DEFAULT 0 CHECK (inherit_children IN (0, 1))"
+    ));
     assert!(resource_permissions_sql.contains("revoked_at TEXT"));
     assert!(resource_permissions_sql.contains(
         "CHECK (
@@ -1315,7 +1323,10 @@ async fn platform_store_migrates_timescale_into_the_iot_nano_schema() {
              'telemetry',
              'alert_rules',
              'notification_outbox',
-             'command_outbox'
+             'command_outbox',
+             'user_groups',
+             'user_group_members',
+             'resource_permissions'
            )
          ORDER BY table_name",
     )
@@ -1333,10 +1344,206 @@ async fn platform_store_migrates_timescale_into_the_iot_nano_schema() {
             "command_outbox",
             "devices",
             "notification_outbox",
+            "resource_permissions",
             "telemetry",
+            "user_group_members",
+            "user_groups",
             "users",
         ]
     );
+
+    let legacy_tables = sqlx::query(
+        "SELECT table_name
+         FROM information_schema.tables
+         WHERE table_schema = 'iot_nano'
+           AND table_name IN ('resource_grants', 'resource_shares')
+         ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(legacy_tables.is_empty());
+
+    let authorization_constraints = sqlx::query(
+        "SELECT relation.relname AS table_name,
+                pg_get_constraintdef(constraint_row.oid) AS definition
+         FROM pg_constraint AS constraint_row
+         JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'iot_nano'
+           AND relation.relname IN (
+             'user_groups',
+             'user_group_members',
+             'resource_permissions'
+           )
+         ORDER BY relation.relname, definition",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("table_name"),
+            row.get::<String, _>("definition"),
+        )
+    })
+    .collect::<Vec<_>>();
+    let has_constraint = |table_name: &str, definition: &str| {
+        authorization_constraints
+            .iter()
+            .any(|(actual_table_name, actual_definition)| {
+                actual_table_name == table_name && actual_definition.contains(definition)
+            })
+    };
+
+    assert!(has_constraint(
+        "user_groups",
+        "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint("user_groups", "UNIQUE (id, tenant_id)"));
+    assert!(has_constraint(
+        "user_groups",
+        "FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint(
+        "user_group_members",
+        "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint(
+        "user_group_members",
+        "PRIMARY KEY (group_id, user_id)"
+    ));
+    assert!(has_constraint(
+        "user_group_members",
+        "FOREIGN KEY (group_id, tenant_id) REFERENCES user_groups(id, tenant_id) ON DELETE CASCADE"
+    ));
+    assert!(has_constraint(
+        "user_group_members",
+        "FOREIGN KEY (user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE CASCADE"
+    ));
+    assert!(has_constraint(
+        "resource_permissions",
+        "FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint(
+        "resource_permissions",
+        "FOREIGN KEY (subject_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint(
+        "resource_permissions",
+        "FOREIGN KEY (subject_group_id, tenant_id) REFERENCES user_groups(id, tenant_id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint(
+        "resource_permissions",
+        "FOREIGN KEY (asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint(
+        "resource_permissions",
+        "FOREIGN KEY (device_id, tenant_id) REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT"
+    ));
+    assert!(has_constraint(
+        "resource_permissions",
+        "FOREIGN KEY (created_by_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT"
+    ));
+
+    let authorization_indexes = sqlx::query(
+        "SELECT table_relation.relname AS table_name,
+                index_relation.relname AS index_name,
+                pg_get_indexdef(index_relation.oid) AS definition,
+                pg_get_expr(index_row.indpred, index_row.indrelid) AS predicate
+         FROM pg_index AS index_row
+         JOIN pg_class AS index_relation ON index_relation.oid = index_row.indexrelid
+         JOIN pg_class AS table_relation ON table_relation.oid = index_row.indrelid
+         JOIN pg_namespace AS namespace ON namespace.oid = table_relation.relnamespace
+         WHERE namespace.nspname = 'iot_nano'
+           AND index_relation.relname IN (
+             'user_group_members_tenant_user_group_index',
+             'resource_permissions_active_asset_group_index',
+             'resource_permissions_active_asset_user_index',
+             'resource_permissions_active_device_group_index',
+             'resource_permissions_active_device_user_index'
+           )
+         ORDER BY index_relation.relname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.get::<String, _>("table_name"),
+            row.get::<String, _>("index_name"),
+            row.get::<String, _>("definition"),
+            row.get::<Option<String>, _>("predicate"),
+        )
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(authorization_indexes.len(), 5);
+
+    let user_group_members_index = authorization_indexes
+        .iter()
+        .find(|(_, index_name, _, _)| index_name == "user_group_members_tenant_user_group_index")
+        .unwrap();
+    assert_eq!(user_group_members_index.0, "user_group_members");
+    assert!(
+        user_group_members_index
+            .2
+            .contains("(tenant_id, user_id, group_id)")
+    );
+    assert!(user_group_members_index.3.is_none());
+
+    let expected_active_permission_indexes = [
+        (
+            "resource_permissions_active_asset_group_index",
+            "(tenant_id, asset_id, subject_group_id)",
+            [
+                "revoked_at IS NULL",
+                "asset_id IS NOT NULL",
+                "subject_group_id IS NOT NULL",
+            ],
+        ),
+        (
+            "resource_permissions_active_asset_user_index",
+            "(tenant_id, asset_id, subject_user_id)",
+            [
+                "revoked_at IS NULL",
+                "asset_id IS NOT NULL",
+                "subject_user_id IS NOT NULL",
+            ],
+        ),
+        (
+            "resource_permissions_active_device_group_index",
+            "(tenant_id, device_id, subject_group_id)",
+            [
+                "revoked_at IS NULL",
+                "device_id IS NOT NULL",
+                "subject_group_id IS NOT NULL",
+            ],
+        ),
+        (
+            "resource_permissions_active_device_user_index",
+            "(tenant_id, device_id, subject_user_id)",
+            [
+                "revoked_at IS NULL",
+                "device_id IS NOT NULL",
+                "subject_user_id IS NOT NULL",
+            ],
+        ),
+    ];
+    for (index_name, expected_columns, expected_predicate_fragments) in
+        expected_active_permission_indexes
+    {
+        let (_, _, definition, predicate) = authorization_indexes
+            .iter()
+            .find(|(_, actual_index_name, _, _)| actual_index_name == index_name)
+            .unwrap();
+        assert!(definition.contains(expected_columns));
+        let predicate = predicate.as_deref().unwrap();
+        for expected_fragment in expected_predicate_fragments {
+            assert!(predicate.contains(expected_fragment));
+        }
+    }
 }
 
 #[tokio::test]
