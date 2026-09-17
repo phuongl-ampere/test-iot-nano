@@ -7569,6 +7569,7 @@ const SQLITE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
     "devices",
     "telemetry",
     "gateway_event_receipts",
+    "command_outbox",
     "telemetry_rollups_5m",
     "telemetry_rollups_1h",
     "api_access_tokens",
@@ -7615,6 +7616,7 @@ const SQLITE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "device_profiles",
     "assets",
     "resource_grants",
+    "command_outbox",
 ];
 
 const TIMESCALE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
@@ -7665,6 +7667,7 @@ const TIMESCALE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "device_runtime_state",
     "telemetry",
     "gateway_event_receipts",
+    "command_outbox",
 ];
 
 async fn pre_tenant_platform_sqlite_table(
