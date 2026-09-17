@@ -3,10 +3,11 @@ use iot_core::{
     hash_device_token,
 };
 use iot_storage::{
-    DeviceTokenRepository, DeviceTokenRepositoryError, IdentityRepository, NewDeviceToken,
-    NewOwnedDeviceToken, PlatformStore,
+    DeviceTokenRepository, DeviceTokenRepositoryError, IdentityRepository, ManagementDeviceError,
+    ManagementDeviceRepository, ManagementDeviceTopology, NewDeviceToken, NewOwnedDeviceToken,
+    PlatformStore, UpdateManagementDevice,
 };
-use sqlx::{Connection, PgConnection};
+use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use uuid::Uuid;
 
 mod common;
@@ -199,8 +200,16 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
 #[tokio::test]
 async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_rotation() {
     let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
     let tenant_id = provisioning_tenant_id();
     let other_tenant_id = Uuid::from_u128(10_009);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'other-device-tokens', 'active')",
+    )
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
     let issued = DeviceTokenRepository::provision_device_token(
         &store,
         tenant_id,
@@ -209,6 +218,13 @@ async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_
     )
     .await
     .unwrap();
+    let history_before =
+        DeviceTokenRepository::list_device_tokens(&store, tenant_id, &issued.device_id)
+            .await
+            .unwrap();
+    assert_eq!(history_before.len(), 1);
+    assert_eq!(history_before[0].id, issued.id);
+    assert!(history_before[0].revoked_at.is_none());
 
     let issuance_error = DeviceTokenRepository::create_device_token(
         &store,
@@ -235,6 +251,13 @@ async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_
         rotation_error,
         DeviceTokenRepositoryError::TokenNotFound
     ));
+    let history_after =
+        DeviceTokenRepository::list_device_tokens(&store, tenant_id, &issued.device_id)
+            .await
+            .unwrap();
+    assert_eq!(history_after.len(), 1);
+    assert_eq!(history_after[0].id, issued.id);
+    assert!(history_after[0].revoked_at.is_none());
 
     assert!(
         DeviceTokenRepository::list_device_tokens(&store, other_tenant_id, &issued.device_id)
@@ -264,6 +287,124 @@ async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_
             .unwrap()
             .id,
         issued.id
+    );
+}
+
+#[tokio::test]
+async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_mutations() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = provisioning_tenant_id();
+    let other_tenant_id = Uuid::from_u128(10_009);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'management-token-other', 'active')",
+    )
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway) VALUES
+             ('topology-gateway', ?, 1),
+             ('topology-race', ?, 0),
+             ('delete-race', ?, 0)",
+    )
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let topology_token = DeviceTokenRepository::create_device_token(
+        &store,
+        tenant_id,
+        "topology-race",
+        token("topology-race-token"),
+    )
+    .await
+    .unwrap();
+    let deleted_token = DeviceTokenRepository::create_device_token(
+        &store,
+        tenant_id,
+        "delete-race",
+        token("delete-race-token"),
+    )
+    .await
+    .unwrap();
+
+    // Reassign after the scoped device mutation but before token revocation.
+    let topology_trigger = format!(
+        "CREATE TRIGGER move_topology_race_to_other_tenant
+         AFTER UPDATE OF gateway_device_id ON devices
+         WHEN NEW.device_id = 'topology-race' AND NEW.tenant_id = '{tenant_id}'
+         BEGIN
+             UPDATE devices
+             SET tenant_id = '{other_tenant_id}', gateway_device_id = NULL
+             WHERE device_id = 'topology-race';
+         END",
+    );
+    sqlx::query(AssertSqlSafe(topology_trigger))
+        .execute(pool)
+        .await
+        .unwrap();
+    let topology_error = ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "topology-race",
+        UpdateManagementDevice {
+            display_name: "Topology race".to_owned(),
+            asset_id: None,
+            device_profile_id: None,
+            attributes: None,
+            topology: Some(ManagementDeviceTopology {
+                is_gateway: false,
+                gateway_device_id: Some("topology-gateway".to_owned()),
+            }),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        topology_error,
+        ManagementDeviceError::DeviceNotFound
+    ));
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT revoked_at FROM device_tokens WHERE id = ?",
+        )
+        .bind(topology_token.id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    let delete_trigger = format!(
+        "CREATE TRIGGER move_delete_race_to_other_tenant
+         AFTER UPDATE OF deleted_at ON devices
+         WHEN NEW.device_id = 'delete-race' AND NEW.tenant_id = '{tenant_id}'
+         BEGIN
+             UPDATE devices
+             SET tenant_id = '{other_tenant_id}'
+             WHERE device_id = 'delete-race';
+         END",
+    );
+    sqlx::query(AssertSqlSafe(delete_trigger))
+        .execute(pool)
+        .await
+        .unwrap();
+    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "delete-race")
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT revoked_at FROM device_tokens WHERE id = ?",
+        )
+        .bind(deleted_token.id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -547,6 +688,20 @@ async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
     .await
     .unwrap();
     let other_tenant_id = Uuid::from_u128(10_009);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'other-device-tokens', 'active')",
+    )
+    .bind(other_tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let history_before =
+        DeviceTokenRepository::list_device_tokens(&store, tenant_id, "token-history")
+            .await
+            .unwrap();
+    assert_eq!(history_before.len(), 1);
+    assert_eq!(history_before[0].id, first.id);
+    assert!(history_before[0].revoked_at.is_none());
     assert!(
         DeviceTokenRepository::list_device_tokens(&store, other_tenant_id, "token-history")
             .await
@@ -570,6 +725,13 @@ async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
         .unwrap_err(),
         DeviceTokenRepositoryError::TokenNotFound
     ));
+    let history_after =
+        DeviceTokenRepository::list_device_tokens(&store, tenant_id, "token-history")
+            .await
+            .unwrap();
+    assert_eq!(history_after.len(), 1);
+    assert_eq!(history_after[0].id, first.id);
+    assert!(history_after[0].revoked_at.is_none());
     assert!(matches!(
         DeviceTokenRepository::revoke_device_token(&store, other_tenant_id, first.id)
             .await
@@ -635,7 +797,7 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
         .execute(pool)
         .await
         .unwrap();
-    let (raw_token, token) = generated_token();
+    let (raw_token, issued_token) = generated_token();
 
     let issued = DeviceTokenRepository::provision_owned_device_token(
         &store,
@@ -644,7 +806,7 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
             display_name: "Owned device".to_owned(),
             owner_user_id,
             asset_id: Some(asset_id),
-            token,
+            token: issued_token,
         },
     )
     .await
@@ -667,4 +829,67 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
         .unwrap();
     assert_eq!(resolved.token_id, issued.id);
     assert_eq!(resolved.device_id, issued.device_id);
+
+    let other_tenant_id = Uuid::from_u128(10_009);
+    let other_owner_user_id = Uuid::now_v7();
+    let other_asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'other-device-tokens', 'active')",
+    )
+    .bind(other_tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'other-token-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(other_owner_user_id)
+    .bind(other_tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES ($1, $2, 'other token asset')")
+        .bind(other_asset_id)
+        .bind(other_tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        DeviceTokenRepository::provision_owned_device_token(
+            &store,
+            tenant_id,
+            NewOwnedDeviceToken {
+                display_name: "Cross-tenant asset device".to_owned(),
+                owner_user_id,
+                asset_id: Some(other_asset_id),
+                token: token("timescale-cross-tenant-owned-asset"),
+            },
+        )
+        .await
+        .unwrap_err(),
+        DeviceTokenRepositoryError::DeviceNotFound
+    ));
+    assert!(matches!(
+        DeviceTokenRepository::provision_owned_device_token(
+            &store,
+            tenant_id,
+            NewOwnedDeviceToken {
+                display_name: "Cross-tenant owner device".to_owned(),
+                owner_user_id: other_owner_user_id,
+                asset_id: None,
+                token: token("timescale-cross-tenant-owned-owner"),
+            },
+        )
+        .await
+        .unwrap_err(),
+        DeviceTokenRepositoryError::DeviceNotFound
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM devices")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        1
+    );
 }

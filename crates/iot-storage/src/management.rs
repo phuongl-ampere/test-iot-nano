@@ -2495,10 +2495,17 @@ async fn update_management_device(
                 sqlx::query(
                     "UPDATE device_tokens
                      SET revoked_at = ?
-                     WHERE device_id = ? AND revoked_at IS NULL",
+                     WHERE device_id = ? AND revoked_at IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM devices
+                           WHERE devices.device_id = device_tokens.device_id
+                             AND devices.tenant_id = ?
+                             AND devices.deleted_at IS NULL
+                       )",
                 )
                 .bind(Utc::now().to_rfc3339())
                 .bind(device_id)
+                .bind(tenant_id.to_string())
                 .execute(&mut *transaction)
                 .await?;
             }
@@ -2547,9 +2554,16 @@ async fn update_management_device(
                 sqlx::query(
                     "UPDATE device_tokens
                      SET revoked_at = now()
-                     WHERE device_id = $1 AND revoked_at IS NULL",
+                     WHERE device_id = $1 AND revoked_at IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM devices
+                           WHERE devices.device_id = device_tokens.device_id
+                             AND devices.tenant_id = $2
+                             AND devices.deleted_at IS NULL
+                       )",
                 )
                 .bind(device_id)
+                .bind(tenant_id)
                 .execute(&mut *transaction)
                 .await?;
             }
@@ -2586,10 +2600,16 @@ async fn delete_management_device(
             }
             sqlx::query(
                 "UPDATE device_tokens SET revoked_at = ?
-                 WHERE device_id = ? AND revoked_at IS NULL",
+                 WHERE device_id = ? AND revoked_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = device_tokens.device_id
+                         AND devices.tenant_id = ?
+                   )",
             )
             .bind(Utc::now().to_rfc3339())
             .bind(device_id)
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
             transaction.commit().await?;
@@ -2613,9 +2633,15 @@ async fn delete_management_device(
             }
             sqlx::query(
                 "UPDATE device_tokens SET revoked_at = now()
-                 WHERE device_id = $1 AND revoked_at IS NULL",
+                 WHERE device_id = $1 AND revoked_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = device_tokens.device_id
+                         AND devices.tenant_id = $2
+                   )",
             )
             .bind(device_id)
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
             transaction.commit().await?;
