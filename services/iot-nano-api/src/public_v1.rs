@@ -11,9 +11,9 @@ use axum::{
 use chrono::Utc;
 use iot_core::RpcMode;
 use iot_storage::{
-    AccountClass, AuthorizationRepository, NewPublicAsset, NewPublicDevice,
-    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice,
-    PublicDeviceError, PublicPrincipal, PublicTelemetry, ResourcePermission,
+    AuthorizationRepository, NewPublicAsset, NewPublicDevice, PlatformStore, PublicAlert,
+    PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice, PublicDeviceError,
+    PublicPrincipal, PublicTelemetry, ResourcePermission,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -172,6 +172,10 @@ struct AssetResponse {
     parent_asset_id: Option<Uuid>,
     metadata: Value,
     attributes: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_permission: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_source: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +230,10 @@ struct DeviceResponse {
     metadata: Value,
     asset_id: Option<Uuid>,
     device_profile_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_permission: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_source: Option<&'static str>,
 }
 
 const DEFAULT_PUBLIC_LIMIT: usize = 50;
@@ -242,30 +250,24 @@ async fn authenticate(
     if !token.allows_scope(scope) {
         return Err(PublicApiError::Forbidden);
     }
-    let (tenant_id, account_class) = match token.user_id {
-        Some(user_id) => {
-            let tenant_id = PublicApiRepository::public_user_tenant_id(store.as_ref(), user_id)
-                .await
-                .map_err(|_| PublicApiError::Unavailable)?
-                .ok_or(PublicApiError::Forbidden)?;
-            if tenant_id != token.tenant_id {
-                return Err(PublicApiError::Forbidden);
-            }
-            let account_class =
-                AuthorizationRepository::authorization_subject(store.as_ref(), user_id)
-                    .await
-                    .map_err(|_| PublicApiError::Unavailable)?
-                    .ok_or(PublicApiError::Forbidden)?
-                    .account_class;
-            (tenant_id, account_class)
-        }
-        None => (token.tenant_id, AccountClass::User),
-    };
+    let user_id = token.user_id.ok_or(PublicApiError::Forbidden)?;
+    let tenant_id = PublicApiRepository::public_user_tenant_id(store.as_ref(), user_id)
+        .await
+        .map_err(|_| PublicApiError::Unavailable)?
+        .ok_or(PublicApiError::Forbidden)?;
+    if tenant_id != token.tenant_id {
+        return Err(PublicApiError::Forbidden);
+    }
+    let account_class = AuthorizationRepository::authorization_subject(store.as_ref(), user_id)
+        .await
+        .map_err(|_| PublicApiError::Unavailable)?
+        .ok_or(PublicApiError::Forbidden)?
+        .account_class;
     Ok((
         store,
         PublicPrincipal {
             tenant_id,
-            user_id: token.user_id,
+            user_id: Some(user_id),
             app_id: token.app_id,
             account_class,
         },
@@ -480,6 +482,7 @@ fn validate_metadata(metadata: Value) -> Result<Value, PublicApiError> {
 }
 
 fn asset_response(asset: PublicAsset) -> AssetResponse {
+    let access = asset.access;
     AssetResponse {
         id: asset.id,
         name: asset.name,
@@ -487,6 +490,8 @@ fn asset_response(asset: PublicAsset) -> AssetResponse {
         parent_asset_id: asset.parent_asset_id,
         attributes: asset.metadata.clone(),
         metadata: asset.metadata,
+        effective_permission: access.map(|access| access.permission.as_str()),
+        access_source: access.map(|access| access.source.as_str()),
     }
 }
 
@@ -645,17 +650,21 @@ async fn delete_device(
 }
 
 fn device_response(device: PublicDevice) -> DeviceResponse {
+    let access = device.access;
     DeviceResponse {
         device_id: device.device_id,
         display_name: device.display_name,
         metadata: device.metadata,
         asset_id: device.asset_id,
         device_profile_id: device.device_profile_id,
+        effective_permission: access.map(|access| access.permission.as_str()),
+        access_source: access.map(|access| access.source.as_str()),
     }
 }
 
 fn public_device_error(error: PublicDeviceError) -> PublicApiError {
     match error {
+        PublicDeviceError::Unauthorized => PublicApiError::Forbidden,
         PublicDeviceError::AssetUnavailable(_) | PublicDeviceError::DeviceProfileUnavailable(_) => {
             PublicApiError::Conflict
         }
@@ -665,7 +674,10 @@ fn public_device_error(error: PublicDeviceError) -> PublicApiError {
 
 fn public_asset_error(error: PublicAssetError) -> PublicApiError {
     match error {
-        PublicAssetError::AssetProfileUnavailable(_) => PublicApiError::Conflict,
+        PublicAssetError::Unauthorized => PublicApiError::Forbidden,
+        PublicAssetError::ParentUnavailable(_) | PublicAssetError::AssetProfileUnavailable(_) => {
+            PublicApiError::Conflict
+        }
         PublicAssetError::Storage { .. } => PublicApiError::Unavailable,
     }
 }

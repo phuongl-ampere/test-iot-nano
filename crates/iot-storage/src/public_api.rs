@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use super::*;
+use sqlx::QueryBuilder;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -17,6 +20,7 @@ pub struct PublicAsset {
     pub asset_profile_id: Option<Uuid>,
     pub parent_asset_id: Option<Uuid>,
     pub metadata: serde_json::Value,
+    pub access: Option<ResourceAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +30,7 @@ pub struct PublicDevice {
     pub metadata: serde_json::Value,
     pub asset_id: Option<Uuid>,
     pub device_profile_id: Option<Uuid>,
+    pub access: Option<ResourceAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +44,8 @@ pub struct NewPublicDevice {
 
 #[derive(Debug, Error)]
 pub enum PublicDeviceError {
+    #[error("public device operations require a user principal")]
+    Unauthorized,
     #[error("public device asset is unavailable: {0}")]
     AssetUnavailable(Uuid),
     #[error("public device profile is unavailable: {0}")]
@@ -64,6 +71,10 @@ impl From<sqlx::Error> for PublicDeviceError {
 
 #[derive(Debug, Error)]
 pub enum PublicAssetError {
+    #[error("public asset operations require a user principal")]
+    Unauthorized,
+    #[error("public asset parent is unavailable: {0}")]
+    ParentUnavailable(Uuid),
     #[error("public asset profile is unavailable: {0}")]
     AssetProfileUnavailable(Uuid),
     #[error("public asset storage operation failed")]
@@ -497,82 +508,74 @@ async fn list_public_devices(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicDevice>, PlatformStoreError> {
+    let Some(subject) = public_authorization_subject(store, principal).await? else {
+        return Ok(Vec::new());
+    };
+    let authorized =
+        AuthorizationRepository::list_authorized_devices(store, &subject, after, limit).await?;
+    if authorized.is_empty() {
+        return Ok(Vec::new());
+    }
+    let access_by_device_id = authorized
+        .iter()
+        .map(|device| (device.device_id.clone(), device.access))
+        .collect::<HashMap<_, _>>();
+
     match store {
         PlatformStore::Sqlite(store) => {
-            let user_id = principal.user_id.map(|id| id.to_string());
-            sqlx::query(
-                "SELECT d.device_id, d.display_name, d.metadata, d.asset_id, d.device_profile_id
-                 FROM devices d
-                 WHERE d.deleted_at IS NULL
-                   AND d.tenant_id = ?6
-                   AND (?1 IS NULL OR d.device_id > ?1)
-                   AND (
-                     ?2
-                     OR d.owner_user_id = ?3
-                     OR EXISTS (
-                       SELECT 1 FROM resource_shares s
-                       WHERE s.resource_type = 'device' AND s.resource_id = d.device_id
-                         AND s.target_user_id = ?3 AND s.state = 'active'
-                     )
-                     OR EXISTS (
-                       SELECT 1 FROM resource_grants g
-                       WHERE g.resource_type = 'device' AND g.resource_id = d.device_id
-                         AND g.tenant_id = ?6
-                         AND ((g.grantee_type = 'user' AND g.grantee_id = ?3)
-                              OR (g.grantee_type = 'application' AND g.grantee_id = ?4))
-                     )
-                   )
-                 ORDER BY d.device_id
-                 LIMIT ?5",
-            )
-            .bind(after)
-            .bind(principal.account_class == AccountClass::Admin)
-            .bind(user_id)
-            .bind(&principal.app_id)
-            .bind(i64::from(limit))
-            .bind(principal.tenant_id.to_string())
-            .fetch_all(store.pool())
-            .await?
-            .into_iter()
-            .map(sqlite_device_record)
-            .collect()
+            let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT device_id, display_name, metadata, asset_id, device_profile_id
+                 FROM devices
+                 WHERE tenant_id = ",
+            );
+            query.push_bind(subject.tenant_id.to_string());
+            query.push(" AND deleted_at IS NULL AND device_id IN (");
+            for (index, authorized_device) in authorized.iter().enumerate() {
+                if index > 0 {
+                    query.push(", ");
+                }
+                query.push_bind(authorized_device.device_id.clone());
+            }
+            query.push(") ORDER BY device_id");
+            query
+                .build()
+                .fetch_all(store.pool())
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let mut device = sqlite_device_record(row)?;
+                    device.access = access_by_device_id.get(&device.device_id).copied();
+                    Ok(device)
+                })
+                .collect()
         }
-        PlatformStore::Timescale(pool) => sqlx::query(
-            "SELECT d.device_id, d.display_name, d.metadata, d.asset_id, d.device_profile_id
-                 FROM devices d
-                 WHERE d.deleted_at IS NULL
-                   AND d.tenant_id = $6
-                   AND ($1::text IS NULL OR d.device_id > $1)
-                   AND (
-                     $2
-                     OR d.owner_user_id = $3
-                     OR EXISTS (
-                       SELECT 1 FROM resource_shares s
-                       WHERE s.resource_type = 'device' AND s.resource_id = d.device_id
-                         AND s.target_user_id = $3 AND s.state = 'active'
-                     )
-                     OR EXISTS (
-                       SELECT 1 FROM resource_grants g
-                       WHERE g.resource_type = 'device' AND g.resource_id = d.device_id
-                         AND g.tenant_id = $6
-                         AND ((g.grantee_type = 'user' AND g.grantee_id = $3::text)
-                              OR (g.grantee_type = 'application' AND g.grantee_id = $4))
-                     )
-                   )
-                 ORDER BY d.device_id
-                 LIMIT $5",
-        )
-        .bind(after)
-        .bind(principal.account_class == AccountClass::Admin)
-        .bind(principal.user_id)
-        .bind(&principal.app_id)
-        .bind(i64::from(limit))
-        .bind(principal.tenant_id)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(timescale_device_record)
-        .collect(),
+        PlatformStore::Timescale(pool) => {
+            let mut query = QueryBuilder::<sqlx::Postgres>::new(
+                "SELECT device_id, display_name, metadata, asset_id, device_profile_id
+                 FROM devices
+                 WHERE tenant_id = ",
+            );
+            query.push_bind(subject.tenant_id);
+            query.push(" AND deleted_at IS NULL AND device_id IN (");
+            for (index, authorized_device) in authorized.iter().enumerate() {
+                if index > 0 {
+                    query.push(", ");
+                }
+                query.push_bind(authorized_device.device_id.clone());
+            }
+            query.push(") ORDER BY device_id");
+            query
+                .build()
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let mut device = timescale_device_record(row)?;
+                    device.access = access_by_device_id.get(&device.device_id).copied();
+                    Ok(device)
+                })
+                .collect()
+        }
     }
 }
 
@@ -581,6 +584,9 @@ async fn create_public_device(
     principal: &PublicPrincipal,
     device: NewPublicDevice,
 ) -> Result<PublicDevice, PublicDeviceError> {
+    if principal.user_id.is_none() {
+        return Err(PublicDeviceError::Unauthorized);
+    }
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -625,25 +631,14 @@ async fn create_public_device(
                 map_public_device_reference_error(error, device.asset_id, device.device_profile_id)
             })?;
             let created = sqlite_device_record(row)?;
-            if principal.user_id.is_none() {
-                sqlx::query(
-                    "INSERT INTO resource_grants (
-                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
-                        permission
-                     ) VALUES (?, ?, 'device', ?, 'application', ?, 'manager')",
-                )
-                .bind(Uuid::now_v7().to_string())
-                .bind(principal.tenant_id.to_string())
-                .bind(&created.device_id)
-                .bind(&principal.app_id)
-                .execute(&mut *transaction)
-                .await?;
-            }
             transaction.commit().await?;
             Ok(created)
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
             lock_timescale_public_device_asset_assignment(
                 &mut transaction,
                 device.asset_id,
@@ -691,20 +686,6 @@ async fn create_public_device(
                 map_public_device_reference_error(error, device.asset_id, device.device_profile_id)
             })?;
             let created = timescale_device_record(row)?;
-            if principal.user_id.is_none() {
-                sqlx::query(
-                    "INSERT INTO resource_grants (
-                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
-                        permission
-                     ) VALUES ($1, $2, 'device', $3, 'application', $4, 'manager')",
-                )
-                .bind(Uuid::now_v7())
-                .bind(principal.tenant_id)
-                .bind(&created.device_id)
-                .bind(&principal.app_id)
-                .execute(&mut *transaction)
-                .await?;
-            }
             transaction.commit().await?;
             Ok(created)
         }
@@ -717,15 +698,14 @@ async fn update_public_device(
     device_id: &str,
     device: NewPublicDevice,
 ) -> Result<Option<PublicDevice>, PublicDeviceError> {
-    if !public_device_permission(store, principal, device_id)
-        .await?
-        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
-    {
-        return Ok(None);
-    }
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if !sqlite_public_device_manager_permission(&mut transaction, principal, device_id)
+                .await?
+            {
+                return Ok(None);
+            }
             if let Some(asset_id) = device.asset_id {
                 if !sqlite_public_asset_manager_permission(&mut transaction, principal, asset_id)
                     .await?
@@ -770,6 +750,14 @@ async fn update_public_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
+            if !timescale_public_device_manager_permission(&mut transaction, principal, device_id)
+                .await?
+            {
+                return Ok(None);
+            }
             lock_timescale_public_device_asset_assignment(
                 &mut transaction,
                 device.asset_id,
@@ -827,7 +815,9 @@ async fn sqlite_public_asset_manager_permission(
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
     let asset_id = asset_id.to_string();
-    let user_id = principal.user_id.map(|id| id.to_string());
+    let Some(user_id) = principal.user_id.map(|id| id.to_string()) else {
+        return Ok(false);
+    };
     let owner = sqlx::query_scalar::<_, Option<String>>(
         "SELECT owner_user_id FROM assets WHERE id = ? AND tenant_id = ?",
     )
@@ -841,11 +831,11 @@ async fn sqlite_public_asset_manager_permission(
     if principal.account_class == AccountClass::Admin {
         return Ok(true);
     }
-    if owner.is_some() && owner.as_deref() == user_id.as_deref() {
+    if owner.as_deref() == Some(user_id.as_str()) {
         return Ok(true);
     }
 
-    let permissions = sqlx::query_scalar::<_, String>(
+    Ok(sqlx::query_scalar::<_, i64>(
         "WITH RECURSIVE ancestors(id, depth) AS (
             SELECT ?, 0
             UNION ALL
@@ -854,34 +844,113 @@ async fn sqlite_public_asset_manager_permission(
             WHERE assets.tenant_id = ?
               AND assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
          )
-         SELECT permission FROM resource_shares
-         WHERE resource_type = 'asset' AND resource_id = ?
-           AND target_user_id = ? AND state = 'active'
-         UNION ALL
-         SELECT shares.permission FROM resource_shares AS shares
-         JOIN ancestors ON shares.resource_id = ancestors.id
-         WHERE shares.resource_type = 'asset' AND shares.target_user_id = ?
-           AND shares.state = 'active' AND shares.inherit_children = 1
-         UNION ALL
-         SELECT permission FROM resource_grants
-         WHERE resource_type = 'asset' AND resource_id = ?
-           AND tenant_id = ?
-           AND ((grantee_type = 'user' AND grantee_id = ?)
-                OR (grantee_type = 'application' AND grantee_id = ?))",
+         SELECT 1
+         FROM resource_permissions AS permission
+         JOIN ancestors ON permission.asset_id = ancestors.id
+         WHERE permission.tenant_id = ?
+           AND permission.revoked_at IS NULL
+           AND permission.permission = 'manager'
+           AND (ancestors.depth = 0 OR permission.inherit_children = 1)
+           AND (
+                permission.subject_user_id = ?
+                OR EXISTS (
+                    SELECT 1 FROM user_group_members AS membership
+                    WHERE membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = ?
+                )
+           )
+         LIMIT 1",
     )
     .bind(&asset_id)
     .bind(principal.tenant_id.to_string())
-    .bind(&asset_id)
-    .bind(&user_id)
-    .bind(&user_id)
-    .bind(&asset_id)
     .bind(principal.tenant_id.to_string())
     .bind(&user_id)
-    .bind(&principal.app_id)
-    .fetch_all(&mut **transaction)
+    .bind(&user_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
+async fn sqlite_public_device_manager_permission(
+    transaction: &mut Transaction<'_, Sqlite>,
+    principal: &PublicPrincipal,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    let Some(user_id) = principal.user_id.map(|id| id.to_string()) else {
+        return Ok(false);
+    };
+    let tenant_id = principal.tenant_id.to_string();
+    let owner = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT owner_user_id
+         FROM devices
+         WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+    )
+    .bind(device_id)
+    .bind(&tenant_id)
+    .fetch_optional(&mut **transaction)
     .await?;
-    Ok(strongest_share_permission(permissions)
-        .is_some_and(|permission| permission.allows(ResourcePermission::Manager)))
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    if principal.account_class == AccountClass::Admin || owner.as_deref() == Some(user_id.as_str())
+    {
+        return Ok(true);
+    }
+
+    Ok(sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT asset_id, 0
+            FROM devices
+            WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL
+              AND asset_id IS NOT NULL
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = ?
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT 1
+         FROM resource_permissions AS permission
+         WHERE permission.tenant_id = ?
+           AND permission.revoked_at IS NULL
+           AND permission.permission = 'manager'
+           AND (
+                (permission.device_id = ? AND (
+                    permission.subject_user_id = ?
+                    OR EXISTS (
+                        SELECT 1 FROM user_group_members AS membership
+                        WHERE membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = ?
+                    )
+                ))
+                OR (permission.asset_id IN (SELECT id FROM ancestors)
+                    AND permission.inherit_children = 1 AND (
+                        permission.subject_user_id = ?
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = ?
+                        )
+                    ))
+           )
+         LIMIT 1",
+    )
+    .bind(device_id)
+    .bind(&tenant_id)
+    .bind(&tenant_id)
+    .bind(&tenant_id)
+    .bind(device_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
 }
 
 async fn sqlite_public_device_profile_exists(
@@ -914,6 +983,57 @@ async fn sqlite_public_asset_profile_exists(
             .await?
             .is_some(),
     )
+}
+
+async fn sqlite_public_asset_parent_is_valid(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
+    asset_id: Option<Uuid>,
+    parent_asset_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    let asset_id = asset_id.map(|id| id.to_string());
+    Ok(sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT id, 0
+            FROM assets
+            WHERE id = ? AND tenant_id = ?
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = ?
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         ),
+         descendants(id, depth) AS (
+            SELECT id, 0
+            FROM assets
+            WHERE id = ? AND tenant_id = ?
+            UNION ALL
+            SELECT child.id, descendants.depth + 1
+            FROM descendants
+            JOIN assets AS child
+              ON child.parent_asset_id = descendants.id AND child.tenant_id = ?
+            WHERE descendants.depth < 64
+         )
+         SELECT CASE
+            WHEN NOT EXISTS (SELECT 1 FROM ancestors) THEN 0
+            WHEN EXISTS (SELECT 1 FROM ancestors WHERE id = ?) THEN 0
+            WHEN COALESCE((SELECT MAX(depth) FROM ancestors), -1)
+               + 1
+               + COALESCE((SELECT MAX(depth) FROM descendants), 0) > 64 THEN 0
+            ELSE 1
+         END",
+    )
+    .bind(parent_asset_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(&asset_id)
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(&asset_id)
+    .fetch_one(&mut **transaction)
+    .await?
+        == 1)
 }
 
 async fn lock_timescale_public_device_asset_assignment(
@@ -951,30 +1071,11 @@ async fn lock_timescale_public_device_asset_assignment(
              JOIN ancestors ON asset.id = ancestors.id
              WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
          )
-         SELECT share.id
-         FROM resource_shares AS share
-         JOIN ancestors ON share.resource_id = ancestors.id::text
-         WHERE share.resource_type = 'asset'
-         FOR SHARE OF share",
-        )
-        .bind(asset_id)
-        .bind(tenant_id)
-        .fetch_all(&mut **transaction)
-        .await?;
-        sqlx::query(
-            "WITH RECURSIVE ancestors(id) AS (
-             SELECT $1::uuid
-             UNION
-             SELECT asset.parent_asset_id
-             FROM assets AS asset
-             JOIN ancestors ON asset.id = ancestors.id
-             WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
-         )
-         SELECT resource_grant.id
-         FROM resource_grants AS resource_grant
-         JOIN ancestors ON resource_grant.resource_id = ancestors.id::text
-         WHERE resource_grant.resource_type = 'asset' AND resource_grant.tenant_id = $2
-         FOR SHARE OF resource_grant",
+         SELECT permission.id
+         FROM resource_permissions AS permission
+         JOIN ancestors ON permission.asset_id = ancestors.id
+         WHERE permission.tenant_id = $2
+         FOR SHARE OF permission",
         )
         .bind(asset_id)
         .bind(tenant_id)
@@ -987,11 +1088,40 @@ async fn lock_timescale_public_device_asset_assignment(
     Ok(())
 }
 
+async fn lock_timescale_public_asset_ancestors(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    asset_id: Uuid,
+) -> Result<(), PlatformStoreError> {
+    sqlx::query(
+        "WITH RECURSIVE ancestors(id) AS (
+             SELECT $1::uuid
+             UNION
+             SELECT asset.parent_asset_id
+             FROM assets AS asset
+             JOIN ancestors ON asset.id = ancestors.id
+             WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
+         )
+         SELECT asset.id
+         FROM assets AS asset
+         JOIN ancestors ON asset.id = ancestors.id AND asset.tenant_id = $2
+         FOR SHARE OF asset",
+    )
+    .bind(asset_id)
+    .bind(tenant_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 async fn timescale_public_asset_manager_permission(
     transaction: &mut Transaction<'_, Postgres>,
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
+    let Some(user_id) = principal.user_id else {
+        return Ok(false);
+    };
     let owner = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT owner_user_id FROM assets WHERE id = $1 AND tenant_id = $2 FOR SHARE",
     )
@@ -1005,11 +1135,24 @@ async fn timescale_public_asset_manager_permission(
     if principal.account_class == AccountClass::Admin {
         return Ok(true);
     }
-    if owner.is_some() && owner == principal.user_id {
+    if owner == Some(user_id) {
         return Ok(true);
     }
 
-    let permissions = sqlx::query_scalar::<_, String>(
+    lock_timescale_public_asset_ancestors(transaction, principal.tenant_id, asset_id).await?;
+
+    sqlx::query(
+        "SELECT group_id
+         FROM user_group_members
+         WHERE tenant_id = $1 AND user_id = $2
+         FOR SHARE",
+    )
+    .bind(principal.tenant_id)
+    .bind(user_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    Ok(sqlx::query_scalar::<_, i64>(
         "WITH RECURSIVE ancestors(id, depth) AS (
             SELECT $1::uuid, 0
             UNION ALL
@@ -1018,29 +1161,120 @@ async fn timescale_public_asset_manager_permission(
             WHERE assets.tenant_id = $2
               AND assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
          )
-         SELECT permission FROM resource_shares
-         WHERE resource_type = 'asset' AND resource_id = $1::text
-           AND target_user_id = $3 AND state = 'active'
-         UNION ALL
-         SELECT shares.permission FROM resource_shares AS shares
-         JOIN ancestors ON shares.resource_id = ancestors.id::text
-         WHERE shares.resource_type = 'asset' AND shares.target_user_id = $3
-           AND shares.state = 'active' AND shares.inherit_children = TRUE
-         UNION ALL
-         SELECT permission FROM resource_grants
-         WHERE resource_type = 'asset' AND resource_id = $1::text
-           AND tenant_id = $2
-           AND ((grantee_type = 'user' AND grantee_id = $3::text)
-                OR (grantee_type = 'application' AND grantee_id = $4))",
+         SELECT 1::bigint
+         FROM resource_permissions AS permission
+         JOIN ancestors ON permission.asset_id = ancestors.id
+         WHERE permission.tenant_id = $2
+           AND permission.revoked_at IS NULL
+           AND permission.permission = 'manager'
+           AND (ancestors.depth = 0 OR permission.inherit_children = TRUE)
+           AND (
+                permission.subject_user_id = $3
+                OR EXISTS (
+                    SELECT 1 FROM user_group_members AS membership
+                    WHERE membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = $3
+                )
+           )
+         LIMIT 1
+         FOR SHARE OF permission",
     )
     .bind(asset_id)
     .bind(principal.tenant_id)
-    .bind(principal.user_id)
-    .bind(&principal.app_id)
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
+async fn timescale_public_device_manager_permission(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal: &PublicPrincipal,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    let Some(user_id) = principal.user_id else {
+        return Ok(false);
+    };
+    let device = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
+        "SELECT owner_user_id, asset_id
+         FROM devices
+         WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+         FOR SHARE",
+    )
+    .bind(device_id)
+    .bind(principal.tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((owner, asset_id)) = device else {
+        return Ok(false);
+    };
+    if principal.account_class == AccountClass::Admin || owner == Some(user_id) {
+        return Ok(true);
+    }
+
+    if let Some(asset_id) = asset_id {
+        lock_timescale_public_asset_ancestors(transaction, principal.tenant_id, asset_id).await?;
+    }
+
+    sqlx::query(
+        "SELECT group_id
+         FROM user_group_members
+         WHERE tenant_id = $1 AND user_id = $2
+         FOR SHARE",
+    )
+    .bind(principal.tenant_id)
+    .bind(user_id)
     .fetch_all(&mut **transaction)
     .await?;
-    Ok(strongest_share_permission(permissions)
-        .is_some_and(|permission| permission.allows(ResourcePermission::Manager)))
+    Ok(sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT asset_id, 0
+            FROM devices
+            WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+              AND asset_id IS NOT NULL
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = $2
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT 1::bigint
+         FROM resource_permissions AS permission
+         WHERE permission.tenant_id = $2
+           AND permission.revoked_at IS NULL
+           AND permission.permission = 'manager'
+           AND (
+                (permission.device_id = $1 AND (
+                    permission.subject_user_id = $3
+                    OR EXISTS (
+                        SELECT 1 FROM user_group_members AS membership
+                        WHERE membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = $3
+                    )
+                ))
+                OR (permission.asset_id IN (SELECT id FROM ancestors)
+                    AND permission.inherit_children = TRUE AND (
+                        permission.subject_user_id = $3
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = $3
+                        )
+                    ))
+           )
+         LIMIT 1
+         FOR SHARE OF permission",
+    )
+    .bind(device_id)
+    .bind(principal.tenant_id)
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
 }
 
 async fn timescale_public_device_profile_exists(
@@ -1079,6 +1313,52 @@ async fn timescale_public_asset_profile_exists(
     .is_some())
 }
 
+async fn timescale_public_asset_parent_is_valid(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    asset_id: Option<Uuid>,
+    parent_asset_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT id, 0
+            FROM assets
+            WHERE id = $1 AND tenant_id = $2
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = $2
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         ),
+         descendants(id, depth) AS (
+            SELECT id, 0
+            FROM assets
+            WHERE id = $3 AND tenant_id = $2
+            UNION ALL
+            SELECT child.id, descendants.depth + 1
+            FROM descendants
+            JOIN assets AS child
+              ON child.parent_asset_id = descendants.id AND child.tenant_id = $2
+            WHERE descendants.depth < 64
+         )
+         SELECT CASE
+            WHEN NOT EXISTS (SELECT 1 FROM ancestors) THEN 0::bigint
+            WHEN EXISTS (SELECT 1 FROM ancestors WHERE id = $3) THEN 0::bigint
+            WHEN COALESCE((SELECT MAX(depth) FROM ancestors), -1)
+               + 1
+               + COALESCE((SELECT MAX(depth) FROM descendants), 0) > 64 THEN 0::bigint
+            ELSE 1::bigint
+         END",
+    )
+    .bind(parent_asset_id)
+    .bind(tenant_id)
+    .bind(asset_id)
+    .fetch_one(&mut **transaction)
+    .await?
+        == 1)
+}
+
 fn map_public_device_reference_error(
     error: sqlx::Error,
     asset_id: Option<Uuid>,
@@ -1106,35 +1386,51 @@ async fn delete_public_device(
     principal: &PublicPrincipal,
     device_id: &str,
 ) -> Result<bool, PlatformStoreError> {
-    if !public_device_permission(store, principal, device_id)
-        .await?
-        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
-    {
-        return Ok(false);
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if !sqlite_public_device_manager_permission(&mut transaction, principal, device_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            let affected = sqlx::query(
+                "UPDATE devices
+                 SET deleted_at = CURRENT_TIMESTAMP
+                 WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+            )
+            .bind(device_id)
+            .bind(principal.tenant_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            transaction.commit().await?;
+            Ok(affected == 1)
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
+            if !timescale_public_device_manager_permission(&mut transaction, principal, device_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            let affected = sqlx::query(
+                "UPDATE devices
+                 SET deleted_at = now()
+                 WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+            )
+            .bind(device_id)
+            .bind(principal.tenant_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            transaction.commit().await?;
+            Ok(affected == 1)
+        }
     }
-    let affected = match store {
-        PlatformStore::Sqlite(store) => sqlx::query(
-            "UPDATE devices
-             SET deleted_at = CURRENT_TIMESTAMP
-             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
-        )
-        .bind(device_id)
-        .bind(principal.tenant_id.to_string())
-        .execute(store.pool())
-        .await?
-        .rows_affected(),
-        PlatformStore::Timescale(pool) => sqlx::query(
-            "UPDATE devices
-             SET deleted_at = now()
-             WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
-        )
-        .bind(device_id)
-        .bind(principal.tenant_id)
-        .execute(pool)
-        .await?
-        .rows_affected(),
-    };
-    Ok(affected == 1)
 }
 
 fn public_cursor_parts(
@@ -1181,53 +1477,96 @@ async fn list_public_telemetry(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicTelemetry>, PlatformStoreError> {
+    let Some(subject) = public_authorization_subject(store, principal).await? else {
+        return Ok(Vec::new());
+    };
     let cursor = public_cursor_parts(after)?;
     let limit = i64::from(limit);
     match store {
         PlatformStore::Sqlite(store) => {
-            let user_id = principal.user_id.map(|id| id.to_string());
+            let tenant_id = subject.tenant_id.to_string();
+            let user_id = subject.user_id.to_string();
             let cursor_at = cursor.as_ref().map(|value| value.0.to_rfc3339());
             let cursor_device = cursor.as_ref().map(|value| value.1.clone());
             let cursor_sequence = cursor.as_ref().map(|value| value.2);
             let rows = sqlx::query(
-                "SELECT t.event_at, t.received_at, t.device_id, t.boot_id,
+                "WITH RECURSIVE candidates(device_id, asset_id, owner_user_id) AS (
+                     SELECT device_id, asset_id, owner_user_id
+                     FROM devices
+                     WHERE tenant_id = ? AND deleted_at IS NULL
+                 ),
+                 ancestors(device_id, asset_id, depth) AS (
+                     SELECT device_id, asset_id, 0
+                     FROM candidates
+                     WHERE asset_id IS NOT NULL
+                     UNION ALL
+                     SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = ?
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 authorized(device_id) AS (
+                     SELECT device_id FROM candidates
+                     WHERE ? = 1 OR owner_user_id = ?
+                     UNION
+                     SELECT candidate.device_id
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = ?
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = ?
+                        )
+                     UNION
+                     SELECT ancestors.device_id
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = 1
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = ?
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = ?
+                        )
+                 )
+                 SELECT t.event_at, t.received_at, t.device_id, t.boot_id,
                         t.sequence, t.measurements, t.topic
                  FROM telemetry AS t
-                 JOIN devices AS d ON d.device_id = t.device_id
-                 WHERE d.deleted_at IS NULL
-                   AND d.tenant_id = ?
+                 JOIN authorized ON authorized.device_id = t.device_id
+                 WHERE t.tenant_id = ?
                    AND t.event_at >= ? AND t.event_at <= ?
                    AND (? IS NULL OR t.device_id = ?)
-                   AND (? = 1 OR d.owner_user_id = ?
-                    OR EXISTS (
-                        SELECT 1 FROM resource_shares
-                        WHERE resource_type = 'device' AND resource_id = t.device_id
-                          AND target_user_id = ? AND state = 'active'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM resource_grants
-                        WHERE resource_type = 'device' AND resource_id = t.device_id
-                          AND tenant_id = ?
-                          AND ((grantee_type = 'user' AND grantee_id = ?)
-                               OR (grantee_type = 'application' AND grantee_id = ?))
-                    ))
                    AND (? IS NULL OR t.event_at > ?
                         OR (t.event_at = ? AND (t.device_id > ?
                             OR (t.device_id = ? AND t.sequence > ?))))
                  ORDER BY t.event_at, t.device_id, t.sequence
                  LIMIT ?",
             )
-            .bind(principal.tenant_id.to_string())
+            .bind(&tenant_id)
+            .bind(&tenant_id)
+            .bind(i64::from(subject.account_class == AccountClass::Admin))
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
             .bind(from.to_rfc3339())
             .bind(to.to_rfc3339())
             .bind(device_id)
             .bind(device_id)
-            .bind(i64::from(principal.account_class == AccountClass::Admin))
-            .bind(&user_id)
-            .bind(&user_id)
-            .bind(principal.tenant_id.to_string())
-            .bind(&user_id)
-            .bind(&principal.app_id)
             .bind(&cursor_at)
             .bind(&cursor_at)
             .bind(&cursor_at)
@@ -1241,44 +1580,78 @@ async fn list_public_telemetry(
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "SELECT t.event_at, t.received_at, t.device_id, t.boot_id,
+                "WITH RECURSIVE candidates(device_id, asset_id, owner_user_id) AS (
+                     SELECT device_id, asset_id, owner_user_id
+                     FROM devices
+                     WHERE tenant_id = $1 AND deleted_at IS NULL
+                 ),
+                 ancestors(device_id, asset_id, depth) AS (
+                     SELECT device_id, asset_id, 0
+                     FROM candidates
+                     WHERE asset_id IS NOT NULL
+                     UNION ALL
+                     SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = $1
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 authorized(device_id) AS (
+                     SELECT device_id FROM candidates
+                     WHERE $2::boolean OR owner_user_id = $3
+                     UNION
+                     SELECT candidate.device_id
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = $3
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = $3
+                        )
+                     UNION
+                     SELECT ancestors.device_id
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = TRUE
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = $3
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = $3
+                        )
+                 )
+                 SELECT t.event_at, t.received_at, t.device_id, t.boot_id,
                         t.sequence, t.measurements, t.topic
                  FROM telemetry AS t
-                 JOIN devices AS d ON d.device_id = t.device_id
-                 WHERE d.deleted_at IS NULL
-                   AND d.tenant_id = $11
-                   AND t.event_at >= $1 AND t.event_at <= $2
-                   AND ($3::text IS NULL OR t.device_id = $3)
-                   AND ($4::boolean OR d.owner_user_id = $5
-                    OR EXISTS (
-                        SELECT 1 FROM resource_shares
-                        WHERE resource_type = 'device' AND resource_id = t.device_id
-                          AND target_user_id = $5 AND state = 'active'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM resource_grants
-                        WHERE resource_type = 'device' AND resource_id = t.device_id
-                          AND tenant_id = $11
-                          AND ((grantee_type = 'user' AND grantee_id = $5::text)
-                               OR (grantee_type = 'application' AND grantee_id = $6))
-                    ))
+                 JOIN authorized ON authorized.device_id = t.device_id
+                 WHERE t.tenant_id = $1
+                   AND t.event_at >= $4 AND t.event_at <= $5
+                   AND ($6::text IS NULL OR t.device_id = $6)
                    AND ($7::timestamptz IS NULL OR t.event_at > $7
                         OR (t.event_at = $7 AND (t.device_id > $8
                             OR (t.device_id = $8 AND t.sequence > $9))))
                  ORDER BY t.event_at, t.device_id, t.sequence
                  LIMIT $10",
             )
+            .bind(subject.tenant_id)
+            .bind(subject.account_class == AccountClass::Admin)
+            .bind(subject.user_id)
             .bind(from)
             .bind(to)
             .bind(device_id)
-            .bind(principal.account_class == AccountClass::Admin)
-            .bind(principal.user_id)
-            .bind(&principal.app_id)
             .bind(cursor.as_ref().map(|value| value.0))
             .bind(cursor.as_ref().map(|value| value.1.clone()))
             .bind(cursor.as_ref().map(|value| value.2))
             .bind(limit)
-            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter().map(timescale_telemetry_record).collect()
@@ -1336,12 +1709,65 @@ async fn list_public_alerts(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicAlert>, PlatformStoreError> {
+    let Some(subject) = public_authorization_subject(store, principal).await? else {
+        return Ok(Vec::new());
+    };
     let limit = i64::from(limit);
     match store {
         PlatformStore::Sqlite(store) => {
-            let user_id = principal.user_id.map(|id| id.to_string());
+            let tenant_id = subject.tenant_id.to_string();
+            let user_id = subject.user_id.to_string();
             let rows = sqlx::query(
-                "SELECT incidents.id, incidents.rule_id, rules.name AS rule_name, rules.severity,
+                "WITH RECURSIVE candidates(device_id, asset_id, owner_user_id) AS (
+                     SELECT device_id, asset_id, owner_user_id
+                     FROM devices
+                     WHERE tenant_id = ? AND deleted_at IS NULL
+                 ),
+                 ancestors(device_id, asset_id, depth) AS (
+                     SELECT device_id, asset_id, 0
+                     FROM candidates
+                     WHERE asset_id IS NOT NULL
+                     UNION ALL
+                     SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = ?
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 authorized(device_id) AS (
+                     SELECT device_id FROM candidates
+                     WHERE ? = 1 OR owner_user_id = ?
+                     UNION
+                     SELECT candidate.device_id
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = ?
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = ?
+                        )
+                     UNION
+                     SELECT ancestors.device_id
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = 1
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = ?
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = ?
+                        )
+                 )
+                 SELECT incidents.id, incidents.rule_id, rules.name AS rule_name, rules.severity,
                         incidents.device_id, incidents.status, incidents.condition_started_at,
                         incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
                         incidents.acknowledged_by, incidents.last_value, incidents.updated_at
@@ -1349,35 +1775,23 @@ async fn list_public_alerts(
                  JOIN alert_rules AS rules
                     ON rules.id = incidents.rule_id
                    AND rules.tenant_id = incidents.tenant_id
-                 JOIN devices AS devices
-                    ON devices.device_id = incidents.device_id
-                   AND devices.tenant_id = incidents.tenant_id
-                 WHERE devices.deleted_at IS NULL
-                   AND incidents.tenant_id = ?
-                   AND (? = 1 OR devices.owner_user_id = ?
-                    OR EXISTS (
-                        SELECT 1 FROM resource_shares
-                        WHERE resource_type = 'device' AND resource_id = incidents.device_id
-                          AND target_user_id = ? AND state = 'active'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM resource_grants
-                        WHERE resource_type = 'device' AND resource_id = incidents.device_id
-                          AND tenant_id = ?
-                          AND ((grantee_type = 'user' AND grantee_id = ?)
-                               OR (grantee_type = 'application' AND grantee_id = ?))
-                    ))
+                 JOIN authorized ON authorized.device_id = incidents.device_id
+                 WHERE incidents.tenant_id = ?
                    AND (? IS NULL OR incidents.id > ?)
                  ORDER BY incidents.id
                  LIMIT ?",
             )
-            .bind(principal.tenant_id.to_string())
-            .bind(i64::from(principal.account_class == AccountClass::Admin))
+            .bind(&tenant_id)
+            .bind(&tenant_id)
+            .bind(i64::from(subject.account_class == AccountClass::Admin))
+            .bind(&user_id)
+            .bind(&tenant_id)
             .bind(&user_id)
             .bind(&user_id)
-            .bind(principal.tenant_id.to_string())
+            .bind(&tenant_id)
             .bind(&user_id)
-            .bind(&principal.app_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
             .bind(after)
             .bind(after)
             .bind(limit)
@@ -1387,7 +1801,56 @@ async fn list_public_alerts(
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "SELECT incidents.id, incidents.rule_id, rules.name AS rule_name, rules.severity,
+                "WITH RECURSIVE candidates(device_id, asset_id, owner_user_id) AS (
+                     SELECT device_id, asset_id, owner_user_id
+                     FROM devices
+                     WHERE tenant_id = $1 AND deleted_at IS NULL
+                 ),
+                 ancestors(device_id, asset_id, depth) AS (
+                     SELECT device_id, asset_id, 0
+                     FROM candidates
+                     WHERE asset_id IS NOT NULL
+                     UNION ALL
+                     SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = $1
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 authorized(device_id) AS (
+                     SELECT device_id FROM candidates
+                     WHERE $2::boolean OR owner_user_id = $3
+                     UNION
+                     SELECT candidate.device_id
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = $3
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = $3
+                        )
+                     UNION
+                     SELECT ancestors.device_id
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = TRUE
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = $3
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = $3
+                        )
+                 )
+                 SELECT incidents.id, incidents.rule_id, rules.name AS rule_name, rules.severity,
                         incidents.device_id, incidents.status, incidents.condition_started_at,
                         incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
                         incidents.acknowledged_by, incidents.last_value, incidents.updated_at
@@ -1395,34 +1858,17 @@ async fn list_public_alerts(
                  JOIN alert_rules AS rules
                     ON rules.id = incidents.rule_id
                    AND rules.tenant_id = incidents.tenant_id
-                 JOIN devices AS devices
-                    ON devices.device_id = incidents.device_id
-                   AND devices.tenant_id = incidents.tenant_id
-                 WHERE devices.deleted_at IS NULL
-                   AND incidents.tenant_id = $6
-                   AND ($1::boolean OR devices.owner_user_id = $2
-                    OR EXISTS (
-                        SELECT 1 FROM resource_shares
-                        WHERE resource_type = 'device' AND resource_id = incidents.device_id
-                          AND target_user_id = $2 AND state = 'active'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM resource_grants
-                        WHERE resource_type = 'device' AND resource_id = incidents.device_id
-                          AND tenant_id = $6
-                          AND ((grantee_type = 'user' AND grantee_id = $2::text)
-                               OR (grantee_type = 'application' AND grantee_id = $3))
-                    ))
+                 JOIN authorized ON authorized.device_id = incidents.device_id
+                 WHERE incidents.tenant_id = $1
                    AND ($4::uuid IS NULL OR incidents.id > $4)
                  ORDER BY incidents.id
                  LIMIT $5",
             )
-            .bind(principal.account_class == AccountClass::Admin)
-            .bind(principal.user_id)
-            .bind(&principal.app_id)
+            .bind(subject.tenant_id)
+            .bind(subject.account_class == AccountClass::Admin)
+            .bind(subject.user_id)
             .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
             .bind(limit)
-            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter().map(timescale_alert_record).collect()
@@ -1495,17 +1941,32 @@ async fn acknowledge_public_alert(
     alert_id: Uuid,
     actor: &str,
 ) -> Result<Option<PublicAlert>, PlatformStoreError> {
-    let Some(alert) = get_public_alert(store, principal, alert_id).await? else {
-        return Ok(None);
-    };
-    if !public_device_permission(store, principal, &alert.device_id)
-        .await?
-        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
-    {
-        return Ok(None);
-    }
     match store {
         PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            let device_id = sqlx::query_scalar::<_, String>(
+                "SELECT incidents.device_id
+                 FROM alert_incidents AS incidents
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id
+                   AND rules.tenant_id = incidents.tenant_id
+                 JOIN devices AS devices
+                    ON devices.device_id = incidents.device_id
+                   AND devices.tenant_id = incidents.tenant_id
+                 WHERE incidents.id = ? AND incidents.tenant_id = ?",
+            )
+            .bind(alert_id.to_string())
+            .bind(principal.tenant_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(device_id) = device_id else {
+                return Ok(None);
+            };
+            if !sqlite_public_device_manager_permission(&mut transaction, principal, &device_id)
+                .await?
+            {
+                return Ok(None);
+            }
             sqlx::query(
                 "UPDATE alert_incidents
                  SET acknowledged_at = ?, acknowledged_by = ?, updated_at = ?
@@ -1527,10 +1988,39 @@ async fn acknowledge_public_alert(
             .bind(Utc::now().to_rfc3339())
             .bind(alert_id.to_string())
             .bind(principal.tenant_id.to_string())
-            .execute(store.pool())
+            .execute(&mut *transaction)
             .await?;
+            transaction.commit().await?;
         }
         PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
+            let device_id = sqlx::query_scalar::<_, String>(
+                "SELECT incidents.device_id
+                 FROM alert_incidents AS incidents
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id
+                   AND rules.tenant_id = incidents.tenant_id
+                 JOIN devices AS devices
+                    ON devices.device_id = incidents.device_id
+                   AND devices.tenant_id = incidents.tenant_id
+                 WHERE incidents.id = $1 AND incidents.tenant_id = $2
+                 FOR SHARE OF incidents",
+            )
+            .bind(alert_id)
+            .bind(principal.tenant_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let Some(device_id) = device_id else {
+                return Ok(None);
+            };
+            if !timescale_public_device_manager_permission(&mut transaction, principal, &device_id)
+                .await?
+            {
+                return Ok(None);
+            }
             sqlx::query(
                 "UPDATE alert_incidents
                  SET acknowledged_at = now(), acknowledged_by = $2, updated_at = now()
@@ -1550,8 +2040,9 @@ async fn acknowledge_public_alert(
             .bind(alert_id)
             .bind(actor)
             .bind(principal.tenant_id)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await?;
+            transaction.commit().await?;
         }
     }
     get_public_alert(store, principal, alert_id).await
@@ -1626,76 +2117,258 @@ async fn list_public_assets(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicAsset>, PlatformStoreError> {
+    let Some(subject) = public_authorization_subject(store, principal).await? else {
+        return Ok(Vec::new());
+    };
     let limit = i64::from(limit);
     match store {
         PlatformStore::Sqlite(store) => {
-            let user_id = principal.user_id.map(|id| id.to_string());
+            let tenant_id = subject.tenant_id.to_string();
+            let user_id = subject.user_id.to_string();
             let rows = sqlx::query(
-                "SELECT id, name, asset_profile_id, parent_asset_id, metadata
-                 FROM assets
-                 WHERE assets.tenant_id = ?
-                   AND (? = 1 OR owner_user_id = ?
-                    OR EXISTS (
-                        SELECT 1 FROM resource_shares
-                        WHERE resource_type = 'asset' AND resource_id = assets.id
-                          AND target_user_id = ? AND state = 'active'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM resource_grants
-                        WHERE resource_type = 'asset' AND resource_id = assets.id
-                          AND tenant_id = ?
-                          AND ((grantee_type = 'user' AND grantee_id = ?)
-                               OR (grantee_type = 'application' AND grantee_id = ?))
-                    ))
-                   AND (? IS NULL OR id > ?)
-                 ORDER BY id
+                "WITH RECURSIVE candidates(
+                     id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
+                 ) AS (
+                     SELECT id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
+                     FROM assets
+                     WHERE tenant_id = ?
+                       AND (? IS NULL OR id > ?)
+                 ),
+                 ancestors(candidate_id, asset_id, depth) AS (
+                     SELECT id, id, 0 FROM candidates
+                     UNION ALL
+                     SELECT ancestors.candidate_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = ?
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 access_candidates(id, permission_rank, source_rank, access_source) AS (
+                     SELECT id, 3, 0, 'tenant_account'
+                     FROM candidates
+                     WHERE ? = 1
+                     UNION ALL
+                     SELECT id, 3, 1, 'owner'
+                     FROM candidates
+                     WHERE owner_user_id = ?
+                     UNION ALL
+                     SELECT candidate.id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            2,
+                            'direct_user'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = candidate.id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = ?
+                     UNION ALL
+                     SELECT candidate.id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            3,
+                            'group'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = candidate.id
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = ?
+                     UNION ALL
+                     SELECT ancestors.candidate_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            4,
+                            'inherited_user'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = 1
+                      AND permission.revoked_at IS NULL
+                     WHERE ancestors.depth > 0 AND permission.subject_user_id = ?
+                     UNION ALL
+                     SELECT ancestors.candidate_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            5,
+                            'inherited_group'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = 1
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = ?
+                     WHERE ancestors.depth > 0
+                 ),
+                 authorized(id, effective_permission, access_source) AS (
+                     SELECT id,
+                            CASE permission_rank
+                                WHEN 3 THEN 'owner'
+                                WHEN 2 THEN 'manager'
+                                ELSE 'viewer'
+                            END,
+                            access_source
+                     FROM (
+                         SELECT access_candidates.*,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY id
+                                    ORDER BY permission_rank DESC, source_rank ASC
+                                ) AS access_rank
+                         FROM access_candidates
+                     ) AS ranked_access
+                     WHERE access_rank = 1
+                 )
+                 SELECT candidates.id, candidates.name, candidates.asset_profile_id,
+                        candidates.parent_asset_id, candidates.metadata,
+                        authorized.effective_permission, authorized.access_source
+                 FROM candidates
+                 JOIN authorized ON authorized.id = candidates.id
+                 ORDER BY candidates.id
                  LIMIT ?",
             )
-            .bind(principal.tenant_id.to_string())
-            .bind(i64::from(principal.account_class == AccountClass::Admin))
-            .bind(&user_id)
-            .bind(&user_id)
-            .bind(principal.tenant_id.to_string())
-            .bind(&user_id)
-            .bind(&principal.app_id)
+            .bind(&tenant_id)
             .bind(after)
             .bind(after)
+            .bind(&tenant_id)
+            .bind(i64::from(subject.account_class == AccountClass::Admin))
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
             .bind(limit)
             .fetch_all(store.pool())
             .await?;
-            rows.into_iter().map(sqlite_asset_record).collect()
+            rows.into_iter()
+                .map(sqlite_authorized_asset_record)
+                .collect()
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "SELECT id, name, asset_profile_id, parent_asset_id, metadata
-                 FROM assets
-                 WHERE assets.tenant_id = $6
-                   AND ($1::boolean OR owner_user_id = $2
-                    OR EXISTS (
-                        SELECT 1 FROM resource_shares
-                        WHERE resource_type = 'asset' AND resource_id = assets.id::text
-                          AND target_user_id = $2 AND state = 'active'
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM resource_grants
-                        WHERE resource_type = 'asset' AND resource_id = assets.id::text
-                          AND tenant_id = $6
-                          AND ((grantee_type = 'user' AND grantee_id = $2::text)
-                               OR (grantee_type = 'application' AND grantee_id = $3))
-                    ))
-                   AND ($4::uuid IS NULL OR id > $4)
-                 ORDER BY id
+                "WITH RECURSIVE candidates(
+                     id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
+                 ) AS (
+                     SELECT id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
+                     FROM assets
+                     WHERE tenant_id = $1
+                       AND ($2::uuid IS NULL OR id > $2)
+                 ),
+                 ancestors(candidate_id, asset_id, depth) AS (
+                     SELECT id, id, 0 FROM candidates
+                     UNION ALL
+                     SELECT ancestors.candidate_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = $1
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 access_candidates(id, permission_rank, source_rank, access_source) AS (
+                     SELECT id, 3, 0, 'tenant_account'
+                     FROM candidates
+                     WHERE $3::boolean
+                     UNION ALL
+                     SELECT id, 3, 1, 'owner'
+                     FROM candidates
+                     WHERE owner_user_id = $4
+                     UNION ALL
+                     SELECT candidate.id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            2,
+                            'direct_user'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = candidate.id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = $4
+                     UNION ALL
+                     SELECT candidate.id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            3,
+                            'group'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = candidate.id
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = $4
+                     UNION ALL
+                     SELECT ancestors.candidate_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            4,
+                            'inherited_user'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = TRUE
+                      AND permission.revoked_at IS NULL
+                     WHERE ancestors.depth > 0 AND permission.subject_user_id = $4
+                     UNION ALL
+                     SELECT ancestors.candidate_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            5,
+                            'inherited_group'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = TRUE
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = $4
+                     WHERE ancestors.depth > 0
+                 ),
+                 authorized(id, effective_permission, access_source) AS (
+                     SELECT id,
+                            CASE permission_rank
+                                WHEN 3 THEN 'owner'
+                                WHEN 2 THEN 'manager'
+                                ELSE 'viewer'
+                            END,
+                            access_source
+                     FROM (
+                         SELECT access_candidates.*,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY id
+                                    ORDER BY permission_rank DESC, source_rank ASC
+                                ) AS access_rank
+                         FROM access_candidates
+                     ) AS ranked_access
+                     WHERE access_rank = 1
+                 )
+                 SELECT candidates.id, candidates.name, candidates.asset_profile_id,
+                        candidates.parent_asset_id, candidates.metadata,
+                        authorized.effective_permission, authorized.access_source
+                 FROM candidates
+                 JOIN authorized ON authorized.id = candidates.id
+                 ORDER BY candidates.id
                  LIMIT $5",
             )
-            .bind(principal.account_class == AccountClass::Admin)
-            .bind(principal.user_id)
-            .bind(&principal.app_id)
+            .bind(subject.tenant_id)
             .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
+            .bind(subject.account_class == AccountClass::Admin)
+            .bind(subject.user_id)
             .bind(limit)
-            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
-            rows.into_iter().map(timescale_asset_record).collect()
+            rows.into_iter()
+                .map(timescale_authorized_asset_record)
+                .collect()
         }
     }
 }
@@ -1734,10 +2407,31 @@ async fn create_public_asset(
     principal: &PublicPrincipal,
     asset: NewPublicAsset,
 ) -> Result<PublicAsset, PublicAssetError> {
+    if principal.user_id.is_none() {
+        return Err(PublicAssetError::Unauthorized);
+    }
     let id = Uuid::now_v7();
     let created = match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                if !sqlite_public_asset_manager_permission(
+                    &mut transaction,
+                    principal,
+                    parent_asset_id,
+                )
+                .await?
+                    || !sqlite_public_asset_parent_is_valid(
+                        &mut transaction,
+                        principal.tenant_id,
+                        None,
+                        parent_asset_id,
+                    )
+                    .await?
+                {
+                    return Err(PublicAssetError::ParentUnavailable(parent_asset_id));
+                }
+            }
             if let Some(asset_profile_id) = asset.asset_profile_id {
                 if !sqlite_public_asset_profile_exists(
                     &mut transaction,
@@ -1765,25 +2459,32 @@ async fn create_public_asset(
             .fetch_one(&mut *transaction)
             .await?;
             let created = sqlite_asset_record(row)?;
-            if principal.user_id.is_none() {
-                sqlx::query(
-                    "INSERT INTO resource_grants (
-                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
-                        permission
-                     ) VALUES (?, ?, 'asset', ?, 'application', ?, 'manager')",
-                )
-                .bind(Uuid::now_v7().to_string())
-                .bind(principal.tenant_id.to_string())
-                .bind(id.to_string())
-                .bind(&principal.app_id)
-                .execute(&mut *transaction)
-                .await?;
-            }
             transaction.commit().await?;
             created
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                if !timescale_public_asset_manager_permission(
+                    &mut transaction,
+                    principal,
+                    parent_asset_id,
+                )
+                .await?
+                    || !timescale_public_asset_parent_is_valid(
+                        &mut transaction,
+                        principal.tenant_id,
+                        None,
+                        parent_asset_id,
+                    )
+                    .await?
+                {
+                    return Err(PublicAssetError::ParentUnavailable(parent_asset_id));
+                }
+            }
             if let Some(asset_profile_id) = asset.asset_profile_id {
                 if !timescale_public_asset_profile_exists(
                     &mut transaction,
@@ -1811,20 +2512,6 @@ async fn create_public_asset(
             .fetch_one(&mut *transaction)
             .await?;
             let created = timescale_asset_record(row)?;
-            if principal.user_id.is_none() {
-                sqlx::query(
-                    "INSERT INTO resource_grants (
-                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
-                        permission
-                     ) VALUES ($1, $2, 'asset', $3::text, 'application', $4, 'manager')",
-                )
-                .bind(Uuid::now_v7())
-                .bind(principal.tenant_id)
-                .bind(id)
-                .bind(&principal.app_id)
-                .execute(&mut *transaction)
-                .await?;
-            }
             transaction.commit().await?;
             created
         }
@@ -1838,15 +2525,32 @@ async fn update_public_asset(
     asset_id: Uuid,
     asset: NewPublicAsset,
 ) -> Result<Option<PublicAsset>, PublicAssetError> {
-    if !public_asset_permission(store, principal, asset_id)
-        .await?
-        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
-    {
-        return Ok(None);
-    }
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if !sqlite_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                .await?
+            {
+                return Ok(None);
+            }
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                if !sqlite_public_asset_manager_permission(
+                    &mut transaction,
+                    principal,
+                    parent_asset_id,
+                )
+                .await?
+                    || !sqlite_public_asset_parent_is_valid(
+                        &mut transaction,
+                        principal.tenant_id,
+                        Some(asset_id),
+                        parent_asset_id,
+                    )
+                    .await?
+                {
+                    return Err(PublicAssetError::ParentUnavailable(parent_asset_id));
+                }
+            }
             if let Some(asset_profile_id) = asset.asset_profile_id {
                 if !sqlite_public_asset_profile_exists(
                     &mut transaction,
@@ -1880,6 +2584,32 @@ async fn update_public_asset(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
+            if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                .await?
+            {
+                return Ok(None);
+            }
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                if !timescale_public_asset_manager_permission(
+                    &mut transaction,
+                    principal,
+                    parent_asset_id,
+                )
+                .await?
+                    || !timescale_public_asset_parent_is_valid(
+                        &mut transaction,
+                        principal.tenant_id,
+                        Some(asset_id),
+                        parent_asset_id,
+                    )
+                    .await?
+                {
+                    return Err(PublicAssetError::ParentUnavailable(parent_asset_id));
+                }
+            }
             if let Some(asset_profile_id) = asset.asset_profile_id {
                 if !timescale_public_asset_profile_exists(
                     &mut transaction,
@@ -1919,31 +2649,43 @@ async fn delete_public_asset(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
-    if !public_asset_permission(store, principal, asset_id)
-        .await?
-        .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
-    {
-        return Ok(false);
-    }
-    let affected = match store {
+    match store {
         PlatformStore::Sqlite(store) => {
-            sqlx::query("DELETE FROM assets WHERE id = ? AND tenant_id = ?")
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if !sqlite_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            let affected = sqlx::query("DELETE FROM assets WHERE id = ? AND tenant_id = ?")
                 .bind(asset_id.to_string())
                 .bind(principal.tenant_id.to_string())
-                .execute(store.pool())
+                .execute(&mut *transaction)
                 .await?
-                .rows_affected()
+                .rows_affected();
+            transaction.commit().await?;
+            Ok(affected == 1)
         }
         PlatformStore::Timescale(pool) => {
-            sqlx::query("DELETE FROM assets WHERE id = $1 AND tenant_id = $2")
+            let mut transaction = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                .execute(&mut *transaction)
+                .await?;
+            if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
+                .await?
+            {
+                return Ok(false);
+            }
+            let affected = sqlx::query("DELETE FROM assets WHERE id = $1 AND tenant_id = $2")
                 .bind(asset_id)
                 .bind(principal.tenant_id)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await?
-                .rows_affected()
+                .rows_affected();
+            transaction.commit().await?;
+            Ok(affected == 1)
         }
-    };
-    Ok(affected == 1)
+    }
 }
 
 fn sqlite_device_record(row: SqliteRow) -> Result<PublicDevice, PlatformStoreError> {
@@ -1976,6 +2718,7 @@ fn sqlite_device_record(row: SqliteRow) -> Result<PublicDevice, PlatformStoreErr
         metadata,
         asset_id,
         device_profile_id,
+        access: None,
     })
 }
 
@@ -1986,6 +2729,7 @@ fn timescale_device_record(row: PgRow) -> Result<PublicDevice, PlatformStoreErro
         metadata: row.try_get::<Json<serde_json::Value>, _>("metadata")?.0,
         asset_id: row.try_get("asset_id")?,
         device_profile_id: row.try_get("device_profile_id")?,
+        access: None,
     })
 }
 
@@ -2024,6 +2768,7 @@ fn sqlite_asset_record(row: SqliteRow) -> Result<PublicAsset, PlatformStoreError
         asset_profile_id,
         parent_asset_id,
         metadata,
+        access: None,
     })
 }
 
@@ -2034,5 +2779,43 @@ fn timescale_asset_record(row: PgRow) -> Result<PublicAsset, PlatformStoreError>
         asset_profile_id: row.try_get("asset_profile_id")?,
         parent_asset_id: row.try_get("parent_asset_id")?,
         metadata: row.try_get::<Json<serde_json::Value>, _>("metadata")?.0,
+        access: None,
     })
+}
+
+fn public_resource_access(
+    permission: String,
+    source: String,
+) -> Result<ResourceAccess, PlatformStoreError> {
+    let permission = ResourcePermission::parse(&permission).ok_or_else(|| {
+        PlatformStoreError::Database(sqlx::Error::Protocol(
+            "invalid public resource permission".to_owned(),
+        ))
+    })?;
+    let source = ResourceAccessSource::parse(&source).ok_or_else(|| {
+        PlatformStoreError::Database(sqlx::Error::Protocol(
+            "invalid public resource access source".to_owned(),
+        ))
+    })?;
+    Ok(ResourceAccess { permission, source })
+}
+
+fn sqlite_authorized_asset_record(row: SqliteRow) -> Result<PublicAsset, PlatformStoreError> {
+    let access = public_resource_access(
+        row.try_get("effective_permission")?,
+        row.try_get("access_source")?,
+    )?;
+    let mut asset = sqlite_asset_record(row)?;
+    asset.access = Some(access);
+    Ok(asset)
+}
+
+fn timescale_authorized_asset_record(row: PgRow) -> Result<PublicAsset, PlatformStoreError> {
+    let access = public_resource_access(
+        row.try_get("effective_permission")?,
+        row.try_get("access_source")?,
+    )?;
+    let mut asset = timescale_asset_record(row)?;
+    asset.access = Some(access);
+    Ok(asset)
 }

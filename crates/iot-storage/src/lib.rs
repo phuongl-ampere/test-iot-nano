@@ -1516,14 +1516,56 @@ impl ResourcePermission {
         self as u8 >= required as u8
     }
 
-    fn parse_share(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "viewer" => Some(Self::Viewer),
             "controller" => Some(Self::Controller),
             "manager" => Some(Self::Manager),
+            "owner" => Some(Self::Owner),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceAccessSource {
+    TenantAccount,
+    Owner,
+    DirectUser,
+    Group,
+    InheritedUser,
+    InheritedGroup,
+}
+
+impl ResourceAccessSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TenantAccount => "tenant_account",
+            Self::Owner => "owner",
+            Self::DirectUser => "direct_user",
+            Self::Group => "group",
+            Self::InheritedUser => "inherited_user",
+            Self::InheritedGroup => "inherited_group",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "tenant_account" => Some(Self::TenantAccount),
+            "owner" => Some(Self::Owner),
+            "direct_user" => Some(Self::DirectUser),
+            "group" => Some(Self::Group),
+            "inherited_user" => Some(Self::InheritedUser),
+            "inherited_group" => Some(Self::InheritedGroup),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceAccess {
+    pub permission: ResourcePermission,
+    pub source: ResourceAccessSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1555,6 +1597,14 @@ pub struct AuthorizedDeviceSummary {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizedDeviceListEntry {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub access: ResourceAccess,
+}
+
 pub trait AuthorizationRepository: Send + Sync {
     fn authorization_subject<'a>(
         &'a self,
@@ -1573,7 +1623,7 @@ pub trait AuthorizationRepository: Send + Sync {
         limit: u32,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Vec<AuthorizedDeviceSummary>, PlatformStoreError>>
+            dyn Future<Output = Result<Vec<AuthorizedDeviceListEntry>, PlatformStoreError>>
                 + Send
                 + 'a,
         >,
@@ -2854,7 +2904,7 @@ impl PlatformStore {
         subject: &AuthorizationSubject,
         after: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<AuthorizedDeviceSummary>, PlatformStoreError> {
+    ) -> Result<Vec<AuthorizedDeviceListEntry>, PlatformStoreError> {
         let limit = i64::from(limit);
         match self {
             Self::Sqlite(store) => {
@@ -2881,25 +2931,44 @@ impl PlatformStore {
                            ON asset.id = ancestors.asset_id AND asset.tenant_id = ?
                          WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
                      ),
-                     authorized(device_id) AS (
-                         SELECT device_id FROM candidates
-                         WHERE ? = 1 OR owner_user_id = ?
-                         UNION
-                         SELECT candidate.device_id
+                     access_candidates(device_id, permission_rank, source_rank, access_source) AS (
+                         SELECT device_id, 3, 0, 'tenant_account'
+                         FROM candidates
+                         WHERE ? = 1
+                         UNION ALL
+                         SELECT device_id, 3, 1, 'owner'
+                         FROM candidates
+                         WHERE owner_user_id = ?
+                         UNION ALL
+                         SELECT candidate.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                2,
+                                'direct_user'
                          FROM candidates AS candidate
                          JOIN resource_permissions AS permission
                            ON permission.tenant_id = ?
                           AND permission.device_id = candidate.device_id
                           AND permission.revoked_at IS NULL
                          WHERE permission.subject_user_id = ?
-                            OR EXISTS (
-                                SELECT 1 FROM user_group_members AS membership
-                                WHERE membership.tenant_id = permission.tenant_id
-                                  AND membership.group_id = permission.subject_group_id
-                                  AND membership.user_id = ?
-                            )
-                         UNION
-                         SELECT ancestors.device_id
+                         UNION ALL
+                         SELECT candidate.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                3,
+                                'group'
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.device_id = candidate.device_id
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = ?
+                         UNION ALL
+                         SELECT ancestors.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                4,
+                                'inherited_user'
                          FROM ancestors
                          JOIN resource_permissions AS permission
                            ON permission.tenant_id = ?
@@ -2907,14 +2976,42 @@ impl PlatformStore {
                           AND permission.inherit_children = 1
                           AND permission.revoked_at IS NULL
                          WHERE permission.subject_user_id = ?
-                            OR EXISTS (
-                                SELECT 1 FROM user_group_members AS membership
-                                WHERE membership.tenant_id = permission.tenant_id
-                                  AND membership.group_id = permission.subject_group_id
-                                  AND membership.user_id = ?
-                            )
+                         UNION ALL
+                         SELECT ancestors.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                5,
+                                'inherited_group'
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.asset_id = ancestors.asset_id
+                          AND permission.inherit_children = 1
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = ?
+                     ),
+                     authorized(device_id, effective_permission, access_source) AS (
+                         SELECT device_id,
+                                CASE permission_rank
+                                    WHEN 3 THEN 'owner'
+                                    WHEN 2 THEN 'manager'
+                                    ELSE 'viewer'
+                                END,
+                                access_source
+                         FROM (
+                             SELECT access_candidates.*,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY device_id
+                                        ORDER BY permission_rank DESC, source_rank ASC
+                                    ) AS access_rank
+                             FROM access_candidates
+                         ) AS ranked_access
+                         WHERE access_rank = 1
                      )
-                     SELECT candidate.device_id, candidate.display_name, candidate.last_seen_at
+                     SELECT candidate.device_id, candidate.display_name, candidate.last_seen_at,
+                            authorized.effective_permission, authorized.access_source
                      FROM candidates AS candidate
                      JOIN authorized ON authorized.device_id = candidate.device_id
                      ORDER BY candidate.device_id
@@ -2928,9 +3025,11 @@ impl PlatformStore {
                 .bind(&user_id)
                 .bind(&tenant_id)
                 .bind(&user_id)
+                .bind(&tenant_id)
                 .bind(&user_id)
                 .bind(&tenant_id)
                 .bind(&user_id)
+                .bind(&tenant_id)
                 .bind(&user_id)
                 .bind(limit)
                 .fetch_all(store.pool())
@@ -2941,10 +3040,14 @@ impl PlatformStore {
                             .try_get::<Option<String>, _>("last_seen_at")?
                             .map(|value| parse_authorized_device_timestamp(&value))
                             .transpose()?;
-                        Ok(AuthorizedDeviceSummary {
+                        Ok(AuthorizedDeviceListEntry {
                             device_id: row.try_get("device_id")?,
                             display_name: row.try_get("display_name")?,
                             last_seen_at,
+                            access: resource_access_from_storage(
+                                row.try_get("effective_permission")?,
+                                row.try_get("access_source")?,
+                            )?,
                         })
                     })
                     .collect()
@@ -2971,25 +3074,44 @@ impl PlatformStore {
                            ON asset.id = ancestors.asset_id AND asset.tenant_id = $1
                          WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
                      ),
-                     authorized(device_id) AS (
-                         SELECT device_id FROM candidates
-                         WHERE $3::boolean OR owner_user_id = $4
-                         UNION
-                         SELECT candidate.device_id
+                     access_candidates(device_id, permission_rank, source_rank, access_source) AS (
+                         SELECT device_id, 3, 0, 'tenant_account'
+                         FROM candidates
+                         WHERE $3::boolean
+                         UNION ALL
+                         SELECT device_id, 3, 1, 'owner'
+                         FROM candidates
+                         WHERE owner_user_id = $4
+                         UNION ALL
+                         SELECT candidate.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                2,
+                                'direct_user'
                          FROM candidates AS candidate
                          JOIN resource_permissions AS permission
                            ON permission.tenant_id = $1
                           AND permission.device_id = candidate.device_id
                           AND permission.revoked_at IS NULL
                          WHERE permission.subject_user_id = $4
-                            OR EXISTS (
-                                SELECT 1 FROM user_group_members AS membership
-                                WHERE membership.tenant_id = permission.tenant_id
-                                  AND membership.group_id = permission.subject_group_id
-                                  AND membership.user_id = $4
-                            )
-                         UNION
-                         SELECT ancestors.device_id
+                         UNION ALL
+                         SELECT candidate.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                3,
+                                'group'
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.device_id = candidate.device_id
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = $4
+                         UNION ALL
+                         SELECT ancestors.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                4,
+                                'inherited_user'
                          FROM ancestors
                          JOIN resource_permissions AS permission
                            ON permission.tenant_id = $1
@@ -2997,14 +3119,42 @@ impl PlatformStore {
                           AND permission.inherit_children = TRUE
                           AND permission.revoked_at IS NULL
                          WHERE permission.subject_user_id = $4
-                            OR EXISTS (
-                                SELECT 1 FROM user_group_members AS membership
-                                WHERE membership.tenant_id = permission.tenant_id
-                                  AND membership.group_id = permission.subject_group_id
-                                  AND membership.user_id = $4
-                            )
+                         UNION ALL
+                         SELECT ancestors.device_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                5,
+                                'inherited_group'
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.asset_id = ancestors.asset_id
+                          AND permission.inherit_children = TRUE
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = $4
+                     ),
+                     authorized(device_id, effective_permission, access_source) AS (
+                         SELECT device_id,
+                                CASE permission_rank
+                                    WHEN 3 THEN 'owner'
+                                    WHEN 2 THEN 'manager'
+                                    ELSE 'viewer'
+                                END,
+                                access_source
+                         FROM (
+                             SELECT access_candidates.*,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY device_id
+                                        ORDER BY permission_rank DESC, source_rank ASC
+                                    ) AS access_rank
+                             FROM access_candidates
+                         ) AS ranked_access
+                         WHERE access_rank = 1
                      )
-                     SELECT candidate.device_id, candidate.display_name, runtime.last_seen_at
+                     SELECT candidate.device_id, candidate.display_name, runtime.last_seen_at,
+                            authorized.effective_permission, authorized.access_source
                      FROM candidates AS candidate
                      JOIN authorized ON authorized.device_id = candidate.device_id
                      LEFT JOIN device_runtime_state AS runtime
@@ -3022,10 +3172,14 @@ impl PlatformStore {
                 .await?;
                 rows.into_iter()
                     .map(|row| {
-                        Ok(AuthorizedDeviceSummary {
+                        Ok(AuthorizedDeviceListEntry {
                             device_id: row.try_get("device_id")?,
                             display_name: row.try_get("display_name")?,
                             last_seen_at: row.try_get("last_seen_at")?,
+                            access: resource_access_from_storage(
+                                row.try_get("effective_permission")?,
+                                row.try_get("access_source")?,
+                            )?,
                         })
                     })
                     .collect()
@@ -6897,7 +7051,7 @@ impl AuthorizationRepository for PlatformStore {
         limit: u32,
     ) -> Pin<
         Box<
-            dyn Future<Output = Result<Vec<AuthorizedDeviceSummary>, PlatformStoreError>>
+            dyn Future<Output = Result<Vec<AuthorizedDeviceListEntry>, PlatformStoreError>>
                 + Send
                 + 'a,
         >,
@@ -7261,12 +7415,6 @@ impl OAuthRepository for PlatformStore {
     }
 }
 
-fn strongest_share_permission(rows: Vec<String>) -> Option<ResourcePermission> {
-    rows.into_iter()
-        .filter_map(|value| ResourcePermission::parse_share(&value))
-        .max()
-}
-
 fn strongest_resource_permission(rows: Vec<String>) -> Option<ResourcePermission> {
     rows.into_iter()
         .filter_map(|value| match value.as_str() {
@@ -7275,6 +7423,23 @@ fn strongest_resource_permission(rows: Vec<String>) -> Option<ResourcePermission
             _ => None,
         })
         .max()
+}
+
+fn resource_access_from_storage(
+    permission: String,
+    source: String,
+) -> Result<ResourceAccess, PlatformStoreError> {
+    let permission = ResourcePermission::parse(&permission).ok_or_else(|| {
+        PlatformStoreError::Database(sqlx::Error::Protocol(
+            "invalid resource access permission".to_owned(),
+        ))
+    })?;
+    let source = ResourceAccessSource::parse(&source).ok_or_else(|| {
+        PlatformStoreError::Database(sqlx::Error::Protocol(
+            "invalid resource access source".to_owned(),
+        ))
+    })?;
+    Ok(ResourceAccess { permission, source })
 }
 
 async fn sqlite_device_resource_permission(

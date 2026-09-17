@@ -15,22 +15,29 @@ use iot_api::{
     CoreFacadeError, CoreTelemetryPoint, CoreTelemetryQuery, TokenVault, public_v1_router,
 };
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
-use iot_storage::{
-    ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret,
-    OAuthClientCredentialsToken, OAuthRepository, PlatformStore,
-};
+use iot_storage::{ApplicationKind, ApplicationRepository, NewApplication, PlatformStore};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const APP_ID: &str = "task-8-router-export";
 const CLIENT_ID: &str = "task-8-router-export-client";
-const CLIENT_SECRET: &str = "task-8-router-export-secret";
 const ACCESS_TOKEN: &str = "task-8-router-export-token";
+const APPLICATION_ONLY_ACCESS_TOKEN: &str = "task-8-router-export-application-token";
+const SHARED_ACCESS_TOKEN: &str = "task-8-router-export-shared-token";
 const DEVICE_ID: &str = "task-8-router-export-device";
 
 fn tenant_id() -> Uuid {
     Uuid::from_u128(10_004)
+}
+
+fn user_id() -> Uuid {
+    Uuid::from_u128(10_005)
+}
+
+fn access_token_hash(access_token: &str) -> String {
+    format!("{:x}", Sha256::digest(access_token.as_bytes()))
 }
 
 #[derive(Clone, Default)]
@@ -110,24 +117,22 @@ async fn exported_router_with_store() -> (
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
-        .bind(DEVICE_ID)
-        .bind(tenant_id().to_string())
-        .execute(pool)
-        .await
-        .unwrap();
     sqlx::query(
-        "INSERT INTO resource_grants
-            (id, tenant_id, resource_type, resource_id, grantee_type, grantee_id, permission)
-         VALUES (?, ?, 'device', ?, 'application', ?, 'controller')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-router-user', 'unused', 'viewer', 'user')",
     )
-    .bind(Uuid::now_v7().to_string())
+    .bind(user_id().to_string())
     .bind(tenant_id().to_string())
-    .bind(DEVICE_ID)
-    .bind(APP_ID)
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id, owner_user_id) VALUES (?, ?, ?)")
+        .bind(DEVICE_ID)
+        .bind(tenant_id().to_string())
+        .bind(user_id().to_string())
+        .execute(pool)
+        .await
+        .unwrap();
     ApplicationRepository::upsert_application(
         &store,
         NewApplication {
@@ -143,6 +148,7 @@ async fn exported_router_with_store() -> (
                 "alerts:read".to_owned(),
                 "alerts:write".to_owned(),
                 "commands:write".to_owned(),
+                "devices:read".to_owned(),
                 "devices:write".to_owned(),
                 "authorization:read".to_owned(),
                 "telemetry:read".to_owned(),
@@ -152,36 +158,47 @@ async fn exported_router_with_store() -> (
     )
     .await
     .unwrap();
-    OAuthRepository::register_client_secret(
-        &store,
-        NewOAuthClientSecret {
-            app_id: APP_ID.parse().unwrap(),
-            tenant_id: tenant_id(),
-            client_secret: CLIENT_SECRET.to_owned(),
-        },
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::hours(1);
+    let user_scopes = json!([
+        "assets:read",
+        "assets:write",
+        "alerts:read",
+        "alerts:write",
+        "commands:write",
+        "devices:read",
+        "devices:write",
+        "authorization:read",
+        "telemetry:read",
+    ])
+    .to_string();
+    sqlx::query(
+        "INSERT INTO oauth_access_tokens (
+            token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(access_token_hash(ACCESS_TOKEN))
+    .bind(APP_ID)
+    .bind(tenant_id().to_string())
+    .bind(user_id().to_string())
+    .bind(&user_scopes)
+    .bind(issued_at.to_rfc3339())
+    .bind(expires_at.to_rfc3339())
+    .execute(pool)
     .await
     .unwrap();
-    OAuthRepository::issue_client_credentials_access_token(
-        &store,
-        OAuthClientCredentialsToken {
-            client_id: CLIENT_ID.parse().unwrap(),
-            client_secret: CLIENT_SECRET.to_owned(),
-            access_token: ACCESS_TOKEN.to_owned(),
-            scopes: vec![
-                "assets:read".to_owned(),
-                "assets:write".to_owned(),
-                "alerts:read".to_owned(),
-                "alerts:write".to_owned(),
-                "commands:write".to_owned(),
-                "devices:write".to_owned(),
-                "authorization:read".to_owned(),
-                "telemetry:read".to_owned(),
-            ],
-            issued_at: Utc::now(),
-            expires_at: Utc::now() + Duration::hours(1),
-        },
+    sqlx::query(
+        "INSERT INTO oauth_access_tokens (
+            token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+         ) VALUES (?, ?, ?, NULL, ?, ?, ?)",
     )
+    .bind(access_token_hash(APPLICATION_ONLY_ACCESS_TOKEN))
+    .bind(APP_ID)
+    .bind(tenant_id().to_string())
+    .bind(json!(["assets:read"]).to_string())
+    .bind(issued_at.to_rfc3339())
+    .bind(expires_at.to_rfc3339())
+    .execute(pool)
     .await
     .unwrap();
 
@@ -204,7 +221,6 @@ async fn exported_public_router_mounts_resources_and_delegates_supplied_ports() 
         "/api/v1/assets",
         "/api/v1/telemetry?from=2026-01-01T00:00:00Z&to=2026-01-01T00:01:00Z",
         "/api/v1/alerts",
-        "/api/v1/resource-grants",
     ] {
         let response = app
             .clone()
@@ -272,6 +288,196 @@ async fn exported_public_router_rejects_an_unavailable_device_profile() {
 }
 
 #[tokio::test]
+async fn exported_public_router_rejects_application_only_tokens() {
+    let (_directory, app, _core) = exported_router().await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/assets")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {APPLICATION_ONLY_ACCESS_TOKEN}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {APPLICATION_ONLY_ACCESS_TOKEN}"),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "device_id": "application-only-device",
+                        "metadata": {},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn exported_public_lists_include_effective_permission_and_access_source() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let member_id = Uuid::now_v7();
+    let group_id = Uuid::now_v7();
+    let root_asset_id = Uuid::now_v7();
+    let child_asset_id = Uuid::now_v7();
+    let device_id = format!("shared-list-device-{}", Uuid::now_v7());
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::hours(1);
+
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-list-member', 'unused', 'viewer', 'user')",
+    )
+    .bind(member_id.to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO user_groups (id, tenant_id, owner_user_id, name)
+         VALUES (?, ?, ?, 'public-list-group')",
+    )
+    .bind(group_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO user_group_members (tenant_id, group_id, user_id) VALUES (?, ?, ?)")
+        .bind(tenant_id().to_string())
+        .bind(group_id.to_string())
+        .bind(member_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, parent_asset_id, owner_user_id)
+         VALUES (?, ?, 'shared-root', NULL, ?), (?, ?, 'shared-child', ?, ?)",
+    )
+    .bind(root_asset_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(user_id().to_string())
+    .bind(child_asset_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(root_asset_id.to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, asset_id, owner_user_id)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(&device_id)
+    .bind(tenant_id().to_string())
+    .bind(child_asset_id.to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_group_id, asset_id, permission, inherit_children,
+            created_by_user_id
+         ) VALUES (?, ?, ?, ?, 'viewer', 1, ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(tenant_id().to_string())
+    .bind(group_id.to_string())
+    .bind(root_asset_id.to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO oauth_access_tokens (
+            token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(access_token_hash(SHARED_ACCESS_TOKEN))
+    .bind(APP_ID)
+    .bind(tenant_id().to_string())
+    .bind(member_id.to_string())
+    .bind(json!(["assets:read", "devices:read"]).to_string())
+    .bind(issued_at.to_rfc3339())
+    .bind(expires_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let authorization = format!("Bearer {SHARED_ACCESS_TOKEN}");
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/assets")
+                .header(header::AUTHORIZATION, &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let assets: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let assets = assets["items"].as_array().unwrap();
+    let root = assets
+        .iter()
+        .find(|asset| asset["id"] == Value::String(root_asset_id.to_string()))
+        .unwrap();
+    assert_eq!(root["effective_permission"], "viewer");
+    assert_eq!(root["access_source"], "group");
+    let child = assets
+        .iter()
+        .find(|asset| asset["id"] == Value::String(child_asset_id.to_string()))
+        .unwrap();
+    assert_eq!(child["effective_permission"], "viewer");
+    assert_eq!(child["access_source"], "inherited_group");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let devices: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let device = devices["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["device_id"] == Value::String(device_id.clone()))
+        .unwrap();
+    assert_eq!(device["effective_permission"], "viewer");
+    assert_eq!(device["access_source"], "inherited_group");
+}
+
+#[tokio::test]
 async fn exported_public_router_rejects_an_unavailable_asset_profile() {
     let (_directory, app, _core) = exported_router().await;
     let response = app
@@ -317,23 +523,15 @@ async fn exported_public_router_scopes_alerts_to_the_token_tenant() {
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?), (?, ?)")
-        .bind(&tenant_a_device_id)
-        .bind(tenant_id().to_string())
-        .bind(&tenant_b_device_id)
-        .bind(tenant_b_id.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
     sqlx::query(
-        "INSERT INTO resource_grants (
-            id, tenant_id, resource_type, resource_id, grantee_type, grantee_id, permission
-         ) VALUES (?, ?, 'device', ?, 'application', ?, 'manager')",
+        "INSERT INTO devices (device_id, tenant_id, owner_user_id)
+         VALUES (?, ?, ?), (?, ?, NULL)",
     )
-    .bind(Uuid::now_v7().to_string())
-    .bind(tenant_id().to_string())
     .bind(&tenant_a_device_id)
-    .bind(APP_ID)
+    .bind(tenant_id().to_string())
+    .bind(user_id().to_string())
+    .bind(&tenant_b_device_id)
+    .bind(tenant_b_id.to_string())
     .execute(pool)
     .await
     .unwrap();
