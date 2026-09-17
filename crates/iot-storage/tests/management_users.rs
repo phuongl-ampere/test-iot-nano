@@ -35,6 +35,7 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
+    seed_sqlite_applications(store.sqlite_pool().unwrap(), test_tenant_id()).await;
     (directory, store)
 }
 
@@ -62,16 +63,51 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
     .await
     .unwrap();
     sqlx::query("INSERT INTO tenants (id, slug, status, metadata) VALUES ($1, 'test', 'active', '{}'::jsonb)")
-        .bind(test_tenant_id())
-        .execute(store.timescale_pool().unwrap())
-        .await
-        .unwrap();
+    .bind(test_tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    seed_timescale_applications(store.timescale_pool().unwrap(), test_tenant_id()).await;
     (
         TimescaleTestLock {
             _connection: connection,
         },
         store,
     )
+}
+
+async fn seed_sqlite_applications(pool: &sqlx::SqlitePool, tenant_id: Uuid) {
+    for app_id in ["fleet", "powermonitor", "reports", "blocked"] {
+        sqlx::query(
+            "INSERT INTO applications (
+                app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+             ) VALUES (?, ?, 'frontend', ?, ?, '[]', 1)",
+        )
+        .bind(app_id)
+        .bind(tenant_id.to_string())
+        .bind(format!("https://example.test/{app_id}"))
+        .bind(format!("{app_id}-client"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+async fn seed_timescale_applications(pool: &sqlx::PgPool, tenant_id: Uuid) {
+    for app_id in ["fleet", "powermonitor", "reports", "blocked"] {
+        sqlx::query(
+            "INSERT INTO applications (
+                app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+             ) VALUES ($1, $2, 'frontend', $3, $4, '[]'::jsonb, TRUE)",
+        )
+        .bind(app_id)
+        .bind(tenant_id)
+        .bind(format!("https://example.test/{app_id}"))
+        .bind(format!("{app_id}-client"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 fn user_creation(username: &str) -> CreateManagementUser {
@@ -82,6 +118,52 @@ fn user_creation(username: &str) -> CreateManagementUser {
         default_app: "/apps/powermonitor".to_owned(),
         granted_apps: vec!["fleet".to_owned(), "powermonitor".to_owned()],
     }
+}
+
+#[tokio::test]
+async fn sqlite_schema_rejects_cross_tenant_user_app_grants() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let other_tenant_id = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'other', 'active')")
+        .bind(other_tenant_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'grant-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO applications (
+            app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+         ) VALUES (?, ?, 'frontend', 'https://example.test/other', ?, '[]', 1)",
+    )
+    .bind("other-tenant-app")
+    .bind(other_tenant_id.to_string())
+    .bind("other-tenant-app-client")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let error =
+        sqlx::query("INSERT INTO user_app_grants (user_id, tenant_id, app_key) VALUES (?, ?, ?)")
+            .bind(user_id.to_string())
+            .bind(test_tenant_id().to_string())
+            .bind("other-tenant-app")
+            .execute(pool)
+            .await
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("FOREIGN KEY constraint failed"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -128,10 +210,11 @@ async fn sqlite_management_user_repository_updates_a_username_and_replaces_grant
     let grants: Vec<String> = sqlx::query_scalar(
         "SELECT app_key
          FROM user_app_grants
-         WHERE user_id = ?
+         WHERE user_id = ? AND tenant_id = ?
          ORDER BY app_key",
     )
     .bind(updated.id.to_string())
+    .bind(test_tenant_id().to_string())
     .fetch_all(store.sqlite_pool().unwrap())
     .await
     .unwrap();

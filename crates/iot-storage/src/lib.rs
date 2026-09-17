@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS devices (
     claimed_at TEXT,
     UNIQUE (device_id, tenant_id),
     FOREIGN KEY (asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (device_profile_id, tenant_id)
+        REFERENCES device_profiles(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (gateway_device_id, tenant_id)
         REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
@@ -226,12 +228,6 @@ FOR EACH ROW WHEN NEW.tenant_id IS NOT OLD.tenant_id
 BEGIN
     SELECT RAISE(ABORT, 'users.tenant_id is immutable');
 END;
-CREATE TABLE IF NOT EXISTS user_app_grants (
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    app_key TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, app_key)
-);
 CREATE TABLE IF NOT EXISTS applications (
     app_id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
@@ -241,6 +237,17 @@ CREATE TABLE IF NOT EXISTS applications (
     allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     UNIQUE (app_id, tenant_id)
+);
+CREATE TABLE IF NOT EXISTS user_app_grants (
+    user_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    app_key TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, app_key),
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (app_key, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS application_redirect_uris (
     app_id TEXT NOT NULL,
@@ -303,26 +310,32 @@ CREATE INDEX IF NOT EXISTS oauth_access_tokens_expiry_index
 
 CREATE TABLE IF NOT EXISTS asset_profiles (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
     fields TEXT NOT NULL DEFAULT '{}',
     dashboard_defaults TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, name)
 );
 CREATE TABLE IF NOT EXISTS device_profiles (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
     telemetry_schema TEXT NOT NULL DEFAULT '{}',
     metric_mapping TEXT NOT NULL DEFAULT '{}',
     reporting_settings TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, name)
 );
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
-    asset_profile_id TEXT REFERENCES asset_profiles(id) ON DELETE SET NULL,
+    asset_profile_id TEXT,
     parent_asset_id TEXT,
     owner_user_id TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
@@ -330,6 +343,8 @@ CREATE TABLE IF NOT EXISTS assets (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (id, tenant_id),
     UNIQUE (tenant_id, parent_asset_id, name),
+    FOREIGN KEY (asset_profile_id, tenant_id)
+        REFERENCES asset_profiles(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (parent_asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT
 );
@@ -7555,11 +7570,14 @@ const SQLITE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "telemetry_rollups_1h",
     "tenant_accounts",
     "users",
+    "user_app_grants",
     "applications",
     "application_redirect_uris",
     "oauth_client_secrets",
     "oauth_authorization_codes",
     "oauth_access_tokens",
+    "asset_profiles",
+    "device_profiles",
     "assets",
     "resource_grants",
 ];
@@ -7598,11 +7616,14 @@ const TIMESCALE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
 const TIMESCALE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "tenant_accounts",
     "users",
+    "user_app_grants",
     "applications",
     "application_redirect_uris",
     "oauth_client_secrets",
     "oauth_authorization_codes",
     "oauth_access_tokens",
+    "asset_profiles",
+    "device_profiles",
     "assets",
     "devices",
     "resource_grants",

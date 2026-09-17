@@ -77,6 +77,16 @@ async fn seed_tenant_admin_users(store: &PlatformStore) {
     .await
     .unwrap();
     let pool = store.sqlite_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO applications (
+            app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+         ) VALUES ('powermonitor', ?, 'frontend', '/apps/powermonitor', ?, '[]', 1)",
+    )
+    .bind(tenant.id.to_string())
+    .bind(format!("seed-{}-powermonitor", tenant.id))
+    .execute(pool)
+    .await
+    .unwrap();
     for (username, password, role, account_class) in [
         ("admin", "NanoAdmin@1234", "admin", "admin"),
         ("viewer", "NanoView@1234", "viewer", "user"),
@@ -96,11 +106,15 @@ async fn seed_tenant_admin_users(store: &PlatformStore) {
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES (?, 'powermonitor')")
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO user_app_grants (user_id, tenant_id, app_key)
+             VALUES (?, ?, 'powermonitor')",
+        )
+        .bind(user_id)
+        .bind(tenant.id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
 

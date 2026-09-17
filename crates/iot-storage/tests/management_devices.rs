@@ -48,11 +48,14 @@ async fn seed_management_devices(store: &PlatformStore, tenant_id: Uuid) -> (Uui
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO device_profiles (id, name) VALUES (?, 'management profile')")
-        .bind(device_profile_id.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO device_profiles (id, tenant_id, name) VALUES (?, ?, 'management profile')",
+    )
+    .bind(device_profile_id.to_string())
+    .bind(tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO devices (
              device_id, tenant_id, display_name, metadata, last_seen_at, is_gateway
@@ -480,7 +483,11 @@ fn timescale_management_reference_validation_uses_boolean_exists_queries() {
     assert!(
         source.contains("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)")
     );
-    assert!(source.contains("SELECT EXISTS(SELECT 1 FROM device_profiles WHERE id = $1)"));
+    assert!(source.contains(
+        "SELECT EXISTS(
+                SELECT 1 FROM device_profiles WHERE id = $1 AND tenant_id = $2
+             )"
+    ));
 }
 
 #[tokio::test]
@@ -499,10 +506,11 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO device_profiles (id, name)
-         VALUES ($1, 'timescale management profile')",
+        "INSERT INTO device_profiles (id, tenant_id, name)
+         VALUES ($1, $2, 'timescale management profile')",
     )
     .bind(device_profile_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .unwrap();

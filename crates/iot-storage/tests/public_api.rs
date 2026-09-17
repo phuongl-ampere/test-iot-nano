@@ -1836,8 +1836,9 @@ async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
     let unique = Uuid::now_v7();
     let device_profile_id = Uuid::now_v7();
     let pool = store.timescale_pool().unwrap();
-    sqlx::query("INSERT INTO device_profiles (id, name) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO device_profiles (id, tenant_id, name) VALUES ($1, $2, $3)")
         .bind(device_profile_id)
+        .bind(test_tenant_id())
         .bind(format!("timescale-device-profile-lock-{unique}"))
         .execute(pool)
         .await
@@ -1849,8 +1850,9 @@ async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
         .await
         .unwrap();
     sqlx::query("BEGIN").execute(&mut gate).await.unwrap();
-    sqlx::query("SELECT id FROM device_profiles WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM device_profiles WHERE id = $1 AND tenant_id = $2 FOR UPDATE")
         .bind(device_profile_id)
+        .bind(test_tenant_id())
         .execute(&mut gate)
         .await
         .unwrap();

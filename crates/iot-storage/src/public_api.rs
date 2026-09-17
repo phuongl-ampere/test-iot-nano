@@ -768,7 +768,12 @@ async fn create_public_device(
                 }
             }
             if let Some(device_profile_id) = device.device_profile_id {
-                if !sqlite_public_device_profile_exists(&mut transaction, device_profile_id).await?
+                if !sqlite_public_device_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    device_profile_id,
+                )
+                .await?
                 {
                     return Err(PublicDeviceError::DeviceProfileUnavailable(
                         device_profile_id,
@@ -829,8 +834,12 @@ async fn create_public_device(
                 }
             }
             if let Some(device_profile_id) = device.device_profile_id {
-                if !timescale_public_device_profile_exists(&mut transaction, device_profile_id)
-                    .await?
+                if !timescale_public_device_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    device_profile_id,
+                )
+                .await?
                 {
                     return Err(PublicDeviceError::DeviceProfileUnavailable(
                         device_profile_id,
@@ -901,7 +910,12 @@ async fn update_public_device(
                 }
             }
             if let Some(device_profile_id) = device.device_profile_id {
-                if !sqlite_public_device_profile_exists(&mut transaction, device_profile_id).await?
+                if !sqlite_public_device_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    device_profile_id,
+                )
+                .await?
                 {
                     return Err(PublicDeviceError::DeviceProfileUnavailable(
                         device_profile_id,
@@ -946,8 +960,12 @@ async fn update_public_device(
                 }
             }
             if let Some(device_profile_id) = device.device_profile_id {
-                if !timescale_public_device_profile_exists(&mut transaction, device_profile_id)
-                    .await?
+                if !timescale_public_device_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    device_profile_id,
+                )
+                .await?
                 {
                     return Err(PublicDeviceError::DeviceProfileUnavailable(
                         device_profile_id,
@@ -1044,14 +1062,18 @@ async fn sqlite_public_asset_manager_permission(
 
 async fn sqlite_public_device_profile_exists(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     device_profile_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
     Ok(
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM device_profiles WHERE id = ?")
-            .bind(device_profile_id.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some(),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM device_profiles WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(device_profile_id.to_string())
+        .bind(tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some(),
     )
 }
 
@@ -1184,15 +1206,20 @@ async fn timescale_public_asset_manager_permission(
 
 async fn timescale_public_device_profile_exists(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     device_profile_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
-    Ok(
-        sqlx::query_scalar::<_, Uuid>("SELECT id FROM device_profiles WHERE id = $1 FOR KEY SHARE")
-            .bind(device_profile_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some(),
+    Ok(sqlx::query_scalar::<_, Uuid>(
+        "SELECT id
+             FROM device_profiles
+             WHERE id = $1 AND tenant_id = $2
+             FOR KEY SHARE",
     )
+    .bind(device_profile_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
 }
 
 fn map_public_device_reference_error(

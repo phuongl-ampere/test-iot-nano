@@ -56,23 +56,92 @@ fn asset_profile(name: &str) -> CreateManagementAssetProfile {
 }
 
 #[tokio::test]
+async fn sqlite_schema_scopes_profiles_and_rejects_cross_tenant_profile_references() {
+    let (_directory, store, tenant_a) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_b = seed_tenant(pool, "management-profiles-other").await;
+    let asset_profile_a = Uuid::now_v7();
+    let device_profile_a = Uuid::now_v7();
+
+    for (profile_id, tenant_id, name) in [
+        (asset_profile_a, tenant_a, "Shared asset profile"),
+        (Uuid::now_v7(), tenant_b, "Shared asset profile"),
+    ] {
+        sqlx::query("INSERT INTO asset_profiles (id, tenant_id, name) VALUES (?, ?, ?)")
+            .bind(profile_id.to_string())
+            .bind(tenant_id.to_string())
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    for (profile_id, tenant_id, name) in [
+        (device_profile_a, tenant_a, "Shared device profile"),
+        (Uuid::now_v7(), tenant_b, "Shared device profile"),
+    ] {
+        sqlx::query("INSERT INTO device_profiles (id, tenant_id, name) VALUES (?, ?, ?)")
+            .bind(profile_id.to_string())
+            .bind(tenant_id.to_string())
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    let asset_error = sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, asset_profile_id) VALUES (?, ?, ?, ?)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(tenant_b.to_string())
+    .bind("cross-tenant-profile-asset")
+    .bind(asset_profile_a.to_string())
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert!(
+        asset_error
+            .to_string()
+            .contains("FOREIGN KEY constraint failed"),
+        "{asset_error}"
+    );
+
+    let device_error = sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, device_profile_id) VALUES (?, ?, ?)",
+    )
+    .bind("cross-tenant-profile-device")
+    .bind(tenant_b.to_string())
+    .bind(device_profile_a.to_string())
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert!(
+        device_error
+            .to_string()
+            .contains("FOREIGN KEY constraint failed"),
+        "{device_error}"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_management_profile_repositories_create_list_update_and_delete() {
-    let (_directory, store, _tenant_id) = sqlite_store().await;
+    let (_directory, store, tenant_id) = sqlite_store().await;
 
     let device_z = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Z device profile"),
     )
     .await
     .unwrap();
     let device_a = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("A device profile"),
     )
     .await
     .unwrap();
     assert_eq!(
-        ManagementDeviceProfileRepository::list_management_device_profiles(&store)
+        ManagementDeviceProfileRepository::list_management_device_profiles(&store, tenant_id)
             .await
             .unwrap()
             .iter()
@@ -82,6 +151,7 @@ async fn sqlite_management_profile_repositories_create_list_update_and_delete() 
     );
     let updated_device = ManagementDeviceProfileRepository::update_management_device_profile(
         &store,
+        tenant_id,
         device_z.id,
         UpdateManagementDeviceProfile {
             name: "Renamed device profile".to_owned(),
@@ -97,11 +167,15 @@ async fn sqlite_management_profile_repositories_create_list_update_and_delete() 
         updated_device.metric_mapping,
         json!({"humidity_pct": "humidity"})
     );
-    ManagementDeviceProfileRepository::delete_management_device_profile(&store, device_a.id)
-        .await
-        .unwrap();
+    ManagementDeviceProfileRepository::delete_management_device_profile(
+        &store,
+        tenant_id,
+        device_a.id,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        ManagementDeviceProfileRepository::list_management_device_profiles(&store)
+        ManagementDeviceProfileRepository::list_management_device_profiles(&store, tenant_id)
             .await
             .unwrap(),
         [updated_device]
@@ -109,18 +183,20 @@ async fn sqlite_management_profile_repositories_create_list_update_and_delete() 
 
     let asset_z = ManagementAssetProfileRepository::create_management_asset_profile(
         &store,
+        tenant_id,
         asset_profile("Z asset profile"),
     )
     .await
     .unwrap();
     let asset_a = ManagementAssetProfileRepository::create_management_asset_profile(
         &store,
+        tenant_id,
         asset_profile("A asset profile"),
     )
     .await
     .unwrap();
     assert_eq!(
-        ManagementAssetProfileRepository::list_management_asset_profiles(&store)
+        ManagementAssetProfileRepository::list_management_asset_profiles(&store, tenant_id)
             .await
             .unwrap()
             .iter()
@@ -130,6 +206,7 @@ async fn sqlite_management_profile_repositories_create_list_update_and_delete() 
     );
     let updated_asset = ManagementAssetProfileRepository::update_management_asset_profile(
         &store,
+        tenant_id,
         asset_z.id,
         UpdateManagementAssetProfile {
             name: "Renamed asset profile".to_owned(),
@@ -140,11 +217,13 @@ async fn sqlite_management_profile_repositories_create_list_update_and_delete() 
     .await
     .unwrap();
     assert_eq!(updated_asset.fields, json!({"floor": {"type": "integer"}}));
-    ManagementAssetProfileRepository::delete_management_asset_profile(&store, asset_a.id)
-        .await
-        .unwrap();
+    ManagementAssetProfileRepository::delete_management_asset_profile(
+        &store, tenant_id, asset_a.id,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        ManagementAssetProfileRepository::list_management_asset_profiles(&store)
+        ManagementAssetProfileRepository::list_management_asset_profiles(&store, tenant_id)
             .await
             .unwrap(),
         [updated_asset]
@@ -157,12 +236,14 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     let pool = store.sqlite_pool().unwrap();
     let device = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Referenced device profile"),
     )
     .await
     .unwrap();
     let asset = ManagementAssetProfileRepository::create_management_asset_profile(
         &store,
+        tenant_id,
         asset_profile("Referenced asset profile"),
     )
     .await
@@ -171,6 +252,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             device_profile(" "),
         )
         .await,
@@ -179,6 +261,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             CreateManagementDeviceProfile {
                 name: "Invalid device JSON".to_owned(),
                 telemetry_schema: json!([]),
@@ -192,6 +275,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             device_profile("Referenced device profile"),
         )
         .await,
@@ -201,6 +285,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementDeviceProfileRepository::update_management_device_profile(
             &store,
+            tenant_id,
             Uuid::now_v7(),
             UpdateManagementDeviceProfile {
                 name: "Missing device profile".to_owned(),
@@ -222,7 +307,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     .await
     .unwrap();
     assert!(matches!(
-        ManagementDeviceProfileRepository::delete_management_device_profile(&store, device.id)
+        ManagementDeviceProfileRepository::delete_management_device_profile(&store, tenant_id, device.id)
             .await,
         Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == device.id
     ));
@@ -230,6 +315,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementAssetProfileRepository::create_management_asset_profile(
             &store,
+            tenant_id,
             asset_profile(" "),
         )
         .await,
@@ -238,6 +324,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementAssetProfileRepository::create_management_asset_profile(
             &store,
+            tenant_id,
             CreateManagementAssetProfile {
                 name: "Invalid asset JSON".to_owned(),
                 fields: json!(false),
@@ -250,6 +337,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementAssetProfileRepository::create_management_asset_profile(
             &store,
+            tenant_id,
             asset_profile("Referenced asset profile"),
         )
         .await,
@@ -259,6 +347,7 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     assert!(matches!(
         ManagementAssetProfileRepository::update_management_asset_profile(
             &store,
+            tenant_id,
             Uuid::now_v7(),
             UpdateManagementAssetProfile {
                 name: "Missing asset profile".to_owned(),
@@ -280,12 +369,16 @@ async fn sqlite_management_profile_repositories_return_typed_errors_and_protect_
     .await
     .unwrap();
     assert!(matches!(
-        ManagementAssetProfileRepository::delete_management_asset_profile(&store, asset.id).await,
+        ManagementAssetProfileRepository::delete_management_asset_profile(&store, tenant_id, asset.id).await,
         Err(ManagementAssetProfileError::AssetProfileInUse(id)) if id == asset.id
     ));
     assert!(matches!(
-        ManagementAssetProfileRepository::delete_management_asset_profile(&store, Uuid::now_v7())
-            .await,
+        ManagementAssetProfileRepository::delete_management_asset_profile(
+            &store,
+            tenant_id,
+            Uuid::now_v7(),
+        )
+        .await,
         Err(ManagementAssetProfileError::AssetProfileNotFound)
     ));
 }
@@ -296,12 +389,14 @@ async fn sqlite_device_profile_deletion_preserves_active_references_and_clears_s
     let pool = store.sqlite_pool().unwrap();
     let active_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Active reference device profile"),
     )
     .await
     .unwrap();
     let deleted_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Soft-deleted reference device profile"),
     )
     .await
@@ -334,15 +429,20 @@ async fn sqlite_device_profile_deletion_preserves_active_references_and_clears_s
     assert!(matches!(
         ManagementDeviceProfileRepository::delete_management_device_profile(
             &store,
+            tenant_id,
             active_profile.id,
         )
         .await,
         Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == active_profile.id
     ));
 
-    ManagementDeviceProfileRepository::delete_management_device_profile(&store, deleted_profile.id)
-        .await
-        .unwrap();
+    ManagementDeviceProfileRepository::delete_management_device_profile(
+        &store,
+        tenant_id,
+        deleted_profile.id,
+    )
+    .await
+    .unwrap();
     let stale_reference: Option<String> = sqlx::query_scalar(
         "SELECT device_profile_id
          FROM devices
@@ -460,18 +560,20 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     let pool = store.timescale_pool().unwrap();
     let device_z = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Timescale Z device profile"),
     )
     .await
     .unwrap();
     let device_a = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Timescale A device profile"),
     )
     .await
     .unwrap();
     assert_eq!(
-        ManagementDeviceProfileRepository::list_management_device_profiles(&store)
+        ManagementDeviceProfileRepository::list_management_device_profiles(&store, tenant_id)
             .await
             .unwrap()
             .iter()
@@ -481,6 +583,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     );
     let updated_device = ManagementDeviceProfileRepository::update_management_device_profile(
         &store,
+        tenant_id,
         device_z.id,
         UpdateManagementDeviceProfile {
             name: "Timescale renamed device profile".to_owned(),
@@ -501,6 +604,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             device_profile("Timescale A device profile"),
         )
         .await,
@@ -510,6 +614,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             CreateManagementDeviceProfile {
                 name: "Invalid Timescale device JSON".to_owned(),
                 telemetry_schema: json!([]),
@@ -523,6 +628,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             device_profile(" "),
         )
         .await,
@@ -531,6 +637,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             CreateManagementDeviceProfile {
                 name: "Invalid Timescale device mapping".to_owned(),
                 telemetry_schema: json!({}),
@@ -544,6 +651,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementDeviceProfileRepository::create_management_device_profile(
             &store,
+            tenant_id,
             CreateManagementDeviceProfile {
                 name: "Invalid Timescale device reporting".to_owned(),
                 telemetry_schema: json!({}),
@@ -557,6 +665,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementDeviceProfileRepository::update_management_device_profile(
             &store,
+            tenant_id,
             Uuid::now_v7(),
             UpdateManagementDeviceProfile {
                 name: "Missing Timescale device profile".to_owned(),
@@ -568,11 +677,15 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
         .await,
         Err(ManagementDeviceProfileError::DeviceProfileNotFound)
     ));
-    ManagementDeviceProfileRepository::delete_management_device_profile(&store, device_a.id)
-        .await
-        .unwrap();
+    ManagementDeviceProfileRepository::delete_management_device_profile(
+        &store,
+        tenant_id,
+        device_a.id,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        ManagementDeviceProfileRepository::list_management_device_profiles(&store)
+        ManagementDeviceProfileRepository::list_management_device_profiles(&store, tenant_id)
             .await
             .unwrap(),
         [updated_device.clone()]
@@ -580,18 +693,20 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
 
     let asset_z = ManagementAssetProfileRepository::create_management_asset_profile(
         &store,
+        tenant_id,
         asset_profile("Timescale Z asset profile"),
     )
     .await
     .unwrap();
     let asset_a = ManagementAssetProfileRepository::create_management_asset_profile(
         &store,
+        tenant_id,
         asset_profile("Timescale A asset profile"),
     )
     .await
     .unwrap();
     assert_eq!(
-        ManagementAssetProfileRepository::list_management_asset_profiles(&store)
+        ManagementAssetProfileRepository::list_management_asset_profiles(&store, tenant_id)
             .await
             .unwrap()
             .iter()
@@ -601,6 +716,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     );
     let updated_asset = ManagementAssetProfileRepository::update_management_asset_profile(
         &store,
+        tenant_id,
         asset_z.id,
         UpdateManagementAssetProfile {
             name: "Timescale renamed asset profile".to_owned(),
@@ -620,6 +736,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementAssetProfileRepository::create_management_asset_profile(
             &store,
+            tenant_id,
             asset_profile("Timescale A asset profile"),
         )
         .await,
@@ -629,6 +746,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementAssetProfileRepository::create_management_asset_profile(
             &store,
+            tenant_id,
             CreateManagementAssetProfile {
                 name: "Invalid Timescale asset JSON".to_owned(),
                 fields: json!(false),
@@ -641,6 +759,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementAssetProfileRepository::create_management_asset_profile(
             &store,
+            tenant_id,
             asset_profile(" "),
         )
         .await,
@@ -649,6 +768,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementAssetProfileRepository::create_management_asset_profile(
             &store,
+            tenant_id,
             CreateManagementAssetProfile {
                 name: "Invalid Timescale asset dashboard".to_owned(),
                 fields: json!({}),
@@ -661,6 +781,7 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     assert!(matches!(
         ManagementAssetProfileRepository::update_management_asset_profile(
             &store,
+            tenant_id,
             Uuid::now_v7(),
             UpdateManagementAssetProfile {
                 name: "Missing Timescale asset profile".to_owned(),
@@ -671,11 +792,13 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
         .await,
         Err(ManagementAssetProfileError::AssetProfileNotFound)
     ));
-    ManagementAssetProfileRepository::delete_management_asset_profile(&store, asset_a.id)
-        .await
-        .unwrap();
+    ManagementAssetProfileRepository::delete_management_asset_profile(
+        &store, tenant_id, asset_a.id,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        ManagementAssetProfileRepository::list_management_asset_profiles(&store)
+        ManagementAssetProfileRepository::list_management_asset_profiles(&store, tenant_id)
             .await
             .unwrap(),
         [updated_asset.clone()]
@@ -701,12 +824,21 @@ async fn timescale_management_profile_repositories_match_sqlite_contract() {
     .await
     .unwrap();
     assert!(matches!(
-        ManagementDeviceProfileRepository::delete_management_device_profile(&store, updated_device.id)
+        ManagementDeviceProfileRepository::delete_management_device_profile(
+            &store,
+            tenant_id,
+            updated_device.id,
+        )
             .await,
         Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == updated_device.id
     ));
     assert!(matches!(
-        ManagementAssetProfileRepository::delete_management_asset_profile(&store, updated_asset.id).await,
+        ManagementAssetProfileRepository::delete_management_asset_profile(
+            &store,
+            tenant_id,
+            updated_asset.id,
+        )
+        .await,
         Err(ManagementAssetProfileError::AssetProfileInUse(id)) if id == updated_asset.id
     ));
 }
@@ -718,12 +850,14 @@ async fn timescale_device_profile_deletion_handles_active_and_soft_deleted_refer
     let pool = store.timescale_pool().unwrap();
     let active_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Timescale active reference device profile"),
     )
     .await
     .unwrap();
     let deleted_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Timescale soft-deleted reference device profile"),
     )
     .await
@@ -756,15 +890,20 @@ async fn timescale_device_profile_deletion_handles_active_and_soft_deleted_refer
     assert!(matches!(
         ManagementDeviceProfileRepository::delete_management_device_profile(
             &store,
+            tenant_id,
             active_profile.id,
         )
         .await,
         Err(ManagementDeviceProfileError::DeviceProfileInUse(id)) if id == active_profile.id
     ));
 
-    ManagementDeviceProfileRepository::delete_management_device_profile(&store, deleted_profile.id)
-        .await
-        .unwrap();
+    ManagementDeviceProfileRepository::delete_management_device_profile(
+        &store,
+        tenant_id,
+        deleted_profile.id,
+    )
+    .await
+    .unwrap();
     let stale_reference: Option<Uuid> = sqlx::query_scalar(
         "SELECT device_profile_id
          FROM devices
@@ -785,6 +924,7 @@ async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typ
 
     let device_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Concurrent device profile"),
     )
     .await
@@ -814,6 +954,7 @@ async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typ
     let mut device_delete = tokio::spawn(async move {
         ManagementDeviceProfileRepository::delete_management_device_profile(
             &delete_store,
+            tenant_id,
             device_profile.id,
         )
         .await
@@ -879,6 +1020,7 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
 
     let device_profile = ManagementDeviceProfileRepository::create_management_device_profile(
         &store,
+        tenant_id,
         device_profile("Concurrent device profile"),
     )
     .await
@@ -908,6 +1050,7 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
     let mut device_delete = tokio::spawn(async move {
         ManagementDeviceProfileRepository::delete_management_device_profile(
             &delete_store,
+            tenant_id,
             device_profile.id,
         )
         .await
@@ -965,6 +1108,7 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
 
     let asset_profile = ManagementAssetProfileRepository::create_management_asset_profile(
         &store,
+        tenant_id,
         asset_profile("Concurrent asset profile"),
     )
     .await
@@ -995,6 +1139,7 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
     let mut asset_delete = tokio::spawn(async move {
         ManagementAssetProfileRepository::delete_management_asset_profile(
             &delete_store,
+            tenant_id,
             asset_profile.id,
         )
         .await

@@ -309,6 +309,16 @@ pub async fn seed_tenant_test_users_sqlite(
         .await?;
     let bootstrap_defaults = rows.is_empty();
     if bootstrap_defaults {
+        sqlx::query(
+            "INSERT OR IGNORE INTO applications (
+                app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+             ) VALUES (?, ?, 'frontend', '/apps/powermonitor', ?, '[]', 1)",
+        )
+        .bind(POWER_MONITOR_APP)
+        .bind(tenant_id.to_string())
+        .bind(format!("seed-{tenant_id}-powermonitor"))
+        .execute(&mut *transaction)
+        .await?;
         for (role, password) in [
             (Role::Admin, INITIAL_ADMIN_PASSWORD),
             (Role::Viewer, INITIAL_VIEWER_PASSWORD),
@@ -337,10 +347,11 @@ pub async fn seed_tenant_test_users_sqlite(
                     .fetch_one(&mut *transaction)
                     .await?;
             sqlx::query(
-                "INSERT OR IGNORE INTO user_app_grants (user_id, app_key)
-                 VALUES (?, ?)",
+                "INSERT OR IGNORE INTO user_app_grants (user_id, tenant_id, app_key)
+                 VALUES (?, ?, ?)",
             )
             .bind(user_id)
+            .bind(tenant_id.to_string())
             .bind(POWER_MONITOR_APP)
             .execute(&mut *transaction)
             .await?;
@@ -362,7 +373,7 @@ pub async fn authenticate_credentials(
     password: &str,
 ) -> Result<AuthenticatedUser, AuthError> {
     let row = sqlx::query(
-        "SELECT id, role, account_class, password_hash, default_app
+        "SELECT id, tenant_id, role, account_class, password_hash, default_app
          FROM users
          WHERE username = $1",
     )
@@ -386,13 +397,15 @@ pub async fn authenticate_credentials(
         .is_ok()
     {
         let user_id = row.try_get::<Uuid, _>("id")?;
+        let tenant_id = row.try_get::<Uuid, _>("tenant_id")?;
         let granted_apps = sqlx::query(
             "SELECT app_key
              FROM user_app_grants
-             WHERE user_id = $1
+             WHERE user_id = $1 AND tenant_id = $2
              ORDER BY app_key",
         )
         .bind(user_id)
+        .bind(tenant_id)
         .fetch_all(pool)
         .await?
         .into_iter()
@@ -417,7 +430,7 @@ pub async fn authenticate_credentials_sqlite(
     password: &str,
 ) -> Result<AuthenticatedUser, AuthError> {
     let row = sqlx::query(
-        "SELECT id, role, account_class, password_hash, default_app
+        "SELECT id, tenant_id, role, account_class, password_hash, default_app
          FROM users
          WHERE username = ?",
     )
@@ -444,13 +457,16 @@ pub async fn authenticate_credentials_sqlite(
     }
     let user_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
         .map_err(|_| AuthError::InvalidStoredHash)?;
+    let tenant_id = Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
+        .map_err(|_| AuthError::InvalidStoredHash)?;
     let granted_apps = sqlx::query(
         "SELECT app_key
          FROM user_app_grants
-         WHERE user_id = ?
+         WHERE user_id = ? AND tenant_id = ?
          ORDER BY app_key",
     )
     .bind(user_id.to_string())
+    .bind(tenant_id.to_string())
     .fetch_all(pool)
     .await?
     .into_iter()

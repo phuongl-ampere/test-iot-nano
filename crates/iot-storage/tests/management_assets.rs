@@ -126,10 +126,11 @@ async fn sqlite_management_asset_repository_creates_lists_updates_and_deletes_as
     let pool = store.sqlite_pool().unwrap();
     let profile_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO asset_profiles (id, name)
-         VALUES (?, 'management asset profile')",
+        "INSERT INTO asset_profiles (id, tenant_id, name)
+         VALUES (?, ?, 'management asset profile')",
     )
     .bind(profile_id.to_string())
+    .bind(tenant_id.to_string())
     .execute(pool)
     .await
     .unwrap();
@@ -613,10 +614,11 @@ async fn timescale_management_asset_repository_matches_sqlite_contract() {
     let pool = store.timescale_pool().unwrap();
     let profile_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO asset_profiles (id, name)
-         VALUES ($1, 'timescale management asset profile')",
+        "INSERT INTO asset_profiles (id, tenant_id, name)
+         VALUES ($1, $2, 'timescale management asset profile')",
     )
     .bind(profile_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .unwrap();
@@ -692,10 +694,11 @@ async fn timescale_management_asset_repository_covers_crud_validation_and_refere
     let pool = store.timescale_pool().unwrap();
     let profile_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO asset_profiles (id, name)
-         VALUES ($1, 'timescale expanded management asset profile')",
+        "INSERT INTO asset_profiles (id, tenant_id, name)
+         VALUES ($1, $2, 'timescale expanded management asset profile')",
     )
     .bind(profile_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .unwrap();

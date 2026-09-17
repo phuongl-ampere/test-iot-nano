@@ -40,6 +40,20 @@ async fn management_router() -> (tempfile::TempDir, Arc<PlatformStore>, axum::Ro
     )
     .await
     .unwrap();
+    for app_id in ["fleet", "powermonitor"] {
+        sqlx::query(
+            "INSERT INTO applications (
+                app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+             ) VALUES (?, ?, 'frontend', ?, ?, '[]', 1)",
+        )
+        .bind(app_id)
+        .bind(tenant.id.to_string())
+        .bind(format!("https://example.test/{app_id}"))
+        .bind(format!("management-{app_id}-client"))
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    }
     seed_tenant_test_users_sqlite(store.sqlite_pool().unwrap(), tenant.id)
         .await
         .unwrap();
@@ -63,6 +77,31 @@ async fn login_cookie(router: &axum::Router, username: &str, password: &str) -> 
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({ "username": username, "password": password }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+async fn tenant_account_cookie(router: &axum::Router, tenant_slug: &str, password: &str) -> String {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "tenant_slug": tenant_slug, "password": password }).to_string(),
                 ))
                 .unwrap(),
         )
@@ -112,6 +151,8 @@ async fn json_request(
 async fn management_user_routes_authorize_before_json_and_support_crud() {
     let (_directory, _store, router) = management_router().await;
     let viewer_cookie = login_cookie(&router, "viewer", "NanoView@1234").await;
+    let admin_cookie = login_cookie(&router, "admin", "NanoAdmin@1234").await;
+    let tenant_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
 
     for path in [
         "/api/management/users",
@@ -144,6 +185,20 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
             .await
             .unwrap();
         assert_eq!(viewer.status(), StatusCode::FORBIDDEN, "{path}");
+
+        let user_admin = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(user_admin.status(), StatusCode::FORBIDDEN, "{path}");
     }
 
     for (method, path) in [
@@ -186,16 +241,34 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
             .await
             .unwrap();
         assert_eq!(viewer.status(), StatusCode::FORBIDDEN, "{method} {path}");
+
+        let user_admin = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(COOKIE, &admin_cookie)
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            user_admin.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}"
+        );
     }
 
-    let admin_cookie = login_cookie(&router, "admin", "NanoAdmin@1234").await;
     let missing_content_type = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/management/users")
-                .header(COOKIE, &admin_cookie)
+                .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
                     r#"{"username":"content-type","password":"ContentType@123","default_app":"/apps/fleet","granted_apps":["fleet"]}"#,
                 ))
@@ -214,7 +287,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
                 .method("POST")
                 .uri("/api/management/profiles/asset-profiles")
                 .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &admin_cookie)
+                .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
                     json!({
                         "name": "Oversized",
@@ -235,7 +308,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
             Request::builder()
                 .method("GET")
                 .uri("/api/management/users")
-                .header(COOKIE, &admin_cookie)
+                .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -259,7 +332,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "POST",
         "/api/management/users",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "username": "alice",
             "password": "AlicePassword@123",
@@ -280,7 +353,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "POST",
         "/api/management/users",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "username": "alice",
             "password": "AlicePassword@123",
@@ -294,7 +367,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "POST",
         "/api/management/users",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "username": "not a valid username",
             "password": "InvalidUsername@123",
@@ -308,7 +381,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "POST",
         "/api/management/users",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "username": "invalid-default-app",
             "password": "InvalidDefaultApp@123",
@@ -322,7 +395,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "POST",
         "/api/management/users",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "username": "invalid-grants",
             "password": "InvalidGrants@123",
@@ -336,7 +409,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "PUT",
         "/api/management/users/missing",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "default_app": "/apps/fleet",
             "granted_apps": ["fleet"],
@@ -349,7 +422,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "PUT",
         "/api/management/users/alice",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "default_app": "/apps/fleet",
             "granted_apps": ["fleet"],
@@ -365,7 +438,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         &router,
         "PUT",
         "/api/management/users/alice",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "default_app": "/apps/fleet",
             "granted_apps": ["fleet"],
@@ -390,14 +463,14 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     json_request(
         &router,
         "PUT",
         "/api/management/users/alice",
-        &admin_cookie,
+        &tenant_cookie,
         json!({
             "default_app": "/apps/fleet",
             "granted_apps": ["fleet"],
@@ -426,7 +499,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
 #[tokio::test]
 async fn management_device_profile_routes_support_crud_and_typed_errors() {
     let (_directory, _store, router) = management_router().await;
-    let cookie = login_cookie(&router, "admin", "NanoAdmin@1234").await;
+    let cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
     let request = json!({
         "name": "Environmental Sensor",
         "telemetry_schema": {"temperature_c": {"type": "number"}},
@@ -639,7 +712,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
 #[tokio::test]
 async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     let (_directory, _store, router) = management_router().await;
-    let cookie = login_cookie(&router, "admin", "NanoAdmin@1234").await;
+    let cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
     let created = json_request(
         &router,
         "POST",
@@ -826,9 +899,115 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
 }
 
 #[tokio::test]
+async fn management_profile_routes_are_scoped_to_the_tenant_account() {
+    let (_directory, store, router) = management_router().await;
+    let tenant_a_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
+    let (_tenant_b, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let tenant_b_cookie = tenant_account_cookie(&router, "other", "OtherTenant@2026").await;
+
+    let tenant_a_device_profile = json_request(
+        &router,
+        "POST",
+        "/api/management/profiles/device-profiles",
+        &tenant_a_cookie,
+        json!({
+            "name": "Shared Device Profile",
+            "telemetry_schema": {},
+            "metric_mapping": {},
+            "reporting_settings": {},
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let tenant_b_device_profile = json_request(
+        &router,
+        "POST",
+        "/api/management/profiles/device-profiles",
+        &tenant_b_cookie,
+        json!({
+            "name": "Shared Device Profile",
+            "telemetry_schema": {},
+            "metric_mapping": {},
+            "reporting_settings": {},
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_ne!(tenant_a_device_profile["id"], tenant_b_device_profile["id"]);
+
+    for cookie in [&tenant_a_cookie, &tenant_b_cookie] {
+        let profiles = json_request(
+            &router,
+            "GET",
+            "/api/management/profiles/device-profiles",
+            cookie,
+            json!({}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(profiles.as_array().unwrap().len(), 1);
+        assert_eq!(profiles[0]["name"], "Shared Device Profile");
+    }
+
+    let cross_tenant_update = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/api/management/profiles/device-profiles/{}",
+                    tenant_a_device_profile["id"].as_str().unwrap()
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_b_cookie)
+                .body(Body::from(
+                    json!({
+                        "name": "Other Tenant Cannot Update This",
+                        "telemetry_schema": {},
+                        "metric_mapping": {},
+                        "reporting_settings": {},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_update.status(), StatusCode::NOT_FOUND);
+
+    for cookie in [&tenant_a_cookie, &tenant_b_cookie] {
+        let profile = json_request(
+            &router,
+            "POST",
+            "/api/management/profiles/asset-profiles",
+            cookie,
+            json!({
+                "name": "Shared Asset Profile",
+                "fields": {},
+                "dashboard_defaults": {},
+            }),
+            StatusCode::CREATED,
+        )
+        .await;
+        assert_eq!(profile["name"], "Shared Asset Profile");
+    }
+}
+
+#[tokio::test]
 async fn management_users_and_profiles_report_unavailable_storage() {
     let (_directory, store, router) = management_router().await;
-    let cookie = login_cookie(&router, "admin", "NanoAdmin@1234").await;
+    let cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
     store.sqlite_pool().unwrap().close().await;
 
     let list_users = router

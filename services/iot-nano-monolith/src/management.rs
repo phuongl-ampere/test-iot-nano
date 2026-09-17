@@ -2168,18 +2168,21 @@ async fn list_management_device_profiles(
     State(state): State<ManagementState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ManagementDeviceProfileResponse>>, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
-    ManagementDeviceProfileRepository::list_management_device_profiles(state.store.as_ref())
-        .await
-        .map(|profiles| {
-            Json(
-                profiles
-                    .into_iter()
-                    .map(management_device_profile_response)
-                    .collect(),
-            )
-        })
-        .map_err(management_device_profile_error)
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementDeviceProfileRepository::list_management_device_profiles(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map(|profiles| {
+        Json(
+            profiles
+                .into_iter()
+                .map(management_device_profile_response)
+                .collect(),
+        )
+    })
+    .map_err(management_device_profile_error)
 }
 
 async fn create_management_device_profile(
@@ -2187,11 +2190,12 @@ async fn create_management_device_profile(
     request: Request,
 ) -> Result<(StatusCode, Json<ManagementDeviceProfileResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ManagementDeviceProfileRequest = management_request_json(&state, request).await?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let profile = ManagementDeviceProfileRepository::create_management_device_profile(
         state.store.as_ref(),
+        tenant.tenant_id,
         CreateManagementDeviceProfile {
             name: request.name,
             telemetry_schema: request.telemetry_schema,
@@ -2213,13 +2217,14 @@ async fn update_management_device_profile(
     request: Request,
 ) -> Result<Json<ManagementDeviceProfileResponse>, ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ManagementDeviceProfileRequest = management_request_json(&state, request).await?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let profile = ManagementDeviceProfileRepository::update_management_device_profile(
         state.store.as_ref(),
+        tenant.tenant_id,
         profile_id,
         UpdateManagementDeviceProfile {
             name: request.name,
@@ -2238,12 +2243,13 @@ async fn delete_management_device_profile(
     headers: HeaderMap,
     Path(profile_id): Path<String>,
 ) -> Result<StatusCode, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     ManagementDeviceProfileRepository::delete_management_device_profile(
         state.store.as_ref(),
+        tenant.tenant_id,
         profile_id,
     )
     .await
@@ -2255,18 +2261,21 @@ async fn list_management_asset_profiles(
     State(state): State<ManagementState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ManagementAssetProfileResponse>>, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
-    ManagementAssetProfileRepository::list_management_asset_profiles(state.store.as_ref())
-        .await
-        .map(|profiles| {
-            Json(
-                profiles
-                    .into_iter()
-                    .map(management_asset_profile_response)
-                    .collect(),
-            )
-        })
-        .map_err(management_asset_profile_error)
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementAssetProfileRepository::list_management_asset_profiles(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map(|profiles| {
+        Json(
+            profiles
+                .into_iter()
+                .map(management_asset_profile_response)
+                .collect(),
+        )
+    })
+    .map_err(management_asset_profile_error)
 }
 
 async fn create_management_asset_profile(
@@ -2274,11 +2283,12 @@ async fn create_management_asset_profile(
     request: Request,
 ) -> Result<(StatusCode, Json<ManagementAssetProfileResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ManagementAssetProfileRequest = management_request_json(&state, request).await?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let profile = ManagementAssetProfileRepository::create_management_asset_profile(
         state.store.as_ref(),
+        tenant.tenant_id,
         CreateManagementAssetProfile {
             name: request.name,
             fields: request.fields,
@@ -2299,13 +2309,14 @@ async fn update_management_asset_profile(
     request: Request,
 ) -> Result<Json<ManagementAssetProfileResponse>, ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ManagementAssetProfileRequest = management_request_json(&state, request).await?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let profile = ManagementAssetProfileRepository::update_management_asset_profile(
         state.store.as_ref(),
+        tenant.tenant_id,
         profile_id,
         UpdateManagementAssetProfile {
             name: request.name,
@@ -2323,12 +2334,13 @@ async fn delete_management_asset_profile(
     headers: HeaderMap,
     Path(profile_id): Path<String>,
 ) -> Result<StatusCode, ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let profile_id =
         Uuid::parse_str(&profile_id).map_err(|_| ManagementSessionError::BadRequest)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     ManagementAssetProfileRepository::delete_management_asset_profile(
         state.store.as_ref(),
+        tenant.tenant_id,
         profile_id,
     )
     .await
@@ -2653,19 +2665,6 @@ fn system_tenant_error(error: TenantIdentityError) -> ManagementSessionError {
     }
 }
 
-fn require_management_admin(
-    session_verifier: &ManagementSessionVerifier,
-    headers: &HeaderMap,
-) -> Result<(), ManagementSessionError> {
-    match session_verifier.authorization(headers) {
-        ManagementAuthorization::Unauthenticated => Err(ManagementSessionError::Unauthorized),
-        ManagementAuthorization::Admin => Ok(()),
-        ManagementAuthorization::System | ManagementAuthorization::Forbidden => {
-            Err(ManagementSessionError::Forbidden)
-        }
-    }
-}
-
 fn require_system_account(
     session_verifier: &ManagementSessionVerifier,
     headers: &HeaderMap,
@@ -2677,15 +2676,6 @@ fn require_system_account(
             Err(ManagementSessionError::Forbidden)
         }
     }
-}
-
-async fn authorize_management_mutation<'a>(
-    state: &'a ManagementState,
-    headers: &HeaderMap,
-) -> Result<ManagementMutationLease<'a>, ManagementSessionError> {
-    let lease = state.authorization_gate.acquire_mutation().await;
-    require_management_admin(&state.session_verifier, headers)?;
-    Ok(lease)
 }
 
 async fn authorize_tenant_mutation<'a>(

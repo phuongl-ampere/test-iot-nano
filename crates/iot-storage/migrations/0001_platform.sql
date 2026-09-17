@@ -68,12 +68,6 @@ CREATE TRIGGER users_tenant_id_immutable
     BEFORE UPDATE OF tenant_id ON users
     FOR EACH ROW EXECUTE FUNCTION prevent_users_tenant_id_update();
 
-CREATE TABLE IF NOT EXISTS user_app_grants (
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    app_key TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id, app_key)
-);
 CREATE TABLE IF NOT EXISTS applications (
     app_id TEXT PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
@@ -83,6 +77,17 @@ CREATE TABLE IF NOT EXISTS applications (
     allowed_scopes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     UNIQUE (app_id, tenant_id)
+);
+CREATE TABLE IF NOT EXISTS user_app_grants (
+    user_id UUID NOT NULL,
+    tenant_id UUID NOT NULL,
+    app_key TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, app_key),
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (app_key, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS application_redirect_uris (
     app_id TEXT NOT NULL,
@@ -140,29 +145,40 @@ CREATE TABLE IF NOT EXISTS oauth_access_tokens (
 CREATE INDEX IF NOT EXISTS oauth_access_tokens_expiry_index
     ON oauth_access_tokens (expires_at);
 CREATE TABLE IF NOT EXISTS asset_profiles (
-    id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
     fields JSONB NOT NULL DEFAULT '{}'::jsonb,
     dashboard_defaults JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, name)
 );
 CREATE TABLE IF NOT EXISTS device_profiles (
-    id UUID PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
     telemetry_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
     metric_mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
     reporting_settings JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, name)
 );
 CREATE TABLE IF NOT EXISTS assets (
     id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
-    asset_profile_id UUID REFERENCES asset_profiles(id) ON DELETE SET NULL,
+    asset_profile_id UUID,
     parent_asset_id UUID,
     owner_user_id UUID,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (id, tenant_id),
     UNIQUE (tenant_id, parent_asset_id, name),
+    CONSTRAINT assets_asset_profile_id_fkey
+        FOREIGN KEY (asset_profile_id, tenant_id)
+        REFERENCES asset_profiles(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (parent_asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT
 );
@@ -195,12 +211,15 @@ CREATE TABLE IF NOT EXISTS devices (
     configuration_version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     asset_id UUID,
-    device_profile_id UUID REFERENCES device_profiles(id) ON DELETE SET NULL,
+    device_profile_id UUID,
     deleted_at TIMESTAMPTZ, is_gateway BOOLEAN NOT NULL DEFAULT FALSE,
     gateway_device_id TEXT,
     owner_user_id UUID, claimed_at TIMESTAMPTZ,
     UNIQUE (device_id, tenant_id),
     FOREIGN KEY (asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    CONSTRAINT devices_device_profile_id_fkey
+        FOREIGN KEY (device_profile_id, tenant_id)
+        REFERENCES device_profiles(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (gateway_device_id, tenant_id)
         REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,

@@ -217,6 +217,7 @@ impl From<sqlx::Error> for ManagementDeviceProfileError {
 pub trait ManagementDeviceProfileRepository: Send + Sync {
     fn list_management_device_profiles<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Vec<ManagementDeviceProfile>, ManagementDeviceProfileError>>
@@ -226,6 +227,7 @@ pub trait ManagementDeviceProfileRepository: Send + Sync {
     >;
     fn create_management_device_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile: CreateManagementDeviceProfile,
     ) -> Pin<
         Box<
@@ -236,6 +238,7 @@ pub trait ManagementDeviceProfileRepository: Send + Sync {
     >;
     fn update_management_device_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
         profile: UpdateManagementDeviceProfile,
     ) -> Pin<
@@ -247,6 +250,7 @@ pub trait ManagementDeviceProfileRepository: Send + Sync {
     >;
     fn delete_management_device_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementDeviceProfileError>> + Send + 'a>>;
 }
@@ -254,6 +258,7 @@ pub trait ManagementDeviceProfileRepository: Send + Sync {
 impl ManagementDeviceProfileRepository for PlatformStore {
     fn list_management_device_profiles<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Vec<ManagementDeviceProfile>, ManagementDeviceProfileError>>
@@ -261,11 +266,12 @@ impl ManagementDeviceProfileRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { list_management_device_profiles(self).await })
+        Box::pin(async move { list_management_device_profiles(self, tenant_id).await })
     }
 
     fn create_management_device_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile: CreateManagementDeviceProfile,
     ) -> Pin<
         Box<
@@ -274,11 +280,12 @@ impl ManagementDeviceProfileRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { create_management_device_profile(self, profile).await })
+        Box::pin(async move { create_management_device_profile(self, tenant_id, profile).await })
     }
 
     fn update_management_device_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
         profile: UpdateManagementDeviceProfile,
     ) -> Pin<
@@ -288,14 +295,17 @@ impl ManagementDeviceProfileRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { update_management_device_profile(self, profile_id, profile).await })
+        Box::pin(async move {
+            update_management_device_profile(self, tenant_id, profile_id, profile).await
+        })
     }
 
     fn delete_management_device_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementDeviceProfileError>> + Send + 'a>> {
-        Box::pin(async move { delete_management_device_profile(self, profile_id).await })
+        Box::pin(async move { delete_management_device_profile(self, tenant_id, profile_id).await })
     }
 }
 
@@ -359,6 +369,7 @@ impl From<sqlx::Error> for ManagementAssetProfileError {
 pub trait ManagementAssetProfileRepository: Send + Sync {
     fn list_management_asset_profiles<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Vec<ManagementAssetProfile>, ManagementAssetProfileError>>
@@ -368,6 +379,7 @@ pub trait ManagementAssetProfileRepository: Send + Sync {
     >;
     fn create_management_asset_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile: CreateManagementAssetProfile,
     ) -> Pin<
         Box<
@@ -378,6 +390,7 @@ pub trait ManagementAssetProfileRepository: Send + Sync {
     >;
     fn update_management_asset_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
         profile: UpdateManagementAssetProfile,
     ) -> Pin<
@@ -389,6 +402,7 @@ pub trait ManagementAssetProfileRepository: Send + Sync {
     >;
     fn delete_management_asset_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetProfileError>> + Send + 'a>>;
 }
@@ -396,6 +410,7 @@ pub trait ManagementAssetProfileRepository: Send + Sync {
 impl ManagementAssetProfileRepository for PlatformStore {
     fn list_management_asset_profiles<'a>(
         &'a self,
+        tenant_id: Uuid,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Vec<ManagementAssetProfile>, ManagementAssetProfileError>>
@@ -403,11 +418,12 @@ impl ManagementAssetProfileRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { list_management_asset_profiles(self).await })
+        Box::pin(async move { list_management_asset_profiles(self, tenant_id).await })
     }
 
     fn create_management_asset_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile: CreateManagementAssetProfile,
     ) -> Pin<
         Box<
@@ -416,11 +432,12 @@ impl ManagementAssetProfileRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { create_management_asset_profile(self, profile).await })
+        Box::pin(async move { create_management_asset_profile(self, tenant_id, profile).await })
     }
 
     fn update_management_asset_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
         profile: UpdateManagementAssetProfile,
     ) -> Pin<
@@ -430,14 +447,17 @@ impl ManagementAssetProfileRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { update_management_asset_profile(self, profile_id, profile).await })
+        Box::pin(async move {
+            update_management_asset_profile(self, tenant_id, profile_id, profile).await
+        })
     }
 
     fn delete_management_asset_profile<'a>(
         &'a self,
+        tenant_id: Uuid,
         profile_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetProfileError>> + Send + 'a>> {
-        Box::pin(async move { delete_management_asset_profile(self, profile_id).await })
+        Box::pin(async move { delete_management_asset_profile(self, tenant_id, profile_id).await })
     }
 }
 
@@ -786,11 +806,14 @@ async fn create_management_user(
             .await
             .map_err(|error| map_management_username_conflict(error, &username))?;
             for app_key in user.granted_apps {
-                sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES (?, ?)")
-                    .bind(user_id.to_string())
-                    .bind(app_key)
-                    .execute(&mut *transaction)
-                    .await?;
+                sqlx::query(
+                    "INSERT INTO user_app_grants (user_id, tenant_id, app_key) VALUES (?, ?, ?)",
+                )
+                .bind(user_id.to_string())
+                .bind(tenant_id.to_string())
+                .bind(app_key)
+                .execute(&mut *transaction)
+                .await?;
             }
             transaction.commit().await?;
         }
@@ -810,11 +833,14 @@ async fn create_management_user(
             .await
             .map_err(|error| map_management_username_conflict(error, &username))?;
             for app_key in user.granted_apps {
-                sqlx::query("INSERT INTO user_app_grants (user_id, app_key) VALUES ($1, $2)")
-                    .bind(user_id)
-                    .bind(app_key)
-                    .execute(&mut *transaction)
-                    .await?;
+                sqlx::query(
+                    "INSERT INTO user_app_grants (user_id, tenant_id, app_key) VALUES ($1, $2, $3)",
+                )
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(app_key)
+                .execute(&mut *transaction)
+                .await?;
             }
             transaction.commit().await?;
         }
@@ -865,17 +891,19 @@ async fn update_management_user(
             .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
-            sqlx::query("DELETE FROM user_app_grants WHERE user_id = ?")
+            sqlx::query("DELETE FROM user_app_grants WHERE user_id = ? AND tenant_id = ?")
                 .bind(user_id.to_string())
+                .bind(tenant_id.to_string())
                 .execute(&mut *transaction)
                 .await?;
             for app_key in &user.granted_apps {
                 sqlx::query(
-                    "INSERT INTO user_app_grants (user_id, app_key)
-                     VALUES (?, ?)
+                    "INSERT INTO user_app_grants (user_id, tenant_id, app_key)
+                     VALUES (?, ?, ?)
                      ON CONFLICT(user_id, app_key) DO NOTHING",
                 )
                 .bind(user_id.to_string())
+                .bind(tenant_id.to_string())
                 .bind(app_key)
                 .execute(&mut *transaction)
                 .await?;
@@ -919,17 +947,19 @@ async fn update_management_user(
             .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
-            sqlx::query("DELETE FROM user_app_grants WHERE user_id = $1")
+            sqlx::query("DELETE FROM user_app_grants WHERE user_id = $1 AND tenant_id = $2")
                 .bind(user_id)
+                .bind(tenant_id)
                 .execute(&mut *transaction)
                 .await?;
             for app_key in &user.granted_apps {
                 sqlx::query(
-                    "INSERT INTO user_app_grants (user_id, app_key)
-                     VALUES ($1, $2)
+                    "INSERT INTO user_app_grants (user_id, tenant_id, app_key)
+                     VALUES ($1, $2, $3)
                      ON CONFLICT(user_id, app_key) DO NOTHING",
                 )
                 .bind(user_id)
+                .bind(tenant_id)
                 .bind(app_key)
                 .execute(&mut *transaction)
                 .await?;
@@ -1124,7 +1154,7 @@ async fn sqlite_management_user_from_row(
         .map_err(|_| ManagementUserError::InvalidStoredUserId)?;
     let tenant_id = Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
         .map_err(|_| ManagementUserError::InvalidStoredUserId)?;
-    let granted_apps = sqlite_management_user_grants(pool, id).await?;
+    let granted_apps = sqlite_management_user_grants(pool, id, tenant_id).await?;
     management_user_from_parts(
         id,
         tenant_id,
@@ -1139,14 +1169,16 @@ async fn sqlite_management_user_from_row(
 async fn sqlite_management_user_grants(
     pool: &sqlx::SqlitePool,
     user_id: Uuid,
+    tenant_id: Uuid,
 ) -> Result<Vec<String>, ManagementUserError> {
     sqlx::query_scalar(
         "SELECT app_key
          FROM user_app_grants
-         WHERE user_id = ?
+         WHERE user_id = ? AND tenant_id = ?
          ORDER BY app_key",
     )
     .bind(user_id.to_string())
+    .bind(tenant_id.to_string())
     .fetch_all(pool)
     .await
     .map_err(ManagementUserError::from)
@@ -1158,7 +1190,7 @@ async fn timescale_management_user_from_row(
 ) -> Result<ManagementUser, ManagementUserError> {
     let id = row.try_get("id")?;
     let tenant_id = row.try_get("tenant_id")?;
-    let granted_apps = timescale_management_user_grants(pool, id).await?;
+    let granted_apps = timescale_management_user_grants(pool, id, tenant_id).await?;
     management_user_from_parts(
         id,
         tenant_id,
@@ -1173,14 +1205,16 @@ async fn timescale_management_user_from_row(
 async fn timescale_management_user_grants(
     pool: &sqlx::PgPool,
     user_id: Uuid,
+    tenant_id: Uuid,
 ) -> Result<Vec<String>, ManagementUserError> {
     sqlx::query_scalar(
         "SELECT app_key
          FROM user_app_grants
-         WHERE user_id = $1
+         WHERE user_id = $1 AND tenant_id = $2
          ORDER BY app_key",
     )
     .bind(user_id)
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .map_err(ManagementUserError::from)
@@ -2133,11 +2167,14 @@ async fn validate_sqlite_asset_references(
     parent_asset_id: Option<Uuid>,
 ) -> Result<(), ManagementAssetError> {
     if let Some(asset_profile_id) = asset_profile_id {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM asset_profiles WHERE id = ?")
-            .bind(asset_profile_id.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some();
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM asset_profiles WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(asset_profile_id.to_string())
+        .bind(tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some();
         if !exists {
             return Err(ManagementAssetError::AssetProfileUnavailable(
                 asset_profile_id,
@@ -2169,9 +2206,12 @@ async fn validate_timescale_asset_references(
 ) -> Result<(), ManagementAssetError> {
     if let Some(asset_profile_id) = asset_profile_id {
         let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM asset_profiles WHERE id = $1)",
+            "SELECT EXISTS(
+                SELECT 1 FROM asset_profiles WHERE id = $1 AND tenant_id = $2
+             )",
         )
         .bind(asset_profile_id)
+        .bind(tenant_id)
         .fetch_one(&mut **transaction)
         .await?;
         if !exists {
@@ -2857,11 +2897,14 @@ async fn validate_sqlite_references(
         }
     }
     if let Some(device_profile_id) = device_profile_id {
-        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM device_profiles WHERE id = ?")
-            .bind(device_profile_id.to_string())
-            .fetch_optional(&mut **transaction)
-            .await?
-            .is_some();
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM device_profiles WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(device_profile_id.to_string())
+        .bind(tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some();
         if !exists {
             return Err(ManagementDeviceError::DeviceProfileUnavailable(
                 device_profile_id,
@@ -2891,9 +2934,12 @@ async fn validate_timescale_references(
     }
     if let Some(device_profile_id) = device_profile_id {
         let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM device_profiles WHERE id = $1)",
+            "SELECT EXISTS(
+                SELECT 1 FROM device_profiles WHERE id = $1 AND tenant_id = $2
+             )",
         )
         .bind(device_profile_id)
+        .bind(tenant_id)
         .fetch_one(&mut **transaction)
         .await?;
         if !exists {
@@ -3468,14 +3514,17 @@ fn sqlite_device_token_timestamp(
 
 async fn list_management_device_profiles(
     store: &PlatformStore,
+    tenant_id: Uuid,
 ) -> Result<Vec<ManagementDeviceProfile>, ManagementDeviceProfileError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let rows = sqlx::query(
                 "SELECT id, name, telemetry_schema, metric_mapping, reporting_settings
                  FROM device_profiles
+                 WHERE tenant_id = ?
                  ORDER BY name, id",
             )
+            .bind(tenant_id.to_string())
             .fetch_all(store.pool())
             .await?;
             rows.into_iter()
@@ -3486,8 +3535,10 @@ async fn list_management_device_profiles(
             let rows = sqlx::query(
                 "SELECT id, name, telemetry_schema, metric_mapping, reporting_settings
                  FROM device_profiles
+                 WHERE tenant_id = $1
                  ORDER BY name, id",
             )
+            .bind(tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter()
@@ -3499,6 +3550,7 @@ async fn list_management_device_profiles(
 
 async fn create_management_device_profile(
     store: &PlatformStore,
+    tenant_id: Uuid,
     profile: CreateManagementDeviceProfile,
 ) -> Result<ManagementDeviceProfile, ManagementDeviceProfileError> {
     let profile = validate_management_device_profile(
@@ -3512,10 +3564,11 @@ async fn create_management_device_profile(
         PlatformStore::Sqlite(store) => {
             sqlx::query(
                 "INSERT INTO device_profiles (
-                    id, name, telemetry_schema, metric_mapping, reporting_settings, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, ?)",
+                    id, tenant_id, name, telemetry_schema, metric_mapping, reporting_settings, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(profile.id.to_string())
+            .bind(tenant_id.to_string())
             .bind(&profile.name)
             .bind(profile.telemetry_schema.to_string())
             .bind(profile.metric_mapping.to_string())
@@ -3528,10 +3581,11 @@ async fn create_management_device_profile(
         PlatformStore::Timescale(pool) => {
             sqlx::query(
                 "INSERT INTO device_profiles (
-                    id, name, telemetry_schema, metric_mapping, reporting_settings
-                 ) VALUES ($1, $2, $3, $4, $5)",
+                    id, tenant_id, name, telemetry_schema, metric_mapping, reporting_settings
+                 ) VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(profile.id)
+            .bind(tenant_id)
             .bind(&profile.name)
             .bind(Json(profile.telemetry_schema.clone()))
             .bind(Json(profile.metric_mapping.clone()))
@@ -3546,6 +3600,7 @@ async fn create_management_device_profile(
 
 async fn update_management_device_profile(
     store: &PlatformStore,
+    tenant_id: Uuid,
     profile_id: Uuid,
     profile: UpdateManagementDeviceProfile,
 ) -> Result<ManagementDeviceProfile, ManagementDeviceProfileError> {
@@ -3561,7 +3616,7 @@ async fn update_management_device_profile(
             "UPDATE device_profiles
                  SET name = ?, telemetry_schema = ?, metric_mapping = ?,
                      reporting_settings = ?, updated_at = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND tenant_id = ?",
         )
         .bind(&profile.name)
         .bind(profile.telemetry_schema.to_string())
@@ -3569,6 +3624,7 @@ async fn update_management_device_profile(
         .bind(profile.reporting_settings.to_string())
         .bind(Utc::now().to_rfc3339())
         .bind(profile.id.to_string())
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await
         .map_err(|error| map_management_device_profile_conflict(error, &profile.name))?
@@ -3577,13 +3633,14 @@ async fn update_management_device_profile(
             "UPDATE device_profiles
                  SET name = $2, telemetry_schema = $3, metric_mapping = $4,
                      reporting_settings = $5, updated_at = now()
-                 WHERE id = $1",
+                 WHERE id = $1 AND tenant_id = $6",
         )
         .bind(profile.id)
         .bind(&profile.name)
         .bind(Json(profile.telemetry_schema.clone()))
         .bind(Json(profile.metric_mapping.clone()))
         .bind(Json(profile.reporting_settings.clone()))
+        .bind(tenant_id)
         .execute(pool)
         .await
         .map_err(|error| map_management_device_profile_conflict(error, &profile.name))?
@@ -3597,16 +3654,20 @@ async fn update_management_device_profile(
 
 async fn delete_management_device_profile(
     store: &PlatformStore,
+    tenant_id: Uuid,
     profile_id: Uuid,
 ) -> Result<(), ManagementDeviceProfileError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
-            let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM device_profiles WHERE id = ?")
-                .bind(profile_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
-                .is_some();
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM device_profiles WHERE id = ? AND tenant_id = ?",
+            )
+            .bind(profile_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some();
             if !exists {
                 return Err(ManagementDeviceProfileError::DeviceProfileNotFound);
             }
@@ -3614,10 +3675,11 @@ async fn delete_management_device_profile(
                 "SELECT EXISTS(
                     SELECT 1
                     FROM devices
-                    WHERE device_profile_id = ? AND deleted_at IS NULL
+                    WHERE device_profile_id = ? AND tenant_id = ? AND deleted_at IS NULL
                  )",
             )
             .bind(profile_id.to_string())
+            .bind(tenant_id.to_string())
             .fetch_one(&mut *transaction)
             .await?
                 != 0;
@@ -3627,13 +3689,15 @@ async fn delete_management_device_profile(
             sqlx::query(
                 "UPDATE devices
                  SET device_profile_id = NULL
-                 WHERE device_profile_id = ? AND deleted_at IS NOT NULL",
+                 WHERE device_profile_id = ? AND tenant_id = ? AND deleted_at IS NOT NULL",
             )
             .bind(profile_id.to_string())
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
-            sqlx::query("DELETE FROM device_profiles WHERE id = ?")
+            sqlx::query("DELETE FROM device_profiles WHERE id = ? AND tenant_id = ?")
                 .bind(profile_id.to_string())
+                .bind(tenant_id.to_string())
                 .execute(&mut *transaction)
                 .await?;
             transaction.commit().await?;
@@ -3644,9 +3708,10 @@ async fn delete_management_device_profile(
                 .execute(&mut *transaction)
                 .await?;
             let exists = sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM device_profiles WHERE id = $1 FOR UPDATE",
+                "SELECT id FROM device_profiles WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
             )
             .bind(profile_id)
+            .bind(tenant_id)
             .fetch_optional(&mut *transaction)
             .await?
             .is_some();
@@ -3657,10 +3722,11 @@ async fn delete_management_device_profile(
                 "SELECT EXISTS(
                     SELECT 1
                     FROM devices
-                    WHERE device_profile_id = $1 AND deleted_at IS NULL
+                    WHERE device_profile_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
                  )",
             )
             .bind(profile_id)
+            .bind(tenant_id)
             .fetch_one(&mut *transaction)
             .await?;
             if referenced {
@@ -3669,13 +3735,15 @@ async fn delete_management_device_profile(
             sqlx::query(
                 "UPDATE devices
                  SET device_profile_id = NULL
-                 WHERE device_profile_id = $1 AND deleted_at IS NOT NULL",
+                 WHERE device_profile_id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL",
             )
             .bind(profile_id)
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
-            sqlx::query("DELETE FROM device_profiles WHERE id = $1")
+            sqlx::query("DELETE FROM device_profiles WHERE id = $1 AND tenant_id = $2")
                 .bind(profile_id)
+                .bind(tenant_id)
                 .execute(&mut *transaction)
                 .await?;
             transaction.commit().await?;
@@ -3722,14 +3790,17 @@ fn timescale_management_device_profile_from_row(
 
 async fn list_management_asset_profiles(
     store: &PlatformStore,
+    tenant_id: Uuid,
 ) -> Result<Vec<ManagementAssetProfile>, ManagementAssetProfileError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let rows = sqlx::query(
                 "SELECT id, name, fields, dashboard_defaults
                  FROM asset_profiles
+                 WHERE tenant_id = ?
                  ORDER BY name, id",
             )
+            .bind(tenant_id.to_string())
             .fetch_all(store.pool())
             .await?;
             rows.into_iter()
@@ -3740,8 +3811,10 @@ async fn list_management_asset_profiles(
             let rows = sqlx::query(
                 "SELECT id, name, fields, dashboard_defaults
                  FROM asset_profiles
+                 WHERE tenant_id = $1
                  ORDER BY name, id",
             )
+            .bind(tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter()
@@ -3753,6 +3826,7 @@ async fn list_management_asset_profiles(
 
 async fn create_management_asset_profile(
     store: &PlatformStore,
+    tenant_id: Uuid,
     profile: CreateManagementAssetProfile,
 ) -> Result<ManagementAssetProfile, ManagementAssetProfileError> {
     let profile = validate_management_asset_profile(
@@ -3764,10 +3838,12 @@ async fn create_management_asset_profile(
     match store {
         PlatformStore::Sqlite(store) => {
             sqlx::query(
-                "INSERT INTO asset_profiles (id, name, fields, dashboard_defaults, updated_at)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO asset_profiles (
+                    id, tenant_id, name, fields, dashboard_defaults, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(profile.id.to_string())
+            .bind(tenant_id.to_string())
             .bind(&profile.name)
             .bind(profile.fields.to_string())
             .bind(profile.dashboard_defaults.to_string())
@@ -3778,10 +3854,11 @@ async fn create_management_asset_profile(
         }
         PlatformStore::Timescale(pool) => {
             sqlx::query(
-                "INSERT INTO asset_profiles (id, name, fields, dashboard_defaults)
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO asset_profiles (id, tenant_id, name, fields, dashboard_defaults)
+                 VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(profile.id)
+            .bind(tenant_id)
             .bind(&profile.name)
             .bind(Json(profile.fields.clone()))
             .bind(Json(profile.dashboard_defaults.clone()))
@@ -3795,6 +3872,7 @@ async fn create_management_asset_profile(
 
 async fn update_management_asset_profile(
     store: &PlatformStore,
+    tenant_id: Uuid,
     profile_id: Uuid,
     profile: UpdateManagementAssetProfile,
 ) -> Result<ManagementAssetProfile, ManagementAssetProfileError> {
@@ -3808,13 +3886,14 @@ async fn update_management_asset_profile(
         PlatformStore::Sqlite(store) => sqlx::query(
             "UPDATE asset_profiles
                  SET name = ?, fields = ?, dashboard_defaults = ?, updated_at = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND tenant_id = ?",
         )
         .bind(&profile.name)
         .bind(profile.fields.to_string())
         .bind(profile.dashboard_defaults.to_string())
         .bind(Utc::now().to_rfc3339())
         .bind(profile.id.to_string())
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await
         .map_err(|error| map_management_asset_profile_conflict(error, &profile.name))?
@@ -3822,12 +3901,13 @@ async fn update_management_asset_profile(
         PlatformStore::Timescale(pool) => sqlx::query(
             "UPDATE asset_profiles
                  SET name = $2, fields = $3, dashboard_defaults = $4, updated_at = now()
-                 WHERE id = $1",
+                 WHERE id = $1 AND tenant_id = $5",
         )
         .bind(profile.id)
         .bind(&profile.name)
         .bind(Json(profile.fields.clone()))
         .bind(Json(profile.dashboard_defaults.clone()))
+        .bind(tenant_id)
         .execute(pool)
         .await
         .map_err(|error| map_management_asset_profile_conflict(error, &profile.name))?
@@ -3841,31 +3921,41 @@ async fn update_management_asset_profile(
 
 async fn delete_management_asset_profile(
     store: &PlatformStore,
+    tenant_id: Uuid,
     profile_id: Uuid,
 ) -> Result<(), ManagementAssetProfileError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
-            let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM asset_profiles WHERE id = ?")
-                .bind(profile_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
-                .is_some();
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM asset_profiles WHERE id = ? AND tenant_id = ?",
+            )
+            .bind(profile_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some();
             if !exists {
                 return Err(ManagementAssetProfileError::AssetProfileNotFound);
             }
             let referenced = sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_profile_id = ?)",
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM assets
+                    WHERE asset_profile_id = ? AND tenant_id = ?
+                 )",
             )
             .bind(profile_id.to_string())
+            .bind(tenant_id.to_string())
             .fetch_one(&mut *transaction)
             .await?
                 != 0;
             if referenced {
                 return Err(ManagementAssetProfileError::AssetProfileInUse(profile_id));
             }
-            sqlx::query("DELETE FROM asset_profiles WHERE id = ?")
+            sqlx::query("DELETE FROM asset_profiles WHERE id = ? AND tenant_id = ?")
                 .bind(profile_id.to_string())
+                .bind(tenant_id.to_string())
                 .execute(&mut *transaction)
                 .await?;
             transaction.commit().await?;
@@ -3876,9 +3966,10 @@ async fn delete_management_asset_profile(
                 .execute(&mut *transaction)
                 .await?;
             let exists = sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM asset_profiles WHERE id = $1 FOR UPDATE",
+                "SELECT id FROM asset_profiles WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
             )
             .bind(profile_id)
+            .bind(tenant_id)
             .fetch_optional(&mut *transaction)
             .await?
             .is_some();
@@ -3886,16 +3977,22 @@ async fn delete_management_asset_profile(
                 return Err(ManagementAssetProfileError::AssetProfileNotFound);
             }
             let referenced = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_profile_id = $1)",
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM assets
+                    WHERE asset_profile_id = $1 AND tenant_id = $2
+                 )",
             )
             .bind(profile_id)
+            .bind(tenant_id)
             .fetch_one(&mut *transaction)
             .await?;
             if referenced {
                 return Err(ManagementAssetProfileError::AssetProfileInUse(profile_id));
             }
-            sqlx::query("DELETE FROM asset_profiles WHERE id = $1")
+            sqlx::query("DELETE FROM asset_profiles WHERE id = $1 AND tenant_id = $2")
                 .bind(profile_id)
+                .bind(tenant_id)
                 .execute(&mut *transaction)
                 .await?;
             transaction.commit().await?;
