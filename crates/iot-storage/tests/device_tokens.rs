@@ -7,7 +7,7 @@ use iot_storage::{
     ManagementDeviceRepository, ManagementDeviceTopology, NewDeviceToken, NewOwnedDeviceToken,
     PlatformStore, UpdateManagementDevice,
 };
-use sqlx::{Connection, PgConnection};
+use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use uuid::Uuid;
 
 mod common;
@@ -411,6 +411,140 @@ async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_m
         assert_eq!(history[0].id, token_id);
         assert!(history[0].revoked_at.is_none());
     }
+}
+
+#[tokio::test]
+async fn sqlite_management_token_revocations_require_tenant_after_post_mutation_change() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = provisioning_tenant_id();
+    let other_tenant_id = Uuid::from_u128(10_009);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'post-mutation-other', 'active')",
+    )
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway) VALUES
+             ('post-mutation-gateway', ?, 1),
+             ('post-mutation-topology', ?, 0),
+             ('post-mutation-delete', ?, 0)",
+    )
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let topology_token = DeviceTokenRepository::create_device_token(
+        &store,
+        tenant_id,
+        "post-mutation-topology",
+        token("post-mutation-topology-token"),
+    )
+    .await
+    .unwrap();
+    let deleted_token = DeviceTokenRepository::create_device_token(
+        &store,
+        tenant_id,
+        "post-mutation-delete",
+        token("post-mutation-delete-token"),
+    )
+    .await
+    .unwrap();
+
+    let topology_trigger = format!(
+        "CREATE TRIGGER move_post_mutation_topology_to_other_tenant
+         AFTER UPDATE OF gateway_device_id ON devices
+         WHEN NEW.device_id = 'post-mutation-topology' AND NEW.tenant_id = '{tenant_id}'
+         BEGIN
+             UPDATE devices
+             SET tenant_id = '{other_tenant_id}', gateway_device_id = NULL
+             WHERE device_id = 'post-mutation-topology';
+         END",
+    );
+    sqlx::query(AssertSqlSafe(topology_trigger))
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ManagementDeviceRepository::update_management_device(
+            &store,
+            tenant_id,
+            "post-mutation-topology",
+            UpdateManagementDevice {
+                display_name: "Post-mutation topology".to_owned(),
+                asset_id: None,
+                device_profile_id: None,
+                attributes: None,
+                topology: Some(ManagementDeviceTopology {
+                    is_gateway: false,
+                    gateway_device_id: Some("post-mutation-gateway".to_owned()),
+                }),
+            },
+        )
+        .await
+        .unwrap_err(),
+        ManagementDeviceError::DeviceNotFound
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT tenant_id FROM devices WHERE device_id = 'post-mutation-topology'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        other_tenant_id.to_string()
+    );
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT revoked_at FROM device_tokens WHERE id = ?",
+        )
+        .bind(topology_token.id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    let delete_trigger = format!(
+        "CREATE TRIGGER move_post_mutation_delete_to_other_tenant
+         AFTER UPDATE OF deleted_at ON devices
+         WHEN NEW.device_id = 'post-mutation-delete' AND NEW.tenant_id = '{tenant_id}'
+         BEGIN
+             UPDATE devices
+             SET tenant_id = '{other_tenant_id}'
+             WHERE device_id = 'post-mutation-delete';
+         END",
+    );
+    sqlx::query(AssertSqlSafe(delete_trigger))
+        .execute(pool)
+        .await
+        .unwrap();
+    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "post-mutation-delete")
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT deleted_at FROM devices WHERE device_id = 'post-mutation-delete'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT revoked_at FROM device_tokens WHERE id = ?",
+        )
+        .bind(deleted_token.id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[tokio::test]
