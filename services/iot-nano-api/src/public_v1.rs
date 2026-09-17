@@ -12,8 +12,8 @@ use chrono::Utc;
 use iot_core::RpcMode;
 use iot_storage::{
     AccountClass, AuthorizationRepository, NewPublicAsset, NewPublicDevice, NewPublicResourceGrant,
-    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicDevice, PublicDeviceError,
-    PublicPrincipal, PublicResourceGrant, PublicTelemetry, ResourcePermission,
+    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice,
+    PublicDeviceError, PublicPrincipal, PublicResourceGrant, PublicTelemetry, ResourcePermission,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -396,7 +396,7 @@ async fn create_asset(
         },
     )
     .await
-    .map_err(|_| PublicApiError::Unavailable)?;
+    .map_err(public_asset_error)?;
     Ok((axum::http::StatusCode::CREATED, Json(asset_response(asset))))
 }
 
@@ -431,7 +431,7 @@ async fn update_asset(
         },
     )
     .await
-    .map_err(|_| PublicApiError::Unavailable)?
+    .map_err(public_asset_error)?
     .ok_or(PublicApiError::Forbidden)?;
     Ok(Json(asset_response(asset)))
 }
@@ -668,6 +668,13 @@ fn public_device_error(error: PublicDeviceError) -> PublicApiError {
             PublicApiError::Conflict
         }
         PublicDeviceError::Storage { .. } => PublicApiError::Unavailable,
+    }
+}
+
+fn public_asset_error(error: PublicAssetError) -> PublicApiError {
+    match error {
+        PublicAssetError::AssetProfileUnavailable(_) => PublicApiError::Conflict,
+        PublicAssetError::Storage { .. } => PublicApiError::Unavailable,
     }
 }
 
@@ -1174,6 +1181,7 @@ async fn create_command(
     let record = facade
         .create_command(CoreCommandCreateRequest {
             id: command_id,
+            tenant_id: principal.tenant_id,
             device_id,
             method: request.method,
             params: request.params,
@@ -1201,12 +1209,15 @@ async fn get_command(
         .as_ref()
         .ok_or(PublicApiError::Unavailable)?;
     let record = facade
-        .get_command(command_id)
+        .get_command(principal.tenant_id, command_id)
         .await
         .map_err(|error| match error {
             CoreFacadeError::NotFound => PublicApiError::Forbidden,
             other => public_command_error(other),
         })?;
+    if record.tenant_id != principal.tenant_id {
+        return Err(PublicApiError::Forbidden);
+    }
     if !PublicApiRepository::public_device_permission(store.as_ref(), &principal, &record.device_id)
         .await
         .map_err(|_| PublicApiError::Unavailable)?

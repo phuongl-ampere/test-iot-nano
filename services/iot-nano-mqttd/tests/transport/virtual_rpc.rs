@@ -14,6 +14,8 @@ use tokio::{io::duplex, sync::Mutex};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 #[derive(Clone)]
 struct StaticAuthenticator;
 
@@ -29,6 +31,7 @@ impl DeviceAuthenticator for StaticAuthenticator {
             }
             Ok(AuthenticatedDevice {
                 token_id: Uuid::now_v7(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "device-a".to_owned(),
                 is_gateway: false,
             })
@@ -51,6 +54,7 @@ impl DeviceAuthenticator for StaticGatewayAuthenticator {
             }
             Ok(AuthenticatedDevice {
                 token_id: Uuid::now_v7(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "gateway-a".to_owned(),
                 is_gateway: true,
             })
@@ -214,7 +218,7 @@ async fn token_authenticated_device_receives_virtual_me_rpc_and_acknowledges_it(
     let router_for_publish = router.clone();
     let publication = tokio::spawn(async move {
         router_for_publish
-            .publish_to_device("device-a", request)
+            .publish_to_device(TEST_TENANT_ID, "device-a", request)
             .await
     });
     let publish = match client.next().await.unwrap().unwrap() {
@@ -304,7 +308,7 @@ async fn gateway_session_receives_child_command_on_the_gateway_virtual_topic() {
     let router_for_publish = router.clone();
     let publication = tokio::spawn(async move {
         router_for_publish
-            .publish_to_device("gateway-a", request)
+            .publish_to_device(TEST_TENANT_ID, "gateway-a", request)
             .await
     });
     let publish = match client.next().await.unwrap().unwrap() {
@@ -381,7 +385,7 @@ async fn two_way_response_is_forwarded_only_after_the_matching_virtual_rpc_is_pu
     let publication_router = router.clone();
     let publication = tokio::spawn(async move {
         publication_router
-            .publish_to_device("device-a", request)
+            .publish_to_device(TEST_TENANT_ID, "device-a", request)
             .await
     });
     let command = match client.next().await.unwrap().unwrap() {
@@ -410,6 +414,7 @@ async fn two_way_response_is_forwarded_only_after_the_matching_virtual_rpc_is_pu
     let forwarded = responses.responses.lock().await;
     assert_eq!(forwarded.len(), 1);
     assert_eq!(forwarded[0].command_id, command_id);
+    assert_eq!(forwarded[0].tenant_id, TEST_TENANT_ID);
     assert_eq!(forwarded[0].device_id, "device-a");
     assert_eq!(
         forwarded[0].response,

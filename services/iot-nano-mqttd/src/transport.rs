@@ -330,6 +330,7 @@ impl RpcSessionRouter {
 
     pub async fn publish_to_device(
         &self,
+        tenant_id: Uuid,
         device_id: &str,
         request: RpcRequest,
     ) -> Result<(), SessionError> {
@@ -337,11 +338,13 @@ impl RpcSessionRouter {
             .active_snapshot(device_id)
             .await
             .ok_or(SessionError::DeviceOffline)?;
-        self.publish_to_snapshot(&snapshot, request).await
+        self.publish_to_snapshot(tenant_id, &snapshot, request)
+            .await
     }
 
     pub async fn publish_to_snapshot(
         &self,
+        tenant_id: Uuid,
         snapshot: &SessionSnapshot,
         request: RpcRequest,
     ) -> Result<(), SessionError> {
@@ -350,7 +353,9 @@ impl RpcSessionRouter {
             let (sender, lifecycle) = state
                 .sessions
                 .get(&snapshot.registration.device_id)
-                .filter(|session| snapshot.matches(session))
+                .filter(|session| {
+                    snapshot.matches(session) && session.registration.tenant_id == tenant_id
+                })
                 .map(|session| (session.sender.clone(), Arc::clone(&session.lifecycle)))
                 .ok_or(SessionError::SessionUnavailable)?;
             if !lifecycle.is_active() {
@@ -359,7 +364,7 @@ impl RpcSessionRouter {
             let pending = if request.mode == RpcMode::TwoWay {
                 let pending = PendingRpcResponse {
                     command_id: request.id,
-                    tenant_id: snapshot.registration.tenant_id,
+                    tenant_id,
                     device_id: snapshot.registration.device_id.clone(),
                     token_id: snapshot.registration.token_id,
                     connection_id: snapshot.registration.connection_id.clone(),
@@ -468,6 +473,7 @@ pub struct TransportUplink {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TransportRpcResponse {
     pub command_id: Uuid,
+    pub tenant_id: Uuid,
     pub device_id: String,
     pub token_id: Uuid,
     pub response: serde_json::Value,
@@ -829,6 +835,7 @@ impl MqttdDeviceTransport {
                                     .rpc_response_forwarder
                                     .forward_response(TransportRpcResponse {
                                         command_id,
+                                        tenant_id: pending.tenant_id,
                                         device_id: device.device_id.clone(),
                                         token_id: device.token_id,
                                         response,
@@ -992,6 +999,7 @@ impl MqttdDeviceTransport {
                             .rpc_response_forwarder
                             .forward_response(TransportRpcResponse {
                                 command_id,
+                                tenant_id: pending_response.tenant_id,
                                 device_id: device.device_id.clone(),
                                 token_id: device.token_id,
                                 response,

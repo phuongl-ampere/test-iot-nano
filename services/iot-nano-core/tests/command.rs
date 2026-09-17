@@ -443,6 +443,58 @@ async fn platform_dispatcher_claims_and_publishes_through_the_platform_store() {
 }
 
 #[tokio::test]
+async fn platform_dispatcher_derives_and_forwards_each_command_tenant() {
+    let (_directory, store) = platform_store().await;
+    let tenant_b = Uuid::from_u128(2);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'command-dispatcher-b', 'active', '{}')",
+    )
+    .bind(tenant_b.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    store.register_device(tenant_b, "device-b").await.unwrap();
+    let now = Utc::now();
+
+    for (tenant_id, device_id) in [(TEST_TENANT_ID, "device-a"), (tenant_b, "device-b")] {
+        store
+            .enqueue_command(PlatformCommand {
+                id: Uuid::now_v7().to_string(),
+                tenant_id,
+                device_id: device_id.to_owned(),
+                method: "sample_now".to_owned(),
+                params: "{}".to_owned(),
+                mode: RpcMode::OneWay,
+                expires_at: now + Duration::seconds(30),
+                next_attempt_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
+    let transport = RecordingTransport::succeeds();
+    let result = PlatformCommandDispatcher::new(Arc::new(store), transport.clone(), 10)
+        .dispatch_once(now)
+        .await
+        .unwrap();
+
+    assert_eq!(result.claimed, 2);
+    assert_eq!(result.published, 2);
+    let requests = transport.requests.lock().await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.tenant_id == TEST_TENANT_ID && request.device_id == "device-a")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.tenant_id == tenant_b && request.device_id == "device-b")
+    );
+}
+
+#[tokio::test]
 async fn platform_dispatcher_releases_unavailable_commands_for_retry() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();

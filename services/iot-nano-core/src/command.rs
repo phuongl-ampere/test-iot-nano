@@ -18,6 +18,7 @@ const COMMAND_LEASE_DURATION: Duration = Duration::seconds(30);
 const COMMAND_RETRY_DELAY: Duration = Duration::seconds(1);
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TransportRpcPublishRequest {
+    pub tenant_id: Uuid,
     pub device_id: String,
     pub id: Uuid,
     pub method: String,
@@ -79,6 +80,7 @@ pub enum CommandError {
 #[derive(Clone)]
 pub struct SqliteCommandDispatcher<C> {
     store: CoreSqliteStore,
+    tenant_id: Uuid,
     transport: C,
     batch_size: u32,
 }
@@ -87,9 +89,10 @@ impl<C> SqliteCommandDispatcher<C>
 where
     C: CommandTransport,
 {
-    pub fn new(store: CoreSqliteStore, transport: C, batch_size: u32) -> Self {
+    pub fn new(store: CoreSqliteStore, tenant_id: Uuid, transport: C, batch_size: u32) -> Self {
         Self {
             store,
+            tenant_id,
             transport,
             batch_size: batch_size.max(1),
         }
@@ -100,12 +103,17 @@ where
         now: DateTime<Utc>,
     ) -> Result<CommandDispatchResult, CommandError> {
         let mut result = CommandDispatchResult {
-            expired: self.store.expire_commands(now).await?.len(),
+            expired: self.store.expire_commands(self.tenant_id, now).await?.len(),
             ..CommandDispatchResult::default()
         };
         let commands = self
             .store
-            .claim_commands(now, now + COMMAND_LEASE_DURATION, self.batch_size)
+            .claim_commands(
+                self.tenant_id,
+                now,
+                now + COMMAND_LEASE_DURATION,
+                self.batch_size,
+            )
             .await?;
         result.claimed = commands.len();
 
@@ -119,6 +127,7 @@ where
 #[derive(Clone)]
 pub struct CommandDispatcher<C> {
     pool: PgPool,
+    tenant_id: Uuid,
     transport: C,
     batch_size: u32,
 }
@@ -127,9 +136,10 @@ impl<C> CommandDispatcher<C>
 where
     C: CommandTransport,
 {
-    pub fn new(pool: PgPool, transport: C, batch_size: u32) -> Self {
+    pub fn new(pool: PgPool, tenant_id: Uuid, transport: C, batch_size: u32) -> Self {
         Self {
             pool,
+            tenant_id,
             transport,
             batch_size: batch_size.max(1),
         }
@@ -140,11 +150,12 @@ where
         now: DateTime<Utc>,
     ) -> Result<CommandDispatchResult, CommandError> {
         let mut result = CommandDispatchResult {
-            expired: expire_postgres_commands(&self.pool, now).await? as usize,
+            expired: expire_postgres_commands(&self.pool, self.tenant_id, now).await? as usize,
             ..CommandDispatchResult::default()
         };
         let commands = claim_postgres_commands(
             &self.pool,
+            self.tenant_id,
             now,
             now + COMMAND_LEASE_DURATION,
             self.batch_size,
@@ -182,24 +193,27 @@ where
         &self,
         now: DateTime<Utc>,
     ) -> Result<CommandDispatchResult, CommandError> {
-        let mut result = CommandDispatchResult {
-            expired: CommandLifecycleRepository::expire_commands(self.store.as_ref(), now)
-                .await?
-                .len(),
-            ..CommandDispatchResult::default()
-        };
-        let commands = CommandLifecycleRepository::claim_commands(
-            self.store.as_ref(),
-            now,
-            now + COMMAND_LEASE_DURATION,
-            self.batch_size,
-        )
-        .await?;
-        result.claimed = commands.len();
+        let mut result = CommandDispatchResult::default();
+        for tenant_id in self.store.command_tenants_with_open_commands().await? {
+            result.expired +=
+                CommandLifecycleRepository::expire_commands(self.store.as_ref(), tenant_id, now)
+                    .await?
+                    .len();
+            let commands = CommandLifecycleRepository::claim_commands(
+                self.store.as_ref(),
+                tenant_id,
+                now,
+                now + COMMAND_LEASE_DURATION,
+                self.batch_size,
+            )
+            .await?;
+            result.claimed += commands.len();
 
-        for record in commands {
-            let command = PlatformClaimedCommand::from_record(record);
-            dispatch_platform_command(&self.store, &self.transport, &command, &mut result).await?;
+            for record in commands {
+                let command = PlatformClaimedCommand::from_record(record);
+                dispatch_platform_command(&self.store, &self.transport, &command, &mut result)
+                    .await?;
+            }
         }
         Ok(result)
     }
@@ -208,6 +222,7 @@ where
 #[derive(Debug, Clone)]
 struct ClaimedCommand {
     id: String,
+    tenant_id: Uuid,
     device_id: String,
     method: String,
     params: String,
@@ -220,6 +235,7 @@ impl From<CommandOutboxRecord> for ClaimedCommand {
     fn from(command: CommandOutboxRecord) -> Self {
         Self {
             id: command.id,
+            tenant_id: command.tenant_id,
             device_id: command.device_id,
             method: command.method,
             params: command.params,
@@ -233,6 +249,7 @@ impl From<CommandOutboxRecord> for ClaimedCommand {
 #[derive(Debug, Clone)]
 struct PlatformClaimedCommand {
     id: String,
+    tenant_id: Uuid,
     device_id: String,
     method: String,
     params: String,
@@ -245,6 +262,7 @@ impl PlatformClaimedCommand {
     fn from_record(command: PlatformCommandOutboxRecord) -> Self {
         Self {
             id: command.id,
+            tenant_id: command.tenant_id,
             device_id: command.device_id,
             method: command.method,
             params: command.params,
@@ -271,6 +289,7 @@ fn platform_command_request(
     )
     .map_err(|error| format!("invalid command request: {error}"))?;
     Ok(TransportRpcPublishRequest {
+        tenant_id: command.tenant_id,
         device_id: command.device_id.clone(),
         id: request.id,
         method: request.method,
@@ -294,13 +313,8 @@ where
         return Ok(false);
     }
 
-    let command_id = match Uuid::parse_str(&command.id) {
-        Ok(command_id) => command_id,
-        Err(_) => {
-            mark_invalid_platform_command_failed(store, command, result).await?;
-            return Ok(false);
-        }
-    };
+    let command_id = Uuid::parse_str(&command.id)
+        .map_err(|_| CommandError::InvalidCommandId(command.id.clone()))?;
     match platform_command_request(command) {
         Ok(request) => match transport.publish(request).await {
             Ok(()) => {
@@ -310,6 +324,7 @@ where
                 }
                 if CommandLifecycleRepository::mark_command_published(
                     store,
+                    command.tenant_id,
                     command_id,
                     completed_at,
                 )
@@ -330,6 +345,7 @@ where
                 ) {
                     let _ = CommandLifecycleRepository::release_command_for_retry(
                         store,
+                        command.tenant_id,
                         command_id,
                         &error.to_string(),
                         Utc::now() + COMMAND_RETRY_DELAY,
@@ -338,6 +354,7 @@ where
                     return Ok(true);
                 } else if CommandLifecycleRepository::mark_command_failed(
                     store,
+                    command.tenant_id,
                     command_id,
                     &error.to_string(),
                 )
@@ -350,34 +367,20 @@ where
             }
         },
         Err(error) => {
-            if CommandLifecycleRepository::mark_command_failed(store, command_id, &error)
-                .await?
-                .is_some()
+            if CommandLifecycleRepository::mark_command_failed(
+                store,
+                command.tenant_id,
+                command_id,
+                &error,
+            )
+            .await?
+            .is_some()
             {
                 result.failed += 1;
             }
             Ok(false)
         }
     }
-}
-
-async fn mark_invalid_platform_command_failed(
-    store: &PlatformStore,
-    command: &PlatformClaimedCommand,
-    result: &mut CommandDispatchResult,
-) -> Result<(), CommandError> {
-    const INVALID_COMMAND_ID_ERROR: &str = "command ID is not a UUID";
-
-    let marked = CommandLifecycleRepository::mark_legacy_command_failed(
-        store,
-        &command.id,
-        INVALID_COMMAND_ID_ERROR,
-    )
-    .await?;
-    if marked.is_some() {
-        result.failed += 1;
-    }
-    Ok(())
 }
 
 async fn expire_platform_command_if_elapsed(
@@ -390,7 +393,7 @@ async fn expire_platform_command_if_elapsed(
         return Ok(false);
     }
 
-    result.expired += CommandLifecycleRepository::expire_commands(store, now)
+    result.expired += CommandLifecycleRepository::expire_commands(store, command.tenant_id, now)
         .await?
         .len();
     Ok(true)
@@ -410,6 +413,7 @@ fn command_request(command: &ClaimedCommand) -> Result<TransportRpcPublishReques
     )
     .map_err(|error| format!("invalid command request: {error}"))?;
     Ok(TransportRpcPublishRequest {
+        tenant_id: command.tenant_id,
         device_id: command.device_id.clone(),
         id: request.id,
         method: request.method,
@@ -441,7 +445,7 @@ where
                     return Ok(());
                 }
                 if store
-                    .mark_command_published(&command.id, completed_at)
+                    .mark_command_published(command.tenant_id, &command.id, completed_at)
                     .await?
                     .is_some()
                 {
@@ -455,6 +459,7 @@ where
                 if retryable_transport_error(&error) {
                     let _ = store
                         .release_command_for_retry(
+                            command.tenant_id,
                             &command.id,
                             &error.to_string(),
                             Utc::now() + COMMAND_RETRY_DELAY,
@@ -463,7 +468,7 @@ where
                     return Ok(());
                 }
                 if store
-                    .mark_command_failed(&command.id, &error.to_string())
+                    .mark_command_failed(command.tenant_id, &command.id, &error.to_string())
                     .await?
                     .is_some()
                 {
@@ -473,7 +478,7 @@ where
         },
         Err(error) => {
             if store
-                .mark_command_failed(&command.id, &error)
+                .mark_command_failed(command.tenant_id, &command.id, &error)
                 .await?
                 .is_some()
             {
@@ -494,7 +499,7 @@ async fn expire_sqlite_command_if_elapsed(
         return Ok(false);
     }
 
-    result.expired += store.expire_commands(now).await?.len();
+    result.expired += store.expire_commands(command.tenant_id, now).await?.len();
     Ok(true)
 }
 
@@ -518,7 +523,14 @@ where
                 if expire_postgres_command_if_elapsed(pool, command, completed_at, result).await? {
                     return Ok(());
                 }
-                if mark_postgres_command_published(pool, &command.id, completed_at).await? {
+                if mark_postgres_command_published(
+                    pool,
+                    command.tenant_id,
+                    &command.id,
+                    completed_at,
+                )
+                .await?
+                {
                     result.published += 1;
                 }
             }
@@ -529,6 +541,7 @@ where
                 if retryable_transport_error(&error) {
                     let _ = release_postgres_command_for_retry(
                         pool,
+                        command.tenant_id,
                         &command.id,
                         &error.to_string(),
                         Utc::now() + COMMAND_RETRY_DELAY,
@@ -536,13 +549,20 @@ where
                     .await?;
                     return Ok(());
                 }
-                if mark_postgres_command_failed(pool, &command.id, &error.to_string()).await? {
+                if mark_postgres_command_failed(
+                    pool,
+                    command.tenant_id,
+                    &command.id,
+                    &error.to_string(),
+                )
+                .await?
+                {
                     result.failed += 1;
                 }
             }
         },
         Err(error) => {
-            if mark_postgres_command_failed(pool, &command.id, &error).await? {
+            if mark_postgres_command_failed(pool, command.tenant_id, &command.id, &error).await? {
                 result.failed += 1;
             }
         }
@@ -560,12 +580,13 @@ async fn expire_postgres_command_if_elapsed(
         return Ok(false);
     }
 
-    result.expired += expire_postgres_commands(pool, now).await? as usize;
+    result.expired += expire_postgres_commands(pool, command.tenant_id, now).await? as usize;
     Ok(true)
 }
 
 async fn claim_postgres_commands(
     pool: &PgPool,
+    tenant_id: Uuid,
     now: DateTime<Utc>,
     lease_until: DateTime<Utc>,
     limit: u32,
@@ -574,24 +595,26 @@ async fn claim_postgres_commands(
         "WITH due AS (
             SELECT id
             FROM command_outbox
-            WHERE expires_at > $1
+            WHERE tenant_id = $1
+              AND expires_at > $2
               AND (
-                  (state = 'queued' AND next_attempt_at <= $1)
-                  OR (state = 'leased' AND lease_until <= $1)
+                  (state = 'queued' AND next_attempt_at <= $2)
+                  OR (state = 'leased' AND lease_until <= $2)
               )
             ORDER BY next_attempt_at, created_at, id
-            LIMIT $2
+            LIMIT $3
             FOR UPDATE SKIP LOCKED
          )
          UPDATE command_outbox AS command
          SET state = 'leased',
-             lease_until = $3,
+             lease_until = $4,
              attempt_count = command.attempt_count + 1
          FROM due
-         WHERE command.id = due.id
-         RETURNING command.id, command.device_id, command.method, command.params,
+         WHERE command.id = due.id AND command.tenant_id = $1
+         RETURNING command.id, command.tenant_id, command.device_id, command.method, command.params,
                    command.mode, command.next_attempt_at, command.expires_at",
     )
+    .bind(tenant_id)
     .bind(now)
     .bind(i64::from(limit))
     .bind(lease_until)
@@ -601,6 +624,7 @@ async fn claim_postgres_commands(
         .map(|row| {
             Ok(ClaimedCommand {
                 id: row.try_get::<Uuid, _>("id")?.to_string(),
+                tenant_id: row.try_get("tenant_id")?,
                 device_id: row.try_get("device_id")?,
                 method: row.try_get("method")?,
                 params: row
@@ -615,17 +639,23 @@ async fn claim_postgres_commands(
         .collect()
 }
 
-async fn expire_postgres_commands(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+async fn expire_postgres_commands(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
     Ok(sqlx::query(
         "UPDATE command_outbox
          SET state = 'expired',
              lease_until = NULL
-         WHERE (
+         WHERE tenant_id = $1
+           AND (
                 state IN ('queued', 'leased')
                 OR (state = 'published_to_broker' AND mode = 'two_way')
                )
-           AND expires_at <= $1",
+           AND expires_at <= $2",
     )
+    .bind(tenant_id)
     .bind(now)
     .execute(pool)
     .await?
@@ -634,6 +664,7 @@ async fn expire_postgres_commands(pool: &PgPool, now: DateTime<Utc>) -> Result<u
 
 async fn mark_postgres_command_published(
     pool: &PgPool,
+    tenant_id: Uuid,
     command_id: &str,
     published_at: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
@@ -645,11 +676,13 @@ async fn mark_postgres_command_published(
              published_at = $1,
              lease_until = NULL
          WHERE id = $2
+           AND tenant_id = $3
            AND state = 'leased'
            AND expires_at > $1",
     )
     .bind(published_at)
     .bind(command_id)
+    .bind(tenant_id)
     .execute(pool)
     .await?
     .rows_affected()
@@ -658,6 +691,7 @@ async fn mark_postgres_command_published(
 
 async fn mark_postgres_command_failed(
     pool: &PgPool,
+    tenant_id: Uuid,
     command_id: &str,
     error: &str,
 ) -> Result<bool, sqlx::Error> {
@@ -669,10 +703,12 @@ async fn mark_postgres_command_failed(
              last_error = $1,
              lease_until = NULL
          WHERE id = $2
+           AND tenant_id = $3
            AND state = 'leased'",
     )
     .bind(error)
     .bind(command_id)
+    .bind(tenant_id)
     .execute(pool)
     .await?
     .rows_affected()
@@ -681,6 +717,7 @@ async fn mark_postgres_command_failed(
 
 async fn release_postgres_command_for_retry(
     pool: &PgPool,
+    tenant_id: Uuid,
     command_id: &str,
     error: &str,
     next_attempt_at: DateTime<Utc>,
@@ -694,12 +731,14 @@ async fn release_postgres_command_for_retry(
              last_error = $2,
              lease_until = NULL
          WHERE id = $3
+           AND tenant_id = $4
            AND state = 'leased'
            AND expires_at > $1",
     )
     .bind(next_attempt_at)
     .bind(error)
     .bind(command_id)
+    .bind(tenant_id)
     .execute(pool)
     .await?
     .rows_affected()

@@ -54,6 +54,7 @@ impl CoreFacade for PlatformCoreFacade {
             let record = store
                 .enqueue_command(NewCommandOutboxEntry {
                     id: command.id.to_string(),
+                    tenant_id: request.tenant_id,
                     device_id,
                     method: command.method,
                     params: command.params.to_string(),
@@ -69,10 +70,11 @@ impl CoreFacade for PlatformCoreFacade {
 
     fn get_command(
         &self,
+        tenant_id: uuid::Uuid,
         id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
         let store = Arc::clone(&self.store);
-        Box::pin(async move { get_command(&store, id).await })
+        Box::pin(async move { get_command(&store, tenant_id, id).await })
     }
 
     fn record_command_response(
@@ -125,6 +127,7 @@ fn core_command_record(record: CommandOutboxRecord) -> Result<CoreCommandRecord,
         .map_err(|_| CoreFacadeError::Unavailable)?;
     Ok(CoreCommandRecord {
         id,
+        tenant_id: record.tenant_id,
         device_id: record.device_id,
         state: command_state_name(record.state).to_owned(),
         expires_at: record.expires_at,
@@ -136,15 +139,17 @@ fn core_command_record(record: CommandOutboxRecord) -> Result<CoreCommandRecord,
 
 async fn get_command(
     store: &PlatformStore,
+    tenant_id: uuid::Uuid,
     id: uuid::Uuid,
 ) -> Result<CoreCommandRecord, CoreFacadeError> {
     if let Some(pool) = store.sqlite_pool() {
         let row = sqlx::query(
-            "SELECT id, device_id, state, expires_at, mode, response, responded_at
+            "SELECT id, tenant_id, device_id, state, expires_at, mode, response, responded_at
              FROM command_outbox
-             WHERE id = ?",
+             WHERE id = ? AND tenant_id = ?",
         )
         .bind(id.to_string())
+        .bind(tenant_id.to_string())
         .fetch_optional(pool)
         .await
         .map_err(|_| CoreFacadeError::Unavailable)?
@@ -153,11 +158,12 @@ async fn get_command(
     }
     let pool = store.timescale_pool().ok_or(CoreFacadeError::Unavailable)?;
     let row = sqlx::query(
-        "SELECT id, device_id, state, expires_at, mode, response, responded_at
+        "SELECT id, tenant_id, device_id, state, expires_at, mode, response, responded_at
          FROM command_outbox
-         WHERE id = $1",
+         WHERE id = $1 AND tenant_id = $2",
     )
     .bind(id)
+    .bind(tenant_id)
     .fetch_optional(pool)
     .await
     .map_err(|_| CoreFacadeError::Unavailable)?
@@ -188,6 +194,11 @@ fn sqlite_command_record(
         .map_err(|_| CoreFacadeError::Unavailable)?;
     Ok(CoreCommandRecord {
         id,
+        tenant_id: uuid::Uuid::parse_str(
+            &row.try_get::<String, _>("tenant_id")
+                .map_err(|_| CoreFacadeError::Unavailable)?,
+        )
+        .map_err(|_| CoreFacadeError::Unavailable)?,
         device_id: row
             .try_get("device_id")
             .map_err(|_| CoreFacadeError::Unavailable)?,
@@ -219,6 +230,9 @@ fn postgres_command_record(
     Ok(CoreCommandRecord {
         id: row
             .try_get("id")
+            .map_err(|_| CoreFacadeError::Unavailable)?,
+        tenant_id: row
+            .try_get("tenant_id")
             .map_err(|_| CoreFacadeError::Unavailable)?,
         device_id: row
             .try_get("device_id")
@@ -284,6 +298,7 @@ async fn record_command_response(
 
     if store
         .mark_command_responded(
+            request.tenant_id,
             request.command_id,
             &request.device_id,
             request.token_id,
@@ -302,6 +317,7 @@ async fn record_command_response(
             "UPDATE command_outbox AS command
              SET state = 'expired', lease_until = NULL
              WHERE command.id = ?
+               AND command.tenant_id = ?
                AND command.device_id = ?
                AND command.mode = 'two_way'
                AND command.state = 'published_to_broker'
@@ -309,12 +325,16 @@ async fn record_command_response(
                AND EXISTS (
                     SELECT 1
                     FROM device_tokens
-                    WHERE id = ?
-                      AND device_id = command.device_id
-                      AND revoked_at IS NULL
+                    JOIN devices ON devices.device_id = device_tokens.device_id
+                    WHERE device_tokens.id = ?
+                      AND device_tokens.device_id = command.device_id
+                      AND devices.tenant_id = command.tenant_id
+                      AND device_tokens.revoked_at IS NULL
+                      AND devices.deleted_at IS NULL
                )",
         )
         .bind(request.command_id.to_string())
+        .bind(request.tenant_id.to_string())
         .bind(&request.device_id)
         .bind(&response_at)
         .bind(request.token_id.to_string())
@@ -334,19 +354,24 @@ async fn record_command_response(
         "UPDATE command_outbox AS command
          SET state = 'expired', lease_until = NULL
          WHERE command.id = $1
-           AND command.device_id = $2
+           AND command.tenant_id = $2
+           AND command.device_id = $3
            AND command.mode = 'two_way'
            AND command.state = 'published_to_broker'
-           AND command.expires_at <= $3
+           AND command.expires_at <= $4
            AND EXISTS (
                 SELECT 1
                 FROM device_tokens
-                WHERE id = $4
-                  AND device_id = command.device_id
-                  AND revoked_at IS NULL
+                JOIN devices ON devices.device_id = device_tokens.device_id
+                WHERE device_tokens.id = $5
+                  AND device_tokens.device_id = command.device_id
+                  AND devices.tenant_id = command.tenant_id
+                  AND device_tokens.revoked_at IS NULL
+                  AND devices.deleted_at IS NULL
            )",
     )
     .bind(request.command_id)
+    .bind(request.tenant_id)
     .bind(&request.device_id)
     .bind(request.responded_at)
     .bind(request.token_id)
@@ -543,6 +568,7 @@ impl PlatformCommandTransport {
                 COMMAND_REQUEST_EXPIRED.to_owned(),
             ));
         }
+        let tenant_id = request.tenant_id;
         let device_id = request.device_id.clone();
         let rpc = RpcRequest::with_mode(
             request.id,
@@ -558,12 +584,16 @@ impl PlatformCommandTransport {
             .active_snapshot(&device_id)
             .await
             .ok_or(CommandTransportError::NoActiveSession)?;
+        let session = snapshot.authenticated_device();
+        if session.tenant_id != tenant_id {
+            return Err(CommandTransportError::NoActiveSession);
+        }
         self.authorization
-            .authorize_session(snapshot.authenticated_device())
+            .authorize_session(session)
             .await
             .map_err(map_authorization_error)?;
         self.router
-            .publish_to_snapshot(&snapshot, rpc)
+            .publish_to_snapshot(tenant_id, &snapshot, rpc)
             .await
             .map_err(map_session_error)
     }
@@ -620,6 +650,7 @@ impl CommandResponsePort for PlatformCommandResponse {
                 .map_err(|_| CommandResponseError::Unavailable(STORAGE_UNAVAILABLE.to_owned()))?;
             store
                 .mark_command_responded(
+                    response.tenant_id,
                     response.command_id,
                     &response.device_id,
                     response.token_id,

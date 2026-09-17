@@ -9,6 +9,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreCommandCreateRequest {
     pub id: Uuid,
+    pub tenant_id: Uuid,
     pub device_id: String,
     pub method: String,
     pub params: serde_json::Value,
@@ -20,6 +21,7 @@ pub struct CoreCommandCreateRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreCommandResponseRequest {
     pub command_id: Uuid,
+    pub tenant_id: Uuid,
     pub device_id: String,
     #[serde(skip_serializing)]
     pub token_id: Uuid,
@@ -30,6 +32,7 @@ pub struct CoreCommandResponseRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreCommandRecord {
     pub id: Uuid,
+    pub tenant_id: Uuid,
     pub device_id: String,
     pub state: String,
     pub expires_at: DateTime<Utc>,
@@ -79,6 +82,7 @@ pub trait CoreFacade: Send + Sync {
 
     fn get_command(
         &self,
+        tenant_id: Uuid,
         id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>>;
 

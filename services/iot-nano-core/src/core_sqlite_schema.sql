@@ -148,6 +148,7 @@ CREATE INDEX IF NOT EXISTS notification_outbox_due_index
 
 CREATE TABLE IF NOT EXISTS command_outbox (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     method TEXT NOT NULL CHECK (trim(method) <> ''),
     params TEXT NOT NULL DEFAULT '{}',
@@ -166,5 +167,5 @@ CREATE TABLE IF NOT EXISTS command_outbox (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS command_outbox_due_index
-    ON command_outbox (state, next_attempt_at)
+    ON command_outbox (tenant_id, state, next_attempt_at)
     WHERE state = 'queued';

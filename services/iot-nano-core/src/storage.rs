@@ -35,6 +35,7 @@ const CORE_SQLITE_TENANT_TABLES: &[&str] = &[
     "gateway_event_receipts",
     "telemetry_rollups_5m",
     "telemetry_rollups_1h",
+    "command_outbox",
 ];
 
 #[derive(Clone)]
@@ -69,6 +70,7 @@ impl CommandOutboxState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewCommandOutboxEntry {
     pub id: String,
+    pub tenant_id: uuid::Uuid,
     pub device_id: String,
     pub method: String,
     pub params: String,
@@ -80,6 +82,7 @@ pub struct NewCommandOutboxEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutboxRecord {
     pub id: String,
+    pub tenant_id: uuid::Uuid,
     pub device_id: String,
     pub method: String,
     pub params: String,
@@ -214,14 +217,15 @@ impl CoreSqliteStore {
     ) -> Result<CommandOutboxRecord, CoreSqliteStoreError> {
         let result = sqlx::query(
             "INSERT INTO command_outbox (
-                id, device_id, method, params, mode, expires_at, next_attempt_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, tenant_id, device_id, method, params, mode, expires_at, next_attempt_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO NOTHING
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(&command.id)
+        .bind(command.tenant_id.to_string())
         .bind(&command.device_id)
         .bind(&command.method)
         .bind(&command.params)
@@ -235,12 +239,13 @@ impl CoreSqliteStore {
             Ok(None) => {
                 let row = sqlx::query(
                     "SELECT
-                        id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                        id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                         lease_until, attempt_count, last_error, published_at, response, responded_at
                      FROM command_outbox
-                     WHERE id = ?",
+                     WHERE id = ? AND tenant_id = ?",
                 )
                 .bind(&command.id)
+                .bind(command.tenant_id.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
                 let row = row.ok_or(CoreSqliteStoreError::Database(sqlx::Error::RowNotFound))?;
@@ -250,10 +255,12 @@ impl CoreSqliteStore {
                 if existing_params.as_ref().is_some_and(|existing_params| {
                     requested_params.as_ref().is_some_and(|requested_params| {
                         command_payload_matches(
+                            record.tenant_id,
                             &record.device_id,
                             &record.method,
                             existing_params,
                             record.mode,
+                            command.tenant_id,
                             &command.device_id,
                             &command.method,
                             requested_params,
@@ -272,6 +279,7 @@ impl CoreSqliteStore {
 
     pub async fn claim_commands(
         &self,
+        tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
         lease_until: DateTime<Utc>,
         limit: u32,
@@ -285,7 +293,8 @@ impl CoreSqliteStore {
             "WITH due AS (
                 SELECT id
                 FROM command_outbox
-                WHERE expires_at > ?
+                WHERE tenant_id = ?
+                  AND expires_at > ?
                   AND (
                       (state = 'queued' AND next_attempt_at <= ?)
                       OR (state = 'leased' AND lease_until <= ?)
@@ -297,16 +306,18 @@ impl CoreSqliteStore {
              SET state = 'leased',
                  lease_until = ?,
                  attempt_count = attempt_count + 1
-             WHERE id IN (SELECT id FROM due)
+             WHERE tenant_id = ? AND id IN (SELECT id FROM due)
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
+        .bind(tenant_id.to_string())
         .bind(&now)
         .bind(&now)
         .bind(&now)
         .bind(i64::from(limit))
         .bind(lease_until.to_rfc3339())
+        .bind(tenant_id.to_string())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(command_outbox_record).collect()
@@ -314,6 +325,7 @@ impl CoreSqliteStore {
 
     pub async fn mark_command_published(
         &self,
+        tenant_id: uuid::Uuid,
         command_id: &str,
         published_at: DateTime<Utc>,
     ) -> Result<Option<CommandOutboxRecord>, CoreSqliteStoreError> {
@@ -324,14 +336,16 @@ impl CoreSqliteStore {
                  published_at = ?,
                  lease_until = NULL
              WHERE id = ?
+               AND tenant_id = ?
                AND state = 'leased'
                AND expires_at > ?
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(&published_at)
         .bind(command_id)
+        .bind(tenant_id.to_string())
         .bind(&published_at)
         .fetch_optional(&self.pool)
         .await?;
@@ -340,6 +354,7 @@ impl CoreSqliteStore {
 
     pub async fn mark_command_failed(
         &self,
+        tenant_id: uuid::Uuid,
         command_id: &str,
         error: &str,
     ) -> Result<Option<CommandOutboxRecord>, CoreSqliteStoreError> {
@@ -349,13 +364,15 @@ impl CoreSqliteStore {
                  last_error = ?,
                  lease_until = NULL
              WHERE id = ?
+               AND tenant_id = ?
                AND state = 'leased'
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(error)
         .bind(command_id)
+        .bind(tenant_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
         row.map(command_outbox_record).transpose()
@@ -363,6 +380,7 @@ impl CoreSqliteStore {
 
     pub async fn release_command_for_retry(
         &self,
+        tenant_id: uuid::Uuid,
         command_id: &str,
         error: &str,
         next_attempt_at: DateTime<Utc>,
@@ -375,15 +393,17 @@ impl CoreSqliteStore {
                  last_error = ?,
                  lease_until = NULL
              WHERE id = ?
+               AND tenant_id = ?
                AND state = 'leased'
                AND expires_at > ?
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
         .bind(&next_attempt_at)
         .bind(error)
         .bind(command_id)
+        .bind(tenant_id.to_string())
         .bind(&next_attempt_at)
         .fetch_optional(&self.pool)
         .await?;
@@ -392,21 +412,24 @@ impl CoreSqliteStore {
 
     pub async fn expire_commands(
         &self,
+        tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
     ) -> Result<Vec<CommandOutboxRecord>, CoreSqliteStoreError> {
         let rows = sqlx::query(
             "UPDATE command_outbox
              SET state = 'expired',
                  lease_until = NULL
-             WHERE (
+             WHERE tenant_id = ?
+               AND (
                     state IN ('queued', 'leased')
                     OR (state = 'published_to_broker' AND mode = 'two_way')
                    )
                AND expires_at <= ?
              RETURNING
-                id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+                id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
+        .bind(tenant_id.to_string())
         .bind(now.to_rfc3339())
         .fetch_all(&self.pool)
         .await?;
@@ -558,15 +581,22 @@ impl CoreSqliteStore {
     }
 }
 
-async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), CoreSqliteStoreError> {
     let columns = sqlx::query("PRAGMA table_info(command_outbox)")
         .fetch_all(pool)
         .await?;
-    for column in columns {
-        if column.try_get::<String, _>("name")? == "mode" {
-            refresh_command_outbox_expiring_index(pool).await?;
-            return Ok(());
-        }
+    let column_names = columns
+        .iter()
+        .map(|column| column.try_get::<String, _>("name"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !column_names.iter().any(|name| name == "tenant_id") {
+        return Err(CoreSqliteStoreError::ResetRequired {
+            table: "command_outbox".to_owned(),
+        });
+    }
+    if column_names.iter().any(|name| name == "mode") {
+        refresh_command_outbox_expiring_index(pool).await?;
+        return Ok(());
     }
 
     let mut transaction = pool.begin().await?;
@@ -579,6 +609,7 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), sqlx::Er
     sqlx::raw_sql(
         "CREATE TABLE command_outbox_rebuild (
             id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
             device_id TEXT NOT NULL,
             method TEXT NOT NULL CHECK (trim(method) <> ''),
             params TEXT NOT NULL DEFAULT '{}',
@@ -601,11 +632,11 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), sqlx::Er
     .await?;
     sqlx::query(
         "INSERT INTO command_outbox_rebuild (
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at,
+            id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, created_at
          )
          SELECT
-            id, device_id, method, params, 'one_way', state, expires_at, next_attempt_at,
+            id, tenant_id, device_id, method, params, 'one_way', state, expires_at, next_attempt_at,
             lease_until, attempt_count, last_error, published_at, created_at
          FROM command_outbox",
     )
@@ -619,13 +650,13 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), sqlx::Er
         .await?;
     sqlx::query(
         "CREATE INDEX command_outbox_due_index
-         ON command_outbox (state, next_attempt_at)
+         ON command_outbox (tenant_id, state, next_attempt_at)
          WHERE state = 'queued'",
     )
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
-    refresh_command_outbox_expiring_index(pool).await
+    Ok(refresh_command_outbox_expiring_index(pool).await?)
 }
 
 async fn refresh_command_outbox_expiring_index(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -635,7 +666,7 @@ async fn refresh_command_outbox_expiring_index(pool: &SqlitePool) -> Result<(), 
         .await?;
     sqlx::query(
         "CREATE INDEX command_outbox_expiring_index
-         ON command_outbox (expires_at)
+         ON command_outbox (tenant_id, expires_at)
          WHERE state IN ('queued', 'leased')
             OR (state = 'published_to_broker' AND mode = 'two_way')",
     )
@@ -647,6 +678,8 @@ async fn refresh_command_outbox_expiring_index(pool: &SqlitePool) -> Result<(), 
 fn command_outbox_record(row: SqliteRow) -> Result<CommandOutboxRecord, CoreSqliteStoreError> {
     Ok(CommandOutboxRecord {
         id: row.try_get("id")?,
+        tenant_id: uuid::Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
+            .map_err(|_| CoreSqliteStoreError::InvalidCommandTenantId)?,
         device_id: row.try_get("device_id")?,
         method: row.try_get("method")?,
         params: row.try_get("params")?,
@@ -1054,6 +1087,8 @@ pub enum CoreSqliteStoreError {
     ResetRequired { table: String },
     #[error("invalid command outbox state: {0}")]
     InvalidCommandState(String),
+    #[error("invalid command outbox tenant ID")]
+    InvalidCommandTenantId,
     #[error("invalid command outbox {column} timestamp: {value}")]
     InvalidCommandTimestamp {
         column: &'static str,
@@ -1074,16 +1109,19 @@ pub enum CoreSqliteStoreError {
 }
 
 pub(crate) fn command_payload_matches(
+    existing_tenant_id: uuid::Uuid,
     existing_device_id: &str,
     existing_method: &str,
     existing_params: &Value,
     existing_mode: RpcMode,
+    requested_tenant_id: uuid::Uuid,
     requested_device_id: &str,
     requested_method: &str,
     requested_params: &Value,
     requested_mode: RpcMode,
 ) -> bool {
-    existing_device_id == requested_device_id
+    existing_tenant_id == requested_tenant_id
+        && existing_device_id == requested_device_id
         && existing_method == requested_method
         && existing_params == requested_params
         && existing_mode == requested_mode
