@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    CoreCommandCreateRequest, CoreFacade, CoreFacadeError, TokenVault,
+    CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreFacade, CoreFacadeError,
+    TokenVault,
     auth::{BearerAccessTokenError, extract_bearer_access_token, validate_bearer_access_token},
 };
 
@@ -982,14 +983,7 @@ async fn create_command(
     request: Request,
 ) -> Result<(axum::http::StatusCode, Json<CommandResponse>), PublicApiError> {
     let headers = request.headers().clone();
-    let (store, principal) = authenticate(&context, &headers, "commands:write").await?;
-    if !PublicApiRepository::public_device_permission(store.as_ref(), &principal, &device_id)
-        .await
-        .map_err(|_| PublicApiError::Unavailable)?
-        .is_some_and(|permission| permission.allows(ResourcePermission::Controller))
-    {
-        return Err(PublicApiError::Forbidden);
-    }
+    let (_store, principal) = authenticate(&context, &headers, "commands:write").await?;
     let request: CommandRequest = serde_json::from_slice(
         &to_bytes(request.into_body(), 1024 * 1024)
             .await
@@ -1026,15 +1020,18 @@ async fn create_command(
         .as_ref()
         .ok_or(PublicApiError::Unavailable)?;
     let record = facade
-        .create_command(CoreCommandCreateRequest {
-            id: command_id,
-            tenant_id: principal.tenant_id,
-            device_id,
-            method: request.method,
-            params: request.params,
-            mode,
-            issued_at,
-            expires_at: issued_at + chrono::Duration::seconds(30),
+        .create_authorized_command(CoreAuthorizedCommandCreateRequest {
+            user_id: principal.user_id.ok_or(PublicApiError::Forbidden)?,
+            command: CoreCommandCreateRequest {
+                id: command_id,
+                tenant_id: principal.tenant_id,
+                device_id,
+                method: request.method,
+                params: request.params,
+                mode,
+                issued_at,
+                expires_at: issued_at + chrono::Duration::seconds(30),
+            },
         })
         .await
         .map_err(public_command_error)?;

@@ -19,6 +19,12 @@ pub struct CoreCommandCreateRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CoreAuthorizedCommandCreateRequest {
+    pub user_id: Uuid,
+    pub command: CoreCommandCreateRequest,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CoreCommandResponseRequest {
     pub command_id: Uuid,
     pub tenant_id: Uuid,
@@ -78,6 +84,11 @@ pub trait CoreFacade: Send + Sync {
     fn create_command(
         &self,
         request: CoreCommandCreateRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>>;
+
+    fn create_authorized_command(
+        &self,
+        request: CoreAuthorizedCommandCreateRequest,
     ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>>;
 
     fn get_command(

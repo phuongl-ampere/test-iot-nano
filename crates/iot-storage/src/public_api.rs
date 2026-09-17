@@ -1,9 +1,52 @@
-use std::collections::HashMap;
+#[cfg(debug_assertions)]
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::*;
-use sqlx::QueryBuilder;
 use thiserror::Error;
+#[cfg(debug_assertions)]
+use tokio::sync::Notify;
 use uuid::Uuid;
+
+#[cfg(debug_assertions)]
+static DEVICE_LIST_HANDOFF_HOOK: OnceLock<Mutex<Option<(Arc<Notify>, Arc<Notify>)>>> =
+    OnceLock::new();
+
+#[cfg(debug_assertions)]
+pub struct PublicDeviceListHandoffHookGuard;
+
+#[cfg(debug_assertions)]
+impl Drop for PublicDeviceListHandoffHookGuard {
+    fn drop(&mut self) {
+        let hook = DEVICE_LIST_HANDOFF_HOOK.get_or_init(|| Mutex::new(None));
+        *hook.lock().expect("public device list hook lock poisoned") = None;
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn install_public_device_list_handoff_hook(
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+) -> PublicDeviceListHandoffHookGuard {
+    let hook = DEVICE_LIST_HANDOFF_HOOK.get_or_init(|| Mutex::new(None));
+    *hook.lock().expect("public device list hook lock poisoned") = Some((entered, release));
+    PublicDeviceListHandoffHookGuard
+}
+
+#[cfg(debug_assertions)]
+async fn wait_for_public_device_list_handoff_hook() {
+    let hook = DEVICE_LIST_HANDOFF_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("public device list hook lock poisoned")
+        .clone();
+    if let Some((entered, release)) = hook {
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn wait_for_public_device_list_handoff_hook() {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrincipal {
@@ -511,69 +554,253 @@ async fn list_public_devices(
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(Vec::new());
     };
-    let authorized =
-        AuthorizationRepository::list_authorized_devices(store, &subject, after, limit).await?;
-    if authorized.is_empty() {
-        return Ok(Vec::new());
-    }
-    let access_by_device_id = authorized
-        .iter()
-        .map(|device| (device.device_id.clone(), device.access))
-        .collect::<HashMap<_, _>>();
-
+    wait_for_public_device_list_handoff_hook().await;
+    let limit = i64::from(limit);
     match store {
         PlatformStore::Sqlite(store) => {
-            let mut query = QueryBuilder::<sqlx::Sqlite>::new(
-                "SELECT device_id, display_name, metadata, asset_id, device_profile_id
-                 FROM devices
-                 WHERE tenant_id = ",
-            );
-            query.push_bind(subject.tenant_id.to_string());
-            query.push(" AND deleted_at IS NULL AND device_id IN (");
-            for (index, authorized_device) in authorized.iter().enumerate() {
-                if index > 0 {
-                    query.push(", ");
-                }
-                query.push_bind(authorized_device.device_id.clone());
-            }
-            query.push(") ORDER BY device_id");
-            query
-                .build()
-                .fetch_all(store.pool())
-                .await?
-                .into_iter()
-                .map(|row| {
-                    let mut device = sqlite_device_record(row)?;
-                    device.access = access_by_device_id.get(&device.device_id).copied();
-                    Ok(device)
-                })
+            let tenant_id = subject.tenant_id.to_string();
+            let user_id = subject.user_id.to_string();
+            let rows = sqlx::query(
+                "WITH RECURSIVE candidates(
+                     device_id, display_name, metadata, asset_id, device_profile_id,
+                     owner_user_id
+                 ) AS (
+                     SELECT device_id, display_name, metadata, asset_id, device_profile_id,
+                            owner_user_id
+                     FROM devices
+                     WHERE tenant_id = ?
+                       AND deleted_at IS NULL
+                       AND (? IS NULL OR device_id > ?)
+                 ),
+                 ancestors(device_id, asset_id, depth) AS (
+                     SELECT device_id, asset_id, 0
+                     FROM candidates
+                     WHERE asset_id IS NOT NULL
+                     UNION ALL
+                     SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = ?
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 access_candidates(device_id, permission_rank, source_rank, access_source) AS (
+                     SELECT device_id, 3, 1, 'owner'
+                     FROM candidates
+                     WHERE owner_user_id = ?
+                     UNION ALL
+                     SELECT candidate.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            2,
+                            'direct_user'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = ?
+                     UNION ALL
+                     SELECT candidate.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            3,
+                            'group'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = ?
+                     UNION ALL
+                     SELECT ancestors.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            4,
+                            'inherited_user'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = 1
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = ?
+                     UNION ALL
+                     SELECT ancestors.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            5,
+                            'inherited_group'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = ?
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = 1
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = ?
+                 ),
+                 authorized(device_id, effective_permission, access_source) AS (
+                     SELECT device_id,
+                            CASE permission_rank
+                                WHEN 3 THEN 'owner'
+                                WHEN 2 THEN 'manager'
+                                ELSE 'viewer'
+                            END,
+                            access_source
+                     FROM (
+                         SELECT access_candidates.*,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY device_id
+                                    ORDER BY permission_rank DESC, source_rank ASC
+                                ) AS access_rank
+                         FROM access_candidates
+                     ) AS ranked_access
+                     WHERE access_rank = 1
+                 )
+                 SELECT candidates.device_id, candidates.display_name, candidates.metadata,
+                        candidates.asset_id, candidates.device_profile_id,
+                        authorized.effective_permission, authorized.access_source
+                 FROM candidates
+                 JOIN authorized ON authorized.device_id = candidates.device_id
+                 ORDER BY candidates.device_id
+                 LIMIT ?",
+            )
+            .bind(&tenant_id)
+            .bind(after)
+            .bind(after)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(&tenant_id)
+            .bind(&user_id)
+            .bind(limit)
+            .fetch_all(store.pool())
+            .await?;
+            rows.into_iter()
+                .map(sqlite_authorized_device_record)
                 .collect()
         }
         PlatformStore::Timescale(pool) => {
-            let mut query = QueryBuilder::<sqlx::Postgres>::new(
-                "SELECT device_id, display_name, metadata, asset_id, device_profile_id
-                 FROM devices
-                 WHERE tenant_id = ",
-            );
-            query.push_bind(subject.tenant_id);
-            query.push(" AND deleted_at IS NULL AND device_id IN (");
-            for (index, authorized_device) in authorized.iter().enumerate() {
-                if index > 0 {
-                    query.push(", ");
-                }
-                query.push_bind(authorized_device.device_id.clone());
-            }
-            query.push(") ORDER BY device_id");
-            query
-                .build()
-                .fetch_all(pool)
-                .await?
-                .into_iter()
-                .map(|row| {
-                    let mut device = timescale_device_record(row)?;
-                    device.access = access_by_device_id.get(&device.device_id).copied();
-                    Ok(device)
-                })
+            let rows = sqlx::query(
+                "WITH RECURSIVE candidates(
+                     device_id, display_name, metadata, asset_id, device_profile_id,
+                     owner_user_id
+                 ) AS (
+                     SELECT device_id, display_name, metadata, asset_id, device_profile_id,
+                            owner_user_id
+                     FROM devices
+                     WHERE tenant_id = $1
+                       AND deleted_at IS NULL
+                       AND ($2::text IS NULL OR device_id > $2)
+                 ),
+                 ancestors(device_id, asset_id, depth) AS (
+                     SELECT device_id, asset_id, 0
+                     FROM candidates
+                     WHERE asset_id IS NOT NULL
+                     UNION ALL
+                     SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                     FROM ancestors
+                     JOIN assets AS asset
+                       ON asset.id = ancestors.asset_id AND asset.tenant_id = $1
+                     WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                 ),
+                 access_candidates(device_id, permission_rank, source_rank, access_source) AS (
+                     SELECT device_id, 3, 1, 'owner'
+                     FROM candidates
+                     WHERE owner_user_id = $3
+                     UNION ALL
+                     SELECT candidate.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            2,
+                            'direct_user'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = $3
+                     UNION ALL
+                     SELECT candidate.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            3,
+                            'group'
+                     FROM candidates AS candidate
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.device_id = candidate.device_id
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = $3
+                     UNION ALL
+                     SELECT ancestors.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            4,
+                            'inherited_user'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = TRUE
+                      AND permission.revoked_at IS NULL
+                     WHERE permission.subject_user_id = $3
+                     UNION ALL
+                     SELECT ancestors.device_id,
+                            CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                            5,
+                            'inherited_group'
+                     FROM ancestors
+                     JOIN resource_permissions AS permission
+                       ON permission.tenant_id = $1
+                      AND permission.asset_id = ancestors.asset_id
+                      AND permission.inherit_children = TRUE
+                      AND permission.revoked_at IS NULL
+                     JOIN user_group_members AS membership
+                       ON membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = $3
+                 ),
+                 authorized(device_id, effective_permission, access_source) AS (
+                     SELECT device_id,
+                            CASE permission_rank
+                                WHEN 3 THEN 'owner'
+                                WHEN 2 THEN 'manager'
+                                ELSE 'viewer'
+                            END,
+                            access_source
+                     FROM (
+                         SELECT access_candidates.*,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY device_id
+                                    ORDER BY permission_rank DESC, source_rank ASC
+                                ) AS access_rank
+                         FROM access_candidates
+                     ) AS ranked_access
+                     WHERE access_rank = 1
+                 )
+                 SELECT candidates.device_id, candidates.display_name, candidates.metadata,
+                        candidates.asset_id, candidates.device_profile_id,
+                        authorized.effective_permission, authorized.access_source
+                 FROM candidates
+                 JOIN authorized ON authorized.device_id = candidates.device_id
+                 ORDER BY candidates.device_id
+                 LIMIT $4",
+            )
+            .bind(subject.tenant_id)
+            .bind(after)
+            .bind(subject.user_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(timescale_authorized_device_record)
                 .collect()
         }
     }
@@ -2777,6 +3004,26 @@ fn public_resource_access(
         ))
     })?;
     Ok(ResourceAccess { permission, source })
+}
+
+fn sqlite_authorized_device_record(row: SqliteRow) -> Result<PublicDevice, PlatformStoreError> {
+    let access = public_resource_access(
+        row.try_get("effective_permission")?,
+        row.try_get("access_source")?,
+    )?;
+    let mut device = sqlite_device_record(row)?;
+    device.access = Some(access);
+    Ok(device)
+}
+
+fn timescale_authorized_device_record(row: PgRow) -> Result<PublicDevice, PlatformStoreError> {
+    let access = public_resource_access(
+        row.try_get("effective_permission")?,
+        row.try_get("access_source")?,
+    )?;
+    let mut device = timescale_device_record(row)?;
+    device.access = Some(access);
+    Ok(device)
 }
 
 fn sqlite_authorized_asset_record(row: SqliteRow) -> Result<PublicAsset, PlatformStoreError> {

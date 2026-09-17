@@ -2,8 +2,8 @@ use std::{env, sync::Arc};
 
 use chrono::{Duration, TimeZone, Utc};
 use iot_api::{
-    CoreCommandCreateRequest, CoreCommandResponseRequest, CoreFacade, CoreFacadeError,
-    CoreTelemetryBucket, CoreTelemetryQuery,
+    CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreCommandResponseRequest,
+    CoreFacade, CoreFacadeError, CoreTelemetryBucket, CoreTelemetryQuery,
 };
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use iot_nano_monolith::PlatformCoreFacade;
@@ -44,6 +44,7 @@ fn command_request(
 ) -> CoreCommandCreateRequest {
     CoreCommandCreateRequest {
         id,
+        tenant_id: TEST_TENANT_ID,
         device_id: device_id.to_owned(),
         method: "device_read".to_owned(),
         params,
@@ -125,11 +126,15 @@ async fn sqlite_core_facade_replays_matching_commands_and_rejects_conflicts() {
     assert_eq!(replay.id, command_id);
     assert_eq!(replay.device_id, "facade-device");
     assert_eq!(
-        facade.get_command(command_id).await.unwrap().mode,
+        facade
+            .get_command(TEST_TENANT_ID, command_id)
+            .await
+            .unwrap()
+            .mode,
         RpcMode::TwoWay
     );
     assert!(matches!(
-        facade.get_command(Uuid::now_v7()).await,
+        facade.get_command(TEST_TENANT_ID, Uuid::now_v7()).await,
         Err(CoreFacadeError::NotFound)
     ));
 
@@ -142,6 +147,87 @@ async fn sqlite_core_facade_replays_matching_commands_and_rejects_conflicts() {
         ))
         .await;
     assert!(matches!(conflict, Err(CoreFacadeError::Rejected(409))));
+}
+
+#[tokio::test]
+async fn sqlite_core_facade_denies_authorized_command_after_permission_revocation() {
+    let (_directory, store) = sqlite_store().await;
+    let owner_id = Uuid::now_v7();
+    let manager_id = Uuid::now_v7();
+    let permission_id = Uuid::now_v7();
+    let device_id = "facade-authorized-device";
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'facade-authorized-owner', 'unused', 'viewer', 'user'),
+                (?, ?, 'facade-authorized-manager', 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
+    .bind(manager_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    TopologyRepository::register_device(store.as_ref(), TEST_TENANT_ID, device_id)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE devices SET owner_user_id = ? WHERE tenant_id = ? AND device_id = ?")
+        .bind(owner_id.to_string())
+        .bind(TEST_TENANT_ID.to_string())
+        .bind(device_id)
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, device_id, permission, inherit_children,
+            created_by_user_id
+         ) VALUES (?, ?, ?, ?, 'manager', 0, ?)",
+    )
+    .bind(permission_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
+    .bind(manager_id.to_string())
+    .bind(device_id)
+    .bind(owner_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    let facade = PlatformCoreFacade::new(store.clone());
+    let now = Utc.with_ymd_and_hms(2026, 9, 14, 10, 5, 0).unwrap();
+    assert!(
+        facade
+            .create_authorized_command(CoreAuthorizedCommandCreateRequest {
+                user_id: manager_id,
+                command: command_request(
+                    Uuid::now_v7(),
+                    device_id,
+                    json!({"channel": "temperature"}),
+                    now,
+                ),
+            })
+            .await
+            .is_ok()
+    );
+    sqlx::query("UPDATE resource_permissions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(permission_id.to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        facade
+            .create_authorized_command(CoreAuthorizedCommandCreateRequest {
+                user_id: manager_id,
+                command: command_request(
+                    Uuid::now_v7(),
+                    device_id,
+                    json!({"channel": "humidity"}),
+                    now,
+                ),
+            })
+            .await,
+        Err(CoreFacadeError::NotFound)
+    ));
 }
 
 #[tokio::test]
@@ -165,17 +251,18 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
         .await
         .unwrap();
     store
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(TEST_TENANT_ID, now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
     store
-        .mark_command_published(command_id, now + Duration::seconds(1))
+        .mark_command_published(TEST_TENANT_ID, command_id, now + Duration::seconds(1))
         .await
         .unwrap()
         .unwrap();
 
     let response = CoreCommandResponseRequest {
         command_id,
+        tenant_id: TEST_TENANT_ID,
         device_id: "facade-device".to_owned(),
         token_id,
         response: json!({"ok": true, "value": 42}),
@@ -187,13 +274,18 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
         .unwrap();
     facade.record_command_response(response).await.unwrap();
     assert_eq!(
-        facade.get_command(command_id).await.unwrap().response,
+        facade
+            .get_command(TEST_TENANT_ID, command_id)
+            .await
+            .unwrap()
+            .response,
         Some(json!({"ok": true, "value": 42}))
     );
     assert!(matches!(
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id,
+                tenant_id: TEST_TENANT_ID,
                 device_id: "facade-device".to_owned(),
                 token_id,
                 response: json!({"ok": false}),
@@ -294,6 +386,7 @@ async fn sqlite_core_facade_rejects_invalid_queries_and_unpublished_responses() 
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id: Uuid::now_v7(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "facade-device".to_owned(),
                 token_id,
                 response: json!({"ok": true}),
@@ -325,11 +418,11 @@ async fn sqlite_core_facade_rejects_response_for_a_revoked_token() {
         .await
         .unwrap();
     store
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(TEST_TENANT_ID, now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
     store
-        .mark_command_published(command_id, now + Duration::seconds(1))
+        .mark_command_published(TEST_TENANT_ID, command_id, now + Duration::seconds(1))
         .await
         .unwrap()
         .unwrap();
@@ -346,6 +439,7 @@ async fn sqlite_core_facade_rejects_response_for_a_revoked_token() {
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id,
+                tenant_id: TEST_TENANT_ID,
                 device_id: "facade-device".to_owned(),
                 token_id: revoked_token_id,
                 response: json!({"ok": true}),
@@ -354,7 +448,10 @@ async fn sqlite_core_facade_rejects_response_for_a_revoked_token() {
             .await,
         Err(CoreFacadeError::Rejected(409))
     ));
-    let command = facade.get_command(command_id).await.unwrap();
+    let command = facade
+        .get_command(TEST_TENANT_ID, command_id)
+        .await
+        .unwrap();
     assert_eq!(command.state, "published_to_broker");
     assert_eq!(command.response, None);
 }

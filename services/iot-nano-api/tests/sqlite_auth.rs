@@ -6,25 +6,32 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use iot_api::{
-    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
-    CoreFacadeError, CoreTelemetryPoint, CoreTelemetryQuery, TokenVault, public_v1_router,
+    CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreCommandRecord,
+    CoreCommandResponseRequest, CoreFacade, CoreFacadeError, CoreTelemetryPoint,
+    CoreTelemetryQuery, TokenVault, public_v1_router,
 };
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_storage::{
-    ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret,
-    OAuthClientCredentialsToken, OAuthRepository, PlatformStore,
-};
+use iot_storage::{ApplicationKind, ApplicationRepository, NewApplication, PlatformStore};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const APP_ID: &str = "sqlite-auth-app";
 const CLIENT_ID: &str = "sqlite-auth-client";
-const CLIENT_SECRET: &str = "sqlite-auth-client-secret";
 const DEVICE_TOKEN: &str = "sqlite-auth-devices-token";
 const ASSET_TOKEN: &str = "sqlite-auth-assets-token";
 
 fn tenant_id() -> Uuid {
     Uuid::from_u128(10_006)
+}
+
+fn user_id() -> Uuid {
+    Uuid::from_u128(10_007)
+}
+
+fn access_token_hash(access_token: &str) -> String {
+    format!("{:x}", Sha256::digest(access_token.as_bytes()))
 }
 
 struct NoopCoreFacade;
@@ -37,8 +44,16 @@ impl CoreFacade for NoopCoreFacade {
         Box::pin(async { Err(CoreFacadeError::NotFound) })
     }
 
+    fn create_authorized_command(
+        &self,
+        _request: CoreAuthorizedCommandCreateRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        Box::pin(async { Err(CoreFacadeError::NotFound) })
+    }
+
     fn get_command(
         &self,
+        _tenant_id: Uuid,
         _id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
         Box::pin(async { Err(CoreFacadeError::NotFound) })
@@ -77,6 +92,15 @@ async fn sqlite_public_router() -> (tempfile::TempDir, axum::Router) {
         .execute(store.sqlite_pool().unwrap())
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'sqlite-auth-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id().to_string())
+    .bind(tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     ApplicationRepository::upsert_application(
         store.as_ref(),
         NewApplication {
@@ -92,32 +116,24 @@ async fn sqlite_public_router() -> (tempfile::TempDir, axum::Router) {
     )
     .await
     .unwrap();
-    OAuthRepository::register_client_secret(
-        store.as_ref(),
-        NewOAuthClientSecret {
-            app_id: APP_ID.parse().unwrap(),
-            tenant_id: tenant_id(),
-            client_secret: CLIENT_SECRET.to_owned(),
-        },
-    )
-    .await
-    .unwrap();
     let now = Utc::now();
     for (access_token, scopes) in [
         (DEVICE_TOKEN, vec!["devices:read".to_owned()]),
         (ASSET_TOKEN, vec!["assets:read".to_owned()]),
     ] {
-        OAuthRepository::issue_client_credentials_access_token(
-            store.as_ref(),
-            OAuthClientCredentialsToken {
-                client_id: CLIENT_ID.parse().unwrap(),
-                client_secret: CLIENT_SECRET.to_owned(),
-                access_token: access_token.to_owned(),
-                scopes,
-                issued_at: now,
-                expires_at: now + Duration::hours(1),
-            },
+        sqlx::query(
+            "INSERT INTO oauth_access_tokens (
+                token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(access_token_hash(access_token))
+        .bind(APP_ID)
+        .bind(tenant_id().to_string())
+        .bind(user_id().to_string())
+        .bind(json!(scopes).to_string())
+        .bind(now.to_rfc3339())
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .execute(store.sqlite_pool().unwrap())
         .await
         .unwrap();
     }

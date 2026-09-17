@@ -16,8 +16,9 @@ pub use auth::{
     seed_tenant_test_users_sqlite, validate_bearer_access_token, validate_password,
 };
 pub use core_facade::{
-    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
-    CoreFacadeError, CoreTelemetryBucket, CoreTelemetryPoint, CoreTelemetryQuery,
+    CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreCommandRecord,
+    CoreCommandResponseRequest, CoreFacade, CoreFacadeError, CoreTelemetryBucket,
+    CoreTelemetryPoint, CoreTelemetryQuery,
 };
 pub use device_tokens::{
     DeviceTokenResponse, DeviceTokenStoreError, create_platform_device_token,

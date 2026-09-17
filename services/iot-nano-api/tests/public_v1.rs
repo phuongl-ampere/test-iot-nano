@@ -11,8 +11,9 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use iot_api::{
-    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
-    CoreFacadeError, CoreTelemetryPoint, CoreTelemetryQuery, TokenVault, public_v1_router,
+    CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreCommandRecord,
+    CoreCommandResponseRequest, CoreFacade, CoreFacadeError, CoreTelemetryPoint,
+    CoreTelemetryQuery, TokenVault, public_v1_router,
 };
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_storage::{ApplicationKind, ApplicationRepository, NewApplication, PlatformStore};
@@ -26,6 +27,7 @@ const CLIENT_ID: &str = "task-8-router-export-client";
 const ACCESS_TOKEN: &str = "task-8-router-export-token";
 const APPLICATION_ONLY_ACCESS_TOKEN: &str = "task-8-router-export-application-token";
 const SHARED_ACCESS_TOKEN: &str = "task-8-router-export-shared-token";
+const COMMAND_RACE_TOKEN: &str = "task-8-router-export-command-race-token";
 const DEVICE_ID: &str = "task-8-router-export-device";
 
 fn tenant_id() -> Uuid {
@@ -43,6 +45,83 @@ fn access_token_hash(access_token: &str) -> String {
 #[derive(Clone, Default)]
 struct RecordingCore {
     created: Arc<Mutex<Vec<CoreCommandCreateRequest>>>,
+}
+
+#[derive(Clone)]
+struct RevokingCore {
+    store: Arc<PlatformStore>,
+    permission_id: Uuid,
+}
+
+impl CoreFacade for RevokingCore {
+    fn create_command(
+        &self,
+        request: CoreCommandCreateRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        let store = Arc::clone(&self.store);
+        let permission_id = self.permission_id;
+        Box::pin(async move {
+            sqlx::query(
+                "UPDATE resource_permissions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(permission_id.to_string())
+            .execute(store.sqlite_pool().expect("SQLite store"))
+            .await
+            .map_err(|_| CoreFacadeError::Unavailable)?;
+            Ok(CoreCommandRecord {
+                id: request.id,
+                tenant_id: request.tenant_id,
+                device_id: request.device_id,
+                state: "queued".to_owned(),
+                expires_at: request.expires_at,
+                mode: request.mode,
+                response: None,
+                responded_at: None,
+            })
+        })
+    }
+
+    fn create_authorized_command(
+        &self,
+        request: CoreAuthorizedCommandCreateRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        let store = Arc::clone(&self.store);
+        let permission_id = self.permission_id;
+        Box::pin(async move {
+            sqlx::query(
+                "UPDATE resource_permissions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(permission_id.to_string())
+            .execute(store.sqlite_pool().expect("SQLite store"))
+            .await
+            .map_err(|_| CoreFacadeError::Unavailable)?;
+            let _ = request;
+            Err(CoreFacadeError::NotFound)
+        })
+    }
+
+    fn get_command(
+        &self,
+        _tenant_id: Uuid,
+        _id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        Box::pin(async { Err(CoreFacadeError::NotFound) })
+    }
+
+    fn record_command_response(
+        &self,
+        _request: CoreCommandResponseRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoreFacadeError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn telemetry(
+        &self,
+        _query: CoreTelemetryQuery,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<CoreTelemetryPoint>, CoreFacadeError>> + Send + '_>>
+    {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 impl CoreFacade for RecordingCore {
@@ -65,6 +144,13 @@ impl CoreFacade for RecordingCore {
             created.lock().unwrap().push(request);
             Ok(record)
         })
+    }
+
+    fn create_authorized_command(
+        &self,
+        request: CoreAuthorizedCommandCreateRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        self.create_command(request.command)
     }
 
     fn get_command(
@@ -323,6 +409,83 @@ async fn exported_public_router_rejects_application_only_tokens() {
                         "metadata": {},
                     })
                     .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn exported_public_command_does_not_enqueue_after_permission_revocation() {
+    let (_directory, _app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let manager_id = Uuid::now_v7();
+    let permission_id = Uuid::now_v7();
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::hours(1);
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-command-race-manager', 'unused', 'viewer', 'user')",
+    )
+    .bind(manager_id.to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, device_id, permission, inherit_children,
+            created_by_user_id
+         ) VALUES (?, ?, ?, ?, 'manager', 0, ?)",
+    )
+    .bind(permission_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(manager_id.to_string())
+    .bind(DEVICE_ID)
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO oauth_access_tokens (
+            token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(access_token_hash(COMMAND_RACE_TOKEN))
+    .bind(APP_ID)
+    .bind(tenant_id().to_string())
+    .bind(manager_id.to_string())
+    .bind(json!(["commands:write"]).to_string())
+    .bind(issued_at.to_rfc3339())
+    .bind(expires_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let app = public_v1_router::<()>(
+        store.clone(),
+        TokenVault::from_key_material("task-8-router-command-race-vault"),
+        Arc::new(RevokingCore {
+            store: store.clone(),
+            permission_id,
+        }),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/commands"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {COMMAND_RACE_TOKEN}"),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", "command-revocation-race")
+                .body(Body::from(
+                    json!({"method":"setRelay","params":{"enabled":true}}).to_string(),
                 ))
                 .unwrap(),
         )

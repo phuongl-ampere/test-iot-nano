@@ -53,6 +53,8 @@ pub use public_api::{
     NewPublicAsset, NewPublicDevice, PublicAlert, PublicApiRepository, PublicAsset,
     PublicAssetError, PublicDevice, PublicDeviceError, PublicPrincipal, PublicTelemetry,
 };
+#[cfg(debug_assertions)]
+pub use public_api::{PublicDeviceListHandoffHookGuard, install_public_device_list_handoff_hook};
 pub use tenant_identity::{
     AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount,
     SystemAccountCredential, Tenant, TenantAccount, TenantAccountCredential, TenantIdentityError,
@@ -3301,6 +3303,68 @@ impl PlatformStore {
         }
     }
 
+    pub async fn enqueue_authorized_command(
+        &self,
+        user_id: uuid::Uuid,
+        mut command: NewCommandOutboxEntry,
+    ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+        let id = uuid::Uuid::parse_str(&command.id)
+            .map_err(|_| PlatformStoreError::InvalidCommandId(command.id.clone()))?;
+        let params = serde_json::from_str::<serde_json::Value>(&command.params)
+            .map_err(|_| PlatformStoreError::InvalidCommandParams)?;
+        command.id = id.to_string();
+        command.params =
+            serde_json::to_string(&params).map_err(|_| PlatformStoreError::InvalidCommandParams)?;
+        command.expires_at = canonical_postgres_timestamp(command.expires_at);
+        command.next_attempt_at = canonical_postgres_timestamp(command.next_attempt_at);
+
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                if !sqlite_user_can_issue_command(
+                    &mut transaction,
+                    user_id,
+                    command.tenant_id,
+                    &command.device_id,
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
+                let record =
+                    enqueue_sqlite_platform_command_in_transaction(&mut transaction, &command)
+                        .await?;
+                transaction.commit().await?;
+                Ok(Some(record))
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                    .execute(&mut *transaction)
+                    .await?;
+                if !timescale_user_can_issue_command(
+                    &mut transaction,
+                    user_id,
+                    command.tenant_id,
+                    &command.device_id,
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
+                let record = enqueue_timescale_platform_command_in_transaction(
+                    &mut transaction,
+                    id,
+                    &params,
+                    &command,
+                )
+                .await?;
+                transaction.commit().await?;
+                Ok(Some(record))
+            }
+        }
+    }
+
     pub async fn ready_command_tenants(
         &self,
         now: DateTime<Utc>,
@@ -4237,6 +4301,312 @@ async fn enqueue_timescale_platform_command(
     };
     transaction.commit().await?;
     result
+}
+
+async fn enqueue_sqlite_platform_command_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    command: &NewCommandOutboxEntry,
+) -> Result<CommandOutboxRecord, PlatformStoreError> {
+    let row = sqlx::query(
+        "INSERT INTO command_outbox (
+            id, tenant_id, device_id, method, params, mode, expires_at, next_attempt_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO NOTHING
+         RETURNING
+            id, tenant_id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at",
+    )
+    .bind(&command.id)
+    .bind(command.tenant_id.to_string())
+    .bind(&command.device_id)
+    .bind(&command.method)
+    .bind(&command.params)
+    .bind(command_mode_value(command.mode))
+    .bind(command.expires_at.to_rfc3339())
+    .bind(command.next_attempt_at.to_rfc3339())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(row) = row {
+        return Ok(command_outbox_record(row)?);
+    }
+
+    let existing = sqlx::query(
+        "SELECT
+            id, tenant_id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at
+         FROM command_outbox
+         WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(&command.id)
+    .bind(command.tenant_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(command_outbox_record)
+    .transpose()?;
+    match existing {
+        Some(existing) if command_payload_matches(&existing, command) => Ok(existing),
+        Some(_) | None => Err(PlatformStoreError::CommandConflict(command.id.clone())),
+    }
+}
+
+async fn enqueue_timescale_platform_command_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    id: uuid::Uuid,
+    params: &serde_json::Value,
+    command: &NewCommandOutboxEntry,
+) -> Result<CommandOutboxRecord, PlatformStoreError> {
+    let row = sqlx::query(
+        "INSERT INTO command_outbox (
+            id, tenant_id, device_id, method, params, mode, expires_at, next_attempt_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (id) DO NOTHING
+         RETURNING
+            id, tenant_id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at",
+    )
+    .bind(id)
+    .bind(command.tenant_id)
+    .bind(&command.device_id)
+    .bind(&command.method)
+    .bind(Json(params.clone()))
+    .bind(command_mode_value(command.mode))
+    .bind(command.expires_at)
+    .bind(command.next_attempt_at)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(row) = row {
+        return postgres_command_outbox_record(row);
+    }
+
+    let existing = sqlx::query(
+        "SELECT
+            id, tenant_id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
+            lease_until, attempt_count, last_error, published_at, response, responded_at
+         FROM command_outbox
+         WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(id)
+    .bind(command.tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(postgres_command_outbox_record)
+    .transpose()?;
+    match existing {
+        Some(existing) if command_payload_matches(&existing, command) => Ok(existing),
+        Some(_) | None => Err(PlatformStoreError::CommandConflict(command.id.clone())),
+    }
+}
+
+async fn sqlite_user_can_issue_command(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    let identity = sqlx::query_as::<_, (String, String)>(
+        "SELECT tenant_id, account_class FROM users WHERE id = ?",
+    )
+    .bind(user_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((user_tenant_id, account_class)) = identity else {
+        return Ok(false);
+    };
+    if user_tenant_id != tenant_id.to_string()
+        || authorization_account_class(&account_class)? == AccountClass::System
+    {
+        return Ok(false);
+    }
+
+    let owner = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT owner_user_id
+         FROM devices
+         WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+    )
+    .bind(device_id)
+    .bind(tenant_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    let user_id = user_id.to_string();
+    if owner.as_deref() == Some(user_id.as_str()) {
+        return Ok(true);
+    }
+
+    Ok(sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT asset_id, 0
+            FROM devices
+            WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL
+              AND asset_id IS NOT NULL
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = ?
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT 1
+         FROM resource_permissions AS permission
+         WHERE permission.tenant_id = ?
+           AND permission.revoked_at IS NULL
+           AND permission.permission = 'manager'
+           AND (
+                (permission.device_id = ? AND (
+                    permission.subject_user_id = ?
+                    OR EXISTS (
+                        SELECT 1 FROM user_group_members AS membership
+                        WHERE membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = ?
+                    )
+                ))
+                OR (permission.asset_id IN (SELECT id FROM ancestors)
+                    AND permission.inherit_children = 1 AND (
+                        permission.subject_user_id = ?
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = ?
+                        )
+                    ))
+           )
+         LIMIT 1",
+    )
+    .bind(device_id)
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(device_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
+async fn timescale_user_can_issue_command(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    let identity = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT tenant_id, account_class FROM users WHERE id = $1 FOR SHARE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((user_tenant_id, account_class)) = identity else {
+        return Ok(false);
+    };
+    if user_tenant_id != tenant_id
+        || authorization_account_class(&account_class)? == AccountClass::System
+    {
+        return Ok(false);
+    }
+
+    let device = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>)>(
+        "SELECT owner_user_id, asset_id
+         FROM devices
+         WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+         FOR SHARE",
+    )
+    .bind(device_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((owner, asset_id)) = device else {
+        return Ok(false);
+    };
+    if owner == Some(user_id) {
+        return Ok(true);
+    }
+
+    if let Some(asset_id) = asset_id {
+        sqlx::query(
+            "WITH RECURSIVE ancestors(id) AS (
+                 SELECT $1::uuid
+                 UNION
+                 SELECT asset.parent_asset_id
+                 FROM assets AS asset
+                 JOIN ancestors ON asset.id = ancestors.id
+                 WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
+             )
+             SELECT asset.id
+             FROM assets AS asset
+             JOIN ancestors ON asset.id = ancestors.id AND asset.tenant_id = $2
+             FOR SHARE OF asset",
+        )
+        .bind(asset_id)
+        .bind(tenant_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+    }
+    sqlx::query(
+        "SELECT group_id
+         FROM user_group_members
+         WHERE tenant_id = $1 AND user_id = $2
+         FOR SHARE",
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    Ok(sqlx::query_scalar::<_, i64>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT asset_id, 0
+            FROM devices
+            WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+              AND asset_id IS NOT NULL
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = $2
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT 1::bigint
+         FROM resource_permissions AS permission
+         WHERE permission.tenant_id = $2
+           AND permission.revoked_at IS NULL
+           AND permission.permission = 'manager'
+           AND (
+                (permission.device_id = $1 AND (
+                    permission.subject_user_id = $3
+                    OR EXISTS (
+                        SELECT 1 FROM user_group_members AS membership
+                        WHERE membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = $3
+                    )
+                ))
+                OR (permission.asset_id IN (SELECT id FROM ancestors)
+                    AND permission.inherit_children = TRUE AND (
+                        permission.subject_user_id = $3
+                        OR EXISTS (
+                            SELECT 1 FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = $3
+                        )
+                    ))
+           )
+         LIMIT 1
+         FOR SHARE OF permission",
+    )
+    .bind(device_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
 }
 
 async fn ingest_sqlite_gateway(

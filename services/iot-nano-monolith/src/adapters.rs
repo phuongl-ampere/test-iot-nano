@@ -2,8 +2,9 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use iot_api::{
-    CoreCommandCreateRequest, CoreCommandRecord, CoreCommandResponseRequest, CoreFacade,
-    CoreFacadeError, CoreTelemetryBucket, CoreTelemetryPoint, CoreTelemetryQuery,
+    CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreCommandRecord,
+    CoreCommandResponseRequest, CoreFacade, CoreFacadeError, CoreTelemetryBucket,
+    CoreTelemetryPoint, CoreTelemetryQuery,
 };
 use iot_core::RpcRequest;
 use iot_nano_core::{CommandTransport, CommandTransportError, TransportRpcPublishRequest};
@@ -64,6 +65,47 @@ impl CoreFacade for PlatformCoreFacade {
                 })
                 .await
                 .map_err(map_command_storage_error)?;
+            core_command_record(record)
+        })
+    }
+
+    fn create_authorized_command(
+        &self,
+        request: CoreAuthorizedCommandCreateRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CoreCommandRecord, CoreFacadeError>> + Send + '_>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            validate_device_id(&request.command.device_id)?;
+            let user_id = request.user_id;
+            let command = request.command;
+            let tenant_id = command.tenant_id;
+            let device_id = command.device_id;
+            let command = RpcRequest::with_mode(
+                command.id,
+                command.method,
+                command.params,
+                command.issued_at,
+                command.expires_at,
+                command.mode,
+            )
+            .map_err(|_| CoreFacadeError::Rejected(400))?;
+            let record = store
+                .enqueue_authorized_command(
+                    user_id,
+                    NewCommandOutboxEntry {
+                        id: command.id.to_string(),
+                        tenant_id,
+                        device_id,
+                        method: command.method,
+                        params: command.params.to_string(),
+                        mode: command.mode,
+                        expires_at: command.expires_at,
+                        next_attempt_at: command.issued_at,
+                    },
+                )
+                .await
+                .map_err(map_command_storage_error)?
+                .ok_or(CoreFacadeError::NotFound)?;
             core_command_record(record)
         })
     }
