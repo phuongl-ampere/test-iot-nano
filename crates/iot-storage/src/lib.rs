@@ -9658,7 +9658,130 @@ async fn pre_tenant_platform_sqlite_table(
             }
         }
     }
+    if platform_tables
+        .iter()
+        .any(|table| table.as_str() == "tenant_accounts")
+        && !sqlite_tenant_account_creator_attribution_constraints_are_complete(pool).await?
+    {
+        return Ok(Some("tenant_accounts".to_owned()));
+    }
+    if platform_tables
+        .iter()
+        .any(|table| table.as_str() == "resource_permissions")
+        && !sqlite_resource_permission_creator_attribution_constraints_are_complete(pool).await?
+    {
+        return Ok(Some("resource_permissions".to_owned()));
+    }
     Ok(None)
+}
+
+async fn sqlite_tenant_account_creator_attribution_constraints_are_complete(
+    pool: &SqlitePool,
+) -> Result<bool, sqlx::Error> {
+    sqlite_table_has_unique_columns(pool, "tenant_accounts", &["id", "tenant_id"]).await
+}
+
+async fn sqlite_resource_permission_creator_attribution_constraints_are_complete(
+    pool: &SqlitePool,
+) -> Result<bool, sqlx::Error> {
+    if !sqlite_table_has_column_named(pool, "resource_permissions", "created_by_tenant_account_id")
+        .await?
+    {
+        return Ok(false);
+    }
+    if !sqlite_table_has_composite_foreign_key(
+        pool,
+        "resource_permissions",
+        "tenant_accounts",
+        &[
+            ("created_by_tenant_account_id", "id"),
+            ("tenant_id", "tenant_id"),
+        ],
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    sqlite_table_has_creator_attribution_xor_check(pool, "resource_permissions").await
+}
+
+async fn sqlite_table_has_column_named(
+    pool: &SqlitePool,
+    table: &str,
+    column_name: &str,
+) -> Result<bool, sqlx::Error> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pragma_table_info(?)
+             WHERE name = ?
+         )",
+    )
+    .bind(table)
+    .bind(column_name)
+    .fetch_one(pool)
+    .await?;
+    Ok(exists != 0)
+}
+
+async fn sqlite_table_has_unique_columns(
+    pool: &SqlitePool,
+    table: &str,
+    expected_columns: &[&str],
+) -> Result<bool, sqlx::Error> {
+    let indexes = sqlx::query(
+        "SELECT name
+         FROM pragma_index_list(?)
+         WHERE \"unique\" = 1 AND \"partial\" = 0",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    for index in indexes {
+        let index_name: String = index.try_get("name")?;
+        let columns = sqlx::query("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+            .bind(index_name)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|row| row.try_get::<Option<String>, _>("name"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns
+            .iter()
+            .map(|column| column.as_deref())
+            .eq(expected_columns.iter().copied().map(Some))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn sqlite_table_has_creator_attribution_xor_check(
+    pool: &SqlitePool,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    let table_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql
+         FROM sqlite_master
+         WHERE type = 'table' AND name = ?",
+    )
+    .bind(table)
+    .fetch_optional(pool)
+    .await?;
+    Ok(table_sql.is_some_and(|sql| creator_attribution_xor_check_is_present(&sql)))
+}
+
+fn creator_attribution_xor_check_is_present(schema_sql: &str) -> bool {
+    let normalized = schema_sql
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    normalized.contains(
+        "created_by_user_idisnotnullandcreated_by_tenant_account_idisnullor\
+         created_by_user_idisnullandcreated_by_tenant_account_idisnotnull",
+    )
 }
 
 async fn sqlite_table_has_non_null_tenant_id(
@@ -9891,7 +10014,138 @@ async fn pre_tenant_platform_timescale_table(
             }
         }
     }
+    if platform_tables
+        .iter()
+        .any(|table| table.as_str() == "tenant_accounts")
+        && !timescale_tenant_account_creator_attribution_constraints_are_complete(transaction)
+            .await?
+    {
+        return Ok(Some("tenant_accounts".to_owned()));
+    }
+    if platform_tables
+        .iter()
+        .any(|table| table.as_str() == "resource_permissions")
+        && !timescale_resource_permission_creator_attribution_constraints_are_complete(transaction)
+            .await?
+    {
+        return Ok(Some("resource_permissions".to_owned()));
+    }
     Ok(None)
+}
+
+async fn timescale_tenant_account_creator_attribution_constraints_are_complete(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<bool, sqlx::Error> {
+    timescale_table_has_unique_columns(transaction, "tenant_accounts", &["id", "tenant_id"]).await
+}
+
+async fn timescale_resource_permission_creator_attribution_constraints_are_complete(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<bool, sqlx::Error> {
+    if !timescale_table_has_column_named(
+        transaction,
+        "resource_permissions",
+        "created_by_tenant_account_id",
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    if !timescale_table_has_composite_foreign_key(
+        transaction,
+        "resource_permissions",
+        "tenant_accounts",
+        &[
+            ("created_by_tenant_account_id", "id"),
+            ("tenant_id", "tenant_id"),
+        ],
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    timescale_table_has_creator_attribution_xor_check(transaction, "resource_permissions").await
+}
+
+async fn timescale_table_has_unique_columns(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: &str,
+    expected_columns: &[&str],
+) -> Result<bool, sqlx::Error> {
+    let unique_columns = sqlx::query(
+        "SELECT array_agg(attribute.attname::text ORDER BY key_column.ordinality) AS key_columns
+         FROM pg_catalog.pg_constraint AS constraint_row
+         JOIN pg_catalog.pg_class AS relation ON relation.oid = constraint_row.conrelid
+         JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         CROSS JOIN LATERAL unnest(constraint_row.conkey) WITH ORDINALITY
+             AS key_column(attnum, ordinality)
+         JOIN pg_catalog.pg_attribute AS attribute
+             ON attribute.attrelid = constraint_row.conrelid
+            AND attribute.attnum = key_column.attnum
+            AND NOT attribute.attisdropped
+         WHERE constraint_row.contype IN ('p', 'u')
+           AND namespace.nspname = 'iot_nano'
+           AND relation.relname = $1
+         GROUP BY constraint_row.oid",
+    )
+    .bind(table)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(unique_columns.into_iter().any(|row| {
+        row.try_get::<Vec<String>, _>("key_columns")
+            .is_ok_and(|columns| {
+                columns
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected_columns.iter().copied())
+            })
+    }))
+}
+
+async fn timescale_table_has_column_named(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: &str,
+    column_name: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pg_catalog.pg_attribute AS attribute
+             JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid
+             JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = 'iot_nano'
+               AND relation.relname = $1
+               AND relation.relkind IN ('r', 'p')
+               AND attribute.attname = $2
+               AND attribute.attnum > 0
+               AND NOT attribute.attisdropped
+         )",
+    )
+    .bind(table)
+    .bind(column_name)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
+async fn timescale_table_has_creator_attribution_xor_check(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    let checks = sqlx::query_scalar::<_, String>(
+        "SELECT pg_get_constraintdef(constraint_row.oid)
+         FROM pg_catalog.pg_constraint AS constraint_row
+         JOIN pg_catalog.pg_class AS relation ON relation.oid = constraint_row.conrelid
+         JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE constraint_row.contype = 'c'
+           AND namespace.nspname = 'iot_nano'
+           AND relation.relname = $1",
+    )
+    .bind(table)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(checks
+        .iter()
+        .any(|check| creator_attribution_xor_check_is_present(check)))
 }
 
 async fn timescale_table_has_non_null_tenant_id(

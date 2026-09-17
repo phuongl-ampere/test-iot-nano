@@ -1,8 +1,23 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_storage::PlatformStore;
-use sqlx::{AssertSqlSafe, Connection, PgConnection, Row, SqliteConnection};
+use iot_storage::{
+    NewResourcePermission, NewUserGroup, PermissionCreator, PlatformStore, ResourcePermission,
+    TenantAuthorizationError,
+};
+use serde_json::json;
+use sqlx::{AssertSqlSafe, Connection, PgConnection, PgPool, Row, SqliteConnection};
+use uuid::Uuid;
 
 mod common;
+
+const CREATOR_TENANT_A: Uuid = Uuid::from_u128(101);
+const CREATOR_TENANT_B: Uuid = Uuid::from_u128(102);
+const CREATOR_OWNER_A: Uuid = Uuid::from_u128(110);
+const CREATOR_MEMBER_A: Uuid = Uuid::from_u128(111);
+const CREATOR_USER_A: Uuid = Uuid::from_u128(112);
+const CREATOR_TENANT_ACCOUNT_A: Uuid = Uuid::from_u128(113);
+const CREATOR_TENANT_ACCOUNT_B: Uuid = Uuid::from_u128(123);
+const CREATOR_ASSET_A: Uuid = Uuid::from_u128(130);
+const CREATOR_DEVICE_A: &str = "creator-attribution-device-a";
 
 fn test_tenant_id() -> uuid::Uuid {
     uuid::Uuid::from_u128(1)
@@ -60,6 +75,60 @@ async fn isolated_timescale_connection() -> (String, PgConnection) {
         .await
         .unwrap();
     (database_url, connection)
+}
+
+async fn seed_creator_attribution_timescale_scope(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status)
+         VALUES ($1, 'creator-tenant-a', 'active'), ($2, 'creator-tenant-b', 'active')",
+    )
+    .bind(CREATOR_TENANT_A)
+    .bind(CREATOR_TENANT_B)
+    .execute(pool)
+    .await
+    .unwrap();
+    for (id, tenant_id, username) in [
+        (CREATOR_OWNER_A, CREATOR_TENANT_A, "creator-owner-a"),
+        (CREATOR_MEMBER_A, CREATOR_TENANT_A, "creator-member-a"),
+        (CREATOR_USER_A, CREATOR_TENANT_A, "creator-user-a"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+             VALUES ($1, $2, $3, 'unused', 'viewer', 'user')",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    for (id, tenant_id) in [
+        (CREATOR_TENANT_ACCOUNT_A, CREATOR_TENANT_A),
+        (CREATOR_TENANT_ACCOUNT_B, CREATOR_TENANT_B),
+    ] {
+        sqlx::query(
+            "INSERT INTO tenant_accounts (id, tenant_id, password_hash, status, credential_version)
+             VALUES ($1, $2, 'unused', 'active', 1)",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES ($1, $2, 'creator-asset-a')")
+        .bind(CREATOR_ASSET_A)
+        .bind(CREATOR_TENANT_A)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ($1, $2)")
+        .bind(CREATOR_DEVICE_A)
+        .bind(CREATOR_TENANT_A)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn assert_timescale_reset_gate(
@@ -225,6 +294,124 @@ async fn sqlite_current_schema_does_not_create_a_pre_migration_backup() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_pre_creator_attribution_schema_without_partial_migration() {
+    let older_schema_replacements = [
+        (
+            "tenant-accounts",
+            "tenant_accounts",
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE tenant_accounts;
+             CREATE TABLE tenant_accounts (
+                 id TEXT PRIMARY KEY,
+                 tenant_id TEXT NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE RESTRICT,
+                 password_hash TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
+                 credential_version INTEGER NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );",
+        ),
+        (
+            "resource-permissions",
+            "resource_permissions",
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE resource_permissions;
+             CREATE TABLE resource_permissions (
+                 id TEXT PRIMARY KEY,
+                 tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+                 subject_user_id TEXT,
+                 subject_group_id TEXT,
+                 asset_id TEXT,
+                 device_id TEXT,
+                 permission TEXT NOT NULL CHECK (permission IN ('viewer', 'manager')),
+                 inherit_children INTEGER NOT NULL DEFAULT 0 CHECK (inherit_children IN (0, 1)),
+                 created_by_user_id TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 revoked_at TEXT,
+                 CHECK (
+                     (subject_user_id IS NOT NULL AND subject_group_id IS NULL)
+                     OR (subject_user_id IS NULL AND subject_group_id IS NOT NULL)
+                 ),
+                 CHECK (
+                     (asset_id IS NOT NULL AND device_id IS NULL)
+                     OR (asset_id IS NULL AND device_id IS NOT NULL)
+                 ),
+                 CHECK (device_id IS NULL OR inherit_children = 0),
+                 FOREIGN KEY (subject_user_id, tenant_id)
+                     REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (subject_group_id, tenant_id)
+                     REFERENCES user_groups(id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (asset_id, tenant_id)
+                     REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (device_id, tenant_id)
+                     REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (created_by_user_id, tenant_id)
+                     REFERENCES users(id, tenant_id) ON DELETE RESTRICT
+             );",
+        ),
+    ];
+
+    for (name, expected_table, replacement) in older_schema_replacements {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration =
+            sqlite_configuration(directory.path().join(format!("{name}-schema.sqlite")));
+        let store = PlatformStore::open(&configuration).await.unwrap();
+        drop(store);
+
+        let path = configuration.sqlite_path.as_ref().unwrap();
+        let mut connection =
+            SqliteConnection::connect(&format!("sqlite://{}?mode=rw", path.display()))
+                .await
+                .unwrap();
+        sqlx::raw_sql(AssertSqlSafe(replacement))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let schema_before: String = sqlx::query_scalar(
+            "SELECT sql
+             FROM sqlite_master
+             WHERE type = 'table' AND name = ?",
+        )
+        .bind(expected_table)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+
+        let error = match PlatformStore::open(&configuration).await {
+            Ok(_) => panic!("pre-creator-attribution {expected_table} schema was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("reset the development database"),
+            "unexpected migration error for {expected_table}: {error}"
+        );
+        assert!(
+            error.to_string().contains(expected_table),
+            "unexpected migration error for {expected_table}: {error}"
+        );
+
+        let mut connection =
+            SqliteConnection::connect(&format!("sqlite://{}?mode=rw", path.display()))
+                .await
+                .unwrap();
+        let schema_after: String = sqlx::query_scalar(
+            "SELECT sql
+             FROM sqlite_master
+             WHERE type = 'table' AND name = ?",
+        )
+        .bind(expected_table)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            schema_after, schema_before,
+            "open partially accepted the old {expected_table} schema"
+        );
+    }
 }
 
 #[tokio::test]
@@ -663,6 +850,238 @@ async fn timescale_open_rejects_pre_tenant_platform_schema_without_partial_migra
     common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_pre_creator_attribution_schema_without_partial_migration() {
+    let (database_url, mut connection) = isolated_timescale_connection().await;
+    sqlx::raw_sql(AssertSqlSafe(
+        "CREATE SCHEMA iot_nano;
+         SET search_path TO iot_nano, public;
+         CREATE TABLE tenants (id UUID PRIMARY KEY);
+         CREATE TABLE tenant_accounts (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE RESTRICT,
+             password_hash TEXT NOT NULL,
+             status TEXT NOT NULL,
+             credential_version INTEGER NOT NULL,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+         );
+         CREATE TABLE resource_permissions (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+             subject_user_id UUID,
+             subject_group_id UUID,
+             asset_id UUID,
+             device_id TEXT,
+             permission TEXT NOT NULL,
+             inherit_children BOOLEAN NOT NULL DEFAULT FALSE,
+             created_by_user_id UUID NOT NULL,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+             revoked_at TIMESTAMPTZ
+         );",
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    let open_result = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await;
+    let migration_started: bool =
+        sqlx::query_scalar("SELECT to_regclass('iot_nano.system_accounts') IS NOT NULL")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+    let creator_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM information_schema.columns
+             WHERE table_schema = 'iot_nano'
+               AND table_name = 'resource_permissions'
+               AND column_name = 'created_by_tenant_account_id'
+         )",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    let error = match open_result {
+        Ok(store) => {
+            drop(store);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    common::reset_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+
+    let error = error.expect("pre-creator-attribution schema was accepted");
+    assert!(
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains("tenant_accounts"),
+        "unexpected migration error: {error}"
+    );
+    assert!(!migration_started);
+    assert!(!creator_column_exists);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_permission_creator_enforces_attribution_contract() {
+    let (database_url, _connection) = isolated_timescale_connection().await;
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let pool = store.timescale_pool().unwrap();
+    seed_creator_attribution_timescale_scope(pool).await;
+
+    let tenant_account_permission = store
+        .create_resource_permission(NewResourcePermission {
+            tenant_id: CREATOR_TENANT_A,
+            subject_user_id: Some(CREATOR_MEMBER_A),
+            subject_group_id: None,
+            asset_id: None,
+            device_id: Some(CREATOR_DEVICE_A.to_owned()),
+            permission: ResourcePermission::Viewer,
+            inherit_children: false,
+            created_by: PermissionCreator::TenantAccount(CREATOR_TENANT_ACCOUNT_A),
+        })
+        .await
+        .unwrap();
+    let group = store
+        .create_user_group(NewUserGroup {
+            tenant_id: CREATOR_TENANT_A,
+            owner_user_id: CREATOR_OWNER_A,
+            name: "creator-operators".to_owned(),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    let user_permission = store
+        .create_resource_permission(NewResourcePermission {
+            tenant_id: CREATOR_TENANT_A,
+            subject_user_id: None,
+            subject_group_id: Some(group.id),
+            asset_id: Some(CREATOR_ASSET_A),
+            device_id: None,
+            permission: ResourcePermission::Manager,
+            inherit_children: true,
+            created_by: PermissionCreator::User(CREATOR_USER_A),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tenant_account_permission.created_by,
+        PermissionCreator::TenantAccount(CREATOR_TENANT_ACCOUNT_A)
+    );
+    assert_eq!(
+        user_permission.created_by,
+        PermissionCreator::User(CREATOR_USER_A)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT created_by_tenant_account_id
+             FROM resource_permissions
+             WHERE id = $1",
+        )
+        .bind(tenant_account_permission.id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        Some(CREATOR_TENANT_ACCOUNT_A)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT created_by_user_id
+             FROM resource_permissions
+             WHERE id = $1",
+        )
+        .bind(user_permission.id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        Some(CREATOR_USER_A)
+    );
+
+    let cross_tenant_creator = store
+        .create_resource_permission(NewResourcePermission {
+            tenant_id: CREATOR_TENANT_A,
+            subject_user_id: Some(CREATOR_MEMBER_A),
+            subject_group_id: None,
+            asset_id: None,
+            device_id: Some(CREATOR_DEVICE_A.to_owned()),
+            permission: ResourcePermission::Viewer,
+            inherit_children: false,
+            created_by: PermissionCreator::TenantAccount(CREATOR_TENANT_ACCOUNT_B),
+        })
+        .await;
+    assert!(matches!(
+        cross_tenant_creator,
+        Err(TenantAuthorizationError::TenantAccountNotFound {
+            tenant_id: CREATOR_TENANT_A,
+            tenant_account_id: CREATOR_TENANT_ACCOUNT_B,
+        })
+    ));
+    assert!(
+        sqlx::query(
+            "INSERT INTO resource_permissions (
+                id, tenant_id, subject_user_id, asset_id, permission, inherit_children,
+                created_by_user_id, created_by_tenant_account_id
+             ) VALUES ($1, $2, $3, $4, 'viewer', FALSE, NULL, $5)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(CREATOR_TENANT_A)
+        .bind(CREATOR_MEMBER_A)
+        .bind(CREATOR_ASSET_A)
+        .bind(CREATOR_TENANT_ACCOUNT_B)
+        .execute(pool)
+        .await
+        .is_err()
+    );
+
+    for (created_by_user_id, created_by_tenant_account_id) in [
+        (None, None),
+        (Some(CREATOR_USER_A), Some(CREATOR_TENANT_ACCOUNT_A)),
+    ] {
+        let result = sqlx::query(
+            "INSERT INTO resource_permissions (
+                id, tenant_id, subject_user_id, asset_id, permission, inherit_children,
+                created_by_user_id, created_by_tenant_account_id
+             ) VALUES ($1, $2, $3, $4, 'viewer', FALSE, $5, $6)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(CREATOR_TENANT_A)
+        .bind(CREATOR_MEMBER_A)
+        .bind(CREATOR_ASSET_A)
+        .bind(created_by_user_id)
+        .bind(created_by_tenant_account_id)
+        .execute(pool)
+        .await;
+        assert!(result.is_err());
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_permissions")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        2
+    );
 }
 
 #[tokio::test]
