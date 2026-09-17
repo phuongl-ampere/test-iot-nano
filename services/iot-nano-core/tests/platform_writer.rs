@@ -21,6 +21,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const TOPIC: &str = "iot/v1/devices/direct-1/telemetry";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 static TEST_EPOCH: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 
 #[derive(Clone)]
@@ -73,6 +74,7 @@ impl Default for FakeRepository {
 impl TelemetryRepository for FakeRepository {
     fn write_telemetry<'a>(
         &'a self,
+        _tenant_id: Uuid,
         event: &'a TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &'a str,
@@ -125,6 +127,7 @@ fn event(device_id: &str, gateway_device_id: Option<&str>, sequence: u64) -> Tel
 
 fn telemetry_message(sequence: u64, received_at: DateTime<Utc>) -> TelemetryMessage {
     TelemetryMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: TOPIC.to_owned(),
         payload: Vec::new(),
         event: event("direct-1", None, sequence),
@@ -140,6 +143,7 @@ fn gateway_message(
     idempotency_key: &str,
 ) -> GatewayMessage {
     GatewayMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: "iot/v1/gateways/gateway-1/events".to_owned(),
         payload: Vec::new(),
         gateway_event: GatewayEvent {
@@ -317,6 +321,7 @@ async fn every_gateway_kind_maps_to_the_platform_request() {
         repository.gateway_calls.lock().unwrap().as_slice(),
         &[
             GatewayIngestRequest {
+                tenant_id: TEST_TENANT_ID,
                 gateway_device_id: "gateway-1".to_owned(),
                 child_device_id: Some("child-1".to_owned()),
                 event_kind: GatewayIngestEventKind::Connect,
@@ -327,6 +332,7 @@ async fn every_gateway_kind_maps_to_the_platform_request() {
                 received_at,
             },
             GatewayIngestRequest {
+                tenant_id: TEST_TENANT_ID,
                 gateway_device_id: "gateway-1".to_owned(),
                 child_device_id: Some("child-1".to_owned()),
                 event_kind: GatewayIngestEventKind::Disconnect,
@@ -337,6 +343,7 @@ async fn every_gateway_kind_maps_to_the_platform_request() {
                 received_at,
             },
             GatewayIngestRequest {
+                tenant_id: TEST_TENANT_ID,
                 gateway_device_id: "gateway-1".to_owned(),
                 child_device_id: Some("child-1".to_owned()),
                 event_kind: GatewayIngestEventKind::ChildTelemetry,
@@ -347,6 +354,7 @@ async fn every_gateway_kind_maps_to_the_platform_request() {
                 received_at,
             },
             GatewayIngestRequest {
+                tenant_id: TEST_TENANT_ID,
                 gateway_device_id: "gateway-1".to_owned(),
                 child_device_id: None,
                 event_kind: GatewayIngestEventKind::Heartbeat,
@@ -404,21 +412,45 @@ async fn sqlite_store() -> (TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'platform-writer', 'active', '{}')",
+    )
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     (directory, store)
 }
 
 #[tokio::test]
 async fn platform_store_writer_persists_topology_runtime_receipt_and_rollup() {
     let (directory, store) = sqlite_store().await;
-    store.register_device("direct-1").await.unwrap();
-    sqlx::query("INSERT INTO devices (device_id, is_gateway) VALUES ('gateway-1', 1)")
-        .execute(store.sqlite_pool().unwrap())
+    store
+        .register_device(TEST_TENANT_ID, "direct-1")
+        .await
+        .unwrap();
+    store
+        .register_device(TEST_TENANT_ID, "gateway-1")
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, gateway_device_id)
-         VALUES ('child-1', 'gateway-1')",
+        "UPDATE devices SET is_gateway = 1 WHERE tenant_id = ? AND device_id = 'gateway-1'",
     )
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    store
+        .register_device(TEST_TENANT_ID, "child-1")
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE devices
+         SET gateway_device_id = 'gateway-1'
+         WHERE tenant_id = ? AND device_id = 'child-1'",
+    )
+    .bind(TEST_TENANT_ID.to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -470,7 +502,7 @@ async fn platform_store_writer_persists_topology_runtime_receipt_and_rollup() {
         1
     );
     let aggregate = store
-        .average_metric("child-1", "temperature_c", at(0), at(20))
+        .average_metric(TEST_TENANT_ID, "child-1", "temperature_c", at(0), at(20))
         .await
         .unwrap()
         .unwrap();

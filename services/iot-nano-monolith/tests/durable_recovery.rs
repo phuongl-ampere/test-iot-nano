@@ -186,10 +186,11 @@ impl Drop for ProtocolBroker {
 async fn instance_lock_rejects_a_second_runtime_and_restored_platform_backup_is_bootable() {
     let fixture = Fixture::sqlite().await;
     let (mut first, _) = fixture.start().await;
+    let tenant_id = create_active_tenant(first.platform().unwrap(), "durable-backup").await;
     first
         .platform()
         .unwrap()
-        .register_device("in-backup")
+        .register_device(tenant_id, "in-backup")
         .await
         .unwrap();
     let backup = first.platform().unwrap().backup_sqlite().await.unwrap();
@@ -197,7 +198,7 @@ async fn instance_lock_rejects_a_second_runtime_and_restored_platform_backup_is_
     first
         .platform()
         .unwrap()
-        .register_device("after-backup")
+        .register_device(tenant_id, "after-backup")
         .await
         .unwrap();
 
@@ -232,8 +233,12 @@ async fn instance_lock_rejects_a_second_runtime_and_restored_platform_backup_is_
 async fn unacknowledged_stream_work_replays_after_a_full_runtime_restart() {
     let fixture = Fixture::sqlite().await;
     let (mut runtime, _) = fixture.start().await;
+    let tenant_id = create_active_tenant(runtime.platform().unwrap(), "durable-stream").await;
     let stream = runtime.stream().unwrap().clone();
-    stream.append(telemetry_message(1)).await.unwrap();
+    stream
+        .append(telemetry_message(tenant_id, 1))
+        .await
+        .unwrap();
     let interrupted_claim = stream
         .claim(claim("recovery", "interrupted"))
         .await
@@ -525,9 +530,10 @@ fn replace_sqlite_database(backup: &std::path::Path, platform: &std::path::Path)
     std::fs::copy(backup, platform).unwrap();
 }
 
-fn telemetry_message(sequence: u64) -> StreamMessage {
+fn telemetry_message(tenant_id: Uuid, sequence: u64) -> StreamMessage {
     let now = Utc::now();
     StreamMessage::Telemetry(TelemetryMessage {
+        tenant_id,
         topic: "iot/v1/devices/durable-device/telemetry".to_owned(),
         payload: format!(r#"{{"sequence":{sequence}}}"#).into_bytes(),
         event: TelemetryEvent {
@@ -550,6 +556,17 @@ fn claim(group: &str, member_id: &str) -> ClaimRequest {
         start: GroupStart::Earliest,
         limit: 10,
     }
+}
+
+async fn create_active_tenant(store: &iot_storage::PlatformStore, slug_prefix: &str) -> Uuid {
+    let tenant_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, ?, 'active')")
+        .bind(tenant_id.to_string())
+        .bind(format!("{slug_prefix}-{tenant_id}"))
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    tenant_id
 }
 
 async fn provision_device_token(runtime: &MonolithRuntime, device_id: &str) -> String {

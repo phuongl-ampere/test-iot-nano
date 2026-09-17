@@ -11,6 +11,8 @@ use iot_storage::{PlatformStore, TopologyRepository};
 use serde_json::json;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 async fn sqlite_store() -> (tempfile::TempDir, Arc<PlatformStore>) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
@@ -23,6 +25,14 @@ async fn sqlite_store() -> (tempfile::TempDir, Arc<PlatformStore>) {
         .await
         .unwrap(),
     );
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'core-facade', 'active', '{}')",
+    )
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     (directory, store)
 }
 
@@ -45,6 +55,7 @@ fn command_request(
 
 async fn write_telemetry(
     store: &PlatformStore,
+    tenant_id: Uuid,
     device_id: &str,
     sequence: u64,
     event_at: chrono::DateTime<Utc>,
@@ -53,6 +64,7 @@ async fn write_telemetry(
 ) {
     store
         .write_telemetry(
+            tenant_id,
             &TelemetryEvent {
                 schema_version: 1,
                 device_id: device_id.to_owned(),
@@ -92,7 +104,7 @@ async fn insert_active_sqlite_token(store: &PlatformStore, device_id: &str) -> U
 #[tokio::test]
 async fn sqlite_core_facade_replays_matching_commands_and_rejects_conflicts() {
     let (_directory, store) = sqlite_store().await;
-    TopologyRepository::register_device(store.as_ref(), "facade-device")
+    TopologyRepository::register_device(store.as_ref(), TEST_TENANT_ID, "facade-device")
         .await
         .unwrap();
     let facade = PlatformCoreFacade::new(store.clone());
@@ -135,7 +147,7 @@ async fn sqlite_core_facade_replays_matching_commands_and_rejects_conflicts() {
 #[tokio::test]
 async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buckets() {
     let (_directory, store) = sqlite_store().await;
-    TopologyRepository::register_device(store.as_ref(), "facade-device")
+    TopologyRepository::register_device(store.as_ref(), TEST_TENANT_ID, "facade-device")
         .await
         .unwrap();
     let token_id = insert_active_sqlite_token(store.as_ref(), "facade-device").await;
@@ -191,9 +203,19 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
         Err(CoreFacadeError::Rejected(409))
     ));
 
-    write_telemetry(store.as_ref(), "facade-device", 1, now, 20.0, 40.0).await;
     write_telemetry(
         store.as_ref(),
+        TEST_TENANT_ID,
+        "facade-device",
+        1,
+        now,
+        20.0,
+        40.0,
+    )
+    .await;
+    write_telemetry(
+        store.as_ref(),
+        TEST_TENANT_ID,
         "facade-device",
         2,
         now + Duration::minutes(2),
@@ -250,7 +272,7 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
 #[tokio::test]
 async fn sqlite_core_facade_rejects_invalid_queries_and_unpublished_responses() {
     let (_directory, store) = sqlite_store().await;
-    TopologyRepository::register_device(store.as_ref(), "facade-device")
+    TopologyRepository::register_device(store.as_ref(), TEST_TENANT_ID, "facade-device")
         .await
         .unwrap();
     let token_id = insert_active_sqlite_token(store.as_ref(), "facade-device").await;
@@ -285,7 +307,7 @@ async fn sqlite_core_facade_rejects_invalid_queries_and_unpublished_responses() 
 #[tokio::test]
 async fn sqlite_core_facade_rejects_response_for_a_revoked_token() {
     let (_directory, store) = sqlite_store().await;
-    TopologyRepository::register_device(store.as_ref(), "facade-device")
+    TopologyRepository::register_device(store.as_ref(), TEST_TENANT_ID, "facade-device")
         .await
         .unwrap();
     let revoked_token_id = insert_active_sqlite_token(store.as_ref(), "facade-device").await;
@@ -353,7 +375,17 @@ async fn timescale_core_facade_normalizes_malformed_and_out_of_range_raw_metrics
         .unwrap(),
     );
     let device_id = format!("facade-metrics-{}", Uuid::now_v7());
-    store.register_device(&device_id).await.unwrap();
+    let tenant_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES ($1, $2, 'active', '{}'::jsonb)",
+    )
+    .bind(tenant_id)
+    .bind(format!("facade-metrics-{tenant_id}"))
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    store.register_device(tenant_id, &device_id).await.unwrap();
     let first_at = Utc::now();
     let second_at = first_at + Duration::milliseconds(1);
     let pool = store.timescale_pool().unwrap();
@@ -372,11 +404,12 @@ async fn timescale_core_facade_normalizes_malformed_and_out_of_range_raw_metrics
     ] {
         sqlx::query(
             "INSERT INTO telemetry (
-                event_at, received_at, device_id, boot_id, sequence, measurements, topic
-             ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'iot/v1/devices/telemetry')",
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'iot/v1/devices/telemetry')",
         )
         .bind(event_at)
         .bind(event_at)
+        .bind(tenant_id)
         .bind(&device_id)
         .bind(Uuid::now_v7())
         .bind(sequence)

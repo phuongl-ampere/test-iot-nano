@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 const DEVICE_ID: &str = "esp-000123";
 const TOPIC: &str = "iot/v1/devices/esp-000123/telemetry";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -183,6 +184,7 @@ fn temperature_message(value: f64, received_at: DateTime<Utc>) -> TelemetryMessa
     let mut measurements = serde_json::Map::new();
     measurements.insert("temperature_c".to_owned(), json!(value));
     TelemetryMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: TOPIC.to_owned(),
         payload: format!(r#"{{"temperature_c":{value}}}"#).into_bytes(),
         event: TelemetryEvent {
@@ -464,13 +466,19 @@ async fn sqlite_window_average_honors_incident_state_transitions() {
     let store = sqlite_store(&tempdir).await;
     insert_sqlite_window_rule(&store, 60, 0).await;
     let high = temperature_message(41.0, at(240)).event;
-    store.write_telemetry(&high, at(240), TOPIC).await.unwrap();
+    store
+        .write_telemetry(TEST_TENANT_ID, &high, at(240), TOPIC)
+        .await
+        .unwrap();
     let evaluator = SqliteAlertEvaluator::new(store.clone(), 100);
 
     let first_window = evaluator.flush_window_rules(at(300)).await.unwrap();
     let sustained_window = evaluator.flush_window_rules(at(361)).await.unwrap();
     let low = temperature_message(39.0, at(540)).event;
-    store.write_telemetry(&low, at(540), TOPIC).await.unwrap();
+    store
+        .write_telemetry(TEST_TENANT_ID, &low, at(540), TOPIC)
+        .await
+        .unwrap();
     let normal_window = evaluator.flush_window_rules(at(541)).await.unwrap();
     let status =
         sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE device_id = ?")

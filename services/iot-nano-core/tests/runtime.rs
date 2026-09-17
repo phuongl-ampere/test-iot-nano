@@ -32,6 +32,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 #[derive(Clone)]
 struct UnavailableTransport;
 
@@ -426,6 +428,14 @@ async fn runtime_config(stream: Arc<dyn StreamPort>) -> (TempDir, CoreRuntimeCon
     })
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'core-runtime', 'active', '{}')",
+    )
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
 
     (
         directory,
@@ -509,7 +519,7 @@ async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
     let (_directory, config) = runtime_config(Arc::new(stream)).await;
     config
         .store
-        .register_device("runtime-device")
+        .register_device(TEST_TENANT_ID, "runtime-device")
         .await
         .unwrap();
     let command_id = Uuid::now_v7();
@@ -569,7 +579,7 @@ async fn command_worker_handoff_waits_for_an_in_flight_claim_then_drains_remaini
     config.command_batch_size = 1;
     config
         .store
-        .register_device("runtime-device")
+        .register_device(TEST_TENANT_ID, "runtime-device")
         .await
         .unwrap();
     let first_command_id = Uuid::now_v7();
@@ -650,7 +660,7 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
     let (_directory, config) = runtime_config(Arc::new(stream)).await;
     config
         .store
-        .register_device("runtime-device")
+        .register_device(TEST_TENANT_ID, "runtime-device")
         .await
         .unwrap();
     let original_next_attempt_at = Utc::now();
@@ -776,6 +786,7 @@ fn telemetry_record(device_id: &str) -> ClaimedRecord {
         partition: PartitionId::new(0),
         offset: 0,
         message: StreamMessage::Telemetry(TelemetryMessage {
+            tenant_id: TEST_TENANT_ID,
             topic: format!("iot/v1/devices/{device_id}/telemetry"),
             payload: b"{}".to_vec(),
             event: TelemetryEvent {
@@ -1067,7 +1078,11 @@ async fn failed_persistence_is_reclaimed_after_lease_expiry_and_acknowledged_onc
     assert_eq!(counted_stream.acknowledgements(), 0);
 
     sleep(Duration::from_millis(60)).await;
-    config.store.register_device("retry-device").await.unwrap();
+    config
+        .store
+        .register_device(TEST_TENANT_ID, "retry-device")
+        .await
+        .unwrap();
 
     let second_consumer =
         CoreStreamConsumer::new(Arc::new(counted_stream.clone()), "writer", "second-member");

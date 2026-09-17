@@ -20,6 +20,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 #[derive(Clone)]
 struct RecordingTransport {
@@ -389,7 +390,18 @@ async fn platform_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
-    store.register_device("device-a").await.unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'command-dispatcher', 'active', '{}')",
+    )
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    store
+        .register_device(TEST_TENANT_ID, "device-a")
+        .await
+        .unwrap();
     (directory, store)
 }
 
