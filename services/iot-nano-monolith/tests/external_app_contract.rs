@@ -581,7 +581,7 @@ async fn create_user(
         .json(&json!({
             "username": USERNAME,
             "password": USER_PASSWORD,
-            "default_app": "/apps/powermonitor",
+            "default_app": "/apps/powermonitor-external",
             "granted_apps": ["powermonitor-external"],
         }))
         .send()

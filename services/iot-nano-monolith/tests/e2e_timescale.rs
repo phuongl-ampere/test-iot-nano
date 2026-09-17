@@ -1535,7 +1535,7 @@ async fn migration_lock_query_detects_waiting_signed_hashtext_lock() -> E2eResul
 fn child_diagnostics_are_bounded_and_redact_child_secrets() {
     let database_url = "postgres://iot:database-password@localhost/iot_nano_test_018f4e40-5d2c-7d19-9d6f-6f996de6f722";
     let vault_key = "e2e-timescale-device-token-vault-key-material-0001";
-    let bootstrap_password = "E2eTimescaleBootstrapAdmin@2026";
+    let bootstrap_password = "E2eTimescaleBootstrapSystem@2026";
     let stderr = format!(
         "{database_url} {vault_key} {bootstrap_password}{}",
         "x".repeat(MAX_CHILD_DIAGNOSTIC_BYTES - 2)
