@@ -397,6 +397,51 @@ async fn sqlite_open_rejects_pre_creator_attribution_schema_without_partial_migr
                      REFERENCES tenant_accounts(id, tenant_id) ON DELETE RESTRICT
              );",
         ),
+        (
+            "resource-permissions-non-null-tenant-account-creator",
+            "resource_permissions",
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE resource_permissions;
+             CREATE TABLE resource_permissions (
+                 id TEXT PRIMARY KEY,
+                 tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+                 subject_user_id TEXT,
+                 subject_group_id TEXT,
+                 asset_id TEXT,
+                 device_id TEXT,
+                 permission TEXT NOT NULL CHECK (permission IN ('viewer', 'manager')),
+                 inherit_children INTEGER NOT NULL DEFAULT 0 CHECK (inherit_children IN (0, 1)),
+                 created_by_user_id TEXT,
+                 created_by_tenant_account_id TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                 revoked_at TEXT,
+                 CHECK (
+                     (subject_user_id IS NOT NULL AND subject_group_id IS NULL)
+                     OR (subject_user_id IS NULL AND subject_group_id IS NOT NULL)
+                 ),
+                 CHECK (
+                     (asset_id IS NOT NULL AND device_id IS NULL)
+                     OR (asset_id IS NULL AND device_id IS NOT NULL)
+                 ),
+                 CHECK (
+                     (created_by_user_id IS NOT NULL AND created_by_tenant_account_id IS NULL)
+                     OR (created_by_user_id IS NULL AND created_by_tenant_account_id IS NOT NULL)
+                 ),
+                 CHECK (device_id IS NULL OR inherit_children = 0),
+                 FOREIGN KEY (subject_user_id, tenant_id)
+                     REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (subject_group_id, tenant_id)
+                     REFERENCES user_groups(id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (asset_id, tenant_id)
+                     REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (device_id, tenant_id)
+                     REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (created_by_user_id, tenant_id)
+                     REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+                 FOREIGN KEY (created_by_tenant_account_id, tenant_id)
+                     REFERENCES tenant_accounts(id, tenant_id) ON DELETE RESTRICT
+             );",
+        ),
     ];
 
     for (name, expected_table, replacement) in older_schema_replacements {
@@ -956,6 +1001,59 @@ async fn timescale_open_rejects_pre_creator_attribution_resource_permission_sche
              inherit_children BOOLEAN NOT NULL DEFAULT FALSE,
              created_by_user_id UUID NOT NULL,
              created_by_tenant_account_id UUID,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+             revoked_at TIMESTAMPTZ,
+             CHECK (
+                 (created_by_user_id IS NOT NULL AND created_by_tenant_account_id IS NULL)
+                 OR (created_by_user_id IS NULL AND created_by_tenant_account_id IS NOT NULL)
+             ),
+             FOREIGN KEY (created_by_user_id, tenant_id)
+                 REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+             FOREIGN KEY (created_by_tenant_account_id, tenant_id)
+                 REFERENCES tenant_accounts(id, tenant_id) ON DELETE RESTRICT
+         );",
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    assert_timescale_reset_gate(&mut connection, database_url, "resource_permissions").await;
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_pre_creator_attribution_non_null_tenant_account_creator_schema() {
+    let (database_url, mut connection) = isolated_timescale_connection().await;
+    sqlx::raw_sql(AssertSqlSafe(
+        "CREATE SCHEMA iot_nano;
+         SET search_path TO iot_nano, public;
+         CREATE TABLE tenants (id UUID PRIMARY KEY);
+         CREATE TABLE tenant_accounts (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE RESTRICT,
+             password_hash TEXT NOT NULL,
+             status TEXT NOT NULL,
+             credential_version INTEGER NOT NULL,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+             UNIQUE (id, tenant_id)
+         );
+         CREATE TABLE users (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+             UNIQUE (id, tenant_id)
+         );
+         CREATE TABLE resource_permissions (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+             subject_user_id UUID,
+             subject_group_id UUID,
+             asset_id UUID,
+             device_id TEXT,
+             permission TEXT NOT NULL,
+             inherit_children BOOLEAN NOT NULL DEFAULT FALSE,
+             created_by_user_id UUID,
+             created_by_tenant_account_id UUID NOT NULL,
              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
              revoked_at TIMESTAMPTZ,
              CHECK (
