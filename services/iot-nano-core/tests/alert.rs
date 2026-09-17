@@ -50,6 +50,26 @@ async fn prepared_pool() -> PgPool {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES ($1, 'core-alert-tests', 'active', '{}'::jsonb)
+         ON CONFLICT (id) DO UPDATE SET status = 'active'",
+    )
+    .bind(TEST_TENANT_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id)
+         VALUES ($1, $2)
+         ON CONFLICT (device_id) DO UPDATE
+         SET tenant_id = EXCLUDED.tenant_id, deleted_at = NULL",
+    )
+    .bind(DEVICE_ID)
+    .bind(TEST_TENANT_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
     pool
 }
 
@@ -106,10 +126,11 @@ async fn insert_window_rule(pool: &PgPool) -> Uuid {
 async fn insert_telemetry(pool: &PgPool, value: f64, event_at: DateTime<Utc>) {
     sqlx::query(
         "INSERT INTO telemetry (
-            event_at, received_at, device_id, boot_id, sequence, measurements, topic
-         ) VALUES ($1, $1, $2, $3, $4, $5, $6)",
+            event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(event_at)
+    .bind(TEST_TENANT_ID)
     .bind(DEVICE_ID)
     .bind(Uuid::new_v4())
     .bind(event_at.timestamp())
