@@ -5,6 +5,35 @@ use sqlx::{Connection, PgConnection};
 
 mod common;
 
+fn test_tenant_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
+
+async fn seed_tenant(store: &PlatformStore) {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES (?, 'telemetry-aggregate', 'active', '{}')",
+            )
+            .bind(test_tenant_id().to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES ($1, 'telemetry-aggregate', 'active', '{}'::jsonb)",
+            )
+            .bind(test_tenant_id())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -15,6 +44,7 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    seed_tenant(&store).await;
     (directory, store)
 }
 
@@ -24,17 +54,22 @@ async fn insert_sqlite_telemetry(
     sequence: i64,
     measurements: &str,
 ) {
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('aggregate-device')")
-        .execute(store.sqlite_pool().unwrap())
-        .await
-        .ok();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id)
+         VALUES ('aggregate-device', ?)",
+    )
+    .bind(test_tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .ok();
     sqlx::query(
         "INSERT INTO telemetry (
-            event_at, received_at, device_id, boot_id, sequence, measurements, topic
-         ) VALUES (?, ?, 'aggregate-device', 'aggregate-boot', ?, ?, 'test')",
+            event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, 'aggregate-device', 'aggregate-boot', ?, ?, 'test')",
     )
     .bind(event_at)
     .bind(event_at)
+    .bind(test_tenant_id().to_string())
     .bind(sequence)
     .bind(measurements)
     .execute(store.sqlite_pool().unwrap())
@@ -48,6 +83,7 @@ async fn exercise_aggregate_contract(store: &PlatformStore) {
 
     let aggregate = TelemetryAggregateRepository::average_metric(
         store,
+        test_tenant_id(),
         "aggregate-device",
         "temperature_c",
         from,
@@ -104,6 +140,7 @@ async fn sqlite_telemetry_aggregate_parses_rfc3339_range_values_without_lexical_
         .unwrap();
     let aggregate = TelemetryAggregateRepository::average_metric(
         &store,
+        test_tenant_id(),
         "aggregate-device",
         "temperature_c",
         from,
@@ -161,6 +198,7 @@ async fn sqlite_telemetry_aggregate_rejects_invalid_metric_identifiers() {
     let (_directory, store) = sqlite_store().await;
     let result = TelemetryAggregateRepository::average_metric(
         &store,
+        test_tenant_id(),
         "device",
         "temperature_c || measurements",
         Utc::now(),
@@ -185,6 +223,7 @@ async fn sqlite_telemetry_aggregate_returns_none_without_numeric_samples() {
     .await;
     let result = TelemetryAggregateRepository::average_metric(
         &store,
+        test_tenant_id(),
         "aggregate-device",
         "temperature_c",
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
@@ -209,6 +248,7 @@ async fn sqlite_telemetry_aggregate_excludes_nonfinite_json_numbers() {
 
     let aggregate = TelemetryAggregateRepository::average_metric(
         &store,
+        test_tenant_id(),
         "aggregate-device",
         "temperature_c",
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
@@ -242,6 +282,7 @@ async fn timescale_store() -> (String, PlatformStore, PgConnection) {
     })
     .await
     .unwrap();
+    seed_tenant(&store).await;
     (database_url, store, connection)
 }
 
@@ -249,7 +290,8 @@ async fn timescale_store() -> (String, PlatformStore, PgConnection) {
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
     let (_database_url, store, _connection) = timescale_store().await;
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('aggregate-device')")
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('aggregate-device', $1)")
+        .bind(test_tenant_id())
         .execute(store.timescale_pool().unwrap())
         .await
         .unwrap();
@@ -271,11 +313,13 @@ async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
             .with_timezone(&Utc);
         sqlx::query(
             "INSERT INTO telemetry (
-                event_at, received_at, device_id, boot_id, sequence, measurements, topic
-             ) VALUES ($1, $1, 'aggregate-device', '00000000-0000-0000-0000-000000000001',
-                       $2, $3::jsonb, 'test')",
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements,
+                topic
+             ) VALUES ($1, $1, $2, 'aggregate-device',
+                       '00000000-0000-0000-0000-000000000001', $3, $4::jsonb, 'test')",
         )
         .bind(event_at)
+        .bind(test_tenant_id())
         .bind(sequence)
         .bind(measurements)
         .execute(store.timescale_pool().unwrap())
@@ -284,6 +328,7 @@ async fn timescale_telemetry_aggregate_matches_sqlite_contract() {
     }
     let aggregate = TelemetryAggregateRepository::average_metric(
         &store,
+        test_tenant_id(),
         "aggregate-device",
         "temperature_c",
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),

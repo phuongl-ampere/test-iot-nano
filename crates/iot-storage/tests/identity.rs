@@ -9,6 +9,35 @@ use uuid::Uuid;
 
 mod common;
 
+fn test_tenant_id() -> Uuid {
+    Uuid::from_u128(1)
+}
+
+async fn seed_tenant(store: &PlatformStore) {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES (?, 'identity', 'active', '{}')",
+            )
+            .bind(test_tenant_id().to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES ($1, 'identity', 'active', '{}'::jsonb)",
+            )
+            .bind(test_tenant_id())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -109,15 +138,19 @@ fn assert_denied(result: Result<impl Sized, PlatformStoreError>) {
 #[tokio::test]
 async fn sqlite_identity_repository_authenticates_active_tokens_and_denies_invalid_tokens() {
     let (_directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway, gateway_device_id)
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
          VALUES
-            ('direct-device', 0, NULL),
-            ('gateway-device', 1, NULL),
-            ('gateway-child', 0, 'gateway-device'),
-            ('deleted-device', 0, NULL),
-            ('mismatch-device', 0, NULL)",
+            ('direct-device', ?, 0, NULL), ('gateway-device', ?, 1, NULL),
+            ('gateway-child', ?, 0, 'gateway-device'), ('deleted-device', ?, 0, NULL),
+            ('mismatch-device', ?, 0, NULL)",
     )
+    .bind(test_tenant_id().to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(test_tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -146,6 +179,7 @@ async fn sqlite_identity_repository_authenticates_active_tokens_and_denies_inval
         .await
         .unwrap();
     assert_eq!(direct.token_id, direct_token_id);
+    assert_eq!(direct.tenant_id, test_tenant_id());
     assert_eq!(direct.device_id, "direct-device");
     assert!(!direct.is_gateway);
     assert_eq!(direct.gateway_device_id, None);
@@ -154,6 +188,7 @@ async fn sqlite_identity_repository_authenticates_active_tokens_and_denies_inval
         .await
         .unwrap();
     assert_eq!(gateway.token_id, gateway_token_id);
+    assert_eq!(gateway.tenant_id, test_tenant_id());
     assert_eq!(gateway.device_id, "gateway-device");
     assert!(gateway.is_gateway);
     assert_eq!(gateway.gateway_device_id, None);
@@ -223,15 +258,17 @@ async fn sqlite_identity_repository_authenticates_active_tokens_and_denies_inval
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_identity_repository_matches_sqlite_identity_contract() {
     let (_test_lock, store) = timescale_store().await;
+    seed_tenant(&store).await;
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway, gateway_device_id)
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
          VALUES
-            ('direct-device', FALSE, NULL),
-            ('gateway-device', TRUE, NULL),
-            ('gateway-child', FALSE, 'gateway-device'),
-            ('deleted-device', FALSE, NULL),
-            ('mismatch-device', FALSE, NULL)",
+            ('direct-device', $1, FALSE, NULL),
+            ('gateway-device', $1, TRUE, NULL),
+            ('gateway-child', $1, FALSE, 'gateway-device'),
+            ('deleted-device', $1, FALSE, NULL),
+            ('mismatch-device', $1, FALSE, NULL)",
     )
+    .bind(test_tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -259,6 +296,7 @@ async fn timescale_identity_repository_matches_sqlite_identity_contract() {
         .await
         .unwrap();
     assert_eq!(direct.token_id, direct_token_id);
+    assert_eq!(direct.tenant_id, test_tenant_id());
     assert_eq!(direct.device_id, "direct-device");
     assert!(!direct.is_gateway);
     assert_eq!(direct.gateway_device_id, None);
@@ -267,6 +305,7 @@ async fn timescale_identity_repository_matches_sqlite_identity_contract() {
         .await
         .unwrap();
     assert_eq!(gateway.token_id, gateway_token_id);
+    assert_eq!(gateway.tenant_id, test_tenant_id());
     assert_eq!(gateway.device_id, "gateway-device");
     assert!(gateway.is_gateway);
     assert_eq!(gateway.gateway_device_id, None);

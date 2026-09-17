@@ -845,13 +845,14 @@ impl DeviceAuthorizationPort for CachedDeviceAuthorization {
 #[derive(Deserialize, Serialize)]
 struct CachedAuthenticatedDevice {
     token_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
     device_id: String,
     is_gateway: bool,
 }
 
 impl CachedAuthenticatedDevice {
     fn is_valid(&self) -> bool {
-        !self.token_id.is_nil() && !self.device_id.trim().is_empty()
+        !self.token_id.is_nil() && !self.tenant_id.is_nil() && !self.device_id.trim().is_empty()
     }
 }
 
@@ -859,6 +860,7 @@ impl From<&AuthenticatedDevice> for CachedAuthenticatedDevice {
     fn from(device: &AuthenticatedDevice) -> Self {
         Self {
             token_id: device.token_id,
+            tenant_id: device.tenant_id,
             device_id: device.device_id.clone(),
             is_gateway: device.is_gateway,
         }
@@ -869,6 +871,7 @@ impl From<CachedAuthenticatedDevice> for AuthenticatedDevice {
     fn from(device: CachedAuthenticatedDevice) -> Self {
         Self {
             token_id: device.token_id,
+            tenant_id: device.tenant_id,
             device_id: device.device_id,
             is_gateway: device.is_gateway,
         }

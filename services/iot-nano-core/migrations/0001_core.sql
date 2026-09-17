@@ -1,36 +1,40 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 CREATE TABLE IF NOT EXISTS device_runtime_state (
-    device_id TEXT PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    device_id TEXT NOT NULL,
     last_seen_at TIMESTAMPTZ,
     gateway_last_read_at TIMESTAMPTZ,
     gateway_read_quality TEXT
-        CHECK (gateway_read_quality IN ('good', 'unavailable'))
+        CHECK (gateway_read_quality IN ('good', 'unavailable')),
+    PRIMARY KEY (tenant_id, device_id)
 );
 
 CREATE TABLE IF NOT EXISTS telemetry (
     event_at TIMESTAMPTZ NOT NULL,
     received_at TIMESTAMPTZ NOT NULL,
+    tenant_id UUID NOT NULL,
     device_id TEXT NOT NULL,
     boot_id UUID NOT NULL,
     sequence BIGINT NOT NULL,
     measurements JSONB NOT NULL,
     topic TEXT NOT NULL,
     gateway_device_id TEXT,
-    CONSTRAINT telemetry_event_identity UNIQUE (event_at, device_id, boot_id, sequence)
+    CONSTRAINT telemetry_event_identity
+        UNIQUE (tenant_id, event_at, device_id, boot_id, sequence)
 );
 
 SELECT public.create_hypertable('telemetry', 'event_at', if_not_exists => TRUE);
 
-CREATE INDEX IF NOT EXISTS telemetry_device_event_at_index
-    ON telemetry (device_id, event_at DESC);
-CREATE INDEX IF NOT EXISTS telemetry_gateway_device_event_at_index
-    ON telemetry (gateway_device_id, event_at DESC)
+CREATE INDEX IF NOT EXISTS telemetry_tenant_device_event_at_index
+    ON telemetry (tenant_id, device_id, event_at DESC);
+CREATE INDEX IF NOT EXISTS telemetry_tenant_gateway_device_event_at_index
+    ON telemetry (tenant_id, gateway_device_id, event_at DESC)
     WHERE gateway_device_id IS NOT NULL;
 
 ALTER TABLE telemetry SET (
     timescaledb.compress,
-    timescaledb.compress_segmentby = 'device_id'
+    timescaledb.compress_segmentby = 'tenant_id,device_id'
 );
 
 SELECT public.add_compression_policy(
@@ -49,24 +53,26 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS telemetry_5m
 WITH (timescaledb.continuous) AS
 SELECT
     public.time_bucket(INTERVAL '5 minutes', event_at) AS bucket,
+    tenant_id,
     device_id,
     count(*) AS event_count,
     avg((measurements ->> 'temperature_c')::double precision) AS avg_temperature_c,
     avg((measurements ->> 'humidity_pct')::double precision) AS avg_humidity_pct
 FROM telemetry
-GROUP BY bucket, device_id
+GROUP BY bucket, tenant_id, device_id
 WITH NO DATA;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS telemetry_1h
 WITH (timescaledb.continuous) AS
 SELECT
     public.time_bucket(INTERVAL '1 hour', event_at) AS bucket,
+    tenant_id,
     device_id,
     count(*) AS event_count,
     avg((measurements ->> 'temperature_c')::double precision) AS avg_temperature_c,
     avg((measurements ->> 'humidity_pct')::double precision) AS avg_humidity_pct
 FROM telemetry
-GROUP BY bucket, device_id
+GROUP BY bucket, tenant_id, device_id
 WITH NO DATA;
 
 SELECT public.add_continuous_aggregate_policy(
@@ -198,9 +204,10 @@ CREATE INDEX IF NOT EXISTS command_outbox_two_way_expiring_index
     WHERE state = 'published_to_broker' AND mode = 'two_way';
 
 CREATE TABLE IF NOT EXISTS gateway_event_receipts (
+    tenant_id UUID NOT NULL,
     gateway_device_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     event_at TIMESTAMPTZ NOT NULL,
     received_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (gateway_device_id, idempotency_key)
+    PRIMARY KEY (tenant_id, gateway_device_id, idempotency_key)
 );

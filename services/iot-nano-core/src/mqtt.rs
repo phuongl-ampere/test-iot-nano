@@ -20,12 +20,13 @@ pub enum MqttConsumerError {
 
 #[derive(Clone)]
 pub struct MqttStreamProducer {
+    tenant_id: uuid::Uuid,
     stream: Arc<dyn StreamPort>,
 }
 
 impl MqttStreamProducer {
-    pub fn new(stream: Arc<dyn StreamPort>) -> Self {
-        Self { stream }
+    pub fn new(tenant_id: uuid::Uuid, stream: Arc<dyn StreamPort>) -> Self {
+        Self { tenant_id, stream }
     }
 
     pub async fn ingest(
@@ -51,6 +52,7 @@ impl MqttStreamProducer {
         received_at: DateTime<Utc>,
     ) -> Result<IngestOutcome, MqttConsumerError> {
         let message = TelemetryMessage {
+            tenant_id: self.tenant_id,
             topic: topic.to_owned(),
             payload,
             event,
@@ -66,6 +68,7 @@ impl MqttStreamProducer {
 
 #[derive(Debug, Clone)]
 pub struct MqttRuntimeConfig {
+    pub tenant_id: uuid::Uuid,
     pub client_id: String,
     pub broker_host: String,
     pub broker_port: u16,
@@ -116,7 +119,7 @@ impl MqttRuntime {
         Self {
             client,
             event_loop,
-            producer: MqttStreamProducer::new(stream),
+            producer: MqttStreamProducer::new(config.tenant_id, stream),
             subscribed: false,
         }
     }

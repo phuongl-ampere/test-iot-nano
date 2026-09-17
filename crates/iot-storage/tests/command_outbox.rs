@@ -12,6 +12,10 @@ mod common;
 
 const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
 
+fn test_tenant_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
+
 async fn store() -> (tempfile::TempDir, SqliteStore) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("rush.db");
@@ -22,7 +26,16 @@ async fn store() -> (tempfile::TempDir, SqliteStore) {
         sqlite_busy_timeout_ms: 5_000,
     };
     let store = SqliteStore::open(&configuration).await.unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('device-1')")
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'command-outbox', 'active', '{}')",
+    )
+    .bind(test_tenant_id().to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('device-1', ?)")
+        .bind(test_tenant_id().to_string())
         .execute(store.pool())
         .await
         .unwrap();
@@ -533,7 +546,18 @@ async fn sqlite_store_reopens_with_the_two_way_expiry_index() {
 async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transitions() {
     let (_connection, store) = timescale_store().await;
     let device_id = "timescale-command-device";
-    store.register_device(device_id).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES ($1, 'command-outbox', 'active', '{}'::jsonb)",
+    )
+    .bind(test_tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    store
+        .register_device(test_tenant_id(), device_id)
+        .await
+        .unwrap();
     let token_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)

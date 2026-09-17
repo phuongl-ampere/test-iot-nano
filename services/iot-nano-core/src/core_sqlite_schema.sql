@@ -1,36 +1,41 @@
 CREATE TABLE IF NOT EXISTS telemetry (
     event_at TEXT NOT NULL,
     received_at TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     boot_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,
     measurements TEXT NOT NULL,
     topic TEXT NOT NULL,
     gateway_device_id TEXT,
-    UNIQUE (event_at, device_id, boot_id, sequence)
+    UNIQUE (tenant_id, event_at, device_id, boot_id, sequence)
 );
 CREATE TABLE IF NOT EXISTS device_runtime_state (
-    device_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
     last_seen_at TEXT,
     gateway_last_read_at TEXT,
-    gateway_read_quality TEXT CHECK (gateway_read_quality IN ('good', 'unavailable'))
+    gateway_read_quality TEXT CHECK (gateway_read_quality IN ('good', 'unavailable')),
+    PRIMARY KEY (tenant_id, device_id)
 );
-CREATE INDEX IF NOT EXISTS telemetry_device_event_at_index
-    ON telemetry (device_id, event_at DESC);
-CREATE INDEX IF NOT EXISTS telemetry_gateway_device_event_at_index
-    ON telemetry (gateway_device_id, event_at DESC)
+CREATE INDEX IF NOT EXISTS telemetry_tenant_device_event_at_index
+    ON telemetry (tenant_id, device_id, event_at DESC);
+CREATE INDEX IF NOT EXISTS telemetry_tenant_gateway_device_event_at_index
+    ON telemetry (tenant_id, gateway_device_id, event_at DESC)
     WHERE gateway_device_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS gateway_event_receipts (
+    tenant_id TEXT NOT NULL,
     gateway_device_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     event_at TEXT NOT NULL,
     received_at TEXT NOT NULL,
-    PRIMARY KEY (gateway_device_id, idempotency_key)
+    PRIMARY KEY (tenant_id, gateway_device_id, idempotency_key)
 );
 
 CREATE TABLE IF NOT EXISTS telemetry_rollups_5m (
     bucket_at TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     event_count INTEGER NOT NULL,
     avg_temperature_c REAL,
@@ -45,10 +50,11 @@ CREATE TABLE IF NOT EXISTS telemetry_rollups_5m (
     power_count INTEGER NOT NULL DEFAULT 0,
     avg_energy_kwh REAL,
     energy_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket_at, device_id)
+    PRIMARY KEY (tenant_id, bucket_at, device_id)
 );
 CREATE TABLE IF NOT EXISTS telemetry_rollups_1h (
     bucket_at TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     event_count INTEGER NOT NULL,
     avg_temperature_c REAL,
@@ -63,7 +69,7 @@ CREATE TABLE IF NOT EXISTS telemetry_rollups_1h (
     power_count INTEGER NOT NULL DEFAULT 0,
     avg_energy_kwh REAL,
     energy_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket_at, device_id)
+    PRIMARY KEY (tenant_id, bucket_at, device_id)
 );
 
 CREATE TABLE IF NOT EXISTS alert_rules (

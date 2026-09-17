@@ -92,31 +92,40 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS telemetry (
     event_at TEXT NOT NULL,
     received_at TEXT NOT NULL,
-    device_id TEXT NOT NULL REFERENCES devices(device_id),
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL,
     boot_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,
     measurements TEXT NOT NULL,
     topic TEXT NOT NULL,
     gateway_device_id TEXT,
-    UNIQUE (event_at, device_id, boot_id, sequence)
+    UNIQUE (tenant_id, event_at, device_id, boot_id, sequence),
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (gateway_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
-CREATE INDEX IF NOT EXISTS telemetry_device_event_at_index
-    ON telemetry (device_id, event_at DESC);
-CREATE INDEX IF NOT EXISTS telemetry_gateway_device_event_at_index
-    ON telemetry (gateway_device_id, event_at DESC)
+CREATE INDEX IF NOT EXISTS telemetry_tenant_device_event_at_index
+    ON telemetry (tenant_id, device_id, event_at DESC);
+CREATE INDEX IF NOT EXISTS telemetry_tenant_gateway_device_event_at_index
+    ON telemetry (tenant_id, gateway_device_id, event_at DESC)
     WHERE gateway_device_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS gateway_event_receipts (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     gateway_device_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     event_at TEXT NOT NULL,
     received_at TEXT NOT NULL,
-    PRIMARY KEY (gateway_device_id, idempotency_key)
+    PRIMARY KEY (tenant_id, gateway_device_id, idempotency_key),
+    FOREIGN KEY (gateway_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS telemetry_rollups_5m (
     bucket_at TEXT NOT NULL,
-    device_id TEXT NOT NULL REFERENCES devices(device_id),
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL,
     event_count INTEGER NOT NULL,
     avg_temperature_c REAL,
     temperature_count INTEGER NOT NULL DEFAULT 0,
@@ -130,11 +139,14 @@ CREATE TABLE IF NOT EXISTS telemetry_rollups_5m (
     power_count INTEGER NOT NULL DEFAULT 0,
     avg_energy_kwh REAL,
     energy_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket_at, device_id)
+    PRIMARY KEY (tenant_id, bucket_at, device_id),
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
 CREATE TABLE IF NOT EXISTS telemetry_rollups_1h (
     bucket_at TEXT NOT NULL,
-    device_id TEXT NOT NULL REFERENCES devices(device_id),
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL,
     event_count INTEGER NOT NULL,
     avg_temperature_c REAL,
     temperature_count INTEGER NOT NULL DEFAULT 0,
@@ -148,7 +160,9 @@ CREATE TABLE IF NOT EXISTS telemetry_rollups_1h (
     power_count INTEGER NOT NULL DEFAULT 0,
     avg_energy_kwh REAL,
     energy_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (bucket_at, device_id)
+    PRIMARY KEY (tenant_id, bucket_at, device_id),
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS api_access_tokens (
@@ -326,6 +340,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS assets_tenant_root_name_unique_index
     WHERE parent_asset_id IS NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_asset_index
     ON devices (tenant_id, asset_id);
+CREATE INDEX IF NOT EXISTS devices_tenant_active_index
+    ON devices (tenant_id, device_id)
+    WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS devices_tenant_gateway_active_index
+    ON devices (tenant_id, gateway_device_id)
+    WHERE deleted_at IS NULL AND gateway_device_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_owner_user_id_index
     ON devices (owner_user_id)
     WHERE owner_user_id IS NOT NULL;
@@ -589,6 +609,13 @@ pub enum PlatformStoreError {
     },
     #[error("device is not registered: {0:?}")]
     UnknownDevice(String),
+    #[error("tenant is not active: {0}")]
+    UnknownTenant(uuid::Uuid),
+    #[error("device {device_id:?} belongs to a different tenant: {tenant_id}")]
+    DeviceTenantConflict {
+        device_id: String,
+        tenant_id: uuid::Uuid,
+    },
     #[error("invalid gateway ingest: {0}")]
     InvalidGatewayIngest(#[from] GatewayIngestValidationError),
     #[error("device token authentication denied")]
@@ -929,6 +956,7 @@ pub trait OAuthRepository: Send + Sync {
 pub trait TopologyRepository: Send + Sync {
     fn register_device<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
 }
@@ -943,6 +971,7 @@ pub enum GatewayIngestEventKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatewayIngestRequest {
+    pub tenant_id: uuid::Uuid,
     pub gateway_device_id: String,
     pub child_device_id: Option<String>,
     pub event_kind: GatewayIngestEventKind,
@@ -969,6 +998,7 @@ pub trait GatewayIngestRepository: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedDeviceToken {
     pub token_id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
     pub device_id: String,
     pub is_gateway: bool,
     pub gateway_device_id: Option<String>,
@@ -987,11 +1017,13 @@ pub trait DeviceAuthorizationRepository: Send + Sync {
     fn authorize_device_session<'a>(
         &'a self,
         token_id: uuid::Uuid,
+        tenant_id: uuid::Uuid,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
     fn authorize_gateway_token<'a>(
         &'a self,
         token_id: uuid::Uuid,
+        tenant_id: uuid::Uuid,
         gateway_device_id: &'a str,
         child_device_id: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>>;
@@ -1123,6 +1155,7 @@ pub trait CommandLifecycleRepository: Send + Sync {
 pub trait TelemetryRepository: Send + Sync {
     fn write_telemetry<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         event: &'a TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &'a str,
@@ -1138,6 +1171,7 @@ pub struct TelemetryAggregate {
 pub trait TelemetryAggregateRepository: Send + Sync {
     fn average_metric<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         device_id: &'a str,
         metric_key: &'a str,
         from: DateTime<Utc>,
@@ -2468,19 +2502,67 @@ impl PlatformStore {
         }
     }
 
-    pub async fn register_device(&self, device_id: &str) -> Result<(), PlatformStoreError> {
+    pub async fn register_device(
+        &self,
+        tenant_id: uuid::Uuid,
+        device_id: &str,
+    ) -> Result<(), PlatformStoreError> {
         match self {
             Self::Sqlite(store) => {
-                sqlx::query("INSERT INTO devices (device_id) VALUES (?) ON CONFLICT DO NOTHING")
-                    .bind(device_id)
-                    .execute(store.pool())
-                    .await?;
+                let tenant_is_active = sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM tenants WHERE id = ? AND status = 'active' LIMIT 1",
+                )
+                .bind(tenant_id.to_string())
+                .fetch_optional(store.pool())
+                .await?
+                .is_some();
+                if !tenant_is_active {
+                    return Err(PlatformStoreError::UnknownTenant(tenant_id));
+                }
+                let registered = sqlx::query(
+                    "INSERT INTO devices (device_id, tenant_id)
+                     VALUES (?, ?)
+                     ON CONFLICT(device_id) DO UPDATE SET device_id = excluded.device_id
+                     WHERE devices.tenant_id = excluded.tenant_id",
+                )
+                .bind(device_id)
+                .bind(tenant_id.to_string())
+                .execute(store.pool())
+                .await?;
+                if registered.rows_affected() != 1 {
+                    return Err(PlatformStoreError::DeviceTenantConflict {
+                        device_id: device_id.to_owned(),
+                        tenant_id,
+                    });
+                }
             }
             Self::Timescale(pool) => {
-                sqlx::query("INSERT INTO devices (device_id) VALUES ($1) ON CONFLICT DO NOTHING")
-                    .bind(device_id)
-                    .execute(pool)
-                    .await?;
+                let tenant_is_active = sqlx::query_scalar::<_, i32>(
+                    "SELECT 1 FROM tenants WHERE id = $1 AND status = 'active' LIMIT 1",
+                )
+                .bind(tenant_id)
+                .fetch_optional(pool)
+                .await?
+                .is_some();
+                if !tenant_is_active {
+                    return Err(PlatformStoreError::UnknownTenant(tenant_id));
+                }
+                let registered = sqlx::query(
+                    "INSERT INTO devices (device_id, tenant_id)
+                     VALUES ($1, $2)
+                     ON CONFLICT(device_id) DO UPDATE SET device_id = EXCLUDED.device_id
+                     WHERE devices.tenant_id = EXCLUDED.tenant_id",
+                )
+                .bind(device_id)
+                .bind(tenant_id)
+                .execute(pool)
+                .await?;
+                if registered.rows_affected() != 1 {
+                    return Err(PlatformStoreError::DeviceTenantConflict {
+                        device_id: device_id.to_owned(),
+                        tenant_id,
+                    });
+                }
             }
         }
         Ok(())
@@ -2498,9 +2580,10 @@ impl PlatformStore {
                 let mut transaction = store.pool().begin().await?;
                 let row = sqlx::query(
                     "SELECT device_tokens.id, device_tokens.device_id, device_tokens.token_hash,
-                            devices.is_gateway, devices.gateway_device_id
+                            devices.tenant_id, devices.is_gateway, devices.gateway_device_id
                      FROM device_tokens
                      JOIN devices ON devices.device_id = device_tokens.device_id
+                     JOIN tenants ON tenants.id = devices.tenant_id AND tenants.status = 'active'
                      WHERE device_tokens.token_prefix = ?
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL",
@@ -2516,6 +2599,8 @@ impl PlatformStore {
                 }
                 let authenticated = AuthenticatedDeviceToken {
                     token_id: uuid::Uuid::parse_str(&row.try_get::<String, _>("id")?)
+                        .map_err(|_| PlatformStoreError::DeviceTokenDenied)?,
+                    tenant_id: uuid::Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
                         .map_err(|_| PlatformStoreError::DeviceTokenDenied)?,
                     device_id: row.try_get("device_id")?,
                     is_gateway: row.try_get::<i64, _>("is_gateway")? != 0,
@@ -2547,9 +2632,10 @@ impl PlatformStore {
                 let mut transaction = pool.begin().await?;
                 let row = sqlx::query(
                     "SELECT device_tokens.id, device_tokens.device_id, device_tokens.token_hash,
-                            devices.is_gateway, devices.gateway_device_id
+                            devices.tenant_id, devices.is_gateway, devices.gateway_device_id
                      FROM device_tokens
                      JOIN devices ON devices.device_id = device_tokens.device_id
+                     JOIN tenants ON tenants.id = devices.tenant_id AND tenants.status = 'active'
                      WHERE device_tokens.token_prefix = $1
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL
@@ -2566,6 +2652,7 @@ impl PlatformStore {
                 }
                 let authenticated = AuthenticatedDeviceToken {
                     token_id: row.try_get("id")?,
+                    tenant_id: row.try_get("tenant_id")?,
                     device_id: row.try_get("device_id")?,
                     is_gateway: row.try_get("is_gateway")?,
                     gateway_device_id: row.try_get("gateway_device_id")?,
@@ -2598,6 +2685,7 @@ impl PlatformStore {
     pub async fn authorize_device_session(
         &self,
         token_id: uuid::Uuid,
+        tenant_id: uuid::Uuid,
         device_id: &str,
     ) -> Result<(), PlatformStoreError> {
         let authorized = match self {
@@ -2607,12 +2695,14 @@ impl PlatformStore {
                      JOIN devices ON devices.device_id = device_tokens.device_id
                      WHERE device_tokens.id = ?
                        AND device_tokens.device_id = ?
+                       AND devices.tenant_id = ?
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL
                        AND devices.gateway_device_id IS NULL",
             )
             .bind(token_id.to_string())
             .bind(device_id)
+            .bind(tenant_id.to_string())
             .fetch_optional(store.pool())
             .await?
             .is_some(),
@@ -2622,12 +2712,14 @@ impl PlatformStore {
                      JOIN devices ON devices.device_id = device_tokens.device_id
                      WHERE device_tokens.id = $1
                        AND device_tokens.device_id = $2
+                       AND devices.tenant_id = $3
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL
                        AND devices.gateway_device_id IS NULL",
             )
             .bind(token_id)
             .bind(device_id)
+            .bind(tenant_id)
             .fetch_optional(pool)
             .await?
             .is_some(),
@@ -2642,6 +2734,7 @@ impl PlatformStore {
     pub async fn authorize_gateway_token(
         &self,
         token_id: uuid::Uuid,
+        tenant_id: uuid::Uuid,
         gateway_device_id: &str,
         child_device_id: Option<&str>,
     ) -> Result<(), PlatformStoreError> {
@@ -2653,6 +2746,7 @@ impl PlatformStore {
                        ON gateways.device_id = device_tokens.device_id
                      WHERE device_tokens.id = ?
                        AND device_tokens.device_id = ?
+                       AND gateways.tenant_id = ?
                        AND device_tokens.revoked_at IS NULL
                        AND gateways.deleted_at IS NULL
                        AND gateways.is_gateway = 1
@@ -2663,12 +2757,14 @@ impl PlatformStore {
                                FROM devices AS children
                                WHERE children.device_id = ?
                                  AND children.gateway_device_id = gateways.device_id
+                                 AND children.tenant_id = gateways.tenant_id
                                  AND children.deleted_at IS NULL
                            )
                        )",
             )
             .bind(token_id.to_string())
             .bind(gateway_device_id)
+            .bind(tenant_id.to_string())
             .bind(child_device_id)
             .bind(child_device_id)
             .fetch_optional(store.pool())
@@ -2681,22 +2777,25 @@ impl PlatformStore {
                        ON gateways.device_id = device_tokens.device_id
                      WHERE device_tokens.id = $1
                        AND device_tokens.device_id = $2
+                       AND gateways.tenant_id = $3
                        AND device_tokens.revoked_at IS NULL
                        AND gateways.deleted_at IS NULL
                        AND gateways.is_gateway = TRUE
                        AND (
-                           $3 IS NULL
+                           $4 IS NULL
                            OR EXISTS (
                                SELECT 1
                                FROM devices AS children
-                               WHERE children.device_id = $3
+                               WHERE children.device_id = $4
                                  AND children.gateway_device_id = gateways.device_id
+                                 AND children.tenant_id = gateways.tenant_id
                                  AND children.deleted_at IS NULL
                            )
                        )",
             )
             .bind(token_id)
             .bind(gateway_device_id)
+            .bind(tenant_id)
             .bind(child_device_id)
             .fetch_optional(pool)
             .await?
@@ -3648,6 +3747,7 @@ impl PlatformStore {
 
     pub async fn write_telemetry(
         &self,
+        tenant_id: uuid::Uuid,
         event: &TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &str,
@@ -3657,24 +3757,29 @@ impl PlatformStore {
 
         match self {
             Self::Sqlite(store) => {
-                self.require_sqlite_registered_device(&event.device_id)
+                self.require_sqlite_tenant_device(tenant_id, &event.device_id)
                     .await?;
-                Ok(store.write_telemetry(event, received_at, topic).await?)
+                Ok(store
+                    .write_telemetry(tenant_id, event, received_at, topic)
+                    .await?)
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
-                if !timescale_device_is_locked(&mut transaction, &event.device_id).await? {
+                if !timescale_tenant_device_is_locked(&mut transaction, tenant_id, &event.device_id)
+                    .await?
+                {
                     return Err(PlatformStoreError::UnknownDevice(event.device_id.clone()));
                 }
                 sqlx::query(
-                    "INSERT INTO device_runtime_state (device_id, last_seen_at)
-                     VALUES ($1, $2)
-                     ON CONFLICT (device_id)
+                    "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (tenant_id, device_id)
                      DO UPDATE SET last_seen_at = GREATEST(
                          COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
                          EXCLUDED.last_seen_at
                      )",
                 )
+                .bind(tenant_id)
                 .bind(&event.device_id)
                 .bind(received_at)
                 .execute(&mut *transaction)
@@ -3682,13 +3787,14 @@ impl PlatformStore {
 
                 let result = sqlx::query(
                     "INSERT INTO telemetry (
-                        event_at, received_at, device_id, boot_id, sequence, measurements, topic,
-                        gateway_device_id
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                     ON CONFLICT (event_at, device_id, boot_id, sequence) DO NOTHING",
+                        event_at, received_at, tenant_id, device_id, boot_id, sequence,
+                        measurements, topic, gateway_device_id
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (tenant_id, event_at, device_id, boot_id, sequence) DO NOTHING",
                 )
                 .bind(event.event_at)
                 .bind(received_at)
+                .bind(tenant_id)
                 .bind(&event.device_id)
                 .bind(event.boot_id)
                 .bind(sequence)
@@ -3715,6 +3821,7 @@ impl PlatformStore {
 
     pub async fn average_metric(
         &self,
+        tenant_id: uuid::Uuid,
         device_id: &str,
         metric_key: &str,
         from: DateTime<Utc>,
@@ -3764,9 +3871,9 @@ impl PlatformStore {
                                            6
                                        ) AS INTEGER
                                    )
-                               END AS event_at_micros
+                        END AS event_at_micros
                         FROM telemetry
-                        WHERE device_id = ?
+                        WHERE tenant_id = ? AND device_id = ?
                      )
                      SELECT AVG(json_extract(measurements, ?)) AS average,
                             COUNT(*) AS sample_count
@@ -3777,6 +3884,7 @@ impl PlatformStore {
                        AND json_extract(measurements, ?) > -1.0e999
                        AND json_extract(measurements, ?) < 1.0e999",
                 )
+                .bind(tenant_id.to_string())
                 .bind(device_id)
                 .bind(&path)
                 .bind(from.timestamp_micros())
@@ -3810,15 +3918,17 @@ impl PlatformStore {
                                     END
                                 END AS finite_value
                          FROM telemetry
-                         WHERE device_id = $2
-                           AND event_at >= $3
-                           AND event_at <= $4
+                         WHERE tenant_id = $2
+                           AND device_id = $3
+                           AND event_at >= $4
+                           AND event_at <= $5
                      )
                      SELECT (AVG(finite_value))::double precision AS average,
                             COUNT(finite_value) AS sample_count
                      FROM finite_telemetry",
                 )
                 .bind(metric_key)
+                .bind(tenant_id)
                 .bind(device_id)
                 .bind(from)
                 .bind(to)
@@ -3848,6 +3958,32 @@ impl PlatformStore {
         let registered = sqlx::query_scalar::<_, String>(
             "SELECT device_id FROM devices WHERE device_id = ? LIMIT 1",
         )
+        .bind(device_id)
+        .fetch_optional(store.pool())
+        .await?
+        .is_some();
+        if registered {
+            Ok(())
+        } else {
+            Err(PlatformStoreError::UnknownDevice(device_id.to_owned()))
+        }
+    }
+
+    async fn require_sqlite_tenant_device(
+        &self,
+        tenant_id: uuid::Uuid,
+        device_id: &str,
+    ) -> Result<(), PlatformStoreError> {
+        let Self::Sqlite(store) = self else {
+            unreachable!("SQLite validation is only used by the SQLite adapter");
+        };
+        let registered = sqlx::query_scalar::<_, String>(
+            "SELECT device_id
+             FROM devices
+             WHERE tenant_id = ? AND device_id = ? AND deleted_at IS NULL
+             LIMIT 1",
+        )
+        .bind(tenant_id.to_string())
         .bind(device_id)
         .fetch_optional(store.pool())
         .await?
@@ -3973,9 +4109,10 @@ async fn ingest_sqlite_gateway(
     let mut transaction = store.pool().begin().await?;
     let receipt = sqlx::query(
         "INSERT OR IGNORE INTO gateway_event_receipts (
-            gateway_device_id, idempotency_key, event_at, received_at
-         ) VALUES (?, ?, ?, ?)",
+            tenant_id, gateway_device_id, idempotency_key, event_at, received_at
+         ) VALUES (?, ?, ?, ?, ?)",
     )
+    .bind(request.tenant_id.to_string())
     .bind(&request.gateway_device_id)
     .bind(&request.idempotency_key)
     .bind(request.event_at.to_rfc3339())
@@ -3993,13 +4130,20 @@ async fn ingest_sqlite_gateway(
         transaction.rollback().await?;
         return Err(error);
     }
-    if !sqlite_active_gateway_exists(&mut transaction, &request.gateway_device_id).await? {
+    if !sqlite_active_gateway_exists(
+        &mut transaction,
+        request.tenant_id,
+        &request.gateway_device_id,
+    )
+    .await?
+    {
         transaction.rollback().await?;
         return Err(PlatformStoreError::UnknownDevice(request.gateway_device_id));
     }
     if let Some(child_device_id) = request.child_device_id.as_deref()
         && !sqlite_active_owned_child_exists(
             &mut transaction,
+            request.tenant_id,
             child_device_id,
             &request.gateway_device_id,
         )
@@ -4018,10 +4162,11 @@ async fn ingest_sqlite_gateway(
              WHEN last_seen_at IS NULL OR last_seen_at < ? THEN ?
              ELSE last_seen_at
          END
-         WHERE device_id = ?",
+         WHERE tenant_id = ? AND device_id = ?",
     )
     .bind(&event_at)
     .bind(&event_at)
+    .bind(request.tenant_id.to_string())
     .bind(&request.gateway_device_id)
     .execute(transaction.as_mut())
     .await?;
@@ -4029,6 +4174,7 @@ async fn ingest_sqlite_gateway(
         store
             .write_telemetry_in_transaction(
                 &mut transaction,
+                request.tenant_id,
                 telemetry_event,
                 request.received_at,
                 &request.topic,
@@ -4043,8 +4189,9 @@ async fn ingest_sqlite_gateway(
                 sqlx::query(
                     "UPDATE devices
                      SET gateway_read_quality = 'unavailable'
-                     WHERE device_id = ?",
+                     WHERE tenant_id = ? AND device_id = ?",
                 )
+                .bind(request.tenant_id.to_string())
                 .bind(child_device_id)
                 .execute(transaction.as_mut())
                 .await?;
@@ -4059,10 +4206,11 @@ async fn ingest_sqlite_gateway(
                              ELSE gateway_last_read_at
                          END,
                          gateway_read_quality = 'good'
-                     WHERE device_id = ?",
+                     WHERE tenant_id = ? AND device_id = ?",
                 )
                 .bind(&event_at)
                 .bind(&event_at)
+                .bind(request.tenant_id.to_string())
                 .bind(child_device_id)
                 .execute(transaction.as_mut())
                 .await?;
@@ -4085,10 +4233,11 @@ async fn ingest_timescale_gateway(
     let mut transaction = pool.begin().await?;
     let receipt = sqlx::query(
         "INSERT INTO gateway_event_receipts (
-            gateway_device_id, idempotency_key, event_at, received_at
-         ) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (gateway_device_id, idempotency_key) DO NOTHING",
+            tenant_id, gateway_device_id, idempotency_key, event_at, received_at
+         ) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (tenant_id, gateway_device_id, idempotency_key) DO NOTHING",
     )
+    .bind(request.tenant_id)
     .bind(&request.gateway_device_id)
     .bind(&request.idempotency_key)
     .bind(request.event_at)
@@ -4106,13 +4255,20 @@ async fn ingest_timescale_gateway(
         transaction.rollback().await?;
         return Err(error);
     }
-    if !timescale_active_gateway_is_locked(&mut transaction, &request.gateway_device_id).await? {
+    if !timescale_active_gateway_is_locked(
+        &mut transaction,
+        request.tenant_id,
+        &request.gateway_device_id,
+    )
+    .await?
+    {
         transaction.rollback().await?;
         return Err(PlatformStoreError::UnknownDevice(request.gateway_device_id));
     }
     if let Some(child_device_id) = request.child_device_id.as_deref()
         && !timescale_active_owned_child_is_locked(
             &mut transaction,
+            request.tenant_id,
             child_device_id,
             &request.gateway_device_id,
         )
@@ -4125,14 +4281,15 @@ async fn ingest_timescale_gateway(
     }
 
     sqlx::query(
-        "INSERT INTO device_runtime_state (device_id, last_seen_at)
-         VALUES ($1, $2)
-         ON CONFLICT (device_id)
+        "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (tenant_id, device_id)
          DO UPDATE SET last_seen_at = GREATEST(
              COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
              EXCLUDED.last_seen_at
          )",
     )
+    .bind(request.tenant_id)
     .bind(&request.gateway_device_id)
     .bind(request.event_at)
     .execute(&mut *transaction)
@@ -4141,27 +4298,29 @@ async fn ingest_timescale_gateway(
         let sequence = i64::try_from(telemetry_event.sequence)
             .map_err(|_| PlatformStoreError::TelemetrySequenceOverflow)?;
         sqlx::query(
-            "INSERT INTO device_runtime_state (device_id, last_seen_at)
-             VALUES ($1, $2)
-             ON CONFLICT (device_id)
+            "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (tenant_id, device_id)
              DO UPDATE SET last_seen_at = GREATEST(
                  COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
                  EXCLUDED.last_seen_at
              )",
         )
+        .bind(request.tenant_id)
         .bind(&telemetry_event.device_id)
         .bind(request.received_at)
         .execute(&mut *transaction)
         .await?;
         let inserted = sqlx::query(
             "INSERT INTO telemetry (
-                event_at, received_at, device_id, boot_id, sequence, measurements, topic,
-                gateway_device_id
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (event_at, device_id, boot_id, sequence) DO NOTHING",
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements,
+                topic, gateway_device_id
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (tenant_id, event_at, device_id, boot_id, sequence) DO NOTHING",
         )
         .bind(telemetry_event.event_at)
         .bind(request.received_at)
+        .bind(request.tenant_id)
         .bind(&telemetry_event.device_id)
         .bind(telemetry_event.boot_id)
         .bind(sequence)
@@ -4180,11 +4339,13 @@ async fn ingest_timescale_gateway(
         GatewayIngestEventKind::Disconnect => {
             if let Some(child_device_id) = request.child_device_id.as_deref() {
                 sqlx::query(
-                    "INSERT INTO device_runtime_state (device_id, gateway_read_quality)
-                     VALUES ($1, 'unavailable')
-                     ON CONFLICT (device_id)
+                    "INSERT INTO device_runtime_state (
+                         tenant_id, device_id, gateway_read_quality
+                     ) VALUES ($1, $2, 'unavailable')
+                     ON CONFLICT (tenant_id, device_id)
                      DO UPDATE SET gateway_read_quality = EXCLUDED.gateway_read_quality",
                 )
+                .bind(request.tenant_id)
                 .bind(child_device_id)
                 .execute(&mut *transaction)
                 .await?;
@@ -4194,9 +4355,9 @@ async fn ingest_timescale_gateway(
             if let Some(child_device_id) = request.child_device_id.as_deref() {
                 sqlx::query(
                     "INSERT INTO device_runtime_state (
-                         device_id, gateway_last_read_at, gateway_read_quality
-                     ) VALUES ($1, $2, 'good')
-                     ON CONFLICT (device_id)
+                         tenant_id, device_id, gateway_last_read_at, gateway_read_quality
+                     ) VALUES ($1, $2, $3, 'good')
+                     ON CONFLICT (tenant_id, device_id)
                      DO UPDATE SET
                          gateway_last_read_at = GREATEST(
                              COALESCE(
@@ -4207,6 +4368,7 @@ async fn ingest_timescale_gateway(
                          ),
                          gateway_read_quality = EXCLUDED.gateway_read_quality",
                 )
+                .bind(request.tenant_id)
                 .bind(child_device_id)
                 .bind(request.event_at)
                 .execute(&mut *transaction)
@@ -4264,13 +4426,15 @@ fn validate_gateway_ingest_request(
 
 async fn sqlite_active_gateway_exists(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
     gateway_device_id: &str,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, String>(
         "SELECT device_id
          FROM devices
-         WHERE device_id = ? AND deleted_at IS NULL AND is_gateway = 1",
+         WHERE tenant_id = ? AND device_id = ? AND deleted_at IS NULL AND is_gateway = 1",
     )
+    .bind(tenant_id.to_string())
     .bind(gateway_device_id)
     .fetch_optional(transaction.as_mut())
     .await
@@ -4279,17 +4443,20 @@ async fn sqlite_active_gateway_exists(
 
 async fn sqlite_active_owned_child_exists(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
     child_device_id: &str,
     gateway_device_id: &str,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, String>(
         "SELECT device_id
          FROM devices
-         WHERE device_id = ?
+         WHERE tenant_id = ?
+           AND device_id = ?
            AND deleted_at IS NULL
            AND is_gateway = 0
            AND gateway_device_id = ?",
     )
+    .bind(tenant_id.to_string())
     .bind(child_device_id)
     .bind(gateway_device_id)
     .fetch_optional(transaction.as_mut())
@@ -4299,14 +4466,16 @@ async fn sqlite_active_owned_child_exists(
 
 async fn timescale_active_gateway_is_locked(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
     gateway_device_id: &str,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, String>(
         "SELECT device_id
          FROM devices
-         WHERE device_id = $1 AND deleted_at IS NULL AND is_gateway = TRUE
+         WHERE tenant_id = $1 AND device_id = $2 AND deleted_at IS NULL AND is_gateway = TRUE
          FOR UPDATE",
     )
+    .bind(tenant_id)
     .bind(gateway_device_id)
     .fetch_optional(&mut **transaction)
     .await
@@ -4315,18 +4484,21 @@ async fn timescale_active_gateway_is_locked(
 
 async fn timescale_active_owned_child_is_locked(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
     child_device_id: &str,
     gateway_device_id: &str,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, String>(
         "SELECT device_id
          FROM devices
-         WHERE device_id = $1
+         WHERE tenant_id = $1
+           AND device_id = $2
            AND deleted_at IS NULL
            AND is_gateway = FALSE
-           AND gateway_device_id = $2
+           AND gateway_device_id = $3
          FOR UPDATE",
     )
+    .bind(tenant_id)
     .bind(child_device_id)
     .bind(gateway_device_id)
     .fetch_optional(&mut **transaction)
@@ -4344,6 +4516,24 @@ async fn timescale_device_is_locked(
          WHERE device_id = $1
          FOR UPDATE",
     )
+    .bind(device_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map(|device| device.is_some())
+}
+
+async fn timescale_tenant_device_is_locked(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT device_id
+         FROM devices
+         WHERE tenant_id = $1 AND device_id = $2 AND deleted_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(tenant_id)
     .bind(device_id)
     .fetch_optional(&mut **transaction)
     .await
@@ -6139,9 +6329,10 @@ impl AlertEvaluationRepository for PlatformStore {
 impl TopologyRepository for PlatformStore {
     fn register_device<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>> {
-        Box::pin(async move { PlatformStore::register_device(self, device_id).await })
+        Box::pin(async move { PlatformStore::register_device(self, tenant_id, device_id).await })
     }
 }
 
@@ -6160,16 +6351,18 @@ impl DeviceAuthorizationRepository for PlatformStore {
     fn authorize_device_session<'a>(
         &'a self,
         token_id: uuid::Uuid,
+        tenant_id: uuid::Uuid,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>> {
-        Box::pin(
-            async move { PlatformStore::authorize_device_session(self, token_id, device_id).await },
-        )
+        Box::pin(async move {
+            PlatformStore::authorize_device_session(self, token_id, tenant_id, device_id).await
+        })
     }
 
     fn authorize_gateway_token<'a>(
         &'a self,
         token_id: uuid::Uuid,
+        tenant_id: uuid::Uuid,
         gateway_device_id: &'a str,
         child_device_id: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<(), PlatformStoreError>> + Send + 'a>> {
@@ -6177,6 +6370,7 @@ impl DeviceAuthorizationRepository for PlatformStore {
             PlatformStore::authorize_gateway_token(
                 self,
                 token_id,
+                tenant_id,
                 gateway_device_id,
                 child_device_id,
             )
@@ -6310,13 +6504,14 @@ impl CommandLifecycleRepository for PlatformStore {
 impl TelemetryRepository for PlatformStore {
     fn write_telemetry<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         event: &'a TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>> {
-        Box::pin(
-            async move { PlatformStore::write_telemetry(self, event, received_at, topic).await },
-        )
+        Box::pin(async move {
+            PlatformStore::write_telemetry(self, tenant_id, event, received_at, topic).await
+        })
     }
 }
 
@@ -6333,6 +6528,7 @@ impl GatewayIngestRepository for PlatformStore {
 impl TelemetryAggregateRepository for PlatformStore {
     fn average_metric<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         device_id: &'a str,
         metric_key: &'a str,
         from: DateTime<Utc>,
@@ -6343,7 +6539,7 @@ impl TelemetryAggregateRepository for PlatformStore {
         >,
     > {
         Box::pin(async move {
-            PlatformStore::average_metric(self, device_id, metric_key, from, to).await
+            PlatformStore::average_metric(self, tenant_id, device_id, metric_key, from, to).await
         })
     }
 }
@@ -7981,13 +8177,14 @@ impl SqliteStore {
 
     pub async fn write_telemetry(
         &self,
+        tenant_id: uuid::Uuid,
         event: &TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &str,
     ) -> Result<bool, SqliteStoreError> {
         let mut transaction = self.pool.begin().await?;
         let inserted = self
-            .write_telemetry_in_transaction(&mut transaction, event, received_at, topic)
+            .write_telemetry_in_transaction(&mut transaction, tenant_id, event, received_at, topic)
             .await?;
         transaction.commit().await?;
         Ok(inserted)
@@ -7996,33 +8193,35 @@ impl SqliteStore {
     pub async fn write_telemetry_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
+        tenant_id: uuid::Uuid,
         event: &TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &str,
     ) -> Result<bool, SqliteStoreError> {
         let received_at = received_at.to_rfc3339();
         sqlx::query(
-            "INSERT INTO devices (device_id, last_seen_at)
-             VALUES (?, ?)
-             ON CONFLICT(device_id) DO UPDATE SET
-                 last_seen_at = CASE
-                     WHEN devices.last_seen_at IS NULL OR excluded.last_seen_at > devices.last_seen_at
-                     THEN excluded.last_seen_at
-                     ELSE devices.last_seen_at
-                 END",
+            "UPDATE devices
+             SET last_seen_at = CASE
+                 WHEN last_seen_at IS NULL OR last_seen_at < ? THEN ?
+                 ELSE last_seen_at
+             END
+             WHERE tenant_id = ? AND device_id = ?",
         )
-        .bind(&event.device_id)
         .bind(&received_at)
+        .bind(&received_at)
+        .bind(tenant_id.to_string())
+        .bind(&event.device_id)
         .execute(transaction.as_mut())
         .await?;
         let insert = sqlx::query(
             "INSERT OR IGNORE INTO telemetry (
-                event_at, received_at, device_id, boot_id, sequence, measurements, topic,
-                gateway_device_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements,
+                topic, gateway_device_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.event_at.to_rfc3339())
         .bind(&received_at)
+        .bind(tenant_id.to_string())
         .bind(&event.device_id)
         .bind(event.boot_id.to_string())
         .bind(i64::try_from(event.sequence).map_err(|_| SqliteStoreError::SequenceOverflow)?)
@@ -8038,6 +8237,7 @@ impl SqliteStore {
                 transaction,
                 RollupTable::FiveMinute,
                 bucket_start(event.event_at, 5 * 60),
+                tenant_id,
                 &event.device_id,
                 metrics,
             )
@@ -8046,6 +8246,7 @@ impl SqliteStore {
                 transaction,
                 RollupTable::OneHour,
                 bucket_start(event.event_at, 60 * 60),
+                tenant_id,
                 &event.device_id,
                 metrics,
             )
@@ -8727,21 +8928,22 @@ async fn upsert_rollup(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table: RollupTable,
     bucket_at: String,
+    tenant_id: uuid::Uuid,
     device_id: &str,
     metrics: MetricAverages,
 ) -> Result<(), sqlx::Error> {
     let query = match table {
         RollupTable::FiveMinute => {
             "INSERT INTO telemetry_rollups_5m (
-                bucket_at, device_id, event_count,
+                bucket_at, tenant_id, device_id, event_count,
                 avg_temperature_c, temperature_count,
                 avg_humidity_pct, humidity_count,
                 avg_voltage_v, voltage_count,
                 avg_current_a, current_count,
                 avg_power_w, power_count,
                 avg_energy_kwh, energy_count
-             ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(bucket_at, device_id) DO UPDATE SET
+             ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, bucket_at, device_id) DO UPDATE SET
                 avg_temperature_c = CASE
                     WHEN excluded.temperature_count = 0 THEN telemetry_rollups_5m.avg_temperature_c
                     WHEN telemetry_rollups_5m.temperature_count = 0 THEN excluded.avg_temperature_c
@@ -8800,15 +9002,15 @@ async fn upsert_rollup(
         }
         RollupTable::OneHour => {
             "INSERT INTO telemetry_rollups_1h (
-                bucket_at, device_id, event_count,
+                bucket_at, tenant_id, device_id, event_count,
                 avg_temperature_c, temperature_count,
                 avg_humidity_pct, humidity_count,
                 avg_voltage_v, voltage_count,
                 avg_current_a, current_count,
                 avg_power_w, power_count,
                 avg_energy_kwh, energy_count
-             ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(bucket_at, device_id) DO UPDATE SET
+             ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, bucket_at, device_id) DO UPDATE SET
                 avg_temperature_c = CASE
                     WHEN excluded.temperature_count = 0 THEN telemetry_rollups_1h.avg_temperature_c
                     WHEN telemetry_rollups_1h.temperature_count = 0 THEN excluded.avg_temperature_c
@@ -8874,7 +9076,10 @@ async fn upsert_rollup(
         metrics.power_w,
         metrics.energy_kwh,
     ];
-    let mut query = sqlx::query(query).bind(bucket_at).bind(device_id);
+    let mut query = sqlx::query(query)
+        .bind(bucket_at)
+        .bind(tenant_id.to_string())
+        .bind(device_id);
     for value in values {
         query = query.bind(value).bind(i64::from(value.is_some()));
     }

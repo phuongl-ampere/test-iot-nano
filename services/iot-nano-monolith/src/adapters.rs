@@ -659,6 +659,7 @@ impl DeviceAuthorizationPort for PlatformDeviceAuthorization {
                 .await
                 .map(|device| AuthenticatedDevice {
                     token_id: device.token_id,
+                    tenant_id: device.tenant_id,
                     device_id: device.device_id,
                     is_gateway: device.is_gateway,
                 })
@@ -675,6 +676,7 @@ impl DeviceAuthorizationPort for PlatformDeviceAuthorization {
             DeviceAuthorizationRepository::authorize_device_session(
                 store.as_ref(),
                 device.token_id,
+                device.tenant_id,
                 &device.device_id,
             )
             .await
@@ -692,12 +694,14 @@ impl DeviceAuthorizationPort for PlatformDeviceAuthorization {
             DeviceAuthorizationRepository::authorize_gateway_token(
                 store.as_ref(),
                 request.token_id,
+                request.tenant_id,
                 &request.gateway_device_id,
                 request.child_device_id.as_deref(),
             )
             .await
             .map_err(map_storage_error)?;
             Ok(GatewayAuthorization {
+                tenant_id: request.tenant_id,
                 gateway_device_id: request.gateway_device_id,
                 token_id: request.token_id,
                 child_device_id: request.child_device_id,

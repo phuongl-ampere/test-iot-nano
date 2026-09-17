@@ -45,6 +45,36 @@ enum Backend {
     Timescale,
 }
 
+fn test_tenant_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
+
+async fn seed_tenant(store: &PlatformStore, backend: Backend) {
+    match backend {
+        Backend::Sqlite => {
+            sqlx::query(
+                "INSERT OR IGNORE INTO tenants (id, slug, status, metadata)
+                 VALUES (?, 'gateway-ingest', 'active', '{}')",
+            )
+            .bind(test_tenant_id().to_string())
+            .execute(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        }
+        Backend::Timescale => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES ($1, 'gateway-ingest', 'active', '{}'::jsonb)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(test_tenant_id())
+            .execute(store.timescale_pool().unwrap())
+            .await
+            .unwrap();
+        }
+    }
+}
+
 async fn sqlite_test_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -66,14 +96,17 @@ async fn seed_device(
     gateway_device_id: Option<&str>,
     deleted: bool,
 ) {
+    seed_tenant(store, backend).await;
     match backend {
         Backend::Sqlite => {
             let deleted_at = deleted.then(|| "2026-09-13T09:00:00+00:00");
             sqlx::query(
-                "INSERT INTO devices (device_id, is_gateway, gateway_device_id, deleted_at)
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO devices (
+                     device_id, tenant_id, is_gateway, gateway_device_id, deleted_at
+                 ) VALUES (?, ?, ?, ?, ?)",
             )
             .bind(device_id)
+            .bind(test_tenant_id().to_string())
             .bind(i64::from(is_gateway))
             .bind(gateway_device_id)
             .bind(deleted_at)
@@ -84,10 +117,12 @@ async fn seed_device(
         Backend::Timescale => {
             let deleted_at = deleted.then(|| Utc.with_ymd_and_hms(2026, 9, 13, 9, 0, 0).unwrap());
             sqlx::query(
-                "INSERT INTO devices (device_id, is_gateway, gateway_device_id, deleted_at)
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO devices (
+                     device_id, tenant_id, is_gateway, gateway_device_id, deleted_at
+                 ) VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(device_id)
+            .bind(test_tenant_id())
             .bind(is_gateway)
             .bind(gateway_device_id)
             .bind(deleted_at)
@@ -129,6 +164,7 @@ fn gateway_request(
     telemetry_event: Option<TelemetryEvent>,
 ) -> GatewayIngestRequest {
     GatewayIngestRequest {
+        tenant_id: test_tenant_id(),
         gateway_device_id: gateway_device_id.to_owned(),
         child_device_id: child_device_id.map(str::to_owned),
         event_kind,
@@ -442,6 +478,7 @@ async fn exercise_receipt_retry_contract(store: &PlatformStore, backend: Backend
 }
 
 async fn exercise_unknown_gateway_rejection_contract(store: &PlatformStore, backend: Backend) {
+    seed_tenant(store, backend).await;
     let event_at = Utc.with_ymd_and_hms(2026, 9, 13, 10, 2, 0).unwrap();
     let result = store
         .ingest_gateway(gateway_request(

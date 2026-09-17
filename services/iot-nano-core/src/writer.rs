@@ -111,10 +111,11 @@ impl TelemetryWriter {
             if let StreamMessage::Gateway(message) = &record.message {
                 let receipt = sqlx::query(
                     "INSERT INTO gateway_event_receipts (
-                        gateway_device_id, idempotency_key, event_at, received_at
-                     ) VALUES ($1, $2, $3, $4)
+                        tenant_id, gateway_device_id, idempotency_key, event_at, received_at
+                     ) VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT DO NOTHING",
                 )
+                .bind(message.tenant_id)
                 .bind(&message.gateway_event.gateway_device_id)
                 .bind(&message.gateway_event.idempotency_key)
                 .bind(message.gateway_event.event_at)
@@ -127,14 +128,15 @@ impl TelemetryWriter {
 
                 let seen_at = message.gateway_event.event_at;
                 sqlx::query(
-                    "INSERT INTO device_runtime_state (device_id, last_seen_at)
-                     VALUES ($1, $2)
-                     ON CONFLICT (device_id) DO UPDATE SET
+                    "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (tenant_id, device_id) DO UPDATE SET
                          last_seen_at = GREATEST(
                              COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
                              EXCLUDED.last_seen_at
                          )",
                 )
+                .bind(message.tenant_id)
                 .bind(&message.gateway_event.gateway_device_id)
                 .bind(seen_at)
                 .execute(&mut *transaction)
@@ -145,6 +147,7 @@ impl TelemetryWriter {
                     inserted += usize::from(
                         write_postgres_telemetry(
                             &mut transaction,
+                            message.tenant_id,
                             event,
                             message.received_at,
                             &message.topic,
@@ -158,11 +161,12 @@ impl TelemetryWriter {
                         if let Some(child_device_id) = &message.gateway_event.child_device_id {
                             sqlx::query(
                                 "INSERT INTO device_runtime_state (
-                                     device_id, gateway_read_quality
-                                 ) VALUES ($1, 'unavailable')
-                                 ON CONFLICT (device_id) DO UPDATE SET
+                                     tenant_id, device_id, gateway_read_quality
+                                 ) VALUES ($1, $2, 'unavailable')
+                                 ON CONFLICT (tenant_id, device_id) DO UPDATE SET
                                      gateway_read_quality = EXCLUDED.gateway_read_quality",
                             )
+                            .bind(message.tenant_id)
                             .bind(child_device_id)
                             .execute(&mut *transaction)
                             .await?;
@@ -172,9 +176,9 @@ impl TelemetryWriter {
                         if let Some(child_device_id) = &message.gateway_event.child_device_id {
                             sqlx::query(
                                 "INSERT INTO device_runtime_state (
-                                     device_id, gateway_last_read_at, gateway_read_quality
-                                 ) VALUES ($1, $2, 'good')
-                                 ON CONFLICT (device_id) DO UPDATE SET
+                                     tenant_id, device_id, gateway_last_read_at, gateway_read_quality
+                                 ) VALUES ($1, $2, $3, 'good')
+                                 ON CONFLICT (tenant_id, device_id) DO UPDATE SET
                                      gateway_last_read_at = GREATEST(
                                          COALESCE(
                                              device_runtime_state.gateway_last_read_at,
@@ -184,6 +188,7 @@ impl TelemetryWriter {
                                      ),
                                      gateway_read_quality = EXCLUDED.gateway_read_quality",
                             )
+                            .bind(message.tenant_id)
                             .bind(child_device_id)
                             .bind(seen_at)
                             .execute(&mut *transaction)
@@ -199,7 +204,14 @@ impl TelemetryWriter {
             };
             telemetry_records += 1;
             inserted += usize::from(
-                write_postgres_telemetry(&mut transaction, event, received_at, topic).await?,
+                write_postgres_telemetry(
+                    &mut transaction,
+                    record.message.tenant_id(),
+                    event,
+                    received_at,
+                    topic,
+                )
+                .await?,
             );
         }
         transaction.commit().await?;
@@ -216,19 +228,21 @@ impl TelemetryWriter {
 
 async fn write_postgres_telemetry(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
     event: &iot_core::TelemetryEvent,
     received_at: DateTime<Utc>,
     topic: &str,
 ) -> Result<bool, WriterError> {
     sqlx::query(
-        "INSERT INTO device_runtime_state (device_id, last_seen_at)
-         VALUES ($1, $2)
-         ON CONFLICT (device_id)
+        "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (tenant_id, device_id)
          DO UPDATE SET last_seen_at = GREATEST(
              COALESCE(device_runtime_state.last_seen_at, '-infinity'::timestamptz),
              EXCLUDED.last_seen_at
          )",
     )
+    .bind(tenant_id)
     .bind(&event.device_id)
     .bind(received_at)
     .execute(&mut **transaction)
@@ -237,13 +251,14 @@ async fn write_postgres_telemetry(
     let measurements = serde_json::Value::Object(event.measurements.clone());
     let result = sqlx::query(
         "INSERT INTO telemetry (
-            event_at, received_at, device_id, boot_id, sequence, measurements, topic,
-            gateway_device_id
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (event_at, device_id, boot_id, sequence) DO NOTHING",
+            event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements,
+            topic, gateway_device_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (tenant_id, event_at, device_id, boot_id, sequence) DO NOTHING",
     )
     .bind(event.event_at)
     .bind(received_at)
+    .bind(tenant_id)
     .bind(&event.device_id)
     .bind(event.boot_id)
     .bind(i64::try_from(event.sequence).map_err(|_| {
@@ -301,7 +316,7 @@ impl SqliteTelemetryWriter {
             telemetry_records += 1;
             inserted += usize::from(
                 self.store
-                    .write_telemetry(event, received_at, topic)
+                    .write_telemetry(record.message.tenant_id(), event, received_at, topic)
                     .await?,
             );
         }
@@ -322,9 +337,10 @@ impl SqliteTelemetryWriter {
         let mut transaction = self.store.pool().begin().await?;
         let receipt = sqlx::query(
             "INSERT OR IGNORE INTO gateway_event_receipts (
-                gateway_device_id, idempotency_key, event_at, received_at
-             ) VALUES (?, ?, ?, ?)",
+                tenant_id, gateway_device_id, idempotency_key, event_at, received_at
+             ) VALUES (?, ?, ?, ?, ?)",
         )
+        .bind(message.tenant_id.to_string())
         .bind(&message.gateway_event.gateway_device_id)
         .bind(&message.gateway_event.idempotency_key)
         .bind(message.gateway_event.event_at.to_rfc3339())
@@ -338,9 +354,9 @@ impl SqliteTelemetryWriter {
 
         let seen_at = message.gateway_event.event_at.to_rfc3339();
         sqlx::query(
-            "INSERT INTO device_runtime_state (device_id, last_seen_at)
-             VALUES (?, ?)
-             ON CONFLICT(device_id) DO UPDATE SET
+            "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(tenant_id, device_id) DO UPDATE SET
                  last_seen_at = CASE
                      WHEN device_runtime_state.last_seen_at IS NULL
                        OR device_runtime_state.last_seen_at < excluded.last_seen_at
@@ -348,6 +364,7 @@ impl SqliteTelemetryWriter {
                      ELSE device_runtime_state.last_seen_at
                  END",
         )
+        .bind(message.tenant_id.to_string())
         .bind(&message.gateway_event.gateway_device_id)
         .bind(&seen_at)
         .execute(&mut *transaction)
@@ -357,6 +374,7 @@ impl SqliteTelemetryWriter {
             self.store
                 .write_telemetry_in_transaction(
                     &mut transaction,
+                    message.tenant_id,
                     event,
                     message.received_at,
                     &message.topic,
@@ -371,11 +389,12 @@ impl SqliteTelemetryWriter {
                 if let Some(child_device_id) = &message.gateway_event.child_device_id {
                     sqlx::query(
                         "INSERT INTO device_runtime_state (
-                             device_id, gateway_read_quality
-                         ) VALUES (?, 'unavailable')
-                         ON CONFLICT(device_id) DO UPDATE SET
+                             tenant_id, device_id, gateway_read_quality
+                         ) VALUES (?, ?, 'unavailable')
+                         ON CONFLICT(tenant_id, device_id) DO UPDATE SET
                              gateway_read_quality = excluded.gateway_read_quality",
                     )
+                    .bind(message.tenant_id.to_string())
                     .bind(child_device_id)
                     .execute(&mut *transaction)
                     .await?;
@@ -385,9 +404,9 @@ impl SqliteTelemetryWriter {
                 if let Some(child_device_id) = &message.gateway_event.child_device_id {
                     sqlx::query(
                         "INSERT INTO device_runtime_state (
-                             device_id, gateway_last_read_at, gateway_read_quality
-                         ) VALUES (?, ?, 'good')
-                         ON CONFLICT(device_id) DO UPDATE SET
+                             tenant_id, device_id, gateway_last_read_at, gateway_read_quality
+                         ) VALUES (?, ?, ?, 'good')
+                         ON CONFLICT(tenant_id, device_id) DO UPDATE SET
                              gateway_last_read_at = CASE
                                  WHEN device_runtime_state.gateway_last_read_at IS NULL
                                    OR device_runtime_state.gateway_last_read_at
@@ -397,6 +416,7 @@ impl SqliteTelemetryWriter {
                              END,
                              gateway_read_quality = excluded.gateway_read_quality",
                     )
+                    .bind(message.tenant_id.to_string())
                     .bind(child_device_id)
                     .bind(&seen_at)
                     .execute(&mut *transaction)
@@ -461,7 +481,12 @@ where
                     telemetry_records += 1;
                     inserted += usize::from(
                         self.store
-                            .write_telemetry(&message.event, message.received_at, &message.topic)
+                            .write_telemetry(
+                                message.tenant_id,
+                                &message.event,
+                                message.received_at,
+                                &message.topic,
+                            )
                             .await
                             .map_err(WriterError::Platform)?,
                     );
@@ -480,6 +505,7 @@ where
 
 fn gateway_ingest_request(message: &GatewayMessage) -> GatewayIngestRequest {
     GatewayIngestRequest {
+        tenant_id: message.tenant_id,
         gateway_device_id: message.gateway_event.gateway_device_id.clone(),
         child_device_id: message.gateway_event.child_device_id.clone(),
         event_kind: match message.gateway_event.event_kind {

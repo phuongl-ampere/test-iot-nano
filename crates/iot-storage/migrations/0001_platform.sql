@@ -210,8 +210,11 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE INDEX IF NOT EXISTS devices_asset_id_index ON devices (asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_asset_index ON devices (tenant_id, asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_device_profile_id_index ON devices (device_profile_id) WHERE device_profile_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS devices_active_index ON devices (device_id) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS devices_gateway_device_id_index ON devices (gateway_device_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS devices_tenant_active_index
+    ON devices (tenant_id, device_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS devices_tenant_gateway_device_id_index
+    ON devices (tenant_id, gateway_device_id)
+    WHERE deleted_at IS NULL AND gateway_device_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_owner_user_id_index ON devices (owner_user_id) WHERE owner_user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS assets_owner_user_id_index ON assets (owner_user_id) WHERE owner_user_id IS NOT NULL;
 
@@ -270,32 +273,47 @@ CREATE INDEX IF NOT EXISTS device_claim_codes_expiry_index ON device_claim_codes
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE TABLE IF NOT EXISTS device_runtime_state (
-    device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL,
     last_seen_at TIMESTAMPTZ, gateway_last_read_at TIMESTAMPTZ,
-    gateway_read_quality TEXT CHECK (gateway_read_quality IN ('good', 'unavailable'))
+    gateway_read_quality TEXT CHECK (gateway_read_quality IN ('good', 'unavailable')),
+    PRIMARY KEY (tenant_id, device_id),
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS telemetry (
     event_at TIMESTAMPTZ NOT NULL, received_at TIMESTAMPTZ NOT NULL,
-    device_id TEXT NOT NULL REFERENCES devices(device_id), boot_id UUID NOT NULL,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL, boot_id UUID NOT NULL,
     sequence BIGINT NOT NULL, measurements JSONB NOT NULL, topic TEXT NOT NULL, gateway_device_id TEXT,
-    CONSTRAINT telemetry_event_identity UNIQUE (event_at, device_id, boot_id, sequence)
+    CONSTRAINT telemetry_event_identity
+        UNIQUE (tenant_id, event_at, device_id, boot_id, sequence),
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (gateway_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
 SELECT public.create_hypertable('telemetry', 'event_at', if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS telemetry_device_event_at_index ON telemetry (device_id, event_at DESC);
-CREATE INDEX IF NOT EXISTS telemetry_gateway_device_event_at_index ON telemetry (gateway_device_id, event_at DESC) WHERE gateway_device_id IS NOT NULL;
-ALTER TABLE telemetry SET (timescaledb.compress, timescaledb.compress_segmentby = 'device_id');
+CREATE INDEX IF NOT EXISTS telemetry_tenant_device_event_at_index
+    ON telemetry (tenant_id, device_id, event_at DESC);
+CREATE INDEX IF NOT EXISTS telemetry_tenant_gateway_device_event_at_index
+    ON telemetry (tenant_id, gateway_device_id, event_at DESC)
+    WHERE gateway_device_id IS NOT NULL;
+ALTER TABLE telemetry SET (timescaledb.compress, timescaledb.compress_segmentby = 'tenant_id,device_id');
 SELECT public.add_compression_policy('telemetry', INTERVAL '7 days', if_not_exists => TRUE);
 SELECT public.add_retention_policy('telemetry', INTERVAL '30 days', if_not_exists => TRUE);
 CREATE MATERIALIZED VIEW IF NOT EXISTS telemetry_5m WITH (timescaledb.continuous) AS
-SELECT public.time_bucket(INTERVAL '5 minutes', event_at) AS bucket, device_id, count(*) AS event_count,
+SELECT public.time_bucket(INTERVAL '5 minutes', event_at) AS bucket, tenant_id, device_id,
+    count(*) AS event_count,
     avg((measurements ->> 'temperature_c')::double precision) AS avg_temperature_c,
     avg((measurements ->> 'humidity_pct')::double precision) AS avg_humidity_pct
-FROM telemetry GROUP BY bucket, device_id WITH NO DATA;
+FROM telemetry GROUP BY bucket, tenant_id, device_id WITH NO DATA;
 CREATE MATERIALIZED VIEW IF NOT EXISTS telemetry_1h WITH (timescaledb.continuous) AS
-SELECT public.time_bucket(INTERVAL '1 hour', event_at) AS bucket, device_id, count(*) AS event_count,
+SELECT public.time_bucket(INTERVAL '1 hour', event_at) AS bucket, tenant_id, device_id,
+    count(*) AS event_count,
     avg((measurements ->> 'temperature_c')::double precision) AS avg_temperature_c,
     avg((measurements ->> 'humidity_pct')::double precision) AS avg_humidity_pct
-FROM telemetry GROUP BY bucket, device_id WITH NO DATA;
+FROM telemetry GROUP BY bucket, tenant_id, device_id WITH NO DATA;
 SELECT public.add_continuous_aggregate_policy('telemetry_5m', start_offset => INTERVAL '30 days',
     end_offset => INTERVAL '5 minutes', schedule_interval => INTERVAL '5 minutes', if_not_exists => TRUE);
 SELECT public.add_continuous_aggregate_policy('telemetry_1h', start_offset => INTERVAL '1 year',
@@ -360,49 +378,13 @@ CREATE INDEX IF NOT EXISTS command_outbox_expiring_index ON command_outbox (expi
 CREATE INDEX IF NOT EXISTS command_outbox_two_way_expiring_index ON command_outbox (expires_at)
     WHERE state = 'published_to_broker' AND mode = 'two_way';
 
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'command_outbox_device_id_fkey'
-          AND conrelid = 'command_outbox'::regclass
-    ) THEN
-        ALTER TABLE command_outbox
-            ADD CONSTRAINT command_outbox_device_id_fkey
-            FOREIGN KEY (device_id)
-            REFERENCES devices(device_id)
-            ON DELETE CASCADE;
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'device_runtime_state_device_id_fkey'
-          AND conrelid = 'device_runtime_state'::regclass
-    ) THEN
-        ALTER TABLE device_runtime_state
-            ADD CONSTRAINT device_runtime_state_device_id_fkey
-            FOREIGN KEY (device_id)
-            REFERENCES devices(device_id)
-            ON DELETE CASCADE;
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conname = 'telemetry_device_id_fkey'
-          AND conrelid = 'telemetry'::regclass
-    ) THEN
-        ALTER TABLE telemetry
-            ADD CONSTRAINT telemetry_device_id_fkey
-            FOREIGN KEY (device_id)
-            REFERENCES devices(device_id);
-    END IF;
-END
-$$;
-
 CREATE TABLE IF NOT EXISTS gateway_event_receipts (
-    gateway_device_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, event_at TIMESTAMPTZ NOT NULL,
-    received_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (gateway_device_id, idempotency_key)
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    gateway_device_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    event_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (tenant_id, gateway_device_id, idempotency_key),
+    FOREIGN KEY (gateway_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );

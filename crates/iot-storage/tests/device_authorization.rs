@@ -8,6 +8,36 @@ use uuid::Uuid;
 
 mod common;
 
+fn tenant_id() -> Uuid {
+    Uuid::from_u128(1)
+}
+
+async fn seed_tenant(store: &PlatformStore) {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query(
+                "INSERT OR IGNORE INTO tenants (id, slug, status, metadata)
+                 VALUES (?, 'device-authorization', 'active', '{}')",
+            )
+            .bind(tenant_id().to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES ($1, 'device-authorization', 'active', '{}'::jsonb)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(tenant_id())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
 async fn store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -64,10 +94,14 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
 #[tokio::test]
 async fn sqlite_device_authorization_rejects_revoked_child_and_mismatched_sessions() {
     let (_directory, store) = store().await;
+    seed_tenant(&store).await;
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway, gateway_device_id)
-         VALUES ('direct', 0, NULL), ('gateway', 1, NULL), ('child', 0, 'gateway')",
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
+         VALUES ('direct', ?, 0, NULL), ('gateway', ?, 1, NULL), ('child', ?, 0, 'gateway')",
     )
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -82,20 +116,41 @@ async fn sqlite_device_authorization_rejects_revoked_child_and_mismatched_sessio
 
     assert!(
         store
-            .authorize_device_session(direct_id, "direct")
+            .authorize_device_session(direct_id, tenant_id(), "direct")
             .await
             .is_ok()
     );
     assert!(
         store
-            .authorize_device_session(gateway_id, "gateway")
+            .authorize_device_session(gateway_id, tenant_id(), "gateway")
             .await
             .is_ok()
     );
+    let cross_tenant_id = Uuid::from_u128(2);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'other-device-authorization', 'active', '{}')",
+    )
+    .bind(cross_tenant_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    assert!(matches!(
+        store
+            .authorize_device_session(direct_id, cross_tenant_id, "direct")
+            .await,
+        Err(PlatformStoreError::DeviceTokenDenied)
+    ));
     for denied in [
-        store.authorize_device_session(direct_id, "other").await,
-        store.authorize_device_session(child_id, "child").await,
-        store.authorize_device_session(revoked_id, "direct").await,
+        store
+            .authorize_device_session(direct_id, tenant_id(), "other")
+            .await,
+        store
+            .authorize_device_session(child_id, tenant_id(), "child")
+            .await,
+        store
+            .authorize_device_session(revoked_id, tenant_id(), "direct")
+            .await,
     ] {
         assert!(matches!(denied, Err(PlatformStoreError::DeviceTokenDenied)));
     }
@@ -104,13 +159,19 @@ async fn sqlite_device_authorization_rejects_revoked_child_and_mismatched_sessio
 #[tokio::test]
 async fn sqlite_gateway_authorization_requires_exact_active_gateway_and_child() {
     let (_directory, store) = store().await;
+    seed_tenant(&store).await;
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway, gateway_device_id)
-         VALUES ('gateway', 1, NULL), ('deleted-gateway', 1, NULL),
-                ('other-gateway', 1, NULL), ('child', 0, 'gateway'),
-                ('other-child', 0, 'other-gateway'),
-                ('direct', 0, NULL)",
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
+         VALUES ('gateway', ?, 1, NULL), ('deleted-gateway', ?, 1, NULL),
+                ('other-gateway', ?, 1, NULL), ('child', ?, 0, 'gateway'),
+                ('other-child', ?, 0, 'other-gateway'), ('direct', ?, 0, NULL)",
     )
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -129,28 +190,28 @@ async fn sqlite_gateway_authorization_requires_exact_active_gateway_and_child() 
 
     assert!(
         store
-            .authorize_gateway_token(gateway_id, "gateway", Some("child"))
+            .authorize_gateway_token(gateway_id, tenant_id(), "gateway", Some("child"))
             .await
             .is_ok()
     );
     assert!(
         store
-            .authorize_gateway_token(gateway_id, "gateway", None)
+            .authorize_gateway_token(gateway_id, tenant_id(), "gateway", None)
             .await
             .is_ok()
     );
     for denied in [
         store
-            .authorize_gateway_token(gateway_id, "other-gateway", Some("child"))
+            .authorize_gateway_token(gateway_id, tenant_id(), "other-gateway", Some("child"))
             .await,
         store
-            .authorize_gateway_token(gateway_id, "gateway", Some("other-child"))
+            .authorize_gateway_token(gateway_id, tenant_id(), "gateway", Some("other-child"))
             .await,
         store
-            .authorize_gateway_token(revoked_gateway_id, "gateway", None)
+            .authorize_gateway_token(revoked_gateway_id, tenant_id(), "gateway", None)
             .await,
         store
-            .authorize_gateway_token(deleted_gateway_id, "deleted-gateway", None)
+            .authorize_gateway_token(deleted_gateway_id, tenant_id(), "deleted-gateway", None)
             .await,
     ] {
         assert!(matches!(denied, Err(PlatformStoreError::DeviceTokenDenied)));
@@ -162,7 +223,7 @@ async fn sqlite_gateway_authorization_requires_exact_active_gateway_and_child() 
         .unwrap();
     assert!(matches!(
         store
-            .authorize_gateway_token(gateway_id, "gateway", Some("child"))
+            .authorize_gateway_token(gateway_id, tenant_id(), "gateway", Some("child"))
             .await,
         Err(PlatformStoreError::DeviceTokenDenied)
     ));
@@ -179,12 +240,14 @@ async fn sqlite_gateway_authorization_requires_exact_active_gateway_and_child() 
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_device_authorization_matches_sqlite_contract() {
     let (_lock, store) = timescale_store().await;
+    seed_tenant(&store).await;
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway, gateway_device_id)
-         VALUES ('gateway', TRUE, NULL), ('deleted-gateway', TRUE, NULL),
-                ('other-gateway', TRUE, NULL), ('child', FALSE, 'gateway'),
-                ('other-child', FALSE, 'other-gateway'), ('direct', FALSE, NULL)",
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
+         VALUES ('gateway', $1, TRUE, NULL), ('deleted-gateway', $1, TRUE, NULL),
+                ('other-gateway', $1, TRUE, NULL), ('child', $1, FALSE, 'gateway'),
+                ('other-child', $1, FALSE, 'other-gateway'), ('direct', $1, FALSE, NULL)",
     )
+    .bind(tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -203,46 +266,46 @@ async fn timescale_device_authorization_matches_sqlite_contract() {
 
     assert!(
         store
-            .authorize_device_session(direct_id, "direct")
+            .authorize_device_session(direct_id, tenant_id(), "direct")
             .await
             .is_ok()
     );
     assert!(
         store
-            .authorize_device_session(gateway_id, "gateway")
+            .authorize_device_session(gateway_id, tenant_id(), "gateway")
             .await
             .is_ok()
     );
     assert!(
         store
-            .authorize_device_session(gateway_id, "child")
+            .authorize_device_session(gateway_id, tenant_id(), "child")
             .await
             .is_err()
     );
     assert!(
         store
-            .authorize_gateway_token(gateway_id, "gateway", None)
+            .authorize_gateway_token(gateway_id, tenant_id(), "gateway", None)
             .await
             .is_ok()
     );
     assert!(
         store
-            .authorize_gateway_token(gateway_id, "gateway", Some("child"))
+            .authorize_gateway_token(gateway_id, tenant_id(), "gateway", Some("child"))
             .await
             .is_ok()
     );
     for denied in [
         store
-            .authorize_gateway_token(gateway_id, "wrong-gateway", None)
+            .authorize_gateway_token(gateway_id, tenant_id(), "wrong-gateway", None)
             .await,
         store
-            .authorize_gateway_token(gateway_id, "gateway", Some("other-child"))
+            .authorize_gateway_token(gateway_id, tenant_id(), "gateway", Some("other-child"))
             .await,
         store
-            .authorize_gateway_token(revoked_id, "gateway", None)
+            .authorize_gateway_token(revoked_id, tenant_id(), "gateway", None)
             .await,
         store
-            .authorize_gateway_token(deleted_id, "deleted-gateway", None)
+            .authorize_gateway_token(deleted_id, tenant_id(), "deleted-gateway", None)
             .await,
     ] {
         assert!(matches!(denied, Err(PlatformStoreError::DeviceTokenDenied)));

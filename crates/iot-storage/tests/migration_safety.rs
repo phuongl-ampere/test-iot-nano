@@ -4,6 +4,21 @@ use sqlx::{Connection, PgConnection, Row, SqliteConnection};
 
 mod common;
 
+fn test_tenant_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
+
+async fn seed_test_tenant(store: &PlatformStore) {
+    sqlx::query(
+        "INSERT OR IGNORE INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'migration-safety', 'active', '{}')",
+    )
+    .bind(test_tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+}
+
 #[test]
 fn platform_store_owns_its_postgres_migration_source() {
     let migration = include_str!("../migrations/0001_platform.sql");
@@ -12,13 +27,10 @@ fn platform_store_owns_its_postgres_migration_source() {
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS devices"));
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS telemetry"));
     assert!(migration.contains("CREATE TABLE IF NOT EXISTS command_outbox"));
-    assert!(migration.contains("DO $$"));
-    assert!(migration.contains("command_outbox_device_id_fkey"));
-    assert!(migration.contains("device_runtime_state_device_id_fkey"));
-    assert!(migration.contains("telemetry_device_id_fkey"));
-    assert!(migration.contains("ALTER TABLE command_outbox"));
-    assert!(migration.contains("ALTER TABLE device_runtime_state"));
-    assert!(migration.contains("ALTER TABLE telemetry"));
+    assert!(migration.contains("tenant_id UUID NOT NULL"));
+    assert!(migration.contains("FOREIGN KEY (device_id, tenant_id)"));
+    assert!(migration.contains("FOREIGN KEY (gateway_device_id, tenant_id)"));
+    assert!(!migration.contains("ADD CONSTRAINT telemetry_device_id_fkey"));
     assert!(!storage_source.contains("services/iot-nano-api/migrations"));
     assert!(!storage_source.contains("services/iot-nano-core/migrations"));
 }
@@ -105,7 +117,11 @@ async fn sqlite_backup_preserves_committed_platform_data() {
     let store = PlatformStore::open(&sqlite_configuration(platform_path))
         .await
         .unwrap();
-    store.register_device("backup-device").await.unwrap();
+    seed_test_tenant(&store).await;
+    store
+        .register_device(test_tenant_id(), "backup-device")
+        .await
+        .unwrap();
 
     let backup_path = store.backup_sqlite().await.unwrap();
     assert!(backup_path.exists());
@@ -131,7 +147,11 @@ async fn sqlite_backup_is_a_coherent_snapshot_during_an_atomic_write() {
     let configuration = sqlite_configuration(platform_path);
     let store = PlatformStore::open(&configuration).await.unwrap();
     let device_id = "backup-snapshot-device";
-    store.register_device(device_id).await.unwrap();
+    seed_test_tenant(&store).await;
+    store
+        .register_device(test_tenant_id(), device_id)
+        .await
+        .unwrap();
     sqlx::query("UPDATE devices SET display_name = 'before' WHERE device_id = ?")
         .bind(device_id)
         .execute(store.sqlite_pool().unwrap())

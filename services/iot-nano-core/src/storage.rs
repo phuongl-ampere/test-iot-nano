@@ -313,13 +313,14 @@ impl CoreSqliteStore {
 
     pub async fn write_telemetry(
         &self,
+        tenant_id: uuid::Uuid,
         event: &TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &str,
     ) -> Result<bool, CoreSqliteStoreError> {
         let mut transaction = self.pool.begin().await?;
         let inserted = self
-            .write_telemetry_in_transaction(&mut transaction, event, received_at, topic)
+            .write_telemetry_in_transaction(&mut transaction, tenant_id, event, received_at, topic)
             .await?;
         transaction.commit().await?;
         Ok(inserted)
@@ -328,15 +329,16 @@ impl CoreSqliteStore {
     pub async fn write_telemetry_in_transaction(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
+        tenant_id: uuid::Uuid,
         event: &TelemetryEvent,
         received_at: DateTime<Utc>,
         topic: &str,
     ) -> Result<bool, CoreSqliteStoreError> {
         let received_at = received_at.to_rfc3339();
         sqlx::query(
-            "INSERT INTO device_runtime_state (device_id, last_seen_at)
-             VALUES (?, ?)
-             ON CONFLICT(device_id) DO UPDATE SET
+            "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(tenant_id, device_id) DO UPDATE SET
                  last_seen_at = CASE
                      WHEN device_runtime_state.last_seen_at IS NULL
                        OR excluded.last_seen_at > device_runtime_state.last_seen_at
@@ -344,18 +346,20 @@ impl CoreSqliteStore {
                      ELSE device_runtime_state.last_seen_at
                  END",
         )
+        .bind(tenant_id.to_string())
         .bind(&event.device_id)
         .bind(&received_at)
         .execute(transaction.as_mut())
         .await?;
         let insert = sqlx::query(
             "INSERT OR IGNORE INTO telemetry (
-                event_at, received_at, device_id, boot_id, sequence, measurements, topic,
-                gateway_device_id
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements,
+                topic, gateway_device_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(event.event_at.to_rfc3339())
         .bind(&received_at)
+        .bind(tenant_id.to_string())
         .bind(&event.device_id)
         .bind(event.boot_id.to_string())
         .bind(i64::try_from(event.sequence).map_err(|_| CoreSqliteStoreError::SequenceOverflow)?)
@@ -374,6 +378,7 @@ impl CoreSqliteStore {
                 transaction,
                 RollupTable::FiveMinute,
                 bucket_start(event.event_at, 5 * 60),
+                tenant_id,
                 &event.device_id,
                 metrics,
             )
@@ -382,6 +387,7 @@ impl CoreSqliteStore {
                 transaction,
                 RollupTable::OneHour,
                 bucket_start(event.event_at, 60 * 60),
+                tenant_id,
                 &event.device_id,
                 metrics,
             )
@@ -775,21 +781,22 @@ async fn upsert_rollup(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table: RollupTable,
     bucket_at: String,
+    tenant_id: uuid::Uuid,
     device_id: &str,
     metrics: MetricAverages,
 ) -> Result<(), sqlx::Error> {
     let query = match table {
         RollupTable::FiveMinute => {
             "INSERT INTO telemetry_rollups_5m (
-                bucket_at, device_id, event_count,
+                bucket_at, tenant_id, device_id, event_count,
                 avg_temperature_c, temperature_count,
                 avg_humidity_pct, humidity_count,
                 avg_voltage_v, voltage_count,
                 avg_current_a, current_count,
                 avg_power_w, power_count,
                 avg_energy_kwh, energy_count
-             ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(bucket_at, device_id) DO UPDATE SET
+             ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, bucket_at, device_id) DO UPDATE SET
                 avg_temperature_c = CASE
                     WHEN excluded.temperature_count = 0 THEN telemetry_rollups_5m.avg_temperature_c
                     WHEN telemetry_rollups_5m.temperature_count = 0 THEN excluded.avg_temperature_c
@@ -848,15 +855,15 @@ async fn upsert_rollup(
         }
         RollupTable::OneHour => {
             "INSERT INTO telemetry_rollups_1h (
-                bucket_at, device_id, event_count,
+                bucket_at, tenant_id, device_id, event_count,
                 avg_temperature_c, temperature_count,
                 avg_humidity_pct, humidity_count,
                 avg_voltage_v, voltage_count,
                 avg_current_a, current_count,
                 avg_power_w, power_count,
                 avg_energy_kwh, energy_count
-             ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(bucket_at, device_id) DO UPDATE SET
+             ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, bucket_at, device_id) DO UPDATE SET
                 avg_temperature_c = CASE
                     WHEN excluded.temperature_count = 0 THEN telemetry_rollups_1h.avg_temperature_c
                     WHEN telemetry_rollups_1h.temperature_count = 0 THEN excluded.avg_temperature_c
@@ -922,7 +929,10 @@ async fn upsert_rollup(
         metrics.power_w,
         metrics.energy_kwh,
     ];
-    let mut query = sqlx::query(query).bind(bucket_at).bind(device_id);
+    let mut query = sqlx::query(query)
+        .bind(bucket_at)
+        .bind(tenant_id.to_string())
+        .bind(device_id);
     for value in values {
         query = query.bind(value).bind(i64::from(value.is_some()));
     }

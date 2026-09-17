@@ -59,6 +59,7 @@ pub(crate) const GATEWAY_TOPICS: [&str; 3] = [
 #[derive(Debug, Clone)]
 pub struct SessionRegistration {
     pub token_id: Uuid,
+    pub tenant_id: Uuid,
     pub device_id: String,
     pub client_id: String,
     pub connection_id: String,
@@ -164,6 +165,7 @@ struct RouterState {
 #[derive(Debug, Clone)]
 struct PendingRpcResponse {
     command_id: Uuid,
+    tenant_id: Uuid,
     device_id: String,
     token_id: Uuid,
     connection_id: String,
@@ -174,6 +176,7 @@ struct PendingRpcResponse {
 impl PendingRpcResponse {
     fn matches(&self, device: &AuthenticatedDevice, connection_id: &str, command_id: Uuid) -> bool {
         self.command_id == command_id
+            && self.tenant_id == device.tenant_id
             && self.device_id == device.device_id
             && self.token_id == device.token_id
             && self.connection_id == connection_id
@@ -192,6 +195,7 @@ impl SessionSnapshot {
     pub fn authenticated_device(&self) -> AuthenticatedDevice {
         AuthenticatedDevice {
             token_id: self.registration.token_id,
+            tenant_id: self.registration.tenant_id,
             device_id: self.registration.device_id.clone(),
             is_gateway: self.registration.is_gateway,
         }
@@ -355,6 +359,7 @@ impl RpcSessionRouter {
             let pending = if request.mode == RpcMode::TwoWay {
                 let pending = PendingRpcResponse {
                     command_id: request.id,
+                    tenant_id: snapshot.registration.tenant_id,
                     device_id: snapshot.registration.device_id.clone(),
                     token_id: snapshot.registration.token_id,
                     connection_id: snapshot.registration.connection_id.clone(),
@@ -422,6 +427,7 @@ impl RpcSessionRouter {
                 candidate.matches(
                     &AuthenticatedDevice {
                         token_id: pending.token_id,
+                        tenant_id: pending.tenant_id,
                         device_id: pending.device_id.clone(),
                         is_gateway: pending.is_gateway,
                     },
@@ -438,6 +444,7 @@ impl RpcSessionRouter {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthenticatedDevice {
     pub token_id: Uuid,
+    pub tenant_id: Uuid,
     pub device_id: String,
     pub is_gateway: bool,
 }
@@ -794,6 +801,7 @@ impl MqttdDeviceTransport {
                             if accepted && commands.is_none() {
                                 commands = Some(self.router.register(SessionRegistration {
                                     token_id: device.token_id,
+                                    tenant_id: device.tenant_id,
                                     device_id: device.device_id.clone(),
                                     client_id: client_id.to_owned(),
                                     connection_id: connection_id.to_owned(),
@@ -951,6 +959,7 @@ impl MqttdDeviceTransport {
                             self.router
                                 .register(SessionRegistration {
                                     token_id: device.token_id,
+                                    tenant_id: device.tenant_id,
                                     device_id: device.device_id.clone(),
                                     client_id: client_id.to_owned(),
                                     connection_id: connection_id.to_owned(),

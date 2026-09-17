@@ -2,7 +2,8 @@ use chrono::{Duration, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use iot_storage::{
     CommandLifecycleRepository, CommandOutboxState, CommandRepository, NewCommandOutboxEntry,
-    PlatformStore, PlatformStoreError, TelemetryRepository, TopologyRepository,
+    NewTenant, NewTenantAccount, PlatformStore, PlatformStoreError, TelemetryRepository,
+    TenantIdentityRepository, TopologyRepository,
 };
 use sqlx::{Connection, PgConnection, PgPool, Row};
 
@@ -62,6 +63,71 @@ fn telemetry(device_id: &str, sequence: u64) -> TelemetryEvent {
             .collect(),
         gateway_device_id: None,
     }
+}
+
+async fn create_tenant(store: &PlatformStore, slug: &str) -> uuid::Uuid {
+    TenantIdentityRepository::create_tenant_with_account(
+        store,
+        NewTenant {
+            slug: slug.to_owned(),
+            metadata: serde_json::json!({}),
+        },
+        NewTenantAccount {
+            password_hash: format!("{slug}-password-hash"),
+        },
+    )
+    .await
+    .unwrap()
+    .0
+    .id
+}
+
+fn test_tenant_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
+
+async fn ensure_test_tenant(store: &PlatformStore) {
+    let tenant_id = test_tenant_id();
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query(
+                "INSERT OR IGNORE INTO tenants (id, slug, status, metadata)
+                 VALUES (?, 'backend-contract', 'active', '{}')",
+            )
+            .bind(tenant_id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES ($1, 'backend-contract', 'active', '{}'::jsonb)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+}
+
+async fn register_test_device(store: &PlatformStore, device_id: &str) {
+    ensure_test_tenant(store).await;
+    TopologyRepository::register_device(store, test_tenant_id(), device_id)
+        .await
+        .unwrap();
+}
+
+async fn write_test_telemetry(
+    store: &PlatformStore,
+    event: &TelemetryEvent,
+    received_at: chrono::DateTime<Utc>,
+    topic: &str,
+) -> Result<bool, PlatformStoreError> {
+    ensure_test_tenant(store).await;
+    TelemetryRepository::write_telemetry(store, test_tenant_id(), event, received_at, topic).await
 }
 
 fn lifecycle_command(id: uuid::Uuid) -> NewCommandOutboxEntry {
@@ -438,9 +504,7 @@ async fn platform_store_enqueues_a_command_for_a_registered_sqlite_device() {
     .await
     .unwrap();
 
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
     let now = Utc::now();
     let command = CommandRepository::enqueue_command(
         &store,
@@ -473,9 +537,7 @@ async fn platform_store_returns_the_original_sqlite_command_for_an_idempotent_re
     .await
     .unwrap();
     let canonical_id = uuid::Uuid::now_v7();
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let request = command(
         "platform-command-device",
@@ -509,9 +571,7 @@ async fn platform_store_rejects_a_conflicting_sqlite_command_retry() {
     .await
     .unwrap();
     let command_id = uuid::Uuid::now_v7().to_string();
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let original = command("platform-command-device", &command_id, r#"{"target":"on"}"#);
     CommandRepository::enqueue_command(&store, original.clone())
@@ -538,9 +598,7 @@ async fn platform_store_replays_sqlite_command_when_only_handler_timestamps_chan
     .await
     .unwrap();
     let command_id = uuid::Uuid::now_v7().to_string();
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let original = command("platform-command-device", &command_id, r#"{"target":"on"}"#);
     let mut retry = original.clone();
@@ -570,9 +628,7 @@ async fn platform_store_canonicalizes_sqlite_command_values() {
     .unwrap();
     let canonical_id = uuid::Uuid::now_v7();
     let canonical_params = r#"{"target":"on"}"#;
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let command = CommandRepository::enqueue_command(
         &store,
@@ -607,9 +663,7 @@ async fn platform_store_rejects_malformed_sqlite_commands_before_persistence() {
     })
     .await
     .unwrap();
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let invalid_id = CommandRepository::enqueue_command(
         &store,
@@ -645,6 +699,63 @@ async fn platform_store_rejects_malformed_sqlite_commands_before_persistence() {
 }
 
 #[tokio::test]
+async fn platform_store_scopes_sqlite_registration_and_telemetry_to_the_explicit_tenant() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let tenant_a = create_tenant(&store, "tenant-a").await;
+    let tenant_b = create_tenant(&store, "tenant-b").await;
+    let event = telemetry("tenant-device", 1);
+
+    TopologyRepository::register_device(&store, tenant_a, &event.device_id)
+        .await
+        .unwrap();
+    assert!(
+        TelemetryRepository::write_telemetry(
+            &store,
+            tenant_a,
+            &event,
+            Utc::now(),
+            "iot/v1/devices/telemetry",
+        )
+        .await
+        .unwrap()
+    );
+    assert_unknown_device(
+        TelemetryRepository::write_telemetry(
+            &store,
+            tenant_a,
+            &telemetry("missing-device", 1),
+            Utc::now(),
+            "iot/v1/devices/telemetry",
+        )
+        .await,
+        "missing-device",
+    );
+    assert_unknown_device(
+        TelemetryRepository::write_telemetry(
+            &store,
+            tenant_b,
+            &event,
+            Utc::now(),
+            "iot/v1/devices/telemetry",
+        )
+        .await,
+        &event.device_id,
+    );
+    assert!(matches!(
+        TopologyRepository::register_device(&store, tenant_b, &event.device_id).await,
+        Err(PlatformStoreError::DeviceTenantConflict { .. })
+    ));
+}
+
+#[tokio::test]
 async fn platform_store_rejects_unknown_sqlite_devices_for_commands_and_telemetry() {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -666,7 +777,7 @@ async fn platform_store_rejects_unknown_sqlite_devices_for_commands_and_telemetr
         device_id,
     );
     assert_unknown_device(
-        TelemetryRepository::write_telemetry(
+        write_test_telemetry(
             &store,
             &telemetry(device_id, 1),
             Utc::now(),
@@ -700,29 +811,17 @@ async fn platform_store_persists_idempotent_sqlite_telemetry_via_the_repository_
     .await
     .unwrap();
     let event = telemetry("platform-telemetry-device", 1);
-    TopologyRepository::register_device(&store, &event.device_id)
-        .await
-        .unwrap();
+    register_test_device(&store, &event.device_id).await;
 
     assert!(
-        TelemetryRepository::write_telemetry(
-            &store,
-            &event,
-            Utc::now(),
-            "iot/v1/devices/telemetry",
-        )
-        .await
-        .unwrap()
+        write_test_telemetry(&store, &event, Utc::now(), "iot/v1/devices/telemetry",)
+            .await
+            .unwrap()
     );
     assert!(
-        !TelemetryRepository::write_telemetry(
-            &store,
-            &event,
-            Utc::now(),
-            "iot/v1/devices/telemetry",
-        )
-        .await
-        .unwrap()
+        !write_test_telemetry(&store, &event, Utc::now(), "iot/v1/devices/telemetry",)
+            .await
+            .unwrap()
     );
 }
 
@@ -737,9 +836,7 @@ async fn platform_store_command_lifecycle_sqlite_contract() {
     })
     .await
     .unwrap();
-    TopologyRepository::register_device(&store, "lifecycle-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "lifecycle-device").await;
     let token_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
@@ -760,9 +857,7 @@ async fn platform_store_command_lifecycle_sqlite_contract() {
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn platform_store_command_lifecycle_timescale_contract() {
     let (_test_lock, store) = timescale_test_store().await;
-    TopologyRepository::register_device(&store, "lifecycle-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "lifecycle-device").await;
     let token_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
@@ -791,17 +886,9 @@ async fn platform_store_rejects_overflowing_sqlite_telemetry_sequences() {
     .await
     .unwrap();
     let event = telemetry("platform-telemetry-device", (i64::MAX as u64) + 1);
-    TopologyRepository::register_device(&store, &event.device_id)
-        .await
-        .unwrap();
+    register_test_device(&store, &event.device_id).await;
 
-    let result = TelemetryRepository::write_telemetry(
-        &store,
-        &event,
-        Utc::now(),
-        "iot/v1/devices/telemetry",
-    )
-    .await;
+    let result = write_test_telemetry(&store, &event, Utc::now(), "iot/v1/devices/telemetry").await;
 
     assert!(matches!(
         result,
@@ -814,29 +901,17 @@ async fn platform_store_rejects_overflowing_sqlite_telemetry_sequences() {
 async fn platform_store_persists_idempotent_timescale_telemetry_via_the_repository_port() {
     let (_test_lock, store) = timescale_test_store().await;
     let event = telemetry("platform-telemetry-device", 1);
-    TopologyRepository::register_device(&store, &event.device_id)
-        .await
-        .unwrap();
+    register_test_device(&store, &event.device_id).await;
 
     assert!(
-        TelemetryRepository::write_telemetry(
-            &store,
-            &event,
-            Utc::now(),
-            "iot/v1/devices/telemetry",
-        )
-        .await
-        .unwrap()
+        write_test_telemetry(&store, &event, Utc::now(), "iot/v1/devices/telemetry",)
+            .await
+            .unwrap()
     );
     assert!(
-        !TelemetryRepository::write_telemetry(
-            &store,
-            &event,
-            Utc::now(),
-            "iot/v1/devices/telemetry",
-        )
-        .await
-        .unwrap()
+        !write_test_telemetry(&store, &event, Utc::now(), "iot/v1/devices/telemetry",)
+            .await
+            .unwrap()
     );
 }
 
@@ -845,9 +920,7 @@ async fn platform_store_persists_idempotent_timescale_telemetry_via_the_reposito
 async fn platform_store_enqueues_a_command_for_a_registered_timescale_device() {
     let (_test_lock, store) = timescale_test_store().await;
 
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
     let now = Utc::now();
     let command = CommandRepository::enqueue_command(
         &store,
@@ -873,9 +946,7 @@ async fn platform_store_enqueues_a_command_for_a_registered_timescale_device() {
 async fn platform_store_returns_the_original_timescale_command_for_an_idempotent_retry() {
     let (_test_lock, store) = timescale_test_store().await;
     let canonical_id = uuid::Uuid::now_v7();
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let request = command(
         "platform-command-device",
@@ -902,9 +973,7 @@ async fn platform_store_returns_the_original_timescale_command_for_an_idempotent
 async fn platform_store_rejects_a_conflicting_timescale_command_retry() {
     let (_test_lock, store) = timescale_test_store().await;
     let command_id = uuid::Uuid::now_v7().to_string();
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let original = command("platform-command-device", &command_id, r#"{"target":"on"}"#);
     CommandRepository::enqueue_command(&store, original.clone())
@@ -925,9 +994,7 @@ async fn platform_store_canonicalizes_timescale_command_values() {
     let (_test_lock, store) = timescale_test_store().await;
     let canonical_id = uuid::Uuid::now_v7();
     let canonical_params = r#"{"target":"on"}"#;
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let command = CommandRepository::enqueue_command(
         &store,
@@ -1160,9 +1227,7 @@ async fn platform_store_timescale_serializes_device_deletion_with_command_and_te
     let deletion_pool = PgPool::connect(&database_url).await.unwrap();
 
     let command_device_id = "command-race-device";
-    TopologyRepository::register_device(&store, command_device_id)
-        .await
-        .unwrap();
+    register_test_device(&store, command_device_id).await;
     let mut command_deletion = deletion_pool.begin().await.unwrap();
     sqlx::query("SELECT device_id FROM iot_nano.devices WHERE device_id = $1 FOR UPDATE")
         .bind(command_device_id)
@@ -1193,9 +1258,7 @@ async fn platform_store_timescale_serializes_device_deletion_with_command_and_te
     assert_unknown_device(command_writer.await.unwrap(), command_device_id);
 
     let telemetry_device_id = "telemetry-race-device";
-    TopologyRepository::register_device(&store, telemetry_device_id)
-        .await
-        .unwrap();
+    register_test_device(&store, telemetry_device_id).await;
     let mut telemetry_deletion = deletion_pool.begin().await.unwrap();
     sqlx::query("SELECT device_id FROM iot_nano.devices WHERE device_id = $1 FOR UPDATE")
         .bind(telemetry_device_id)
@@ -1207,6 +1270,7 @@ async fn platform_store_timescale_serializes_device_deletion_with_command_and_te
     let telemetry_writer = tokio::spawn(async move {
         TelemetryRepository::write_telemetry(
             &telemetry_store,
+            test_tenant_id(),
             &event,
             Utc::now(),
             "iot/v1/devices/telemetry",
@@ -1248,9 +1312,7 @@ async fn platform_store_timescale_serializes_device_deletion_with_command_and_te
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn platform_store_rejects_malformed_timescale_commands_before_persistence() {
     let (_test_lock, store) = timescale_test_store().await;
-    TopologyRepository::register_device(&store, "platform-command-device")
-        .await
-        .unwrap();
+    register_test_device(&store, "platform-command-device").await;
 
     let invalid_id = CommandRepository::enqueue_command(
         &store,
@@ -1300,7 +1362,7 @@ async fn platform_store_rejects_unknown_timescale_devices_for_commands_and_telem
         device_id,
     );
     assert_unknown_device(
-        TelemetryRepository::write_telemetry(
+        write_test_telemetry(
             &store,
             &telemetry(device_id, 1),
             Utc::now(),
@@ -1327,17 +1389,9 @@ async fn platform_store_rejects_unknown_timescale_devices_for_commands_and_telem
 async fn platform_store_rejects_overflowing_timescale_telemetry_sequences() {
     let (_test_lock, store) = timescale_test_store().await;
     let event = telemetry("platform-telemetry-device", (i64::MAX as u64) + 1);
-    TopologyRepository::register_device(&store, &event.device_id)
-        .await
-        .unwrap();
+    register_test_device(&store, &event.device_id).await;
 
-    let result = TelemetryRepository::write_telemetry(
-        &store,
-        &event,
-        Utc::now(),
-        "iot/v1/devices/telemetry",
-    )
-    .await;
+    let result = write_test_telemetry(&store, &event, Utc::now(), "iot/v1/devices/telemetry").await;
 
     assert!(matches!(
         result,

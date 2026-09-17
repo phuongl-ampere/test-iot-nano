@@ -8,6 +8,7 @@ use crate::{Offset, PartitionId, StreamError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryMessage {
+    pub tenant_id: Uuid,
     pub topic: String,
     pub payload: Vec<u8>,
     pub event: TelemetryEvent,
@@ -38,6 +39,7 @@ pub struct GatewayEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayMessage {
+    pub tenant_id: Uuid,
     pub topic: String,
     pub payload: Vec<u8>,
     pub gateway_event: GatewayEvent,
@@ -77,6 +79,13 @@ impl StreamMessage {
         match self {
             Self::Telemetry(message) => message.received_at,
             Self::Gateway(message) => message.received_at,
+        }
+    }
+
+    pub fn tenant_id(&self) -> Uuid {
+        match self {
+            Self::Telemetry(message) => message.tenant_id,
+            Self::Gateway(message) => message.tenant_id,
         }
     }
 

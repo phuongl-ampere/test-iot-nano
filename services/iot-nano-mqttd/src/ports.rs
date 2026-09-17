@@ -59,6 +59,7 @@ pub trait CachePort: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayAuthorizationRequest {
+    pub tenant_id: Uuid,
     pub gateway_device_id: String,
     pub token_id: Uuid,
     pub child_device_id: Option<String>,
@@ -68,6 +69,7 @@ pub struct GatewayAuthorizationRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GatewayAuthorization {
+    pub tenant_id: Uuid,
     pub gateway_device_id: String,
     pub token_id: Uuid,
     pub child_device_id: Option<String>,
@@ -83,7 +85,8 @@ impl GatewayAuthorization {
         event_kind: &str,
         child_device_id: Option<&str>,
     ) -> bool {
-        self.gateway_device_id == device.device_id
+        self.tenant_id == device.tenant_id
+            && self.gateway_device_id == device.device_id
             && self.token_id == device.token_id
             && self.topic == topic
             && self.event_kind == event_kind
@@ -193,6 +196,7 @@ impl UplinkForwarder for LocalStreamUplinkForwarder {
                 stream
                     .append(
                         TelemetryMessage {
+                            tenant_id: message.device.tenant_id,
                             topic: format!("iot/v1/devices/{}/telemetry", event.device_id),
                             payload: message.payload,
                             event,
@@ -225,6 +229,7 @@ impl UplinkForwarder for LocalStreamUplinkForwarder {
             };
             let authorization = authorization
                 .authorize_gateway_uplink(GatewayAuthorizationRequest {
+                    tenant_id: message.device.tenant_id,
                     gateway_device_id: message.device.device_id.clone(),
                     token_id: message.device.token_id,
                     child_device_id: child_device_id.map(str::to_owned),
@@ -247,6 +252,7 @@ impl UplinkForwarder for LocalStreamUplinkForwarder {
             stream
                 .append(
                     GatewayMessage {
+                        tenant_id: authorization.tenant_id,
                         topic: format!(
                             "iot/v1/gateways/{}/events",
                             authorization.gateway_device_id
