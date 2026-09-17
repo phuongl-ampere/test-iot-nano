@@ -178,6 +178,23 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .unwrap();
     assert_eq!(tenant_me.status(), StatusCode::OK);
 
+    let create_application = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/applications")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    r#"{"app_id":"powermonitor","kind":"full_stack","launch_url":"https://powermonitor.example.test","client_id":"north-powermonitor-client","redirect_uris":["https://powermonitor.example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_application.status(), StatusCode::CREATED);
+
     let create_user = router
         .clone()
         .oneshot(
@@ -301,6 +318,22 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .next()
         .unwrap()
         .to_owned();
+    let create_application = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/applications")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    r#"{"app_id":"powermonitor","kind":"full_stack","launch_url":"https://powermonitor.example.test","client_id":"north-powermonitor-client","redirect_uris":["https://powermonitor.example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_application.status(), StatusCode::CREATED);
     let create_user = router
         .clone()
         .oneshot(

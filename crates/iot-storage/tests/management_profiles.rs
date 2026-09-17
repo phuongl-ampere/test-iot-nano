@@ -123,6 +123,27 @@ async fn sqlite_schema_scopes_profiles_and_rejects_cross_tenant_profile_referenc
 }
 
 #[tokio::test]
+async fn sqlite_schema_indexes_tenant_scoped_device_profile_references() {
+    let (_directory, store, _tenant_id) = sqlite_store().await;
+
+    let definition: Option<String> = sqlx::query_scalar(
+        "SELECT sql
+         FROM sqlite_master
+         WHERE type = 'index' AND name = 'devices_tenant_device_profile_index'",
+    )
+    .fetch_optional(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    assert!(
+        definition.as_deref().is_some_and(|sql| sql
+            .contains("ON devices (tenant_id, device_profile_id)")
+            && sql.contains("WHERE device_profile_id IS NOT NULL")),
+        "{definition:?}"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_management_profile_repositories_create_list_update_and_delete() {
     let (_directory, store, tenant_id) = sqlite_store().await;
 

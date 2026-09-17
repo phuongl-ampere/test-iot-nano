@@ -62,6 +62,29 @@ impl From<sqlx::Error> for PublicDeviceError {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum PublicAssetError {
+    #[error("public asset profile is unavailable: {0}")]
+    AssetProfileUnavailable(Uuid),
+    #[error("public asset storage operation failed")]
+    Storage {
+        #[source]
+        source: PlatformStoreError,
+    },
+}
+
+impl From<PlatformStoreError> for PublicAssetError {
+    fn from(source: PlatformStoreError) -> Self {
+        Self::Storage { source }
+    }
+}
+
+impl From<sqlx::Error> for PublicAssetError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::from(PlatformStoreError::from(source))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewPublicAsset {
     pub name: String,
@@ -185,13 +208,13 @@ pub trait PublicApiRepository: Send + Sync {
         &'a self,
         principal: &'a PublicPrincipal,
         asset: NewPublicAsset,
-    ) -> Pin<Box<dyn Future<Output = Result<PublicAsset, PlatformStoreError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<PublicAsset, PublicAssetError>> + Send + 'a>>;
     fn update_public_asset<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
         asset_id: Uuid,
         asset: NewPublicAsset,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicAsset>, PlatformStoreError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicAsset>, PublicAssetError>> + Send + 'a>>;
     fn delete_public_asset<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
@@ -388,7 +411,7 @@ impl PublicApiRepository for PlatformStore {
         &'a self,
         principal: &'a PublicPrincipal,
         asset: NewPublicAsset,
-    ) -> Pin<Box<dyn Future<Output = Result<PublicAsset, PlatformStoreError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PublicAsset, PublicAssetError>> + Send + 'a>> {
         Box::pin(async move { create_public_asset(self, principal, asset).await })
     }
 
@@ -397,7 +420,7 @@ impl PublicApiRepository for PlatformStore {
         principal: &'a PublicPrincipal,
         asset_id: Uuid,
         asset: NewPublicAsset,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicAsset>, PlatformStoreError>> + Send + 'a>>
+    ) -> Pin<Box<dyn Future<Output = Result<Option<PublicAsset>, PublicAssetError>> + Send + 'a>>
     {
         Box::pin(async move { update_public_asset(self, principal, asset_id, asset).await })
     }
@@ -1077,6 +1100,21 @@ async fn sqlite_public_device_profile_exists(
     )
 }
 
+async fn sqlite_public_asset_profile_exists(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
+    asset_profile_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM asset_profiles WHERE id = ? AND tenant_id = ?")
+            .bind(asset_profile_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some(),
+    )
+}
+
 async fn lock_timescale_public_device_asset_assignment(
     transaction: &mut Transaction<'_, Postgres>,
     asset_id: Option<Uuid>,
@@ -1216,6 +1254,24 @@ async fn timescale_public_device_profile_exists(
              FOR KEY SHARE",
     )
     .bind(device_profile_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
+async fn timescale_public_asset_profile_exists(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    asset_profile_id: Uuid,
+) -> Result<bool, PlatformStoreError> {
+    Ok(sqlx::query_scalar::<_, Uuid>(
+        "SELECT id
+             FROM asset_profiles
+             WHERE id = $1 AND tenant_id = $2
+             FOR KEY SHARE",
+    )
+    .bind(asset_profile_id)
     .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await?
@@ -2439,10 +2495,22 @@ async fn create_public_asset(
     store: &PlatformStore,
     principal: &PublicPrincipal,
     asset: NewPublicAsset,
-) -> Result<PublicAsset, PlatformStoreError> {
+) -> Result<PublicAsset, PublicAssetError> {
     let id = Uuid::now_v7();
     let created = match store {
         PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(asset_profile_id) = asset.asset_profile_id {
+                if !sqlite_public_asset_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    asset_profile_id,
+                )
+                .await?
+                {
+                    return Err(PublicAssetError::AssetProfileUnavailable(asset_profile_id));
+                }
+            }
             let row = sqlx::query(
                 "INSERT INTO assets (
                     id, tenant_id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
@@ -2456,11 +2524,39 @@ async fn create_public_asset(
             .bind(asset.parent_asset_id.map(|id| id.to_string()))
             .bind(principal.user_id.map(|id| id.to_string()))
             .bind(asset.metadata.to_string())
-            .fetch_one(store.pool())
+            .fetch_one(&mut *transaction)
             .await?;
-            sqlite_asset_record(row)
+            let created = sqlite_asset_record(row)?;
+            if principal.user_id.is_none() {
+                sqlx::query(
+                    "INSERT INTO resource_grants (
+                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
+                        permission
+                     ) VALUES (?, ?, 'asset', ?, 'application', ?, 'manager')",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(principal.tenant_id.to_string())
+                .bind(id.to_string())
+                .bind(&principal.app_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            transaction.commit().await?;
+            created
         }
         PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            if let Some(asset_profile_id) = asset.asset_profile_id {
+                if !timescale_public_asset_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    asset_profile_id,
+                )
+                .await?
+                {
+                    return Err(PublicAssetError::AssetProfileUnavailable(asset_profile_id));
+                }
+            }
             let row = sqlx::query(
                 "INSERT INTO assets (
                     id, tenant_id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
@@ -2474,28 +2570,10 @@ async fn create_public_asset(
             .bind(asset.parent_asset_id)
             .bind(principal.user_id)
             .bind(sqlx::types::Json(asset.metadata))
-            .fetch_one(pool)
+            .fetch_one(&mut *transaction)
             .await?;
-            timescale_asset_record(row)
-        }
-    }?;
-    if principal.user_id.is_none() {
-        match store {
-            PlatformStore::Sqlite(store) => {
-                sqlx::query(
-                    "INSERT INTO resource_grants (
-                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
-                        permission
-                     ) VALUES (?, ?, 'asset', ?, 'application', ?, 'manager')",
-                )
-                .bind(Uuid::now_v7().to_string())
-                .bind(principal.tenant_id.to_string())
-                .bind(id.to_string())
-                .bind(&principal.app_id)
-                .execute(store.pool())
-                .await?;
-            }
-            PlatformStore::Timescale(pool) => {
+            let created = timescale_asset_record(row)?;
+            if principal.user_id.is_none() {
                 sqlx::query(
                     "INSERT INTO resource_grants (
                         id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
@@ -2506,11 +2584,13 @@ async fn create_public_asset(
                 .bind(principal.tenant_id)
                 .bind(id)
                 .bind(&principal.app_id)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await?;
             }
+            transaction.commit().await?;
+            created
         }
-    }
+    };
     Ok(created)
 }
 
@@ -2519,7 +2599,7 @@ async fn update_public_asset(
     principal: &PublicPrincipal,
     asset_id: Uuid,
     asset: NewPublicAsset,
-) -> Result<Option<PublicAsset>, PlatformStoreError> {
+) -> Result<Option<PublicAsset>, PublicAssetError> {
     if !public_asset_permission(store, principal, asset_id)
         .await?
         .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
@@ -2527,40 +2607,72 @@ async fn update_public_asset(
         return Ok(None);
     }
     match store {
-        PlatformStore::Sqlite(store) => sqlx::query(
-            "UPDATE assets
-             SET name = ?, asset_profile_id = ?, parent_asset_id = ?, metadata = ?, updated_at = ?
-             WHERE id = ? AND tenant_id = ?
-             RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
-        )
-        .bind(asset.name)
-        .bind(asset.asset_profile_id.map(|id| id.to_string()))
-        .bind(asset.parent_asset_id.map(|id| id.to_string()))
-        .bind(asset.metadata.to_string())
-        .bind(Utc::now().to_rfc3339())
-        .bind(asset_id.to_string())
-        .bind(principal.tenant_id.to_string())
-        .fetch_optional(store.pool())
-        .await?
-        .map(sqlite_asset_record)
-        .transpose(),
-        PlatformStore::Timescale(pool) => sqlx::query(
-            "UPDATE assets
-             SET name = $2, asset_profile_id = $3, parent_asset_id = $4,
-                 metadata = $5, updated_at = now()
-             WHERE id = $1 AND tenant_id = $6
-             RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
-        )
-        .bind(asset_id)
-        .bind(asset.name)
-        .bind(asset.asset_profile_id)
-        .bind(asset.parent_asset_id)
-        .bind(sqlx::types::Json(asset.metadata))
-        .bind(principal.tenant_id)
-        .fetch_optional(pool)
-        .await?
-        .map(timescale_asset_record)
-        .transpose(),
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            if let Some(asset_profile_id) = asset.asset_profile_id {
+                if !sqlite_public_asset_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    asset_profile_id,
+                )
+                .await?
+                {
+                    return Err(PublicAssetError::AssetProfileUnavailable(asset_profile_id));
+                }
+            }
+            let updated = sqlx::query(
+                "UPDATE assets
+                 SET name = ?, asset_profile_id = ?, parent_asset_id = ?, metadata = ?, updated_at = ?
+                 WHERE id = ? AND tenant_id = ?
+                 RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
+            )
+            .bind(asset.name)
+            .bind(asset.asset_profile_id.map(|id| id.to_string()))
+            .bind(asset.parent_asset_id.map(|id| id.to_string()))
+            .bind(asset.metadata.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .bind(asset_id.to_string())
+            .bind(principal.tenant_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(sqlite_asset_record)
+            .transpose()?;
+            transaction.commit().await?;
+            Ok(updated)
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            if let Some(asset_profile_id) = asset.asset_profile_id {
+                if !timescale_public_asset_profile_exists(
+                    &mut transaction,
+                    principal.tenant_id,
+                    asset_profile_id,
+                )
+                .await?
+                {
+                    return Err(PublicAssetError::AssetProfileUnavailable(asset_profile_id));
+                }
+            }
+            let updated = sqlx::query(
+                "UPDATE assets
+                 SET name = $2, asset_profile_id = $3, parent_asset_id = $4,
+                     metadata = $5, updated_at = now()
+                 WHERE id = $1 AND tenant_id = $6
+                 RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
+            )
+            .bind(asset_id)
+            .bind(asset.name)
+            .bind(asset.asset_profile_id)
+            .bind(asset.parent_asset_id)
+            .bind(sqlx::types::Json(asset.metadata))
+            .bind(principal.tenant_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(timescale_asset_record)
+            .transpose()?;
+            transaction.commit().await?;
+            Ok(updated)
+        }
     }
 }
 

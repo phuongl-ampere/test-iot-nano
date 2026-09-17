@@ -886,6 +886,148 @@ async fn sqlite_public_device_update_rejects_an_unavailable_profile_atomically()
 }
 
 #[tokio::test]
+async fn sqlite_public_asset_create_rejects_a_cross_tenant_profile_atomically() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let owner_id = Uuid::now_v7();
+    let other_tenant_id = Uuid::now_v7();
+    let cross_tenant_profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'public-asset-profile-other', 'active')",
+    )
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-asset-profile-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO asset_profiles (id, tenant_id, name) VALUES (?, ?, ?)")
+        .bind(cross_tenant_profile_id.to_string())
+        .bind(other_tenant_id.to_string())
+        .bind("other tenant profile")
+        .execute(pool)
+        .await
+        .unwrap();
+    let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(owner_id),
+        app_id: "public-asset-profile-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+
+    let error = PublicApiRepository::create_public_asset(
+        &store,
+        &principal,
+        NewPublicAsset {
+            name: "cross-tenant-profile-create".to_owned(),
+            asset_profile_id: Some(cross_tenant_profile_id),
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!("public asset profile is unavailable: {cross_tenant_profile_id}")
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE tenant_id = ? AND name = ?")
+            .bind(test_tenant_id().to_string())
+            .bind("cross-tenant-profile-create")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn sqlite_public_asset_update_rejects_a_cross_tenant_profile_atomically() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let owner_id = Uuid::now_v7();
+    let other_tenant_id = Uuid::now_v7();
+    let cross_tenant_profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (
+            id, slug, status
+         ) VALUES (?, 'public-asset-profile-update-other', 'active')",
+    )
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-asset-profile-update-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO asset_profiles (id, tenant_id, name) VALUES (?, ?, ?)")
+        .bind(cross_tenant_profile_id.to_string())
+        .bind(other_tenant_id.to_string())
+        .bind("other tenant update profile")
+        .execute(pool)
+        .await
+        .unwrap();
+    let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(owner_id),
+        app_id: "public-asset-profile-update-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let asset = PublicApiRepository::create_public_asset(
+        &store,
+        &principal,
+        NewPublicAsset {
+            name: "cross-tenant-profile-update".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({"version": 1}),
+        },
+    )
+    .await
+    .unwrap();
+
+    let error = PublicApiRepository::update_public_asset(
+        &store,
+        &principal,
+        asset.id,
+        NewPublicAsset {
+            name: "updated cross-tenant-profile-update".to_owned(),
+            asset_profile_id: Some(cross_tenant_profile_id),
+            parent_asset_id: None,
+            metadata: json!({"version": 2}),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        format!("public asset profile is unavailable: {cross_tenant_profile_id}")
+    );
+    let current = PublicApiRepository::get_public_asset(&store, &principal, asset.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.name, "cross-tenant-profile-update");
+    assert_eq!(current.asset_profile_id, None);
+    assert_eq!(current.metadata, json!({"version": 1}));
+}
+
+#[tokio::test]
 async fn sqlite_public_device_permission_requires_an_application_grant() {
     let (_directory, store) = sqlite_store().await;
     let owning_application = PublicPrincipal {

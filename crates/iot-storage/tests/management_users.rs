@@ -167,6 +167,107 @@ async fn sqlite_schema_rejects_cross_tenant_user_app_grants() {
 }
 
 #[tokio::test]
+async fn sqlite_management_user_repository_rejects_missing_granted_apps_before_user_creation() {
+    let (_directory, store) = sqlite_store().await;
+
+    let error = ManagementUserRepository::create_management_user(
+        &store,
+        CreateManagementUser {
+            default_app: "/apps/unregistered".to_owned(),
+            granted_apps: vec!["unregistered".to_owned()],
+            ..user_creation("missing-granted-app")
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, ManagementUserError::InvalidGrantedApps));
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = ? AND username = ?")
+            .bind(test_tenant_id().to_string())
+            .bind("missing-granted-app")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn sqlite_management_user_repository_rejects_cross_tenant_granted_apps_before_user_creation()
+{
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let other_tenant_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'grant-other-tenant', 'active')",
+    )
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO applications (
+            app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+         ) VALUES (?, ?, 'frontend', 'https://example.test/other-grant', ?, '[]', 1)",
+    )
+    .bind("other-tenant-grant-app")
+    .bind(other_tenant_id.to_string())
+    .bind("other-tenant-grant-client")
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let error = ManagementUserRepository::create_management_user(
+        &store,
+        CreateManagementUser {
+            default_app: "/apps/other-tenant-grant-app".to_owned(),
+            granted_apps: vec!["other-tenant-grant-app".to_owned()],
+            ..user_creation("cross-tenant-granted-app")
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, ManagementUserError::InvalidGrantedApps));
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = ? AND username = ?")
+            .bind(test_tenant_id().to_string())
+            .bind("cross-tenant-granted-app")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn sqlite_management_user_repository_preserves_grants_when_an_update_references_a_missing_app()
+ {
+    let (_directory, store) = sqlite_store().await;
+    let created = ManagementUserRepository::create_management_user(&store, user_creation("alice"))
+        .await
+        .unwrap();
+
+    let error = ManagementUserRepository::update_management_user(
+        &store,
+        test_tenant_id(),
+        "alice",
+        UpdateManagementUser {
+            default_app: "/apps/unregistered".to_owned(),
+            granted_apps: vec!["unregistered".to_owned()],
+            role: None,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, ManagementUserError::InvalidGrantedApps));
+    let current = ManagementUserRepository::list_management_users(&store, test_tenant_id())
+        .await
+        .unwrap();
+    assert_eq!(current, [created]);
+}
+
+#[tokio::test]
 async fn sqlite_management_user_repository_creates_and_lists_users() {
     let (_directory, store) = sqlite_store().await;
 

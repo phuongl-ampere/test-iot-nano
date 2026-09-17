@@ -51,8 +51,8 @@ pub use management::{
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,
-    PublicAsset, PublicDevice, PublicDeviceError, PublicPrincipal, PublicResourceGrant,
-    PublicTelemetry,
+    PublicAsset, PublicAssetError, PublicDevice, PublicDeviceError, PublicPrincipal,
+    PublicResourceGrant, PublicTelemetry,
 };
 pub use tenant_identity::{
     AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount,
@@ -355,6 +355,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS assets_tenant_root_name_unique_index
     WHERE parent_asset_id IS NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_asset_index
     ON devices (tenant_id, asset_id);
+CREATE INDEX IF NOT EXISTS devices_tenant_device_profile_index
+    ON devices (tenant_id, device_profile_id)
+    WHERE device_profile_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_active_index
     ON devices (tenant_id, device_id)
     WHERE deleted_at IS NULL;
@@ -7877,7 +7880,6 @@ impl SqliteStore {
             .sqlite_path
             .as_ref()
             .ok_or(SqliteStoreError::InvalidConfiguration)?;
-        reject_pre_tenant_platform_sqlite(path, configuration.sqlite_busy_timeout_ms).await?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -7892,6 +7894,10 @@ impl SqliteStore {
             .max_connections(4)
             .connect_with(options)
             .await?;
+        if let Some(table) = pre_tenant_platform_sqlite_table(&pool).await? {
+            pool.close().await;
+            return Err(SqliteStoreError::ResetRequired { table });
+        }
         #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
@@ -8704,7 +8710,7 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), SqliteSt
         .await?;
     sqlx::query(
         "CREATE INDEX command_outbox_due_index
-         ON command_outbox (state, next_attempt_at)
+         ON command_outbox (tenant_id, state, next_attempt_at)
          WHERE state = 'queued'",
     )
     .execute(&mut *transaction)

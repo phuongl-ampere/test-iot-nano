@@ -229,6 +229,8 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE INDEX IF NOT EXISTS devices_asset_id_index ON devices (asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_asset_index ON devices (tenant_id, asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_device_profile_id_index ON devices (device_profile_id) WHERE device_profile_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS devices_tenant_device_profile_index
+    ON devices (tenant_id, device_profile_id) WHERE device_profile_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_active_index
     ON devices (tenant_id, device_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_gateway_device_id_index

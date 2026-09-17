@@ -790,7 +790,9 @@ async fn create_management_user(
     let username = user.username.clone();
     match store {
         PlatformStore::Sqlite(store) => {
-            let mut transaction = store.pool().begin().await?;
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            sqlite_validate_management_user_apps(&mut transaction, tenant_id, &user.granted_apps)
+                .await?;
             sqlx::query(
                 "INSERT INTO users (
                     id, tenant_id, username, password_hash, role, account_class, default_app, updated_at
@@ -819,6 +821,12 @@ async fn create_management_user(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            timescale_validate_management_user_apps(
+                &mut transaction,
+                tenant_id,
+                &user.granted_apps,
+            )
+            .await?;
             sqlx::query(
                 "INSERT INTO users (
                     id, tenant_id, username, password_hash, role, account_class, default_app
@@ -873,6 +881,8 @@ async fn update_management_user(
                 user.role,
             )
             .await?;
+            sqlite_validate_management_user_apps(&mut transaction, tenant_id, &user.granted_apps)
+                .await?;
             sqlx::query(
                 "UPDATE users
                  SET default_app = ?, role = COALESCE(?, role),
@@ -930,6 +940,12 @@ async fn update_management_user(
                 user.role,
             )
             .await?;
+            timescale_validate_management_user_apps(
+                &mut transaction,
+                tenant_id,
+                &user.granted_apps,
+            )
+            .await?;
             sqlx::query(
                 "UPDATE users
                  SET default_app = $2, role = COALESCE($3, role),
@@ -969,6 +985,51 @@ async fn update_management_user(
         }
     };
     management_user(store, tenant_id, user_id).await
+}
+
+async fn sqlite_validate_management_user_apps(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
+    granted_apps: &[String],
+) -> Result<(), ManagementUserError> {
+    for app_key in granted_apps {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM applications WHERE app_id = ? AND tenant_id = ?",
+        )
+        .bind(app_key)
+        .bind(tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some();
+        if !exists {
+            return Err(ManagementUserError::InvalidGrantedApps);
+        }
+    }
+    Ok(())
+}
+
+async fn timescale_validate_management_user_apps(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    granted_apps: &[String],
+) -> Result<(), ManagementUserError> {
+    for app_key in granted_apps {
+        let exists = sqlx::query_scalar::<_, String>(
+            "SELECT app_id
+             FROM applications
+             WHERE app_id = $1 AND tenant_id = $2
+             FOR KEY SHARE",
+        )
+        .bind(app_key)
+        .bind(tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some();
+        if !exists {
+            return Err(ManagementUserError::InvalidGrantedApps);
+        }
+    }
+    Ok(())
 }
 
 async fn sqlite_management_user_mutation_target(
