@@ -700,19 +700,39 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
     let pool = config.store.sqlite_pool().unwrap().clone();
 
     let runtime = CoreRuntime::start(config).await.unwrap();
-    sleep(Duration::from_millis(30)).await;
+
+    let row = timeout(Duration::from_secs(1), async {
+        loop {
+            let row = sqlx::query(
+                "SELECT state, last_error, next_attempt_at
+                 FROM notification_outbox
+                 WHERE id = ? AND tenant_id = ?",
+            )
+            .bind(notification_id.to_string())
+            .bind(TEST_TENANT_ID.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let next_attempt_at =
+                chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("next_attempt_at"))
+                    .unwrap()
+                    .with_timezone(&Utc);
+            if row.get::<String, _>("state") == "pending"
+                && row
+                    .get::<Option<String>, _>("last_error")
+                    .as_deref()
+                    .is_some_and(|error| !error.is_empty())
+                && next_attempt_at > original_next_attempt_at
+            {
+                break row;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("notification worker did not schedule a retry");
 
     assert!(runtime.ready());
-    let row = sqlx::query(
-        "SELECT state, last_error, next_attempt_at
-         FROM notification_outbox
-         WHERE id = ? AND tenant_id = ?",
-    )
-    .bind(notification_id.to_string())
-    .bind(TEST_TENANT_ID.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
     assert_eq!(row.get::<String, _>("state"), "pending");
     let last_error = row.get::<Option<String>, _>("last_error");
     assert!(!last_error.as_deref().unwrap_or_default().is_empty());
