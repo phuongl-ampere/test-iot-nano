@@ -185,6 +185,39 @@ async fn sqlite_tenant_identity_repository_controls_tenant_and_credential_lifecy
 }
 
 #[tokio::test]
+async fn sqlite_tenant_identity_repository_lists_tenants_without_deleted_rows() {
+    let (_directory, store) = sqlite_store().await;
+    for slug in ["north", "south"] {
+        TenantIdentityRepository::create_tenant_with_account(
+            &store,
+            NewTenant {
+                slug: slug.to_owned(),
+                metadata: serde_json::json!({}),
+            },
+            NewTenantAccount {
+                password_hash: "tenant-account-hash".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    TenantIdentityRepository::delete_tenant(&store, "south")
+        .await
+        .unwrap();
+
+    let tenants = TenantIdentityRepository::list_tenants(&store)
+        .await
+        .unwrap();
+    assert_eq!(
+        tenants
+            .into_iter()
+            .map(|tenant| tenant.slug)
+            .collect::<Vec<_>>(),
+        ["north"]
+    );
+}
+
+#[tokio::test]
 async fn sqlite_schema_requires_tenant_id_for_every_user() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
@@ -216,4 +249,95 @@ async fn sqlite_schema_requires_tenant_id_for_every_user() {
     .execute(pool)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_schema_requires_same_tenant_identity_for_assets_and_devices() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status, metadata) VALUES (?, ?, 'active', '{}')")
+        .bind("tenant-north")
+        .bind("north")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let missing_asset_tenant =
+        sqlx::query("INSERT INTO assets (id, name, metadata) VALUES (?, ?, '{}')")
+            .bind("00000000-0000-0000-0000-000000000010")
+            .bind("asset-without-tenant")
+            .execute(pool)
+            .await;
+    assert!(missing_asset_tenant.is_err());
+
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, metadata)
+         VALUES (?, ?, ?, '{}')",
+    )
+    .bind("00000000-0000-0000-0000-000000000010")
+    .bind("tenant-north")
+    .bind("north-asset")
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status, metadata) VALUES (?, ?, 'active', '{}')")
+        .bind("tenant-south")
+        .bind("south")
+        .execute(pool)
+        .await
+        .unwrap();
+    let missing_device_tenant =
+        sqlx::query("INSERT INTO devices (device_id, asset_id) VALUES (?, ?)")
+            .bind("device-without-tenant")
+            .bind("00000000-0000-0000-0000-000000000010")
+            .execute(pool)
+            .await;
+    assert!(missing_device_tenant.is_err());
+    let cross_tenant_assignment = sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, asset_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind("south-device")
+    .bind("tenant-south")
+    .bind("00000000-0000-0000-0000-000000000010")
+    .execute(pool)
+    .await;
+    assert!(cross_tenant_assignment.is_err());
+}
+
+#[tokio::test]
+async fn sqlite_schema_scopes_root_asset_name_uniqueness_to_a_tenant() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    for (id, slug) in [("tenant-north", "north"), ("tenant-south", "south")] {
+        sqlx::query(
+            "INSERT INTO tenants (id, slug, status, metadata) VALUES (?, ?, 'active', '{}')",
+        )
+        .bind(id)
+        .bind(slug)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    for (id, tenant_id) in [
+        ("00000000-0000-0000-0000-000000000011", "tenant-north"),
+        ("00000000-0000-0000-0000-000000000012", "tenant-south"),
+    ] {
+        sqlx::query(
+            "INSERT INTO assets (id, tenant_id, name, metadata) VALUES (?, ?, 'root', '{}')",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    let duplicate = sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, metadata) VALUES (?, ?, 'root', '{}')",
+    )
+    .bind("00000000-0000-0000-0000-000000000013")
+    .bind("tenant-north")
+    .execute(pool)
+    .await;
+    assert!(duplicate.is_err());
 }

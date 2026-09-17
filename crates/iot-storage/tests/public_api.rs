@@ -1,3 +1,4 @@
+use chrono::{Duration as ChronoDuration, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountClass, ManagementAssetRepository, NewPublicAsset, NewPublicDevice,
@@ -21,7 +22,306 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'public-api-fixture', 'active')",
+    )
+    .bind(test_tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     (directory, store)
+}
+
+fn test_tenant_id() -> Uuid {
+    Uuid::from_u128(10_001)
+}
+
+async fn timescale_store() -> (PgConnection, PlatformStore) {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set for ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to use non-test database {database_name:?}"
+    );
+    common::lock_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    (connection, store)
+}
+
+#[tokio::test]
+async fn sqlite_public_assets_are_invisible_across_tenants() {
+    let (_directory, store) = sqlite_store().await;
+    let tenant_a_id = Uuid::now_v7();
+    let tenant_b_id = Uuid::now_v7();
+    let tenant_a_user_id = Uuid::now_v7();
+    let tenant_b_user_id = Uuid::now_v7();
+    let pool = store.sqlite_pool().unwrap();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'public-tenant-a', 'active'),
+                (?, 'public-tenant-b', 'active')",
+    )
+    .bind(tenant_a_id.to_string())
+    .bind(tenant_b_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-tenant-a-user', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-tenant-b-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(tenant_a_user_id.to_string())
+    .bind(tenant_a_id.to_string())
+    .bind(tenant_b_user_id.to_string())
+    .bind(tenant_b_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let tenant_a_principal = PublicPrincipal {
+        tenant_id: tenant_a_id,
+        user_id: Some(tenant_a_user_id),
+        app_id: "public-tenant-a-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let tenant_b_principal = PublicPrincipal {
+        tenant_id: tenant_b_id,
+        user_id: Some(tenant_b_user_id),
+        app_id: "public-tenant-b-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let tenant_b_asset = PublicApiRepository::create_public_asset(
+        &store,
+        &tenant_b_principal,
+        NewPublicAsset {
+            name: "tenant-b-asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PublicApiRepository::get_public_asset(&store, &tenant_a_principal, tenant_b_asset.id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn sqlite_public_application_grant_reads_telemetry_and_alerts() {
+    let (_directory, store) = sqlite_store().await;
+    let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: None,
+        app_id: "public-observer-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let device = PublicApiRepository::create_public_device(
+        &store,
+        &principal,
+        NewPublicDevice {
+            device_id: "public-observer-device".to_owned(),
+            display_name: Some("Public observer device".to_owned()),
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let event_at = Utc::now();
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, ?, ?, ?, 'public-observer')",
+    )
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .bind(&device.device_id)
+    .bind(Uuid::now_v7().to_string())
+    .bind(1_i64)
+    .bind(json!({ "temperature_c": 26.0 }).to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let rule_id = Uuid::now_v7();
+    let alert_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, name, device_id, metric_key, rule_type, comparison, threshold
+         ) VALUES (?, 'Public observer rule', ?, 'temperature_c', 'event', 'gt', 25)",
+    )
+    .bind(rule_id.to_string())
+    .bind(&device.device_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, rule_id, device_id, status, condition_started_at, opened_at, updated_at
+         ) VALUES (?, ?, ?, 'open', ?, ?, ?)",
+    )
+    .bind(alert_id.to_string())
+    .bind(rule_id.to_string())
+    .bind(&device.device_id)
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let telemetry = PublicApiRepository::list_public_telemetry(
+        &store,
+        &principal,
+        None,
+        event_at - ChronoDuration::minutes(1),
+        event_at + ChronoDuration::minutes(1),
+        None,
+        100,
+    )
+    .await
+    .unwrap();
+    let alerts = PublicApiRepository::list_public_alerts(&store, &principal, None, 100)
+        .await
+        .unwrap();
+
+    assert_eq!(telemetry.len(), 1);
+    assert_eq!(telemetry[0].device_id, device.device_id);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].id, alert_id);
+}
+
+#[tokio::test]
+async fn sqlite_users_tenant_id_is_immutable() {
+    let (_directory, store) = sqlite_store().await;
+    let original_tenant_id = Uuid::now_v7();
+    let replacement_tenant_id = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
+    let pool = store.sqlite_pool().unwrap();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'immutable-user-a', 'active'),
+                (?, 'immutable-user-b', 'active')",
+    )
+    .bind(original_tenant_id.to_string())
+    .bind(replacement_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'immutable-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .bind(original_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        sqlx::query("UPDATE users SET tenant_id = ? WHERE id = ?")
+            .bind(replacement_tenant_id.to_string())
+            .bind(user_id.to_string())
+            .execute(pool)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_devices_gateway_must_belong_to_the_same_tenant() {
+    let (_directory, store) = sqlite_store().await;
+    let tenant_a_id = Uuid::now_v7();
+    let tenant_b_id = Uuid::now_v7();
+    let pool = store.sqlite_pool().unwrap();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'gateway-tenant-a', 'active'),
+                (?, 'gateway-tenant-b', 'active')",
+    )
+    .bind(tenant_a_id.to_string())
+    .bind(tenant_b_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway)
+         VALUES ('tenant-b-gateway', ?, 1)",
+    )
+    .bind(tenant_b_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        sqlx::query(
+            "INSERT INTO devices (device_id, tenant_id, gateway_device_id)
+             VALUES ('tenant-a-device', ?, 'tenant-b-gateway')",
+        )
+        .bind(tenant_a_id.to_string())
+        .execute(pool)
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_devices_gateway_must_belong_to_the_same_tenant() {
+    let (_lock, store) = timescale_store().await;
+    let tenant_a_id = Uuid::now_v7();
+    let tenant_b_id = Uuid::now_v7();
+    let pool = store.timescale_pool().unwrap();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'gateway-tenant-a', 'active'),
+                ($2, 'gateway-tenant-b', 'active')",
+    )
+    .bind(tenant_a_id)
+    .bind(tenant_b_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway)
+         VALUES ('tenant-b-gateway', $1, TRUE)",
+    )
+    .bind(tenant_b_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        sqlx::query(
+            "INSERT INTO devices (device_id, tenant_id, gateway_device_id)
+             VALUES ('tenant-a-device', $1, 'tenant-b-gateway')",
+        )
+        .bind(tenant_a_id)
+        .execute(pool)
+        .await
+        .is_err()
+    );
 }
 
 async fn wait_for_timescale_relation_lock_count(
@@ -89,16 +389,19 @@ async fn sqlite_public_repository_filters_assets_and_persists_grants() {
     let user_id = Uuid::now_v7();
     let other_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-repository-user', 'unused', 'viewer', 'user'),
-                (?, 'public-repository-other', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-repository-user', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-repository-other', 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(other_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: "public-repository-app".to_owned(),
         account_class: AccountClass::User,
@@ -158,16 +461,19 @@ async fn sqlite_public_grant_pagination_filters_invisible_rows_before_limit() {
     let user_id = Uuid::now_v7();
     let foreign_user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-grant-page-user', 'unused', 'viewer', 'user'),
-                (?, 'public-grant-page-foreign', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-grant-page-user', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-grant-page-foreign', 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(foreign_user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(pool)
     .await
     .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: "public-grant-page-app".to_owned(),
         account_class: AccountClass::User,
@@ -184,11 +490,12 @@ async fn sqlite_public_grant_pagination_filters_invisible_rows_before_limit() {
     ] {
         sqlx::query(
             "INSERT INTO resource_grants
-                (id, resource_type, resource_id, grantee_type, grantee_id, permission,
+                (id, tenant_id, resource_type, resource_id, grantee_type, grantee_id, permission,
                  created_by_user_id)
-             VALUES (?, 'device', 'public-grant-page-device', 'application', ?, 'viewer', ?)",
+             VALUES (?, ?, 'device', 'public-grant-page-device', 'application', ?, 'viewer', ?)",
         )
         .bind(id.to_string())
+        .bind(test_tenant_id().to_string())
         .bind(grantee_id)
         .bind(created_by_user_id.to_string())
         .execute(pool)
@@ -224,19 +531,22 @@ async fn sqlite_public_device_permission_denies_active_shares_and_grants_for_del
     let user_id = Uuid::now_v7();
     let owner_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-deleted-device-user', 'unused', 'viewer', 'user'),
-                (?, 'public-deleted-device-owner', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-deleted-device-user', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-deleted-device-owner', 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, owner_user_id, deleted_at)
-         VALUES ('public-deleted-device', ?, CURRENT_TIMESTAMP)",
+        "INSERT INTO devices (device_id, tenant_id, owner_user_id, deleted_at)
+         VALUES ('public-deleted-device', ?, ?, CURRENT_TIMESTAMP)",
     )
+    .bind(test_tenant_id().to_string())
     .bind(owner_id.to_string())
     .execute(pool)
     .await
@@ -255,11 +565,12 @@ async fn sqlite_public_device_permission_denies_active_shares_and_grants_for_del
     .unwrap();
     sqlx::query(
         "INSERT INTO resource_grants
-            (id, resource_type, resource_id, grantee_type, grantee_id, permission,
+            (id, tenant_id, resource_type, resource_id, grantee_type, grantee_id, permission,
              created_by_user_id)
-         VALUES (?, 'device', 'public-deleted-device', 'user', ?, 'controller', ?)",
+         VALUES (?, ?, 'device', 'public-deleted-device', 'user', ?, 'controller', ?)",
     )
     .bind(Uuid::now_v7().to_string())
+    .bind(test_tenant_id().to_string())
     .bind(user_id.to_string())
     .bind(owner_id.to_string())
     .execute(pool)
@@ -267,6 +578,7 @@ async fn sqlite_public_device_permission_denies_active_shares_and_grants_for_del
     .unwrap();
 
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: "public-deleted-device-app".to_owned(),
         account_class: AccountClass::User,
@@ -285,14 +597,16 @@ async fn sqlite_public_device_repository_creates_updates_and_soft_deletes_owned_
     let pool = store.sqlite_pool().unwrap();
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-device-owner', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-device-owner', 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(pool)
     .await
     .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: "public-device-app".to_owned(),
         account_class: AccountClass::User,
@@ -369,21 +683,26 @@ async fn sqlite_public_device_asset_assignment_requires_asset_manager_permission
     let attacker_id = Uuid::now_v7();
     let asset_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-asset-owner', 'unused', 'viewer', 'user'),
-                (?, 'public-asset-attacker', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-asset-owner', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-asset-attacker', 'unused', 'viewer', 'user')",
     )
     .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(attacker_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO assets (id, name, owner_user_id) VALUES (?, 'protected', ?)")
-        .bind(asset_id.to_string())
-        .bind(owner_id.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, owner_user_id) VALUES (?, ?, 'protected', ?)",
+    )
+    .bind(asset_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(owner_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO resource_shares (
             id, resource_type, resource_id, target_user_id, permission,
@@ -398,6 +717,7 @@ async fn sqlite_public_device_asset_assignment_requires_asset_manager_permission
     .await
     .unwrap();
     let attacker = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(attacker_id),
         app_id: "public-asset-attacker-app".to_owned(),
         account_class: AccountClass::User,
@@ -460,14 +780,16 @@ async fn sqlite_public_device_create_rejects_an_unavailable_profile_atomically()
     let user_id = Uuid::now_v7();
     let unavailable_profile_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-profile-create-owner', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-profile-create-owner', 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(pool)
     .await
     .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: "public-profile-create-app".to_owned(),
         account_class: AccountClass::User,
@@ -491,10 +813,14 @@ async fn sqlite_public_device_create_rejects_an_unavailable_profile_atomically()
         format!("public device profile is unavailable: {unavailable_profile_id}")
     );
     assert!(
-        PublicApiRepository::get_public_device(&store, "public-unavailable-profile-create")
-            .await
-            .unwrap()
-            .is_none()
+        PublicApiRepository::get_public_device(
+            &store,
+            &principal,
+            "public-unavailable-profile-create",
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
 }
 
@@ -505,14 +831,16 @@ async fn sqlite_public_device_update_rejects_an_unavailable_profile_atomically()
     let user_id = Uuid::now_v7();
     let unavailable_profile_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-profile-update-owner', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-profile-update-owner', 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(pool)
     .await
     .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: "public-profile-update-app".to_owned(),
         account_class: AccountClass::User,
@@ -550,7 +878,7 @@ async fn sqlite_public_device_update_rejects_an_unavailable_profile_atomically()
         format!("public device profile is unavailable: {unavailable_profile_id}")
     );
     assert_eq!(
-        PublicApiRepository::get_public_device(&store, &device.device_id)
+        PublicApiRepository::get_public_device(&store, &principal, &device.device_id)
             .await
             .unwrap(),
         Some(device)
@@ -561,11 +889,13 @@ async fn sqlite_public_device_update_rejects_an_unavailable_profile_atomically()
 async fn sqlite_public_device_permission_requires_an_application_grant() {
     let (_directory, store) = sqlite_store().await;
     let owning_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: "public-device-owning-application".to_owned(),
         account_class: AccountClass::User,
     };
     let other_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: "public-device-other-application".to_owned(),
         account_class: AccountClass::User,
@@ -610,11 +940,13 @@ async fn sqlite_public_device_permission_requires_an_application_grant() {
 async fn sqlite_public_assets_and_grants_require_matching_application_grants() {
     let (_directory, store) = sqlite_store().await;
     let owning_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: "public-asset-owning-application".to_owned(),
         account_class: AccountClass::User,
     };
     let other_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: "public-asset-other-application".to_owned(),
         account_class: AccountClass::User,
@@ -796,21 +1128,25 @@ async fn sqlite_public_device_repository_hides_unknown_inaccessible_and_deleted_
     let owner_id = Uuid::now_v7();
     let viewer_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'public-device-owner-2', 'unused', 'viewer', 'user'),
-                (?, 'public-device-viewer-2', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-device-owner-2', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-device-viewer-2', 'unused', 'viewer', 'user')",
     )
     .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(viewer_id.to_string())
+    .bind(test_tenant_id().to_string())
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO devices (device_id, owner_user_id)
-         VALUES ('public-inaccessible-device', ?),
-                ('public-deleted-device-2', ?)",
+        "INSERT INTO devices (device_id, tenant_id, owner_user_id)
+         VALUES ('public-inaccessible-device', ?, ?),
+                ('public-deleted-device-2', ?, ?)",
     )
+    .bind(test_tenant_id().to_string())
     .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(owner_id.to_string())
     .execute(pool)
     .await
@@ -821,6 +1157,7 @@ async fn sqlite_public_device_repository_hides_unknown_inaccessible_and_deleted_
         .await
         .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(viewer_id),
         app_id: "public-device-app-2".to_owned(),
         account_class: AccountClass::User,
@@ -903,6 +1240,7 @@ async fn timescale_public_repository_creates_and_reads_an_asset() {
     let asset = PublicApiRepository::create_public_asset(
         &store,
         &PublicPrincipal {
+            tenant_id: test_tenant_id(),
             user_id: Some(user_id),
             app_id: "timescale-public-app".to_owned(),
             account_class: AccountClass::User,
@@ -920,6 +1258,7 @@ async fn timescale_public_repository_creates_and_reads_an_asset() {
         PublicApiRepository::get_public_asset(
             &store,
             &PublicPrincipal {
+                tenant_id: test_tenant_id(),
                 user_id: Some(user_id),
                 app_id: "timescale-public-app".to_owned(),
                 account_class: AccountClass::User,
@@ -969,6 +1308,7 @@ async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
     .await
     .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: "timescale-public-device-app".to_owned(),
         account_class: AccountClass::User,
@@ -1068,6 +1408,7 @@ async fn timescale_public_device_asset_assignment_requires_asset_manager_permiss
         .await
         .unwrap();
     let attacker = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(attacker_id),
         app_id: format!("timescale-public-asset-attacker-app-{unique}"),
         account_class: AccountClass::User,
@@ -1149,11 +1490,13 @@ async fn timescale_public_device_permission_requires_an_application_grant() {
     .await
     .unwrap();
     let owning_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: "timescale-public-device-owning-application".to_owned(),
         account_class: AccountClass::User,
     };
     let other_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: "timescale-public-device-other-application".to_owned(),
         account_class: AccountClass::User,
@@ -1223,6 +1566,7 @@ async fn timescale_public_device_create_rejects_an_unavailable_profile_atomicall
     let result = PublicApiRepository::create_public_device(
         &store,
         &PublicPrincipal {
+            tenant_id: test_tenant_id(),
             user_id: None,
             app_id: format!("timescale-unavailable-profile-app-{unavailable_profile_id}"),
             account_class: AccountClass::User,
@@ -1303,7 +1647,12 @@ async fn timescale_public_device_assignment_serializes_with_management_asset_del
 
     let deleting_store = store.clone();
     let mut deletion = tokio::spawn(async move {
-        ManagementAssetRepository::delete_management_asset(&deleting_store, asset_id).await
+        ManagementAssetRepository::delete_management_asset(
+            &deleting_store,
+            test_tenant_id(),
+            asset_id,
+        )
+        .await
     });
     wait_for_timescale_relation_lock_count(pool, "assets", "RowShareLock", 2).await;
 
@@ -1312,6 +1661,7 @@ async fn timescale_public_device_assignment_serializes_with_management_asset_del
         PublicApiRepository::create_public_device(
             &assigning_store,
             &PublicPrincipal {
+                tenant_id: test_tenant_id(),
                 user_id: Some(owner_id),
                 app_id: format!("timescale-asset-delete-app-{unique}"),
                 account_class: AccountClass::User,
@@ -1435,6 +1785,7 @@ async fn timescale_public_device_assignment_waits_for_asset_manager_grant_lock()
         PublicApiRepository::create_public_device(
             &assigning_store,
             &PublicPrincipal {
+                tenant_id: test_tenant_id(),
                 user_id: Some(manager_id),
                 app_id: format!("timescale-asset-lock-app-{unique}"),
                 account_class: AccountClass::User,
@@ -1509,6 +1860,7 @@ async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
         PublicApiRepository::create_public_device(
             &assigning_store,
             &PublicPrincipal {
+                tenant_id: test_tenant_id(),
                 user_id: None,
                 app_id: format!("timescale-device-profile-lock-app-{unique}"),
                 account_class: AccountClass::User,
@@ -1558,11 +1910,13 @@ async fn timescale_public_assets_and_grants_require_matching_application_grants(
     .unwrap();
     let unique = Uuid::now_v7();
     let owning_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: format!("timescale-public-asset-owner-{unique}"),
         account_class: AccountClass::User,
     };
     let other_application = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: None,
         app_id: format!("timescale-public-asset-other-{unique}"),
         account_class: AccountClass::User,
@@ -1740,6 +2094,7 @@ async fn timescale_public_grant_pagination_filters_invisible_rows_before_limit()
     .await
     .unwrap();
     let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
         user_id: Some(user_id),
         app_id: format!("timescale-public-grant-page-app-{unique}"),
         account_class: AccountClass::User,

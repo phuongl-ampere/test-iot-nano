@@ -4,6 +4,7 @@ use iot_storage::{
     PlatformStoreError,
 };
 use sqlx::{Connection, PgConnection};
+use uuid::Uuid;
 
 mod common;
 
@@ -17,12 +18,24 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'application-registry', 'active')",
+    )
+    .bind(test_tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     (directory, store)
+}
+
+fn test_tenant_id() -> Uuid {
+    Uuid::from_u128(10_002)
 }
 
 fn application(enabled: bool) -> NewApplication {
     NewApplication {
         app_id: "power-monitor".parse().unwrap(),
+        tenant_id: test_tenant_id(),
         kind: ApplicationKind::FullStack,
         launch_url: "https://apps.example.test/power".to_owned(),
         client_id: "client-power-monitor".parse().unwrap(),
@@ -37,6 +50,7 @@ fn application(enabled: bool) -> NewApplication {
 
 fn assert_application_shape(application: ApplicationRecord, enabled: bool) {
     assert_eq!(application.app_id.as_str(), "power-monitor");
+    assert_eq!(application.tenant_id, test_tenant_id());
     assert_eq!(application.kind, ApplicationKind::FullStack);
     assert_eq!(application.launch_url, "https://apps.example.test/power");
     assert_eq!(application.client_id.as_str(), "client-power-monitor");
@@ -175,9 +189,9 @@ async fn sqlite_application_registry_maps_write_time_client_id_conflicts_to_type
          WHEN NEW.app_id = 'race-app'
          BEGIN
              INSERT INTO applications (
-                 app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                 app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
              ) VALUES (
-                 'competing-app', 'frontend', 'https://apps.example.test/competing',
+                 'competing-app', NEW.tenant_id, 'frontend', 'https://apps.example.test/competing',
                  NEW.client_id, '[]', 1
              );
          END;",
@@ -207,6 +221,56 @@ async fn sqlite_application_registry_maps_write_time_client_id_conflicts_to_type
 }
 
 #[tokio::test]
+async fn sqlite_application_registry_rejects_a_concurrent_cross_tenant_app_id_takeover() {
+    let (_directory, store) = sqlite_store().await;
+    let foreign_tenant_id = Uuid::now_v7();
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'application-foreign', 'active')",
+    )
+    .bind(foreign_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE application_tenant_race_value (tenant_id TEXT NOT NULL)")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO application_tenant_race_value (tenant_id) VALUES (?)")
+        .bind(foreign_tenant_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER application_tenant_race
+         BEFORE INSERT ON applications
+         WHEN NEW.app_id = 'race-tenant-app'
+         BEGIN
+             INSERT INTO applications (
+                 app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+             ) SELECT
+                 'race-tenant-app', tenant_id, 'frontend',
+                 'https://apps.example.test/foreign', 'race-tenant-client', '[]', 1
+             FROM application_tenant_race_value;
+         END;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut racing_application = application(true);
+    racing_application.app_id = "race-tenant-app".parse().unwrap();
+    racing_application.client_id = "race-tenant-client-local".parse().unwrap();
+    let result = ApplicationRepository::upsert_application(&store, racing_application).await;
+
+    assert!(matches!(
+        result,
+        Err(PlatformStoreError::ApplicationTenantConflict(ref app_id))
+            if app_id.as_str() == "race-tenant-app"
+    ));
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL"]
 async fn timescale_application_registry_matches_sqlite_contract() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
@@ -232,6 +296,13 @@ async fn timescale_application_registry_matches_sqlite_contract() {
     })
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'application-registry', 'active')",
+    )
+    .bind(test_tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     let record = ApplicationRepository::upsert_application(&store, application(true))
         .await
         .unwrap();
@@ -243,9 +314,9 @@ async fn timescale_application_registry_matches_sqlite_contract() {
          BEGIN
              IF NEW.app_id = 'race-app' THEN
                  INSERT INTO applications (
-                     app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
                  ) VALUES (
-                     'competing-app', 'frontend', 'https://apps.example.test/competing',
+                     'competing-app', NEW.tenant_id, 'frontend', 'https://apps.example.test/competing',
                      NEW.client_id, '[]'::jsonb, TRUE
                  );
              END IF;

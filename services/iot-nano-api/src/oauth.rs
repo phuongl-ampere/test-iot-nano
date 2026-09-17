@@ -295,6 +295,7 @@ async fn authorize_request(
         NewOAuthAuthorizationCode {
             code: code.clone(),
             app_id: application.app_id,
+            tenant_id: application.tenant_id,
             user_id,
             redirect_uri: RedirectUri::from_str(redirect_uri)
                 .map_err(|_| OAuthError::InvalidRequest)?,
@@ -348,6 +349,7 @@ fn issue_code_error(error: PlatformStoreError) -> OAuthError {
         PlatformStoreError::ApplicationDisabled(_)
         | PlatformStoreError::OAuthApplicationNotFound => OAuthError::UnauthorizedClient,
         PlatformStoreError::OAuthRedirectUriDenied => OAuthError::InvalidRequest,
+        PlatformStoreError::OAuthAuthorizationCodeDenied => OAuthError::AccessDenied,
         _ => OAuthError::ServerError,
     }
 }

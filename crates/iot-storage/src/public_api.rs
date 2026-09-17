@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrincipal {
+    pub tenant_id: Uuid,
     pub user_id: Option<Uuid>,
     pub app_id: String,
     pub account_class: AccountClass,
@@ -120,6 +121,10 @@ pub struct NewPublicResourceGrant {
 }
 
 pub trait PublicApiRepository: Send + Sync {
+    fn public_user_tenant_id<'a>(
+        &'a self,
+        user_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Uuid>, PlatformStoreError>> + Send + 'a>>;
     fn public_device_permission<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
@@ -140,6 +145,7 @@ pub trait PublicApiRepository: Send + Sync {
     >;
     fn get_public_device<'a>(
         &'a self,
+        principal: &'a PublicPrincipal,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>;
     fn list_public_devices<'a>(
@@ -267,6 +273,13 @@ pub trait PublicApiRepository: Send + Sync {
 }
 
 impl PublicApiRepository for PlatformStore {
+    fn public_user_tenant_id<'a>(
+        &'a self,
+        user_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Uuid>, PlatformStoreError>> + Send + 'a>> {
+        Box::pin(async move { public_user_tenant_id(self, user_id).await })
+    }
+
     fn public_device_permission<'a>(
         &'a self,
         principal: &'a PublicPrincipal,
@@ -293,10 +306,19 @@ impl PublicApiRepository for PlatformStore {
 
     fn get_public_device<'a>(
         &'a self,
+        principal: &'a PublicPrincipal,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<PublicDevice>, PlatformStoreError>> + Send + 'a>>
     {
-        Box::pin(async move { get_public_device(self, device_id).await })
+        Box::pin(async move {
+            if public_device_permission(self, principal, device_id)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            get_public_device(self, principal, device_id).await
+        })
     }
 
     fn list_public_devices<'a>(
@@ -358,7 +380,7 @@ impl PublicApiRepository for PlatformStore {
             {
                 return Ok(None);
             }
-            get_public_asset(self, asset_id).await
+            get_public_asset(self, principal, asset_id).await
         })
     }
 
@@ -495,6 +517,35 @@ impl PublicApiRepository for PlatformStore {
     }
 }
 
+async fn public_user_tenant_id(
+    store: &PlatformStore,
+    user_id: Uuid,
+) -> Result<Option<Uuid>, PlatformStoreError> {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query_scalar::<_, String>("SELECT tenant_id FROM users WHERE id = ?")
+                .bind(user_id.to_string())
+                .fetch_optional(store.pool())
+                .await?
+                .map(|tenant_id| {
+                    Uuid::parse_str(&tenant_id).map_err(|_| {
+                        PlatformStoreError::Database(sqlx::Error::Protocol(
+                            "invalid public user tenant ID".to_owned(),
+                        ))
+                    })
+                })
+                .transpose()
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(PlatformStoreError::from)
+        }
+    }
+}
+
 async fn public_device_permission(
     store: &PlatformStore,
     principal: &PublicPrincipal,
@@ -504,9 +555,10 @@ async fn public_device_permission(
         PlatformStore::Sqlite(store) => {
             let Some(owner) = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT owner_user_id FROM devices
-                 WHERE device_id = ? AND deleted_at IS NULL",
+                 WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
             )
             .bind(device_id)
+            .bind(principal.tenant_id.to_string())
             .fetch_optional(store.pool())
             .await?
             else {
@@ -528,12 +580,14 @@ async fn public_device_permission(
                  UNION ALL
                  SELECT permission FROM resource_grants
                  WHERE resource_type = 'device' AND resource_id = ?
+                   AND tenant_id = ?
                    AND ((grantee_type = 'user' AND grantee_id = ?)
                         OR (grantee_type = 'application' AND grantee_id = ?))",
             )
             .bind(device_id)
             .bind(user_id.clone())
             .bind(device_id)
+            .bind(principal.tenant_id.to_string())
             .bind(user_id)
             .bind(&principal.app_id)
             .fetch_all(store.pool())
@@ -543,9 +597,10 @@ async fn public_device_permission(
         PlatformStore::Timescale(pool) => {
             let Some(owner) = sqlx::query_scalar::<_, Option<Uuid>>(
                 "SELECT owner_user_id FROM devices
-                 WHERE device_id = $1 AND deleted_at IS NULL",
+                 WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
             )
             .bind(device_id)
+            .bind(principal.tenant_id)
             .fetch_optional(pool)
             .await?
             else {
@@ -566,12 +621,14 @@ async fn public_device_permission(
                  UNION ALL
                  SELECT permission FROM resource_grants
                  WHERE resource_type = 'device' AND resource_id = $1
+                   AND tenant_id = $4
                    AND ((grantee_type = 'user' AND grantee_id = $2::text)
                         OR (grantee_type = 'application' AND grantee_id = $3))",
             )
             .bind(device_id)
             .bind(principal.user_id)
             .bind(&principal.app_id)
+            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             Ok(strongest_share_permission(rows))
@@ -581,15 +638,17 @@ async fn public_device_permission(
 
 async fn get_public_device(
     store: &PlatformStore,
+    principal: &PublicPrincipal,
     device_id: &str,
 ) -> Result<Option<PublicDevice>, PlatformStoreError> {
     match store {
         PlatformStore::Sqlite(store) => sqlx::query(
             "SELECT device_id, display_name, metadata, asset_id, device_profile_id
              FROM devices
-             WHERE device_id = ? AND deleted_at IS NULL",
+             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
         )
         .bind(device_id)
+        .bind(principal.tenant_id.to_string())
         .fetch_optional(store.pool())
         .await?
         .map(sqlite_device_record)
@@ -597,9 +656,10 @@ async fn get_public_device(
         PlatformStore::Timescale(pool) => sqlx::query(
             "SELECT device_id, display_name, metadata, asset_id, device_profile_id
              FROM devices
-             WHERE device_id = $1 AND deleted_at IS NULL",
+             WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
         )
         .bind(device_id)
+        .bind(principal.tenant_id)
         .fetch_optional(pool)
         .await?
         .map(timescale_device_record)
@@ -620,6 +680,7 @@ async fn list_public_devices(
                 "SELECT d.device_id, d.display_name, d.metadata, d.asset_id, d.device_profile_id
                  FROM devices d
                  WHERE d.deleted_at IS NULL
+                   AND d.tenant_id = ?6
                    AND (?1 IS NULL OR d.device_id > ?1)
                    AND (
                      ?2
@@ -632,6 +693,7 @@ async fn list_public_devices(
                      OR EXISTS (
                        SELECT 1 FROM resource_grants g
                        WHERE g.resource_type = 'device' AND g.resource_id = d.device_id
+                         AND g.tenant_id = ?6
                          AND ((g.grantee_type = 'user' AND g.grantee_id = ?3)
                               OR (g.grantee_type = 'application' AND g.grantee_id = ?4))
                      )
@@ -644,6 +706,7 @@ async fn list_public_devices(
             .bind(user_id)
             .bind(&principal.app_id)
             .bind(i64::from(limit))
+            .bind(principal.tenant_id.to_string())
             .fetch_all(store.pool())
             .await?
             .into_iter()
@@ -654,6 +717,7 @@ async fn list_public_devices(
             "SELECT d.device_id, d.display_name, d.metadata, d.asset_id, d.device_profile_id
                  FROM devices d
                  WHERE d.deleted_at IS NULL
+                   AND d.tenant_id = $6
                    AND ($1::text IS NULL OR d.device_id > $1)
                    AND (
                      $2
@@ -666,6 +730,7 @@ async fn list_public_devices(
                      OR EXISTS (
                        SELECT 1 FROM resource_grants g
                        WHERE g.resource_type = 'device' AND g.resource_id = d.device_id
+                         AND g.tenant_id = $6
                          AND ((g.grantee_type = 'user' AND g.grantee_id = $3::text)
                               OR (g.grantee_type = 'application' AND g.grantee_id = $4))
                      )
@@ -678,6 +743,7 @@ async fn list_public_devices(
         .bind(principal.user_id)
         .bind(&principal.app_id)
         .bind(i64::from(limit))
+        .bind(principal.tenant_id)
         .fetch_all(pool)
         .await?
         .into_iter()
@@ -711,12 +777,14 @@ async fn create_public_device(
             }
             let row = sqlx::query(
                 "INSERT INTO devices (
-                    device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
+                    device_id, tenant_id, display_name, metadata, asset_id, device_profile_id,
+                    owner_user_id
                  )
-                 VALUES (?, ?, ?, ?, ?, ?)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
                  RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(&device.device_id)
+            .bind(principal.tenant_id.to_string())
             .bind(&device.display_name)
             .bind(device.metadata.to_string())
             .bind(device.asset_id.map(|id| id.to_string()))
@@ -731,10 +799,12 @@ async fn create_public_device(
             if principal.user_id.is_none() {
                 sqlx::query(
                     "INSERT INTO resource_grants (
-                        id, resource_type, resource_id, grantee_type, grantee_id, permission
-                     ) VALUES (?, 'device', ?, 'application', ?, 'manager')",
+                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
+                        permission
+                     ) VALUES (?, ?, 'device', ?, 'application', ?, 'manager')",
                 )
                 .bind(Uuid::now_v7().to_string())
+                .bind(principal.tenant_id.to_string())
                 .bind(&created.device_id)
                 .bind(&principal.app_id)
                 .execute(&mut *transaction)
@@ -745,8 +815,12 @@ async fn create_public_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            lock_timescale_public_device_asset_assignment(&mut transaction, device.asset_id)
-                .await?;
+            lock_timescale_public_device_asset_assignment(
+                &mut transaction,
+                device.asset_id,
+                principal.tenant_id,
+            )
+            .await?;
             if let Some(asset_id) = device.asset_id {
                 if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
                     .await?
@@ -765,12 +839,14 @@ async fn create_public_device(
             }
             let row = sqlx::query(
                 "INSERT INTO devices (
-                    device_id, display_name, metadata, asset_id, device_profile_id, owner_user_id
+                    device_id, tenant_id, display_name, metadata, asset_id, device_profile_id,
+                    owner_user_id
                  )
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(&device.device_id)
+            .bind(principal.tenant_id)
             .bind(&device.display_name)
             .bind(sqlx::types::Json(device.metadata))
             .bind(device.asset_id)
@@ -785,10 +861,12 @@ async fn create_public_device(
             if principal.user_id.is_none() {
                 sqlx::query(
                     "INSERT INTO resource_grants (
-                        id, resource_type, resource_id, grantee_type, grantee_id, permission
-                     ) VALUES ($1, 'device', $2, 'application', $3, 'manager')",
+                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
+                        permission
+                     ) VALUES ($1, $2, 'device', $3, 'application', $4, 'manager')",
                 )
                 .bind(Uuid::now_v7())
+                .bind(principal.tenant_id)
                 .bind(&created.device_id)
                 .bind(&principal.app_id)
                 .execute(&mut *transaction)
@@ -833,7 +911,7 @@ async fn update_public_device(
             let updated = sqlx::query(
                 "UPDATE devices
                  SET display_name = ?, metadata = ?, asset_id = ?, device_profile_id = ?
-                 WHERE device_id = ? AND deleted_at IS NULL
+                 WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL
                  RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(&device.display_name)
@@ -841,6 +919,7 @@ async fn update_public_device(
             .bind(device.asset_id.map(|id| id.to_string()))
             .bind(device.device_profile_id.map(|id| id.to_string()))
             .bind(device_id)
+            .bind(principal.tenant_id.to_string())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(|error| {
@@ -853,8 +932,12 @@ async fn update_public_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            lock_timescale_public_device_asset_assignment(&mut transaction, device.asset_id)
-                .await?;
+            lock_timescale_public_device_asset_assignment(
+                &mut transaction,
+                device.asset_id,
+                principal.tenant_id,
+            )
+            .await?;
             if let Some(asset_id) = device.asset_id {
                 if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
                     .await?
@@ -874,7 +957,7 @@ async fn update_public_device(
             let updated = sqlx::query(
                 "UPDATE devices
                  SET display_name = $2, metadata = $3, asset_id = $4, device_profile_id = $5
-                 WHERE device_id = $1 AND deleted_at IS NULL
+                 WHERE device_id = $1 AND tenant_id = $6 AND deleted_at IS NULL
                  RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(device_id)
@@ -882,6 +965,7 @@ async fn update_public_device(
             .bind(sqlx::types::Json(device.metadata))
             .bind(device.asset_id)
             .bind(device.device_profile_id)
+            .bind(principal.tenant_id)
             .fetch_optional(&mut *transaction)
             .await
             .map_err(|error| {
@@ -900,20 +984,21 @@ async fn sqlite_public_asset_manager_permission(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
-    if principal.account_class == AccountClass::Admin {
-        return Ok(true);
-    }
-
     let asset_id = asset_id.to_string();
     let user_id = principal.user_id.map(|id| id.to_string());
-    let owner =
-        sqlx::query_scalar::<_, Option<String>>("SELECT owner_user_id FROM assets WHERE id = ?")
-            .bind(&asset_id)
-            .fetch_optional(&mut **transaction)
-            .await?;
+    let owner = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT owner_user_id FROM assets WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(&asset_id)
+    .bind(principal.tenant_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
     let Some(owner) = owner else {
         return Ok(false);
     };
+    if principal.account_class == AccountClass::Admin {
+        return Ok(true);
+    }
     if owner.is_some() && owner.as_deref() == user_id.as_deref() {
         return Ok(true);
     }
@@ -924,7 +1009,8 @@ async fn sqlite_public_asset_manager_permission(
             UNION ALL
             SELECT assets.parent_asset_id, ancestors.depth + 1
             FROM ancestors JOIN assets ON assets.id = ancestors.id
-            WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+            WHERE assets.tenant_id = ?
+              AND assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
          )
          SELECT permission FROM resource_shares
          WHERE resource_type = 'asset' AND resource_id = ?
@@ -937,14 +1023,17 @@ async fn sqlite_public_asset_manager_permission(
          UNION ALL
          SELECT permission FROM resource_grants
          WHERE resource_type = 'asset' AND resource_id = ?
+           AND tenant_id = ?
            AND ((grantee_type = 'user' AND grantee_id = ?)
                 OR (grantee_type = 'application' AND grantee_id = ?))",
     )
     .bind(&asset_id)
+    .bind(principal.tenant_id.to_string())
     .bind(&asset_id)
     .bind(&user_id)
     .bind(&user_id)
     .bind(&asset_id)
+    .bind(principal.tenant_id.to_string())
     .bind(&user_id)
     .bind(&principal.app_id)
     .fetch_all(&mut **transaction)
@@ -969,6 +1058,7 @@ async fn sqlite_public_device_profile_exists(
 async fn lock_timescale_public_device_asset_assignment(
     transaction: &mut Transaction<'_, Postgres>,
     asset_id: Option<Uuid>,
+    tenant_id: Uuid,
 ) -> Result<(), PlatformStoreError> {
     if let Some(asset_id) = asset_id {
         // Management asset deletion locks the asset before updating devices.
@@ -980,14 +1070,15 @@ async fn lock_timescale_public_device_asset_assignment(
              SELECT asset.parent_asset_id
              FROM assets AS asset
              JOIN ancestors ON asset.id = ancestors.id
-             WHERE asset.parent_asset_id IS NOT NULL
+             WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
          )
          SELECT asset.id
          FROM assets AS asset
-         JOIN ancestors ON asset.id = ancestors.id
+         JOIN ancestors ON asset.id = ancestors.id AND asset.tenant_id = $2
          FOR SHARE OF asset",
         )
         .bind(asset_id)
+        .bind(tenant_id)
         .fetch_all(&mut **transaction)
         .await?;
         sqlx::query(
@@ -997,7 +1088,7 @@ async fn lock_timescale_public_device_asset_assignment(
              SELECT asset.parent_asset_id
              FROM assets AS asset
              JOIN ancestors ON asset.id = ancestors.id
-             WHERE asset.parent_asset_id IS NOT NULL
+             WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
          )
          SELECT share.id
          FROM resource_shares AS share
@@ -1006,6 +1097,7 @@ async fn lock_timescale_public_device_asset_assignment(
          FOR SHARE OF share",
         )
         .bind(asset_id)
+        .bind(tenant_id)
         .fetch_all(&mut **transaction)
         .await?;
         sqlx::query(
@@ -1015,15 +1107,16 @@ async fn lock_timescale_public_device_asset_assignment(
              SELECT asset.parent_asset_id
              FROM assets AS asset
              JOIN ancestors ON asset.id = ancestors.id
-             WHERE asset.parent_asset_id IS NOT NULL
+             WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
          )
          SELECT resource_grant.id
          FROM resource_grants AS resource_grant
          JOIN ancestors ON resource_grant.resource_id = ancestors.id::text
-         WHERE resource_grant.resource_type = 'asset'
+         WHERE resource_grant.resource_type = 'asset' AND resource_grant.tenant_id = $2
          FOR SHARE OF resource_grant",
         )
         .bind(asset_id)
+        .bind(tenant_id)
         .fetch_all(&mut **transaction)
         .await?;
     }
@@ -1038,19 +1131,19 @@ async fn timescale_public_asset_manager_permission(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
-    if principal.account_class == AccountClass::Admin {
-        return Ok(true);
-    }
-
     let owner = sqlx::query_scalar::<_, Option<Uuid>>(
-        "SELECT owner_user_id FROM assets WHERE id = $1 FOR SHARE",
+        "SELECT owner_user_id FROM assets WHERE id = $1 AND tenant_id = $2 FOR SHARE",
     )
     .bind(asset_id)
+    .bind(principal.tenant_id)
     .fetch_optional(&mut **transaction)
     .await?;
     let Some(owner) = owner else {
         return Ok(false);
     };
+    if principal.account_class == AccountClass::Admin {
+        return Ok(true);
+    }
     if owner.is_some() && owner == principal.user_id {
         return Ok(true);
     }
@@ -1061,23 +1154,26 @@ async fn timescale_public_asset_manager_permission(
             UNION ALL
             SELECT assets.parent_asset_id, ancestors.depth + 1
             FROM ancestors JOIN assets ON assets.id = ancestors.id
-            WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+            WHERE assets.tenant_id = $2
+              AND assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
          )
          SELECT permission FROM resource_shares
          WHERE resource_type = 'asset' AND resource_id = $1::text
-           AND target_user_id = $2 AND state = 'active'
+           AND target_user_id = $3 AND state = 'active'
          UNION ALL
          SELECT shares.permission FROM resource_shares AS shares
          JOIN ancestors ON shares.resource_id = ancestors.id::text
-         WHERE shares.resource_type = 'asset' AND shares.target_user_id = $2
+         WHERE shares.resource_type = 'asset' AND shares.target_user_id = $3
            AND shares.state = 'active' AND shares.inherit_children = TRUE
          UNION ALL
          SELECT permission FROM resource_grants
          WHERE resource_type = 'asset' AND resource_id = $1::text
-           AND ((grantee_type = 'user' AND grantee_id = $2::text)
-                OR (grantee_type = 'application' AND grantee_id = $3))",
+           AND tenant_id = $2
+           AND ((grantee_type = 'user' AND grantee_id = $3::text)
+                OR (grantee_type = 'application' AND grantee_id = $4))",
     )
     .bind(asset_id)
+    .bind(principal.tenant_id)
     .bind(principal.user_id)
     .bind(&principal.app_id)
     .fetch_all(&mut **transaction)
@@ -1136,18 +1232,20 @@ async fn delete_public_device(
         PlatformStore::Sqlite(store) => sqlx::query(
             "UPDATE devices
              SET deleted_at = CURRENT_TIMESTAMP
-             WHERE device_id = ? AND deleted_at IS NULL",
+             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
         )
         .bind(device_id)
+        .bind(principal.tenant_id.to_string())
         .execute(store.pool())
         .await?
         .rows_affected(),
         PlatformStore::Timescale(pool) => sqlx::query(
             "UPDATE devices
              SET deleted_at = now()
-             WHERE device_id = $1 AND deleted_at IS NULL",
+             WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
         )
         .bind(device_id)
+        .bind(principal.tenant_id)
         .execute(pool)
         .await?
         .rows_affected(),
@@ -1213,6 +1311,7 @@ async fn list_public_telemetry(
                  FROM telemetry AS t
                  JOIN devices AS d ON d.device_id = t.device_id
                  WHERE d.deleted_at IS NULL
+                   AND d.tenant_id = ?
                    AND t.event_at >= ? AND t.event_at <= ?
                    AND (? IS NULL OR t.device_id = ?)
                    AND (? = 1 OR d.owner_user_id = ?
@@ -1224,6 +1323,7 @@ async fn list_public_telemetry(
                     OR EXISTS (
                         SELECT 1 FROM resource_grants
                         WHERE resource_type = 'device' AND resource_id = t.device_id
+                          AND tenant_id = ?
                           AND ((grantee_type = 'user' AND grantee_id = ?)
                                OR (grantee_type = 'application' AND grantee_id = ?))
                     ))
@@ -1233,6 +1333,7 @@ async fn list_public_telemetry(
                  ORDER BY t.event_at, t.device_id, t.sequence
                  LIMIT ?",
             )
+            .bind(principal.tenant_id.to_string())
             .bind(from.to_rfc3339())
             .bind(to.to_rfc3339())
             .bind(device_id)
@@ -1240,6 +1341,7 @@ async fn list_public_telemetry(
             .bind(i64::from(principal.account_class == AccountClass::Admin))
             .bind(&user_id)
             .bind(&user_id)
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&principal.app_id)
             .bind(&cursor_at)
@@ -1260,6 +1362,7 @@ async fn list_public_telemetry(
                  FROM telemetry AS t
                  JOIN devices AS d ON d.device_id = t.device_id
                  WHERE d.deleted_at IS NULL
+                   AND d.tenant_id = $11
                    AND t.event_at >= $1 AND t.event_at <= $2
                    AND ($3::text IS NULL OR t.device_id = $3)
                    AND ($4::boolean OR d.owner_user_id = $5
@@ -1271,6 +1374,7 @@ async fn list_public_telemetry(
                     OR EXISTS (
                         SELECT 1 FROM resource_grants
                         WHERE resource_type = 'device' AND resource_id = t.device_id
+                          AND tenant_id = $11
                           AND ((grantee_type = 'user' AND grantee_id = $5::text)
                                OR (grantee_type = 'application' AND grantee_id = $6))
                     ))
@@ -1290,6 +1394,7 @@ async fn list_public_telemetry(
             .bind(cursor.as_ref().map(|value| value.1.clone()))
             .bind(cursor.as_ref().map(|value| value.2))
             .bind(limit)
+            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter().map(timescale_telemetry_record).collect()
@@ -1360,6 +1465,7 @@ async fn list_public_alerts(
                  JOIN alert_rules AS rules ON rules.id = incidents.rule_id
                  JOIN devices AS devices ON devices.device_id = incidents.device_id
                  WHERE devices.deleted_at IS NULL
+                   AND devices.tenant_id = ?
                    AND (? = 1 OR devices.owner_user_id = ?
                     OR EXISTS (
                         SELECT 1 FROM resource_shares
@@ -1369,6 +1475,7 @@ async fn list_public_alerts(
                     OR EXISTS (
                         SELECT 1 FROM resource_grants
                         WHERE resource_type = 'device' AND resource_id = incidents.device_id
+                          AND tenant_id = ?
                           AND ((grantee_type = 'user' AND grantee_id = ?)
                                OR (grantee_type = 'application' AND grantee_id = ?))
                     ))
@@ -1376,9 +1483,11 @@ async fn list_public_alerts(
                  ORDER BY incidents.id
                  LIMIT ?",
             )
+            .bind(principal.tenant_id.to_string())
             .bind(i64::from(principal.account_class == AccountClass::Admin))
             .bind(&user_id)
             .bind(&user_id)
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&principal.app_id)
             .bind(after)
@@ -1398,6 +1507,7 @@ async fn list_public_alerts(
                  JOIN alert_rules AS rules ON rules.id = incidents.rule_id
                  JOIN devices AS devices ON devices.device_id = incidents.device_id
                  WHERE devices.deleted_at IS NULL
+                   AND devices.tenant_id = $6
                    AND ($1::boolean OR devices.owner_user_id = $2
                     OR EXISTS (
                         SELECT 1 FROM resource_shares
@@ -1407,6 +1517,7 @@ async fn list_public_alerts(
                     OR EXISTS (
                         SELECT 1 FROM resource_grants
                         WHERE resource_type = 'device' AND resource_id = incidents.device_id
+                          AND tenant_id = $6
                           AND ((grantee_type = 'user' AND grantee_id = $2::text)
                                OR (grantee_type = 'application' AND grantee_id = $3))
                     ))
@@ -1419,6 +1530,7 @@ async fn list_public_alerts(
             .bind(&principal.app_id)
             .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
             .bind(limit)
+            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter().map(timescale_alert_record).collect()
@@ -1439,9 +1551,11 @@ async fn get_public_alert(
                     incidents.acknowledged_by, incidents.last_value, incidents.updated_at
              FROM alert_incidents AS incidents
              JOIN alert_rules AS rules ON rules.id = incidents.rule_id
-             WHERE incidents.id = ?",
+             JOIN devices AS devices ON devices.device_id = incidents.device_id
+             WHERE incidents.id = ? AND devices.tenant_id = ?",
         )
         .bind(alert_id.to_string())
+        .bind(principal.tenant_id.to_string())
         .fetch_optional(store.pool())
         .await?
         .map(sqlite_alert_record)
@@ -1453,9 +1567,11 @@ async fn get_public_alert(
                     incidents.acknowledged_by, incidents.last_value, incidents.updated_at
              FROM alert_incidents AS incidents
              JOIN alert_rules AS rules ON rules.id = incidents.rule_id
-             WHERE incidents.id = $1",
+             JOIN devices AS devices ON devices.device_id = incidents.device_id
+             WHERE incidents.id = $1 AND devices.tenant_id = $2",
         )
         .bind(alert_id)
+        .bind(principal.tenant_id)
         .fetch_optional(pool)
         .await?
         .map(timescale_alert_record)
@@ -1493,12 +1609,18 @@ async fn acknowledge_public_alert(
             sqlx::query(
                 "UPDATE alert_incidents
                  SET acknowledged_at = ?, acknowledged_by = ?, updated_at = ?
-                 WHERE id = ?",
+                 WHERE id = ?
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = alert_incidents.device_id
+                         AND devices.tenant_id = ?
+                   )",
             )
             .bind(Utc::now().to_rfc3339())
             .bind(actor)
             .bind(Utc::now().to_rfc3339())
             .bind(alert_id.to_string())
+            .bind(principal.tenant_id.to_string())
             .execute(store.pool())
             .await?;
         }
@@ -1506,10 +1628,16 @@ async fn acknowledge_public_alert(
             sqlx::query(
                 "UPDATE alert_incidents
                  SET acknowledged_at = now(), acknowledged_by = $2, updated_at = now()
-                 WHERE id = $1",
+                 WHERE id = $1
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = alert_incidents.device_id
+                         AND devices.tenant_id = $3
+                   )",
             )
             .bind(alert_id)
             .bind(actor)
+            .bind(principal.tenant_id)
             .execute(pool)
             .await?;
         }
@@ -1621,15 +1749,17 @@ async fn public_grant_visible(
 
 async fn public_grant_record(
     store: &PlatformStore,
+    principal: &PublicPrincipal,
     grant_id: Uuid,
 ) -> Result<Option<PublicResourceGrant>, PlatformStoreError> {
     match store {
         PlatformStore::Sqlite(store) => sqlx::query(
             "SELECT id, resource_type, resource_id, grantee_type, grantee_id, permission,
                     created_by_user_id, created_at, updated_at
-             FROM resource_grants WHERE id = ?",
+             FROM resource_grants WHERE id = ? AND tenant_id = ?",
         )
         .bind(grant_id.to_string())
+        .bind(principal.tenant_id.to_string())
         .fetch_optional(store.pool())
         .await?
         .map(sqlite_grant_record)
@@ -1637,9 +1767,10 @@ async fn public_grant_record(
         PlatformStore::Timescale(pool) => sqlx::query(
             "SELECT id, resource_type, resource_id, grantee_type, grantee_id, permission,
                     created_by_user_id, created_at, updated_at
-             FROM resource_grants WHERE id = $1",
+             FROM resource_grants WHERE id = $1 AND tenant_id = $2",
         )
         .bind(grant_id)
+        .bind(principal.tenant_id)
         .fetch_optional(pool)
         .await?
         .map(timescale_grant_record)
@@ -1661,6 +1792,7 @@ async fn list_public_grants(
                         created_by_user_id, created_at, updated_at
                  FROM resource_grants AS listed_grant
                  WHERE (? IS NULL OR listed_grant.id > ?)
+                   AND listed_grant.tenant_id = ?
                    AND (
                        listed_grant.created_by_user_id = ?
                        OR (listed_grant.grantee_type = 'application' AND listed_grant.grantee_id = ?)
@@ -1672,6 +1804,7 @@ async fn list_public_grants(
                                OR EXISTS (
                                    SELECT 1 FROM assets
                                    WHERE assets.id = listed_grant.resource_id
+                                     AND assets.tenant_id = ?
                                      AND assets.owner_user_id = ?
                                )
                                OR EXISTS (
@@ -1685,6 +1818,7 @@ async fn list_public_grants(
                                    SELECT 1 FROM resource_grants AS resource_grant
                                    WHERE resource_grant.resource_type = 'asset'
                                      AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.tenant_id = ?
                                      AND resource_grant.permission = 'manager'
                                      AND (
                                          (resource_grant.grantee_type = 'user'
@@ -1698,15 +1832,17 @@ async fn list_public_grants(
                        OR (
                            listed_grant.resource_type = 'device'
                            AND EXISTS (
-                               SELECT 1 FROM devices
-                               WHERE devices.device_id = listed_grant.resource_id
-                                 AND devices.deleted_at IS NULL
+                                   SELECT 1 FROM devices
+                                   WHERE devices.device_id = listed_grant.resource_id
+                                     AND devices.tenant_id = ?
+                                     AND devices.deleted_at IS NULL
                            )
                            AND (
                                ? = 1
                                OR EXISTS (
                                    SELECT 1 FROM devices
                                    WHERE devices.device_id = listed_grant.resource_id
+                                     AND devices.tenant_id = ?
                                      AND devices.owner_user_id = ?
                                )
                                OR EXISTS (
@@ -1720,6 +1856,7 @@ async fn list_public_grants(
                                    SELECT 1 FROM resource_grants AS resource_grant
                                    WHERE resource_grant.resource_type = 'device'
                                      AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.tenant_id = ?
                                      AND resource_grant.permission = 'manager'
                                      AND (
                                          (resource_grant.grantee_type = 'user'
@@ -1735,17 +1872,23 @@ async fn list_public_grants(
             )
             .bind(after)
             .bind(after)
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&principal.app_id)
             .bind(&user_id)
             .bind(i64::from(principal.account_class == AccountClass::Admin))
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&user_id)
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&principal.app_id)
+            .bind(principal.tenant_id.to_string())
             .bind(i64::from(principal.account_class == AccountClass::Admin))
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&user_id)
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&principal.app_id)
             .bind(i64::from(limit))
@@ -1761,6 +1904,7 @@ async fn list_public_grants(
                         created_by_user_id, created_at, updated_at
                  FROM resource_grants AS listed_grant
                  WHERE ($1::uuid IS NULL OR listed_grant.id > $1)
+                   AND listed_grant.tenant_id = $16
                    AND (
                        listed_grant.created_by_user_id = $2
                        OR (listed_grant.grantee_type = 'application' AND listed_grant.grantee_id = $3)
@@ -1772,6 +1916,7 @@ async fn list_public_grants(
                                OR EXISTS (
                                    SELECT 1 FROM assets
                                    WHERE assets.id::text = listed_grant.resource_id
+                                     AND assets.tenant_id = $16
                                      AND assets.owner_user_id = $6
                                )
                                OR EXISTS (
@@ -1785,6 +1930,7 @@ async fn list_public_grants(
                                    SELECT 1 FROM resource_grants AS resource_grant
                                    WHERE resource_grant.resource_type = 'asset'
                                      AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.tenant_id = $16
                                      AND resource_grant.permission = 'manager'
                                      AND (
                                          (resource_grant.grantee_type = 'user'
@@ -1798,15 +1944,17 @@ async fn list_public_grants(
                        OR (
                            listed_grant.resource_type = 'device'
                            AND EXISTS (
-                               SELECT 1 FROM devices
-                               WHERE devices.device_id = listed_grant.resource_id
-                                 AND devices.deleted_at IS NULL
+                                   SELECT 1 FROM devices
+                                   WHERE devices.device_id = listed_grant.resource_id
+                                     AND devices.tenant_id = $16
+                                     AND devices.deleted_at IS NULL
                            )
                            AND (
                                $10
                                OR EXISTS (
                                    SELECT 1 FROM devices
                                    WHERE devices.device_id = listed_grant.resource_id
+                                     AND devices.tenant_id = $16
                                      AND devices.owner_user_id = $11
                                )
                                OR EXISTS (
@@ -1820,6 +1968,7 @@ async fn list_public_grants(
                                    SELECT 1 FROM resource_grants AS resource_grant
                                    WHERE resource_grant.resource_type = 'device'
                                      AND resource_grant.resource_id = listed_grant.resource_id
+                                     AND resource_grant.tenant_id = $16
                                      AND resource_grant.permission = 'manager'
                                      AND (
                                          (resource_grant.grantee_type = 'user'
@@ -1848,6 +1997,7 @@ async fn list_public_grants(
             .bind(principal.user_id)
             .bind(&principal.app_id)
             .bind(i64::from(limit))
+            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter()
@@ -1862,7 +2012,7 @@ async fn get_public_grant(
     principal: &PublicPrincipal,
     grant_id: Uuid,
 ) -> Result<Option<PublicResourceGrant>, PlatformStoreError> {
-    let Some(grant) = public_grant_record(store, grant_id).await? else {
+    let Some(grant) = public_grant_record(store, principal, grant_id).await? else {
         return Ok(None);
     };
     if public_grant_visible(store, principal, &grant).await? {
@@ -1889,11 +2039,12 @@ async fn create_public_grant(
         PlatformStore::Sqlite(store) => {
             sqlx::query(
                 "INSERT INTO resource_grants (
-                    id, resource_type, resource_id, grantee_type, grantee_id, permission,
-                    created_by_user_id
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
+                    permission, created_by_user_id
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id.to_string())
+            .bind(principal.tenant_id.to_string())
             .bind(&grant.resource_type)
             .bind(&grant.resource_id)
             .bind(&grant.grantee_type)
@@ -1906,11 +2057,12 @@ async fn create_public_grant(
         PlatformStore::Timescale(pool) => {
             sqlx::query(
                 "INSERT INTO resource_grants (
-                    id, resource_type, resource_id, grantee_type, grantee_id, permission,
-                    created_by_user_id
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
+                    permission, created_by_user_id
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(id)
+            .bind(principal.tenant_id)
             .bind(&grant.resource_type)
             .bind(&grant.resource_id)
             .bind(&grant.grantee_type)
@@ -1921,7 +2073,7 @@ async fn create_public_grant(
             .await?;
         }
     }
-    public_grant_record(store, id).await
+    public_grant_record(store, principal, id).await
 }
 
 async fn update_public_grant(
@@ -1930,7 +2082,7 @@ async fn update_public_grant(
     grant_id: Uuid,
     grant: NewPublicResourceGrant,
 ) -> Result<Option<PublicResourceGrant>, PlatformStoreError> {
-    let Some(current) = public_grant_record(store, grant_id).await? else {
+    let Some(current) = public_grant_record(store, principal, grant_id).await? else {
         return Ok(None);
     };
     if !public_grant_visible(store, principal, &current).await?
@@ -1953,13 +2105,14 @@ async fn update_public_grant(
             sqlx::query(
                 "UPDATE resource_grants
                  SET grantee_type = ?, grantee_id = ?, permission = ?, updated_at = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND tenant_id = ?",
             )
             .bind(&grant.grantee_type)
             .bind(&grant.grantee_id)
             .bind(&grant.permission)
             .bind(Utc::now().to_rfc3339())
             .bind(grant_id.to_string())
+            .bind(principal.tenant_id.to_string())
             .execute(store.pool())
             .await?;
         }
@@ -1967,17 +2120,18 @@ async fn update_public_grant(
             sqlx::query(
                 "UPDATE resource_grants
                  SET grantee_type = $2, grantee_id = $3, permission = $4, updated_at = now()
-                 WHERE id = $1",
+                 WHERE id = $1 AND tenant_id = $5",
             )
             .bind(grant_id)
             .bind(&grant.grantee_type)
             .bind(&grant.grantee_id)
             .bind(&grant.permission)
+            .bind(principal.tenant_id)
             .execute(pool)
             .await?;
         }
     }
-    public_grant_record(store, grant_id).await
+    public_grant_record(store, principal, grant_id).await
 }
 
 async fn delete_public_grant(
@@ -1985,7 +2139,7 @@ async fn delete_public_grant(
     principal: &PublicPrincipal,
     grant_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
-    let Some(grant) = public_grant_record(store, grant_id).await? else {
+    let Some(grant) = public_grant_record(store, principal, grant_id).await? else {
         return Ok(false);
     };
     if !public_resource_permission(store, principal, &grant.resource_type, &grant.resource_id)
@@ -1995,16 +2149,22 @@ async fn delete_public_grant(
         return Ok(false);
     }
     let affected = match store {
-        PlatformStore::Sqlite(store) => sqlx::query("DELETE FROM resource_grants WHERE id = ?")
-            .bind(grant_id.to_string())
-            .execute(store.pool())
-            .await?
-            .rows_affected(),
-        PlatformStore::Timescale(pool) => sqlx::query("DELETE FROM resource_grants WHERE id = $1")
-            .bind(grant_id)
-            .execute(pool)
-            .await?
-            .rows_affected(),
+        PlatformStore::Sqlite(store) => {
+            sqlx::query("DELETE FROM resource_grants WHERE id = ? AND tenant_id = ?")
+                .bind(grant_id.to_string())
+                .bind(principal.tenant_id.to_string())
+                .execute(store.pool())
+                .await?
+                .rows_affected()
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query("DELETE FROM resource_grants WHERE id = $1 AND tenant_id = $2")
+                .bind(grant_id)
+                .bind(principal.tenant_id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+        }
     };
     Ok(affected == 1)
 }
@@ -2056,19 +2216,21 @@ async fn public_asset_permission(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
-    if principal.account_class == AccountClass::Admin {
-        return Ok(Some(ResourcePermission::Owner));
-    }
-
     match store {
         PlatformStore::Sqlite(store) => {
             let owner = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT owner_user_id FROM assets WHERE id = ?",
+                "SELECT owner_user_id FROM assets WHERE id = ? AND tenant_id = ?",
             )
             .bind(asset_id.to_string())
+            .bind(principal.tenant_id.to_string())
             .fetch_optional(store.pool())
-            .await?
-            .flatten();
+            .await?;
+            let Some(owner) = owner else {
+                return Ok(None);
+            };
+            if principal.account_class == AccountClass::Admin {
+                return Ok(Some(ResourcePermission::Owner));
+            }
             if let (Some(user_id), Some(owner)) = (principal.user_id, owner) {
                 if user_id.to_string() == owner {
                     return Ok(Some(ResourcePermission::Owner));
@@ -2082,12 +2244,14 @@ async fn public_asset_permission(
                  UNION ALL
                  SELECT permission FROM resource_grants
                  WHERE resource_type = 'asset' AND resource_id = ?
+                   AND tenant_id = ?
                    AND ((grantee_type = 'user' AND grantee_id = ?)
                         OR (grantee_type = 'application' AND grantee_id = ?))",
             )
             .bind(asset_id.to_string())
             .bind(user_id.clone())
             .bind(asset_id.to_string())
+            .bind(principal.tenant_id.to_string())
             .bind(user_id)
             .bind(&principal.app_id)
             .fetch_all(store.pool())
@@ -2096,12 +2260,18 @@ async fn public_asset_permission(
         }
         PlatformStore::Timescale(pool) => {
             let owner = sqlx::query_scalar::<_, Option<Uuid>>(
-                "SELECT owner_user_id FROM assets WHERE id = $1",
+                "SELECT owner_user_id FROM assets WHERE id = $1 AND tenant_id = $2",
             )
             .bind(asset_id)
+            .bind(principal.tenant_id)
             .fetch_optional(pool)
-            .await?
-            .flatten();
+            .await?;
+            let Some(owner) = owner else {
+                return Ok(None);
+            };
+            if principal.account_class == AccountClass::Admin {
+                return Ok(Some(ResourcePermission::Owner));
+            }
             if let (Some(user_id), Some(owner)) = (principal.user_id, owner) {
                 if user_id == owner {
                     return Ok(Some(ResourcePermission::Owner));
@@ -2114,12 +2284,14 @@ async fn public_asset_permission(
                  UNION ALL
                  SELECT permission FROM resource_grants
                  WHERE resource_type = 'asset' AND resource_id = $1::text
+                   AND tenant_id = $4
                    AND ((grantee_type = 'user' AND grantee_id = $2::text)
                         OR (grantee_type = 'application' AND grantee_id = $3))",
             )
             .bind(asset_id)
             .bind(principal.user_id)
             .bind(&principal.app_id)
+            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             Ok(strongest_share_permission(rows))
@@ -2140,7 +2312,8 @@ async fn list_public_assets(
             let rows = sqlx::query(
                 "SELECT id, name, asset_profile_id, parent_asset_id, metadata
                  FROM assets
-                 WHERE (? = 1 OR owner_user_id = ?
+                 WHERE assets.tenant_id = ?
+                   AND (? = 1 OR owner_user_id = ?
                     OR EXISTS (
                         SELECT 1 FROM resource_shares
                         WHERE resource_type = 'asset' AND resource_id = assets.id
@@ -2149,6 +2322,7 @@ async fn list_public_assets(
                     OR EXISTS (
                         SELECT 1 FROM resource_grants
                         WHERE resource_type = 'asset' AND resource_id = assets.id
+                          AND tenant_id = ?
                           AND ((grantee_type = 'user' AND grantee_id = ?)
                                OR (grantee_type = 'application' AND grantee_id = ?))
                     ))
@@ -2156,9 +2330,11 @@ async fn list_public_assets(
                  ORDER BY id
                  LIMIT ?",
             )
+            .bind(principal.tenant_id.to_string())
             .bind(i64::from(principal.account_class == AccountClass::Admin))
             .bind(&user_id)
             .bind(&user_id)
+            .bind(principal.tenant_id.to_string())
             .bind(&user_id)
             .bind(&principal.app_id)
             .bind(after)
@@ -2172,7 +2348,8 @@ async fn list_public_assets(
             let rows = sqlx::query(
                 "SELECT id, name, asset_profile_id, parent_asset_id, metadata
                  FROM assets
-                 WHERE ($1::boolean OR owner_user_id = $2
+                 WHERE assets.tenant_id = $6
+                   AND ($1::boolean OR owner_user_id = $2
                     OR EXISTS (
                         SELECT 1 FROM resource_shares
                         WHERE resource_type = 'asset' AND resource_id = assets.id::text
@@ -2181,6 +2358,7 @@ async fn list_public_assets(
                     OR EXISTS (
                         SELECT 1 FROM resource_grants
                         WHERE resource_type = 'asset' AND resource_id = assets.id::text
+                          AND tenant_id = $6
                           AND ((grantee_type = 'user' AND grantee_id = $2::text)
                                OR (grantee_type = 'application' AND grantee_id = $3))
                     ))
@@ -2193,6 +2371,7 @@ async fn list_public_assets(
             .bind(&principal.app_id)
             .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
             .bind(limit)
+            .bind(principal.tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter().map(timescale_asset_record).collect()
@@ -2202,23 +2381,26 @@ async fn list_public_assets(
 
 async fn get_public_asset(
     store: &PlatformStore,
+    principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<Option<PublicAsset>, PlatformStoreError> {
     match store {
         PlatformStore::Sqlite(store) => sqlx::query(
             "SELECT id, name, asset_profile_id, parent_asset_id, metadata
-             FROM assets WHERE id = ?",
+             FROM assets WHERE id = ? AND tenant_id = ?",
         )
         .bind(asset_id.to_string())
+        .bind(principal.tenant_id.to_string())
         .fetch_optional(store.pool())
         .await?
         .map(sqlite_asset_record)
         .transpose(),
         PlatformStore::Timescale(pool) => sqlx::query(
             "SELECT id, name, asset_profile_id, parent_asset_id, metadata
-             FROM assets WHERE id = $1",
+             FROM assets WHERE id = $1 AND tenant_id = $2",
         )
         .bind(asset_id)
+        .bind(principal.tenant_id)
         .fetch_optional(pool)
         .await?
         .map(timescale_asset_record)
@@ -2235,11 +2417,13 @@ async fn create_public_asset(
     let created = match store {
         PlatformStore::Sqlite(store) => {
             let row = sqlx::query(
-                "INSERT INTO assets (id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata)
-                 VALUES (?, ?, ?, ?, ?, ?)
+                "INSERT INTO assets (
+                    id, tenant_id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                  RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
             )
             .bind(id.to_string())
+            .bind(principal.tenant_id.to_string())
             .bind(asset.name)
             .bind(asset.asset_profile_id.map(|id| id.to_string()))
             .bind(asset.parent_asset_id.map(|id| id.to_string()))
@@ -2251,11 +2435,13 @@ async fn create_public_asset(
         }
         PlatformStore::Timescale(pool) => {
             let row = sqlx::query(
-                "INSERT INTO assets (id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                "INSERT INTO assets (
+                    id, tenant_id, name, asset_profile_id, parent_asset_id, owner_user_id, metadata
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
                  RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
             )
             .bind(id)
+            .bind(principal.tenant_id)
             .bind(asset.name)
             .bind(asset.asset_profile_id)
             .bind(asset.parent_asset_id)
@@ -2271,10 +2457,12 @@ async fn create_public_asset(
             PlatformStore::Sqlite(store) => {
                 sqlx::query(
                     "INSERT INTO resource_grants (
-                        id, resource_type, resource_id, grantee_type, grantee_id, permission
-                     ) VALUES (?, 'asset', ?, 'application', ?, 'manager')",
+                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
+                        permission
+                     ) VALUES (?, ?, 'asset', ?, 'application', ?, 'manager')",
                 )
                 .bind(Uuid::now_v7().to_string())
+                .bind(principal.tenant_id.to_string())
                 .bind(id.to_string())
                 .bind(&principal.app_id)
                 .execute(store.pool())
@@ -2283,10 +2471,12 @@ async fn create_public_asset(
             PlatformStore::Timescale(pool) => {
                 sqlx::query(
                     "INSERT INTO resource_grants (
-                        id, resource_type, resource_id, grantee_type, grantee_id, permission
-                     ) VALUES ($1, 'asset', $2::text, 'application', $3, 'manager')",
+                        id, tenant_id, resource_type, resource_id, grantee_type, grantee_id,
+                        permission
+                     ) VALUES ($1, $2, 'asset', $3::text, 'application', $4, 'manager')",
                 )
                 .bind(Uuid::now_v7())
+                .bind(principal.tenant_id)
                 .bind(id)
                 .bind(&principal.app_id)
                 .execute(pool)
@@ -2313,7 +2503,7 @@ async fn update_public_asset(
         PlatformStore::Sqlite(store) => sqlx::query(
             "UPDATE assets
              SET name = ?, asset_profile_id = ?, parent_asset_id = ?, metadata = ?, updated_at = ?
-             WHERE id = ?
+             WHERE id = ? AND tenant_id = ?
              RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
         )
         .bind(asset.name)
@@ -2322,6 +2512,7 @@ async fn update_public_asset(
         .bind(asset.metadata.to_string())
         .bind(Utc::now().to_rfc3339())
         .bind(asset_id.to_string())
+        .bind(principal.tenant_id.to_string())
         .fetch_optional(store.pool())
         .await?
         .map(sqlite_asset_record)
@@ -2330,7 +2521,7 @@ async fn update_public_asset(
             "UPDATE assets
              SET name = $2, asset_profile_id = $3, parent_asset_id = $4,
                  metadata = $5, updated_at = now()
-             WHERE id = $1
+             WHERE id = $1 AND tenant_id = $6
              RETURNING id, name, asset_profile_id, parent_asset_id, metadata",
         )
         .bind(asset_id)
@@ -2338,6 +2529,7 @@ async fn update_public_asset(
         .bind(asset.asset_profile_id)
         .bind(asset.parent_asset_id)
         .bind(sqlx::types::Json(asset.metadata))
+        .bind(principal.tenant_id)
         .fetch_optional(pool)
         .await?
         .map(timescale_asset_record)
@@ -2357,16 +2549,22 @@ async fn delete_public_asset(
         return Ok(false);
     }
     let affected = match store {
-        PlatformStore::Sqlite(store) => sqlx::query("DELETE FROM assets WHERE id = ?")
-            .bind(asset_id.to_string())
-            .execute(store.pool())
-            .await?
-            .rows_affected(),
-        PlatformStore::Timescale(pool) => sqlx::query("DELETE FROM assets WHERE id = $1")
-            .bind(asset_id)
-            .execute(pool)
-            .await?
-            .rows_affected(),
+        PlatformStore::Sqlite(store) => {
+            sqlx::query("DELETE FROM assets WHERE id = ? AND tenant_id = ?")
+                .bind(asset_id.to_string())
+                .bind(principal.tenant_id.to_string())
+                .execute(store.pool())
+                .await?
+                .rows_affected()
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query("DELETE FROM assets WHERE id = $1 AND tenant_id = $2")
+                .bind(asset_id)
+                .bind(principal.tenant_id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+        }
     };
     Ok(affected == 1)
 }

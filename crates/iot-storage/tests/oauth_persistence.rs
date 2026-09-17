@@ -23,7 +23,16 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'oauth-persistence', 'active')")
+        .bind(test_tenant_id().to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
     (directory, store)
+}
+
+fn test_tenant_id() -> Uuid {
+    Uuid::from_u128(10_003)
 }
 
 async fn sqlite_columns(pool: &SqlitePool, table: &str) -> Vec<String> {
@@ -45,6 +54,7 @@ async fn sqlite_columns(pool: &SqlitePool, table: &str) -> Vec<String> {
 fn application(enabled: bool) -> NewApplication {
     NewApplication {
         app_id: "power-monitor".parse().unwrap(),
+        tenant_id: test_tenant_id(),
         kind: ApplicationKind::FullStack,
         launch_url: "https://apps.example.test/power".to_owned(),
         client_id: "client-power-monitor".parse().unwrap(),
@@ -57,6 +67,7 @@ fn application(enabled: bool) -> NewApplication {
 fn other_application(enabled: bool) -> NewApplication {
     NewApplication {
         app_id: "other-monitor".parse().unwrap(),
+        tenant_id: test_tenant_id(),
         kind: ApplicationKind::FullStack,
         launch_url: "https://apps.example.test/other".to_owned(),
         client_id: "client-other-monitor".parse().unwrap(),
@@ -68,10 +79,11 @@ fn other_application(enabled: bool) -> NewApplication {
 
 async fn seed_user(store: &PlatformStore, user_id: Uuid) {
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, ?, 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, ?, 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(format!("oauth-user-{user_id}"))
     .execute(store.sqlite_pool().unwrap())
     .await
@@ -80,10 +92,11 @@ async fn seed_user(store: &PlatformStore, user_id: Uuid) {
 
 async fn seed_timescale_user(store: &PlatformStore, user_id: Uuid) {
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES ($1, $2, 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, $3, 'unused', 'viewer', 'user')",
     )
     .bind(user_id)
+    .bind(test_tenant_id())
     .bind(format!("oauth-user-{user_id}"))
     .execute(store.timescale_pool().unwrap())
     .await
@@ -97,13 +110,14 @@ async fn sqlite_oauth_schema_normalizes_secret_code_and_token_records() {
 
     assert_eq!(
         sqlite_columns(pool, "oauth_client_secrets").await,
-        ["app_id", "secret_hash", "created_at"]
+        ["app_id", "tenant_id", "secret_hash", "created_at"]
     );
     assert_eq!(
         sqlite_columns(pool, "oauth_authorization_codes").await,
         [
             "code_hash",
             "app_id",
+            "tenant_id",
             "user_id",
             "redirect_uri",
             "code_challenge",
@@ -118,12 +132,64 @@ async fn sqlite_oauth_schema_normalizes_secret_code_and_token_records() {
         [
             "token_hash",
             "app_id",
+            "tenant_id",
             "user_id",
             "scopes_json",
             "issued_at",
             "expires_at",
         ]
     );
+}
+
+#[tokio::test]
+async fn sqlite_oauth_authorization_codes_require_matching_user_and_application_tenants() {
+    let (_directory, store) = sqlite_store().await;
+    let foreign_tenant_id = Uuid::now_v7();
+    let foreign_user_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'oauth-foreign', 'active')")
+        .bind(foreign_tenant_id.to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'oauth-foreign-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(foreign_user_id.to_string())
+    .bind(foreign_tenant_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    ApplicationRepository::upsert_application(&store, application(true))
+        .await
+        .unwrap();
+
+    let now = Utc.with_ymd_and_hms(2026, 9, 13, 1, 2, 3).single().unwrap();
+    let result = OAuthRepository::issue_authorization_code(
+        &store,
+        NewOAuthAuthorizationCode {
+            code: "oauth-cross-tenant-code".to_owned(),
+            app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
+            user_id: foreign_user_id,
+            redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
+            code_challenge: S256_CODE_CHALLENGE.to_owned(),
+            scopes: vec!["devices:read".to_owned()],
+            issued_at: now,
+            expires_at: now + Duration::minutes(10),
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(PlatformStoreError::OAuthAuthorizationCodeDenied)
+    ));
+    let codes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorization_codes")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(codes, 0);
 }
 
 #[tokio::test]
@@ -140,6 +206,7 @@ async fn sqlite_oauth_issues_digest_only_client_secret_and_authorization_code() 
         &store,
         NewOAuthClientSecret {
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             client_secret: "oauth-client-secret-for-test".to_owned(),
         },
     )
@@ -150,6 +217,7 @@ async fn sqlite_oauth_issues_digest_only_client_secret_and_authorization_code() 
         NewOAuthAuthorizationCode {
             code: "oauth-authorization-code-for-test".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -234,6 +302,7 @@ async fn sqlite_oauth_consumes_code_once_and_issues_a_digest_only_access_token()
         NewOAuthAuthorizationCode {
             code: "oauth-code-for-exchange".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -348,6 +417,7 @@ async fn sqlite_oauth_denies_an_expired_code_without_consuming_or_issuing_a_toke
         NewOAuthAuthorizationCode {
             code: "oauth-expired-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -404,6 +474,7 @@ async fn sqlite_oauth_denies_a_code_exchange_with_a_different_redirect_uri() {
         NewOAuthAuthorizationCode {
             code: "oauth-redirect-bound-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -465,6 +536,7 @@ async fn sqlite_oauth_denies_a_code_exchange_through_a_different_client_applicat
         NewOAuthAuthorizationCode {
             code: "oauth-cross-app-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -521,6 +593,7 @@ async fn sqlite_oauth_denies_a_code_exchange_after_the_application_is_disabled()
         NewOAuthAuthorizationCode {
             code: "oauth-disabled-app-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -580,6 +653,7 @@ async fn sqlite_oauth_denies_an_incorrect_confidential_client_secret() {
         &store,
         NewOAuthClientSecret {
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             client_secret: "correct-confidential-client-secret".to_owned(),
         },
     )
@@ -590,6 +664,7 @@ async fn sqlite_oauth_denies_an_incorrect_confidential_client_secret() {
         NewOAuthAuthorizationCode {
             code: "oauth-confidential-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -646,6 +721,7 @@ async fn sqlite_oauth_client_credentials_preserves_requested_scopes_and_denies_e
         &store,
         NewOAuthClientSecret {
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             client_secret: "client-credentials-secret".to_owned(),
         },
     )
@@ -706,6 +782,7 @@ async fn sqlite_oauth_resolves_exact_access_token_scopes_and_denies_expiry() {
         &store,
         NewOAuthClientSecret {
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             client_secret: "access-token-resolution-secret".to_owned(),
         },
     )
@@ -766,6 +843,7 @@ async fn sqlite_oauth_rejects_a_nonfuture_access_token_expiry_before_consuming_a
         NewOAuthAuthorizationCode {
             code: "oauth-token-expiry-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -826,6 +904,7 @@ async fn sqlite_oauth_denies_an_incorrect_s256_verifier_without_consuming_the_co
         NewOAuthAuthorizationCode {
             code: "oauth-pkce-retry-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -931,6 +1010,7 @@ async fn sqlite_oauth_exchanges_a_code_with_the_matching_s256_verifier() {
         NewOAuthAuthorizationCode {
             code: "oauth-pkce-success-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),
@@ -987,6 +1067,13 @@ async fn timescale_oauth_repository_matches_sqlite_contract() {
     })
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'oauth-persistence', 'active')",
+    )
+    .bind(test_tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     let issued_at = Utc
         .with_ymd_and_hms(2026, 9, 13, 10, 11, 12)
         .single()
@@ -1000,6 +1087,7 @@ async fn timescale_oauth_repository_matches_sqlite_contract() {
         &store,
         NewOAuthClientSecret {
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             client_secret: "timescale-client-secret".to_owned(),
         },
     )
@@ -1010,6 +1098,7 @@ async fn timescale_oauth_repository_matches_sqlite_contract() {
         NewOAuthAuthorizationCode {
             code: "timescale-authorization-code".to_owned(),
             app_id: "power-monitor".parse().unwrap(),
+            tenant_id: test_tenant_id(),
             user_id,
             redirect_uri: "https://apps.example.test/callback".parse().unwrap(),
             code_challenge: S256_CODE_CHALLENGE.to_owned(),

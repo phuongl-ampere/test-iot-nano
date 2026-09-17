@@ -29,6 +29,10 @@ const CLIENT_SECRET: &str = "task-8-router-export-secret";
 const ACCESS_TOKEN: &str = "task-8-router-export-token";
 const DEVICE_ID: &str = "task-8-router-export-device";
 
+fn tenant_id() -> Uuid {
+    Uuid::from_u128(10_004)
+}
+
 #[derive(Clone, Default)]
 struct RecordingCore {
     created: Arc<Mutex<Vec<CoreCommandCreateRequest>>>,
@@ -89,17 +93,24 @@ async fn exported_router() -> (tempfile::TempDir, Router, Arc<RecordingCore>) {
     .await
     .unwrap();
     let pool = store.sqlite_pool().unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES (?)")
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'public-router', 'active')")
+        .bind(tenant_id().to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
         .bind(DEVICE_ID)
+        .bind(tenant_id().to_string())
         .execute(pool)
         .await
         .unwrap();
     sqlx::query(
         "INSERT INTO resource_grants
-            (id, resource_type, resource_id, grantee_type, grantee_id, permission)
-         VALUES (?, 'device', ?, 'application', ?, 'controller')",
+            (id, tenant_id, resource_type, resource_id, grantee_type, grantee_id, permission)
+         VALUES (?, ?, 'device', ?, 'application', ?, 'controller')",
     )
     .bind(Uuid::now_v7().to_string())
+    .bind(tenant_id().to_string())
     .bind(DEVICE_ID)
     .bind(APP_ID)
     .execute(pool)
@@ -109,6 +120,7 @@ async fn exported_router() -> (tempfile::TempDir, Router, Arc<RecordingCore>) {
         &store,
         NewApplication {
             app_id: APP_ID.parse().unwrap(),
+            tenant_id: tenant_id(),
             kind: ApplicationKind::FullStack,
             launch_url: "https://client.example.test".to_owned(),
             client_id: CLIENT_ID.parse().unwrap(),
@@ -130,6 +142,7 @@ async fn exported_router() -> (tempfile::TempDir, Router, Arc<RecordingCore>) {
         &store,
         NewOAuthClientSecret {
             app_id: APP_ID.parse().unwrap(),
+            tenant_id: tenant_id(),
             client_secret: CLIENT_SECRET.to_owned(),
         },
     )

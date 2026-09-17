@@ -250,19 +250,29 @@ async fn authenticate(
     if !token.allows_scope(scope) {
         return Err(PublicApiError::Forbidden);
     }
-    let account_class = match token.user_id {
+    let (tenant_id, account_class) = match token.user_id {
         Some(user_id) => {
-            AuthorizationRepository::authorization_subject(store.as_ref(), user_id)
+            let tenant_id = PublicApiRepository::public_user_tenant_id(store.as_ref(), user_id)
                 .await
                 .map_err(|_| PublicApiError::Unavailable)?
-                .ok_or(PublicApiError::Forbidden)?
-                .account_class
+                .ok_or(PublicApiError::Forbidden)?;
+            if tenant_id != token.tenant_id {
+                return Err(PublicApiError::Forbidden);
+            }
+            let account_class =
+                AuthorizationRepository::authorization_subject(store.as_ref(), user_id)
+                    .await
+                    .map_err(|_| PublicApiError::Unavailable)?
+                    .ok_or(PublicApiError::Forbidden)?
+                    .account_class;
+            (tenant_id, account_class)
         }
-        None => AccountClass::User,
+        None => (token.tenant_id, AccountClass::User),
     };
     Ok((
         store,
         PublicPrincipal {
+            tenant_id,
             user_id: token.user_id,
             app_id: token.app_id,
             account_class,
@@ -577,7 +587,7 @@ async fn get_device(
     {
         return Err(PublicApiError::Forbidden);
     }
-    let device = PublicApiRepository::get_public_device(store.as_ref(), &device_id)
+    let device = PublicApiRepository::get_public_device(store.as_ref(), &principal, &device_id)
         .await
         .map_err(|_| PublicApiError::Unavailable)?
         .ok_or(PublicApiError::Forbidden)?;
@@ -598,7 +608,7 @@ async fn update_device(
     {
         return Err(PublicApiError::Forbidden);
     }
-    let current = PublicApiRepository::get_public_device(store.as_ref(), &device_id)
+    let current = PublicApiRepository::get_public_device(store.as_ref(), &principal, &device_id)
         .await
         .map_err(|_| PublicApiError::Unavailable)?
         .ok_or(PublicApiError::Forbidden)?;

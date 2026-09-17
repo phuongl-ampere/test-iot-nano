@@ -114,6 +114,7 @@ impl FromStr for AccountClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BearerAccessToken {
     pub app_id: String,
+    pub tenant_id: Uuid,
     pub user_id: Option<Uuid>,
     pub scopes: Vec<String>,
     pub expires_at: DateTime<Utc>,
@@ -158,6 +159,7 @@ pub async fn validate_bearer_access_token(
         })?;
     Ok(BearerAccessToken {
         app_id: record.app_id.as_str().to_owned(),
+        tenant_id: record.tenant_id,
         user_id: record.user_id,
         scopes: record.scopes,
         expires_at: record.expires_at,

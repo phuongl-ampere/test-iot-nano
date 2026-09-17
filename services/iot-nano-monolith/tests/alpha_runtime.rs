@@ -221,6 +221,7 @@ async fn alpha_runtime_uses_a_management_session_to_issue_a_public_pkce_code() {
         store,
         NewApplication {
             app_id: "alpha-pkce-app".parse().unwrap(),
+            tenant_id: tenant.id,
             kind: ApplicationKind::FullStack,
             launch_url: "https://client.example.test".to_owned(),
             client_id: "alpha-pkce-client".parse().unwrap(),

@@ -27,6 +27,10 @@ const CLIENT_ID: &str = "public-oauth-router-client";
 const CLIENT_SECRET: &str = "public-oauth-router-client-secret";
 const TRUSTED_SESSION_HEADER: &str = "x-test-oauth-session";
 
+fn tenant_id() -> Uuid {
+    Uuid::from_u128(10_005)
+}
+
 async fn public_oauth_store() -> (tempfile::TempDir, Arc<PlatformStore>) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
@@ -39,10 +43,16 @@ async fn public_oauth_store() -> (tempfile::TempDir, Arc<PlatformStore>) {
         .await
         .unwrap(),
     );
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'public-oauth', 'active')")
+        .bind(tenant_id().to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
     ApplicationRepository::upsert_application(
         store.as_ref(),
         NewApplication {
             app_id: APP_ID.parse().unwrap(),
+            tenant_id: tenant_id(),
             kind: ApplicationKind::FullStack,
             launch_url: "https://client.example.test".to_owned(),
             client_id: CLIENT_ID.parse().unwrap(),
@@ -57,6 +67,7 @@ async fn public_oauth_store() -> (tempfile::TempDir, Arc<PlatformStore>) {
         store.as_ref(),
         NewOAuthClientSecret {
             app_id: APP_ID.parse().unwrap(),
+            tenant_id: tenant_id(),
             client_secret: CLIENT_SECRET.to_owned(),
         },
     )
@@ -164,10 +175,11 @@ async fn exported_public_oauth_router_issues_and_exchanges_pkce_codes_from_a_tru
     let (directory, store) = public_oauth_store().await;
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class, default_app)
-         VALUES (?, 'oauth-browser-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
+         VALUES (?, ?, 'oauth-browser-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
     )
     .bind(user_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -251,14 +263,70 @@ async fn exported_public_oauth_router_issues_and_exchanges_pkce_codes_from_a_tru
 }
 
 #[tokio::test]
+async fn exported_public_oauth_router_denies_a_trusted_user_from_another_tenant() {
+    let (_directory, store) = public_oauth_store().await;
+    let foreign_tenant_id = Uuid::now_v7();
+    let foreign_user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'public-oauth-foreign', 'active')",
+    )
+    .bind(foreign_tenant_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
+         VALUES (?, ?, 'oauth-foreign-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+    )
+    .bind(foreign_user_id.to_string())
+    .bind(foreign_tenant_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let app = public_oauth_router_with_browser_session_verifier::<()>(
+        Arc::clone(&store),
+        Arc::new(FixedSessionVerifier {
+            user_id: foreign_user_id,
+        }),
+    );
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(
+        b"public-router-cross-tenant-pkce-verifier-with-at-least-forty-three-characters",
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256"
+                ))
+                .header(TRUSTED_SESSION_HEADER, "trusted")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["error"], "access_denied");
+    let codes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorization_codes")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(codes, 0);
+}
+
+#[tokio::test]
 async fn exported_public_oauth_router_rejects_a_short_pkce_verifier_even_when_its_hash_matches() {
     let (directory, store) = public_oauth_store().await;
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class, default_app)
-         VALUES (?, 'oauth-short-verifier-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
+         VALUES (?, ?, 'oauth-short-verifier-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
     )
     .bind(user_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();

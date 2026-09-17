@@ -50,8 +50,23 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE users ALTER COLUMN id SET DEFAULT public.uuid_generate_v4();
+CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_id_index
+    ON users (id, tenant_id);
 CREATE INDEX IF NOT EXISTS users_tenant_username_id_index
     ON users (tenant_id, username, id);
+CREATE OR REPLACE FUNCTION prevent_users_tenant_id_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+        RAISE EXCEPTION 'users.tenant_id is immutable';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS users_tenant_id_immutable ON users;
+CREATE TRIGGER users_tenant_id_immutable
+    BEFORE UPDATE OF tenant_id ON users
+    FOR EACH ROW EXECUTE FUNCTION prevent_users_tenant_id_update();
 
 CREATE TABLE IF NOT EXISTS user_app_grants (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -61,48 +76,66 @@ CREATE TABLE IF NOT EXISTS user_app_grants (
 );
 CREATE TABLE IF NOT EXISTS applications (
     app_id TEXT PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     kind TEXT NOT NULL CHECK (kind IN ('frontend', 'full_stack')),
     launch_url TEXT NOT NULL,
     client_id TEXT NOT NULL UNIQUE,
     allowed_scopes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE (app_id, tenant_id)
 );
 CREATE TABLE IF NOT EXISTS application_redirect_uris (
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id UUID NOT NULL,
     redirect_uri TEXT NOT NULL,
-    PRIMARY KEY (app_id, redirect_uri)
+    PRIMARY KEY (app_id, tenant_id, redirect_uri),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS application_redirect_uris_lookup_index
-    ON application_redirect_uris (app_id, redirect_uri);
+    ON application_redirect_uris (app_id, tenant_id, redirect_uri);
 CREATE TABLE IF NOT EXISTS oauth_client_secrets (
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id UUID NOT NULL,
     secret_hash TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (app_id, secret_hash)
+    PRIMARY KEY (app_id, secret_hash),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
     code_hash TEXT PRIMARY KEY,
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id UUID NOT NULL,
+    user_id UUID NOT NULL,
     redirect_uri TEXT NOT NULL,
     code_challenge TEXT NOT NULL,
     scopes_json JSONB NOT NULL,
     issued_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ,
-    CHECK (expires_at > issued_at)
+    CHECK (expires_at > issued_at),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS oauth_authorization_codes_active_index
-    ON oauth_authorization_codes (app_id, expires_at)
+    ON oauth_authorization_codes (tenant_id, app_id, expires_at)
     WHERE consumed_at IS NULL;
 CREATE TABLE IF NOT EXISTS oauth_access_tokens (
     token_hash TEXT PRIMARY KEY,
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id UUID NOT NULL,
+    user_id UUID,
     scopes_json JSONB NOT NULL,
     issued_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
-    CHECK (expires_at > issued_at)
+    CHECK (expires_at > issued_at),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS oauth_access_tokens_expiry_index
     ON oauth_access_tokens (expires_at);
@@ -120,49 +153,62 @@ CREATE TABLE IF NOT EXISTS device_profiles (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS assets (
-    id UUID PRIMARY KEY, name TEXT NOT NULL,
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
     asset_profile_id UUID REFERENCES asset_profiles(id) ON DELETE SET NULL,
-    parent_asset_id UUID REFERENCES assets(id) ON DELETE SET NULL,
-    owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    parent_asset_id UUID,
+    owner_user_id UUID,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (parent_asset_id, name)
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, parent_asset_id, name),
+    FOREIGN KEY (parent_asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT
 );
 DO $$
 DECLARE
     duplicate_root_asset_name TEXT;
 BEGIN
-    SELECT name INTO duplicate_root_asset_name
+    SELECT tenant_id::text || ':' || name INTO duplicate_root_asset_name
     FROM assets
     WHERE parent_asset_id IS NULL
-    GROUP BY name
+    GROUP BY tenant_id, name
     HAVING COUNT(*) > 1
     ORDER BY name
     LIMIT 1;
     IF duplicate_root_asset_name IS NOT NULL THEN
         RAISE EXCEPTION
-            'duplicate root asset name "%"; resolve duplicate root assets before migration',
+            'duplicate tenant root asset name "%"; resolve duplicate root assets before migration',
             duplicate_root_asset_name;
     END IF;
 END
 $$;
-CREATE UNIQUE INDEX IF NOT EXISTS assets_root_name_unique_index
-    ON assets (name)
+CREATE UNIQUE INDEX IF NOT EXISTS assets_tenant_root_name_unique_index
+    ON assets (tenant_id, name)
     WHERE parent_asset_id IS NULL;
 CREATE TABLE IF NOT EXISTS devices (
-    device_id TEXT PRIMARY KEY, display_name TEXT,
+    device_id TEXT PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    display_name TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     configuration_version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    asset_id UUID REFERENCES assets(id) ON DELETE SET NULL,
+    asset_id UUID,
     device_profile_id UUID REFERENCES device_profiles(id) ON DELETE SET NULL,
     deleted_at TIMESTAMPTZ, is_gateway BOOLEAN NOT NULL DEFAULT FALSE,
-    gateway_device_id TEXT REFERENCES devices(device_id) ON DELETE RESTRICT,
-    owner_user_id UUID REFERENCES users(id) ON DELETE SET NULL, claimed_at TIMESTAMPTZ,
+    gateway_device_id TEXT,
+    owner_user_id UUID, claimed_at TIMESTAMPTZ,
+    UNIQUE (device_id, tenant_id),
+    FOREIGN KEY (asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (gateway_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
     CHECK ((is_gateway = TRUE AND gateway_device_id IS NULL)
         OR (is_gateway = FALSE AND gateway_device_id IS DISTINCT FROM device_id))
 );
 CREATE INDEX IF NOT EXISTS devices_asset_id_index ON devices (asset_id) WHERE asset_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS devices_tenant_asset_index ON devices (tenant_id, asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_device_profile_id_index ON devices (device_profile_id) WHERE device_profile_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_active_index ON devices (device_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS devices_gateway_device_id_index ON devices (gateway_device_id) WHERE deleted_at IS NULL;
@@ -191,6 +237,7 @@ CREATE INDEX IF NOT EXISTS resource_shares_target_state_index ON resource_shares
 CREATE INDEX IF NOT EXISTS resource_shares_resource_state_index ON resource_shares (resource_type, resource_id, state);
 CREATE TABLE IF NOT EXISTS resource_grants (
     id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
     resource_id TEXT NOT NULL,
     grantee_type TEXT NOT NULL CHECK (grantee_type IN ('user', 'application')),
@@ -203,6 +250,7 @@ CREATE TABLE IF NOT EXISTS resource_grants (
 );
 CREATE INDEX IF NOT EXISTS resource_grants_resource_index ON resource_grants (resource_type, resource_id);
 CREATE INDEX IF NOT EXISTS resource_grants_grantee_index ON resource_grants (grantee_type, grantee_id);
+CREATE INDEX IF NOT EXISTS resource_grants_tenant_id_index ON resource_grants (tenant_id, id);
 CREATE TABLE IF NOT EXISTS audit_events (
     id UUID PRIMARY KEY, actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     actor_account_class TEXT NOT NULL CHECK (actor_account_class IN ('system', 'admin', 'user')),

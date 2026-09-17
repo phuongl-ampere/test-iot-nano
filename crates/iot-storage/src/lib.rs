@@ -63,6 +63,7 @@ pub use tenant_identity::{
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     display_name TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
     configuration_version INTEGER NOT NULL DEFAULT 1,
@@ -72,11 +73,16 @@ CREATE TABLE IF NOT EXISTS devices (
     device_profile_id TEXT,
     deleted_at TEXT,
     is_gateway INTEGER NOT NULL DEFAULT 0,
-    gateway_device_id TEXT REFERENCES devices(device_id) ON DELETE RESTRICT,
+    gateway_device_id TEXT,
     gateway_last_read_at TEXT,
     gateway_read_quality TEXT CHECK (gateway_read_quality IN ('good', 'unavailable')),
-    owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    owner_user_id TEXT,
     claimed_at TEXT,
+    UNIQUE (device_id, tenant_id),
+    FOREIGN KEY (asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (gateway_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
     CHECK (
         (is_gateway = 1 AND gateway_device_id IS NULL)
         OR (is_gateway = 0 AND gateway_device_id IS NOT device_id)
@@ -196,8 +202,16 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX IF NOT EXISTS users_id_tenant_id_index
+    ON users (id, tenant_id);
 CREATE INDEX IF NOT EXISTS users_tenant_username_id_index
     ON users (tenant_id, username, id);
+CREATE TRIGGER IF NOT EXISTS users_tenant_id_immutable
+BEFORE UPDATE OF tenant_id ON users
+FOR EACH ROW WHEN NEW.tenant_id IS NOT OLD.tenant_id
+BEGIN
+    SELECT RAISE(ABORT, 'users.tenant_id is immutable');
+END;
 CREATE TABLE IF NOT EXISTS user_app_grants (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     app_key TEXT NOT NULL,
@@ -206,51 +220,69 @@ CREATE TABLE IF NOT EXISTS user_app_grants (
 );
 CREATE TABLE IF NOT EXISTS applications (
     app_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     kind TEXT NOT NULL CHECK (kind IN ('frontend', 'full_stack')),
     launch_url TEXT NOT NULL,
     client_id TEXT NOT NULL UNIQUE,
     allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
-    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    UNIQUE (app_id, tenant_id)
 );
 CREATE TABLE IF NOT EXISTS application_redirect_uris (
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
     redirect_uri TEXT NOT NULL,
-    PRIMARY KEY (app_id, redirect_uri)
+    PRIMARY KEY (app_id, tenant_id, redirect_uri),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS application_redirect_uris_lookup_index
-    ON application_redirect_uris (app_id, redirect_uri);
+    ON application_redirect_uris (app_id, tenant_id, redirect_uri);
 
 CREATE TABLE IF NOT EXISTS oauth_client_secrets (
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
     secret_hash TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (app_id, secret_hash)
+    PRIMARY KEY (app_id, secret_hash),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS oauth_authorization_codes (
     code_hash TEXT PRIMARY KEY,
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
     redirect_uri TEXT NOT NULL,
     code_challenge TEXT NOT NULL,
     scopes_json TEXT NOT NULL,
     issued_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     consumed_at TEXT,
-    CHECK (expires_at > issued_at)
+    CHECK (expires_at > issued_at),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS oauth_authorization_codes_active_index
-    ON oauth_authorization_codes (app_id, expires_at)
+    ON oauth_authorization_codes (tenant_id, app_id, expires_at)
     WHERE consumed_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS oauth_access_tokens (
     token_hash TEXT PRIMARY KEY,
-    app_id TEXT NOT NULL REFERENCES applications(app_id) ON DELETE CASCADE,
-    user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+    app_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT,
     scopes_json TEXT NOT NULL,
     issued_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
-    CHECK (expires_at > issued_at)
+    CHECK (expires_at > issued_at),
+    FOREIGN KEY (app_id, tenant_id)
+        REFERENCES applications(app_id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS oauth_access_tokens_expiry_index
     ON oauth_access_tokens (expires_at);
@@ -274,15 +306,26 @@ CREATE TABLE IF NOT EXISTS device_profiles (
 );
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
     asset_profile_id TEXT REFERENCES asset_profiles(id) ON DELETE SET NULL,
-    parent_asset_id TEXT REFERENCES assets(id) ON DELETE SET NULL,
-    owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    parent_asset_id TEXT,
+    owner_user_id TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (parent_asset_id, name)
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, parent_asset_id, name),
+    FOREIGN KEY (parent_asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (owner_user_id, tenant_id) REFERENCES users(id, tenant_id) ON DELETE RESTRICT
 );
+CREATE INDEX IF NOT EXISTS assets_tenant_parent_index
+    ON assets (tenant_id, parent_asset_id);
+CREATE UNIQUE INDEX IF NOT EXISTS assets_tenant_root_name_unique_index
+    ON assets (tenant_id, name)
+    WHERE parent_asset_id IS NULL;
+CREATE INDEX IF NOT EXISTS devices_tenant_asset_index
+    ON devices (tenant_id, asset_id);
 CREATE INDEX IF NOT EXISTS devices_owner_user_id_index
     ON devices (owner_user_id)
     WHERE owner_user_id IS NOT NULL;
@@ -315,6 +358,7 @@ CREATE INDEX IF NOT EXISTS resource_shares_resource_state_index
 
 CREATE TABLE IF NOT EXISTS resource_grants (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
     resource_id TEXT NOT NULL,
     grantee_type TEXT NOT NULL CHECK (grantee_type IN ('user', 'application')),
@@ -329,6 +373,8 @@ CREATE INDEX IF NOT EXISTS resource_grants_resource_index
     ON resource_grants (resource_type, resource_id);
 CREATE INDEX IF NOT EXISTS resource_grants_grantee_index
     ON resource_grants (grantee_type, grantee_id);
+CREATE INDEX IF NOT EXISTS resource_grants_tenant_id_index
+    ON resource_grants (tenant_id, id);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY,
@@ -583,6 +629,8 @@ pub enum PlatformStoreError {
     ApplicationDisabled(ApplicationId),
     #[error("application client ID is already registered: {0:?}")]
     ApplicationClientIdConflict(String),
+    #[error("application ID belongs to a different tenant: {0}")]
+    ApplicationTenantConflict(ApplicationId),
     #[error("OAuth application is not registered")]
     OAuthApplicationNotFound,
     #[error("OAuth client secret must not be empty")]
@@ -766,6 +814,7 @@ fn redirect_uri_has_userinfo(value: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewApplication {
     pub app_id: ApplicationId,
+    pub tenant_id: uuid::Uuid,
     pub kind: ApplicationKind,
     pub launch_url: String,
     pub client_id: ClientId,
@@ -777,6 +826,7 @@ pub struct NewApplication {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplicationRecord {
     pub app_id: ApplicationId,
+    pub tenant_id: uuid::Uuid,
     pub kind: ApplicationKind,
     pub launch_url: String,
     pub client_id: ClientId,
@@ -806,12 +856,14 @@ pub trait ApplicationRepository: Send + Sync {
 
 pub struct NewOAuthClientSecret {
     pub app_id: ApplicationId,
+    pub tenant_id: uuid::Uuid,
     pub client_secret: String,
 }
 
 pub struct NewOAuthAuthorizationCode {
     pub code: String,
     pub app_id: ApplicationId,
+    pub tenant_id: uuid::Uuid,
     pub user_id: uuid::Uuid,
     pub redirect_uri: RedirectUri,
     pub code_challenge: String,
@@ -843,6 +895,7 @@ pub struct OAuthClientCredentialsToken {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthAccessTokenRecord {
     pub app_id: ApplicationId,
+    pub tenant_id: uuid::Uuid,
     pub user_id: Option<uuid::Uuid>,
     pub scopes: Vec<String>,
     pub issued_at: DateTime<Utc>,
@@ -1658,6 +1711,15 @@ impl PlatformStore {
         mut application: NewApplication,
     ) -> Result<ApplicationRecord, PlatformStoreError> {
         validate_application(&mut application)?;
+        if let Some(existing) = self
+            .find_application_by_app_id(application.app_id.as_str())
+            .await?
+            && existing.tenant_id != application.tenant_id
+        {
+            return Err(PlatformStoreError::ApplicationTenantConflict(
+                application.app_id.clone(),
+            ));
+        }
         match self {
             Self::Sqlite(store) => {
                 let conflicting_app_id = sqlx::query_scalar::<_, String>(
@@ -1695,18 +1757,20 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin().await?;
-                sqlx::query(
+                let result = sqlx::query(
                     "INSERT INTO applications (
-                        app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
-                     ) VALUES (?, ?, ?, ?, ?, ?)
+                        app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT (app_id) DO UPDATE SET
                         kind = excluded.kind,
                         launch_url = excluded.launch_url,
                         client_id = excluded.client_id,
                         allowed_scopes_json = excluded.allowed_scopes_json,
-                        enabled = excluded.enabled",
+                        enabled = excluded.enabled
+                     WHERE applications.tenant_id = excluded.tenant_id",
                 )
                 .bind(application.app_id.as_str())
+                .bind(application.tenant_id.to_string())
                 .bind(application.kind.as_str())
                 .bind(&application.launch_url)
                 .bind(application.client_id.as_str())
@@ -1717,16 +1781,25 @@ impl PlatformStore {
                 .map_err(|error| {
                     map_application_client_id_conflict(error, application.client_id.as_str())
                 })?;
-                sqlx::query("DELETE FROM application_redirect_uris WHERE app_id = ?")
-                    .bind(application.app_id.as_str())
-                    .execute(&mut *transaction)
-                    .await?;
+                if result.rows_affected() != 1 {
+                    return Err(PlatformStoreError::ApplicationTenantConflict(
+                        application.app_id.clone(),
+                    ));
+                }
+                sqlx::query(
+                    "DELETE FROM application_redirect_uris WHERE app_id = ? AND tenant_id = ?",
+                )
+                .bind(application.app_id.as_str())
+                .bind(application.tenant_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
                 for redirect_uri in &application.redirect_uris {
                     sqlx::query(
-                        "INSERT INTO application_redirect_uris (app_id, redirect_uri)
-                         VALUES (?, ?)",
+                        "INSERT INTO application_redirect_uris (app_id, tenant_id, redirect_uri)
+                         VALUES (?, ?, ?)",
                     )
                     .bind(application.app_id.as_str())
+                    .bind(application.tenant_id.to_string())
                     .bind(redirect_uri.as_str())
                     .execute(&mut *transaction)
                     .await?;
@@ -1742,18 +1815,20 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
-                sqlx::query(
+                let result = sqlx::query(
                     "INSERT INTO applications (
-                        app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
-                     ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                        app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
                      ON CONFLICT (app_id) DO UPDATE SET
                         kind = EXCLUDED.kind,
                         launch_url = EXCLUDED.launch_url,
                         client_id = EXCLUDED.client_id,
                         allowed_scopes_json = EXCLUDED.allowed_scopes_json,
-                        enabled = EXCLUDED.enabled",
+                        enabled = EXCLUDED.enabled
+                     WHERE applications.tenant_id = EXCLUDED.tenant_id",
                 )
                 .bind(application.app_id.as_str())
+                .bind(application.tenant_id)
                 .bind(application.kind.as_str())
                 .bind(&application.launch_url)
                 .bind(application.client_id.as_str())
@@ -1764,16 +1839,25 @@ impl PlatformStore {
                 .map_err(|error| {
                     map_application_client_id_conflict(error, application.client_id.as_str())
                 })?;
-                sqlx::query("DELETE FROM application_redirect_uris WHERE app_id = $1")
-                    .bind(application.app_id.as_str())
-                    .execute(&mut *transaction)
-                    .await?;
+                if result.rows_affected() != 1 {
+                    return Err(PlatformStoreError::ApplicationTenantConflict(
+                        application.app_id.clone(),
+                    ));
+                }
+                sqlx::query(
+                    "DELETE FROM application_redirect_uris WHERE app_id = $1 AND tenant_id = $2",
+                )
+                .bind(application.app_id.as_str())
+                .bind(application.tenant_id)
+                .execute(&mut *transaction)
+                .await?;
                 for redirect_uri in &application.redirect_uris {
                     sqlx::query(
-                        "INSERT INTO application_redirect_uris (app_id, redirect_uri)
-                         VALUES ($1, $2)",
+                        "INSERT INTO application_redirect_uris (app_id, tenant_id, redirect_uri)
+                         VALUES ($1, $2, $3)",
                     )
                     .bind(application.app_id.as_str())
+                    .bind(application.tenant_id)
                     .bind(redirect_uri.as_str())
                     .execute(&mut *transaction)
                     .await?;
@@ -1798,7 +1882,7 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => {
                 let row = sqlx::query(
-                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                    "SELECT app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
                      FROM applications WHERE app_id = ?",
                 )
                 .bind(app_id.as_str())
@@ -1807,18 +1891,20 @@ impl PlatformStore {
                 let Some(row) = row else {
                     return Ok(None);
                 };
+                let tenant_id: String = row.try_get("tenant_id")?;
                 let redirects = sqlx::query_scalar(
                     "SELECT redirect_uri FROM application_redirect_uris
-                     WHERE app_id = ? ORDER BY redirect_uri",
+                     WHERE app_id = ? AND tenant_id = ? ORDER BY redirect_uri",
                 )
                 .bind(app_id.as_str())
+                .bind(tenant_id)
                 .fetch_all(store.pool())
                 .await?;
                 sqlite_application_record(row, redirects).map(Some)
             }
             Self::Timescale(pool) => {
                 let row = sqlx::query(
-                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                    "SELECT app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
                      FROM applications WHERE app_id = $1",
                 )
                 .bind(app_id.as_str())
@@ -1827,11 +1913,13 @@ impl PlatformStore {
                 let Some(row) = row else {
                     return Ok(None);
                 };
+                let tenant_id: uuid::Uuid = row.try_get("tenant_id")?;
                 let redirects = sqlx::query_scalar(
                     "SELECT redirect_uri FROM application_redirect_uris
-                     WHERE app_id = $1 ORDER BY redirect_uri",
+                     WHERE app_id = $1 AND tenant_id = $2 ORDER BY redirect_uri",
                 )
                 .bind(app_id.as_str())
+                .bind(tenant_id)
                 .fetch_all(pool)
                 .await?;
                 postgres_application_record(row, redirects).map(Some)
@@ -1847,7 +1935,7 @@ impl PlatformStore {
         let application = match self {
             Self::Sqlite(store) => {
                 let row = sqlx::query(
-                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                    "SELECT app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
                      FROM applications WHERE client_id = ?",
                 )
                 .bind(client_id.as_str())
@@ -1857,18 +1945,20 @@ impl PlatformStore {
                     return Ok(None);
                 };
                 let app_id: String = row.try_get("app_id")?;
+                let tenant_id: String = row.try_get("tenant_id")?;
                 let redirects = sqlx::query_scalar(
                     "SELECT redirect_uri FROM application_redirect_uris
-                     WHERE app_id = ? ORDER BY redirect_uri",
+                     WHERE app_id = ? AND tenant_id = ? ORDER BY redirect_uri",
                 )
                 .bind(&app_id)
+                .bind(tenant_id)
                 .fetch_all(store.pool())
                 .await?;
                 sqlite_application_record(row, redirects)?
             }
             Self::Timescale(pool) => {
                 let row = sqlx::query(
-                    "SELECT app_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                    "SELECT app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
                      FROM applications WHERE client_id = $1",
                 )
                 .bind(client_id.as_str())
@@ -1878,11 +1968,13 @@ impl PlatformStore {
                     return Ok(None);
                 };
                 let app_id: String = row.try_get("app_id")?;
+                let tenant_id: uuid::Uuid = row.try_get("tenant_id")?;
                 let redirects = sqlx::query_scalar(
                     "SELECT redirect_uri FROM application_redirect_uris
-                     WHERE app_id = $1 ORDER BY redirect_uri",
+                     WHERE app_id = $1 AND tenant_id = $2 ORDER BY redirect_uri",
                 )
                 .bind(&app_id)
+                .bind(tenant_id)
                 .fetch_all(pool)
                 .await?;
                 postgres_application_record(row, redirects)?
@@ -1905,6 +1997,9 @@ impl PlatformStore {
             .find_application_by_app_id(secret.app_id.as_str())
             .await?
             .ok_or(PlatformStoreError::OAuthApplicationNotFound)?;
+        if application.tenant_id != secret.tenant_id {
+            return Err(PlatformStoreError::OAuthApplicationNotFound);
+        }
         if !application.enabled {
             return Err(PlatformStoreError::ApplicationDisabled(application.app_id));
         }
@@ -1912,22 +2007,24 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => {
                 sqlx::query(
-                    "INSERT INTO oauth_client_secrets (app_id, secret_hash)
-                     VALUES (?, ?)
+                    "INSERT INTO oauth_client_secrets (app_id, tenant_id, secret_hash)
+                     VALUES (?, ?, ?)
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(secret.app_id.as_str())
+                .bind(secret.tenant_id.to_string())
                 .bind(secret_hash)
                 .execute(store.pool())
                 .await?;
             }
             Self::Timescale(pool) => {
                 sqlx::query(
-                    "INSERT INTO oauth_client_secrets (app_id, secret_hash)
-                     VALUES ($1, $2)
+                    "INSERT INTO oauth_client_secrets (app_id, tenant_id, secret_hash)
+                     VALUES ($1, $2, $3)
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(secret.app_id.as_str())
+                .bind(secret.tenant_id)
                 .bind(secret_hash)
                 .execute(pool)
                 .await?;
@@ -1954,6 +2051,11 @@ impl PlatformStore {
             .find_application_by_app_id(code.app_id.as_str())
             .await?
             .ok_or(PlatformStoreError::OAuthApplicationNotFound)?;
+        if application.tenant_id != code.tenant_id
+            || !oauth_user_belongs_to_tenant(self, code.user_id, code.tenant_id).await?
+        {
+            return Err(PlatformStoreError::OAuthAuthorizationCodeDenied);
+        }
         if !application.enabled {
             return Err(PlatformStoreError::ApplicationDisabled(application.app_id));
         }
@@ -1978,12 +2080,13 @@ impl PlatformStore {
             Self::Sqlite(store) => {
                 sqlx::query(
                     "INSERT INTO oauth_authorization_codes (
-                        code_hash, app_id, user_id, redirect_uri, code_challenge, scopes_json,
+                        code_hash, app_id, tenant_id, user_id, redirect_uri, code_challenge, scopes_json,
                         issued_at, expires_at, consumed_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                 )
                 .bind(code_hash)
                 .bind(code.app_id.as_str())
+                .bind(code.tenant_id.to_string())
                 .bind(code.user_id.to_string())
                 .bind(code.redirect_uri.as_str())
                 .bind(code.code_challenge)
@@ -1996,12 +2099,13 @@ impl PlatformStore {
             Self::Timescale(pool) => {
                 sqlx::query(
                     "INSERT INTO oauth_authorization_codes (
-                        code_hash, app_id, user_id, redirect_uri, code_challenge, scopes_json,
+                        code_hash, app_id, tenant_id, user_id, redirect_uri, code_challenge, scopes_json,
                         issued_at, expires_at, consumed_at
-                     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, NULL)",
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, NULL)",
                 )
                 .bind(code_hash)
                 .bind(code.app_id.as_str())
+                .bind(code.tenant_id)
                 .bind(code.user_id)
                 .bind(code.redirect_uri.as_str())
                 .bind(code.code_challenge)
@@ -2020,13 +2124,10 @@ impl PlatformStore {
         exchange: OAuthAuthorizationCodeExchange,
     ) -> Result<OAuthAccessTokenRecord, PlatformStoreError> {
         validate_oauth_access_token_expiry(exchange.issued_at, exchange.expires_at)?;
-        if self
+        let application = self
             .find_application_by_client_id(exchange.client_id.as_str())
             .await?
-            .is_none()
-        {
-            return Err(PlatformStoreError::OAuthAuthorizationCodeDenied);
-        }
+            .ok_or(PlatformStoreError::OAuthAuthorizationCodeDenied)?;
         let code_hash = sha256_hex(&exchange.code);
         let code_challenge = s256_code_challenge(&exchange.code_verifier);
         let token_hash = sha256_hex(&exchange.access_token);
@@ -2034,20 +2135,18 @@ impl PlatformStore {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin().await?;
                 let row = sqlx::query(
-                    "SELECT app_id, user_id, scopes_json
+                    "SELECT app_id, tenant_id, user_id, scopes_json
                      FROM oauth_authorization_codes
                      WHERE code_hash = ? AND redirect_uri = ?
                        AND code_challenge = ?
-                       AND app_id = (
-                           SELECT app_id FROM applications
-                           WHERE client_id = ? AND enabled = 1
-                       )
+                       AND app_id = ? AND tenant_id = ?
                        AND consumed_at IS NULL AND expires_at > ?",
                 )
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
                 .bind(&code_challenge)
-                .bind(exchange.client_id.as_str())
+                .bind(application.app_id.as_str())
+                .bind(application.tenant_id.to_string())
                 .bind(exchange.issued_at.to_rfc3339())
                 .fetch_optional(&mut *transaction)
                 .await?;
@@ -2055,12 +2154,14 @@ impl PlatformStore {
                     return Err(PlatformStoreError::OAuthAuthorizationCodeDenied);
                 };
                 let app_id: String = row.try_get("app_id")?;
+                let tenant_id: String = row.try_get("tenant_id")?;
                 let user_id: String = row.try_get("user_id")?;
                 let scopes_json: String = row.try_get("scopes_json")?;
                 let secret_hashes = sqlx::query_scalar(
-                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = ?",
+                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = ? AND tenant_id = ?",
                 )
                 .bind(&app_id)
+                .bind(&tenant_id)
                 .fetch_all(&mut *transaction)
                 .await?;
                 if !oauth_client_secret_matches(&secret_hashes, exchange.client_secret.as_deref()) {
@@ -2068,6 +2169,7 @@ impl PlatformStore {
                 }
                 let record = oauth_access_token_record(
                     app_id,
+                    tenant_id,
                     user_id,
                     &scopes_json,
                     exchange.issued_at,
@@ -2075,20 +2177,18 @@ impl PlatformStore {
                 )?;
                 let consumed = sqlx::query(
                     "UPDATE oauth_authorization_codes
-                     SET consumed_at = ?
+                       SET consumed_at = ?
                      WHERE code_hash = ? AND redirect_uri = ?
                        AND code_challenge = ?
-                       AND app_id = (
-                           SELECT app_id FROM applications
-                           WHERE client_id = ? AND enabled = 1
-                       )
+                       AND app_id = ? AND tenant_id = ?
                        AND consumed_at IS NULL AND expires_at > ?",
                 )
                 .bind(exchange.issued_at.to_rfc3339())
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
                 .bind(&code_challenge)
-                .bind(exchange.client_id.as_str())
+                .bind(record.app_id.as_str())
+                .bind(record.tenant_id.to_string())
                 .bind(exchange.issued_at.to_rfc3339())
                 .execute(&mut *transaction)
                 .await?;
@@ -2097,11 +2197,12 @@ impl PlatformStore {
                 }
                 sqlx::query(
                     "INSERT INTO oauth_access_tokens (
-                        token_hash, app_id, user_id, scopes_json, issued_at, expires_at
-                     ) VALUES (?, ?, ?, ?, ?, ?)",
+                        token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(token_hash)
                 .bind(record.app_id.as_str())
+                .bind(record.tenant_id.to_string())
                 .bind(
                     record
                         .user_id
@@ -2119,21 +2220,19 @@ impl PlatformStore {
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
                 let row = sqlx::query(
-                    "SELECT app_id, user_id, scopes_json::text AS scopes_json
+                    "SELECT app_id, tenant_id, user_id, scopes_json::text AS scopes_json
                      FROM oauth_authorization_codes
                      WHERE code_hash = $1 AND redirect_uri = $2
                        AND code_challenge = $3
-                       AND app_id = (
-                           SELECT app_id FROM applications
-                           WHERE client_id = $4 AND enabled = TRUE
-                       )
-                       AND consumed_at IS NULL AND expires_at > $5
+                       AND app_id = $4 AND tenant_id = $5
+                       AND consumed_at IS NULL AND expires_at > $6
                      FOR UPDATE",
                 )
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
                 .bind(&code_challenge)
-                .bind(exchange.client_id.as_str())
+                .bind(application.app_id.as_str())
+                .bind(application.tenant_id)
                 .bind(exchange.issued_at)
                 .fetch_optional(&mut *transaction)
                 .await?;
@@ -2141,12 +2240,14 @@ impl PlatformStore {
                     return Err(PlatformStoreError::OAuthAuthorizationCodeDenied);
                 };
                 let app_id: String = row.try_get("app_id")?;
+                let tenant_id: uuid::Uuid = row.try_get("tenant_id")?;
                 let user_id: uuid::Uuid = row.try_get("user_id")?;
                 let scopes_json: String = row.try_get("scopes_json")?;
                 let secret_hashes = sqlx::query_scalar(
-                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = $1",
+                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = $1 AND tenant_id = $2",
                 )
                 .bind(&app_id)
+                .bind(tenant_id)
                 .fetch_all(&mut *transaction)
                 .await?;
                 if !oauth_client_secret_matches(&secret_hashes, exchange.client_secret.as_deref()) {
@@ -2154,6 +2255,7 @@ impl PlatformStore {
                 }
                 let record = oauth_access_token_record(
                     app_id,
+                    tenant_id.to_string(),
                     user_id.to_string(),
                     &scopes_json,
                     exchange.issued_at,
@@ -2164,17 +2266,15 @@ impl PlatformStore {
                      SET consumed_at = $1
                      WHERE code_hash = $2 AND redirect_uri = $3
                        AND code_challenge = $4
-                       AND app_id = (
-                           SELECT app_id FROM applications
-                           WHERE client_id = $5 AND enabled = TRUE
-                       )
-                       AND consumed_at IS NULL AND expires_at > $6",
+                       AND app_id = $5 AND tenant_id = $6
+                       AND consumed_at IS NULL AND expires_at > $7",
                 )
                 .bind(exchange.issued_at)
                 .bind(&code_hash)
                 .bind(exchange.redirect_uri.as_str())
                 .bind(&code_challenge)
-                .bind(exchange.client_id.as_str())
+                .bind(record.app_id.as_str())
+                .bind(record.tenant_id)
                 .bind(exchange.issued_at)
                 .execute(&mut *transaction)
                 .await?;
@@ -2183,11 +2283,12 @@ impl PlatformStore {
                 }
                 sqlx::query(
                     "INSERT INTO oauth_access_tokens (
-                        token_hash, app_id, user_id, scopes_json, issued_at, expires_at
-                     ) VALUES ($1, $2, $3, $4::jsonb, $5, $6)",
+                        token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+                     ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)",
                 )
                 .bind(token_hash)
                 .bind(record.app_id.as_str())
+                .bind(record.tenant_id)
                 .bind(
                     record
                         .user_id
@@ -2225,6 +2326,7 @@ impl PlatformStore {
             .map_err(|_| PlatformStoreError::InvalidApplicationScopes)?;
         let record = OAuthAccessTokenRecord {
             app_id: application.app_id.clone(),
+            tenant_id: application.tenant_id,
             user_id: None,
             scopes,
             issued_at: request.issued_at,
@@ -2234,9 +2336,10 @@ impl PlatformStore {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin().await?;
                 let secret_hashes = sqlx::query_scalar(
-                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = ?",
+                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = ? AND tenant_id = ?",
                 )
                 .bind(application.app_id.as_str())
+                .bind(application.tenant_id.to_string())
                 .fetch_all(&mut *transaction)
                 .await?;
                 if secret_hashes.is_empty()
@@ -2246,17 +2349,18 @@ impl PlatformStore {
                 }
                 let inserted = sqlx::query(
                     "INSERT INTO oauth_access_tokens (
-                        token_hash, app_id, user_id, scopes_json, issued_at, expires_at
+                        token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
                      )
-                     SELECT ?, app_id, NULL, ?, ?, ?
+                     SELECT ?, app_id, tenant_id, NULL, ?, ?, ?
                      FROM applications
-                     WHERE app_id = ? AND client_id = ? AND enabled = 1",
+                     WHERE app_id = ? AND tenant_id = ? AND client_id = ? AND enabled = 1",
                 )
                 .bind(token_hash)
                 .bind(scopes_json)
                 .bind(request.issued_at.to_rfc3339())
                 .bind(request.expires_at.to_rfc3339())
                 .bind(application.app_id.as_str())
+                .bind(application.tenant_id.to_string())
                 .bind(request.client_id.as_str())
                 .execute(&mut *transaction)
                 .await?;
@@ -2269,9 +2373,10 @@ impl PlatformStore {
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
                 let secret_hashes = sqlx::query_scalar(
-                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = $1",
+                    "SELECT secret_hash FROM oauth_client_secrets WHERE app_id = $1 AND tenant_id = $2",
                 )
                 .bind(application.app_id.as_str())
+                .bind(application.tenant_id)
                 .fetch_all(&mut *transaction)
                 .await?;
                 if secret_hashes.is_empty()
@@ -2281,17 +2386,18 @@ impl PlatformStore {
                 }
                 let inserted = sqlx::query(
                     "INSERT INTO oauth_access_tokens (
-                        token_hash, app_id, user_id, scopes_json, issued_at, expires_at
+                        token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
                      )
-                     SELECT $1, app_id, NULL, $2::jsonb, $3, $4
+                     SELECT $1, app_id, tenant_id, NULL, $2::jsonb, $3, $4
                      FROM applications
-                     WHERE app_id = $5 AND client_id = $6 AND enabled = TRUE",
+                     WHERE app_id = $5 AND tenant_id = $6 AND client_id = $7 AND enabled = TRUE",
                 )
                 .bind(token_hash)
                 .bind(scopes_json)
                 .bind(request.issued_at)
                 .bind(request.expires_at)
                 .bind(application.app_id.as_str())
+                .bind(application.tenant_id)
                 .bind(request.client_id.as_str())
                 .execute(&mut *transaction)
                 .await?;
@@ -2313,10 +2419,11 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => {
                 let row = sqlx::query(
-                    "SELECT token.app_id, token.user_id, token.scopes_json,
+                    "SELECT token.app_id, token.tenant_id, token.user_id, token.scopes_json,
                             token.issued_at, token.expires_at
                      FROM oauth_access_tokens AS token
-                     JOIN applications AS app ON app.app_id = token.app_id
+                     JOIN applications AS app
+                       ON app.app_id = token.app_id AND app.tenant_id = token.tenant_id
                      WHERE token.token_hash = ? AND token.expires_at > ? AND app.enabled = 1",
                 )
                 .bind(token_hash)
@@ -2326,6 +2433,7 @@ impl PlatformStore {
                 .ok_or(PlatformStoreError::OAuthAccessTokenDenied)?;
                 oauth_resolved_access_token_record(
                     row.try_get("app_id")?,
+                    row.try_get("tenant_id")?,
                     row.try_get("user_id")?,
                     &row.try_get::<String, _>("scopes_json")?,
                     parse_oauth_timestamp(&row.try_get::<String, _>("issued_at")?)?,
@@ -2334,10 +2442,12 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let row = sqlx::query(
-                    "SELECT token.app_id, token.user_id, token.scopes_json::text AS scopes_json,
+                    "SELECT token.app_id, token.tenant_id, token.user_id,
+                            token.scopes_json::text AS scopes_json,
                             token.issued_at, token.expires_at
                      FROM oauth_access_tokens AS token
-                     JOIN applications AS app ON app.app_id = token.app_id
+                     JOIN applications AS app
+                       ON app.app_id = token.app_id AND app.tenant_id = token.tenant_id
                      WHERE token.token_hash = $1 AND token.expires_at > $2 AND app.enabled = TRUE",
                 )
                 .bind(token_hash)
@@ -2347,6 +2457,7 @@ impl PlatformStore {
                 .ok_or(PlatformStoreError::OAuthAccessTokenDenied)?;
                 oauth_resolved_access_token_record(
                     row.try_get("app_id")?,
+                    row.try_get::<uuid::Uuid, _>("tenant_id")?.to_string(),
                     row.try_get::<Option<uuid::Uuid>, _>("user_id")?
                         .map(|user_id| user_id.to_string()),
                     &row.try_get::<String, _>("scopes_json")?,
@@ -6692,6 +6803,31 @@ fn validate_oauth_access_token_expiry(
     Ok(())
 }
 
+async fn oauth_user_belongs_to_tenant(
+    store: &PlatformStore,
+    user_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+) -> Result<bool, PlatformStoreError> {
+    match store {
+        PlatformStore::Sqlite(store) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM users WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(user_id.to_string())
+        .bind(tenant_id.to_string())
+        .fetch_optional(store.pool())
+        .await?
+        .is_some()),
+        PlatformStore::Timescale(pool) => Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?
+        .is_some()),
+    }
+}
+
 fn oauth_client_secret_matches(stored_hashes: &[String], supplied_secret: Option<&str>) -> bool {
     if stored_hashes.is_empty() {
         return true;
@@ -6712,12 +6848,16 @@ fn oauth_client_secret_matches(stored_hashes: &[String], supplied_secret: Option
 
 fn oauth_access_token_record(
     app_id: String,
+    tenant_id: String,
     user_id: String,
     scopes_json: &str,
     issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> Result<OAuthAccessTokenRecord, PlatformStoreError> {
     let app_id = app_id
+        .parse()
+        .map_err(|_| PlatformStoreError::OAuthAuthorizationCodeDenied)?;
+    let tenant_id = tenant_id
         .parse()
         .map_err(|_| PlatformStoreError::OAuthAuthorizationCodeDenied)?;
     let user_id = user_id
@@ -6729,6 +6869,7 @@ fn oauth_access_token_record(
         .map_err(|_| PlatformStoreError::OAuthAuthorizationCodeDenied)?;
     Ok(OAuthAccessTokenRecord {
         app_id,
+        tenant_id,
         user_id: Some(user_id),
         scopes,
         issued_at,
@@ -6744,12 +6885,16 @@ fn parse_oauth_timestamp(value: &str) -> Result<DateTime<Utc>, PlatformStoreErro
 
 fn oauth_resolved_access_token_record(
     app_id: String,
+    tenant_id: String,
     user_id: Option<String>,
     scopes_json: &str,
     issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> Result<OAuthAccessTokenRecord, PlatformStoreError> {
     let app_id = app_id
+        .parse()
+        .map_err(|_| PlatformStoreError::OAuthAccessTokenDenied)?;
+    let tenant_id = tenant_id
         .parse()
         .map_err(|_| PlatformStoreError::OAuthAccessTokenDenied)?;
     let user_id = user_id
@@ -6762,6 +6907,7 @@ fn oauth_resolved_access_token_record(
         .map_err(|_| PlatformStoreError::OAuthAccessTokenDenied)?;
     Ok(OAuthAccessTokenRecord {
         app_id,
+        tenant_id,
         user_id,
         scopes,
         issued_at,
@@ -6779,6 +6925,10 @@ fn sqlite_application_record(
     )?;
     Ok(ApplicationRecord {
         app_id: row.try_get::<String, _>("app_id")?.parse()?,
+        tenant_id: row
+            .try_get::<String, _>("tenant_id")?
+            .parse()
+            .map_err(|_| PlatformStoreError::OAuthApplicationNotFound)?,
         kind: ApplicationKind::parse(&row.try_get::<String, _>("kind")?)?,
         launch_url: row.try_get("launch_url")?,
         client_id: row.try_get::<String, _>("client_id")?.parse()?,
@@ -6801,6 +6951,7 @@ fn postgres_application_record(
     )?;
     Ok(ApplicationRecord {
         app_id: row.try_get::<String, _>("app_id")?.parse()?,
+        tenant_id: row.try_get("tenant_id")?,
         kind: ApplicationKind::parse(&row.try_get::<String, _>("kind")?)?,
         launch_url: row.try_get("launch_url")?,
         client_id: row.try_get::<String, _>("client_id")?.parse()?,
@@ -8035,10 +8186,10 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), sqlx::Er
 
 async fn migrate_root_asset_name_uniqueness(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let duplicate_name = sqlx::query_scalar::<_, String>(
-        "SELECT name
+        "SELECT tenant_id || ':' || name
          FROM assets
          WHERE parent_asset_id IS NULL
-         GROUP BY name
+         GROUP BY tenant_id, name
          HAVING COUNT(*) > 1
          ORDER BY name
          LIMIT 1",
@@ -8047,12 +8198,12 @@ async fn migrate_root_asset_name_uniqueness(pool: &SqlitePool) -> Result<(), sql
     .await?;
     if let Some(name) = duplicate_name {
         return Err(sqlx::Error::Protocol(format!(
-            "duplicate root asset name {name:?}; resolve duplicate root assets before migration"
+            "duplicate tenant root asset name {name:?}; resolve duplicate root assets before migration"
         )));
     }
     sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS assets_root_name_unique_index
-         ON assets (name)
+        "CREATE UNIQUE INDEX IF NOT EXISTS assets_tenant_root_name_unique_index
+         ON assets (tenant_id, name)
          WHERE parent_asset_id IS NULL",
     )
     .execute(pool)

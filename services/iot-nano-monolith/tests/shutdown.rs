@@ -24,6 +24,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PACKET_BYTES: usize = 1_048_576;
 
+fn provisioning_tenant_id() -> Uuid {
+    Uuid::from_u128(10_007)
+}
+
 struct Fixture {
     _directory: TempDir,
     config: MonolithConfig,
@@ -142,8 +146,17 @@ async fn provision_and_connect(
     address: SocketAddr,
 ) -> (TcpStream, String) {
     let vault = TokenVault::from_key_material(vault_key());
+    let store = runtime.platform().unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status)
+         VALUES (?, 'shutdown-provisioning', 'active')",
+    )
+    .bind(provisioning_tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     let provisioned =
-        provision_platform_device_token(runtime.platform().unwrap(), &vault, DEVICE_NAME)
+        provision_platform_device_token(store, &vault, provisioning_tenant_id(), DEVICE_NAME)
             .await
             .unwrap();
     let token = provisioned.token.unwrap();

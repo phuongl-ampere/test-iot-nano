@@ -310,6 +310,33 @@ impl TenantIdentityRepository {
         }
     }
 
+    pub async fn list_tenants(store: &PlatformStore) -> Result<Vec<Tenant>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let rows = sqlx::query(
+                    "SELECT id, slug, status, metadata
+                     FROM tenants
+                     WHERE status <> 'deleted'
+                     ORDER BY slug, id",
+                )
+                .fetch_all(&store.pool)
+                .await?;
+                rows.into_iter().map(tenant_from_sqlite).collect()
+            }
+            PlatformStore::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, slug, status, metadata
+                     FROM tenants
+                     WHERE status <> 'deleted'
+                     ORDER BY slug, id",
+                )
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter().map(tenant_from_postgres).collect()
+            }
+        }
+    }
+
     pub async fn suspend_tenant(
         store: &PlatformStore,
         tenant_slug: &str,
@@ -525,6 +552,26 @@ fn tenant_account_credential_from_sqlite(
     })
 }
 
+fn tenant_from_sqlite(row: SqliteRow) -> Result<Tenant, TenantIdentityError> {
+    let metadata: String = row.try_get("metadata")?;
+    Ok(Tenant {
+        id: parse_uuid(row.try_get::<String, _>("id")?)?,
+        slug: row.try_get("slug")?,
+        status: tenant_status_from_str(&row.try_get::<String, _>("status")?)?,
+        metadata: serde_json::from_str(&metadata)
+            .map_err(|_| TenantIdentityError::InvalidStoredIdentity)?,
+    })
+}
+
+fn tenant_from_postgres(row: PgRow) -> Result<Tenant, TenantIdentityError> {
+    Ok(Tenant {
+        id: row.try_get("id")?,
+        slug: row.try_get("slug")?,
+        status: tenant_status_from_str(&row.try_get::<String, _>("status")?)?,
+        metadata: row.try_get::<Json<Value>, _>("metadata")?.0,
+    })
+}
+
 fn tenant_account_credential_from_postgres(
     row: PgRow,
 ) -> Result<TenantAccountCredential, TenantIdentityError> {
@@ -592,6 +639,15 @@ fn account_status_from_str(value: &str) -> Result<AccountStatus, TenantIdentityE
     match value {
         "active" => Ok(AccountStatus::Active),
         "disabled" => Ok(AccountStatus::Disabled),
+        _ => Err(TenantIdentityError::InvalidStoredIdentity),
+    }
+}
+
+fn tenant_status_from_str(value: &str) -> Result<TenantStatus, TenantIdentityError> {
+    match value {
+        "active" => Ok(TenantStatus::Active),
+        "suspended" => Ok(TenantStatus::Suspended),
+        "deleted" => Ok(TenantStatus::Deleted),
         _ => Err(TenantIdentityError::InvalidStoredIdentity),
     }
 }

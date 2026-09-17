@@ -23,6 +23,10 @@ const CLIENT_SECRET: &str = "sqlite-auth-client-secret";
 const DEVICE_TOKEN: &str = "sqlite-auth-devices-token";
 const ASSET_TOKEN: &str = "sqlite-auth-assets-token";
 
+fn tenant_id() -> Uuid {
+    Uuid::from_u128(10_006)
+}
+
 struct NoopCoreFacade;
 
 impl CoreFacade for NoopCoreFacade {
@@ -68,10 +72,16 @@ async fn sqlite_public_router() -> (tempfile::TempDir, axum::Router) {
         .await
         .unwrap(),
     );
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'sqlite-auth', 'active')")
+        .bind(tenant_id().to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
     ApplicationRepository::upsert_application(
         store.as_ref(),
         NewApplication {
             app_id: APP_ID.parse().unwrap(),
+            tenant_id: tenant_id(),
             kind: ApplicationKind::FullStack,
             launch_url: "https://client.example.test".to_owned(),
             client_id: CLIENT_ID.parse().unwrap(),
@@ -86,6 +96,7 @@ async fn sqlite_public_router() -> (tempfile::TempDir, axum::Router) {
         store.as_ref(),
         NewOAuthClientSecret {
             app_id: APP_ID.parse().unwrap(),
+            tenant_id: tenant_id(),
             client_secret: CLIENT_SECRET.to_owned(),
         },
     )
