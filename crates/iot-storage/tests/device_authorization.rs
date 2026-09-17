@@ -2,7 +2,7 @@ use iot_core::{
     DatabaseStorage, StorageConfiguration, device_token_prefix, generate_device_token,
     hash_device_token,
 };
-use iot_storage::{PlatformStore, PlatformStoreError};
+use iot_storage::{PlatformStore, PlatformStoreError, TenantIdentityRepository};
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
@@ -237,6 +237,88 @@ async fn sqlite_gateway_authorization_requires_exact_active_gateway_and_child() 
 }
 
 #[tokio::test]
+async fn sqlite_suspended_tenant_rejects_previously_authenticated_device_and_gateway_sessions() {
+    let (_directory, store) = store().await;
+    seed_tenant(&store).await;
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
+         VALUES ('direct', ?, 0, NULL), ('gateway', ?, 1, NULL), ('child', ?, 0, 'gateway')",
+    )
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
+    .bind(tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    let direct = generate_device_token();
+    let gateway = generate_device_token();
+    token(&store, "direct", &direct, false).await;
+    token(&store, "gateway", &gateway, false).await;
+
+    let authenticated_direct = store.resolve_active_device_token(&direct).await.unwrap();
+    let authenticated_gateway = store.resolve_active_device_token(&gateway).await.unwrap();
+    assert!(
+        store
+            .authorize_device_session(authenticated_direct.token_id, tenant_id(), "direct")
+            .await
+            .is_ok()
+    );
+    assert!(
+        store
+            .authorize_gateway_token(
+                authenticated_gateway.token_id,
+                tenant_id(),
+                "gateway",
+                Some("child"),
+            )
+            .await
+            .is_ok()
+    );
+
+    TenantIdentityRepository::suspend_tenant(&store, "device-authorization")
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .authorize_device_session(authenticated_direct.token_id, tenant_id(), "direct")
+            .await,
+        Err(PlatformStoreError::DeviceTokenDenied)
+    ));
+    assert!(matches!(
+        store
+            .authorize_gateway_token(
+                authenticated_gateway.token_id,
+                tenant_id(),
+                "gateway",
+                Some("child"),
+            )
+            .await,
+        Err(PlatformStoreError::DeviceTokenDenied)
+    ));
+}
+
+#[tokio::test]
+async fn sqlite_suspended_tenant_registration_returns_unknown_tenant_without_creating_device() {
+    let (_directory, store) = store().await;
+    seed_tenant(&store).await;
+    TenantIdentityRepository::suspend_tenant(&store, "device-authorization")
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.register_device(tenant_id(), "suspended-device").await,
+        Err(PlatformStoreError::UnknownTenant(id)) if id == tenant_id()
+    ));
+    let device_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE device_id = 'suspended-device'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(device_count, 0);
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_device_authorization_matches_sqlite_contract() {
     let (_lock, store) = timescale_store().await;
@@ -310,6 +392,89 @@ async fn timescale_device_authorization_matches_sqlite_contract() {
     ] {
         assert!(matches!(denied, Err(PlatformStoreError::DeviceTokenDenied)));
     }
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_suspended_tenant_rejects_previously_authenticated_device_and_gateway_sessions() {
+    let (_lock, store) = timescale_store().await;
+    seed_tenant(&store).await;
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
+         VALUES ('direct', $1, FALSE, NULL), ('gateway', $1, TRUE, NULL),
+                ('child', $1, FALSE, 'gateway')",
+    )
+    .bind(tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    let direct = generate_device_token();
+    let gateway = generate_device_token();
+    token_timescale(&store, "direct", &direct, false).await;
+    token_timescale(&store, "gateway", &gateway, false).await;
+
+    let authenticated_direct = store.resolve_active_device_token(&direct).await.unwrap();
+    let authenticated_gateway = store.resolve_active_device_token(&gateway).await.unwrap();
+    assert!(
+        store
+            .authorize_device_session(authenticated_direct.token_id, tenant_id(), "direct")
+            .await
+            .is_ok()
+    );
+    assert!(
+        store
+            .authorize_gateway_token(
+                authenticated_gateway.token_id,
+                tenant_id(),
+                "gateway",
+                Some("child"),
+            )
+            .await
+            .is_ok()
+    );
+
+    TenantIdentityRepository::suspend_tenant(&store, "device-authorization")
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .authorize_device_session(authenticated_direct.token_id, tenant_id(), "direct")
+            .await,
+        Err(PlatformStoreError::DeviceTokenDenied)
+    ));
+    assert!(matches!(
+        store
+            .authorize_gateway_token(
+                authenticated_gateway.token_id,
+                tenant_id(),
+                "gateway",
+                Some("child"),
+            )
+            .await,
+        Err(PlatformStoreError::DeviceTokenDenied)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_suspended_tenant_registration_returns_unknown_tenant_without_creating_device() {
+    let (_lock, store) = timescale_store().await;
+    seed_tenant(&store).await;
+    TenantIdentityRepository::suspend_tenant(&store, "device-authorization")
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.register_device(tenant_id(), "suspended-device").await,
+        Err(PlatformStoreError::UnknownTenant(id)) if id == tenant_id()
+    ));
+    let device_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE device_id = 'suspended-device'")
+            .fetch_one(store.timescale_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(device_count, 0);
 }
 
 async fn token_timescale(

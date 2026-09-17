@@ -2509,19 +2509,11 @@ impl PlatformStore {
     ) -> Result<(), PlatformStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let tenant_is_active = sqlx::query_scalar::<_, i64>(
-                    "SELECT 1 FROM tenants WHERE id = ? AND status = 'active' LIMIT 1",
-                )
-                .bind(tenant_id.to_string())
-                .fetch_optional(store.pool())
-                .await?
-                .is_some();
-                if !tenant_is_active {
-                    return Err(PlatformStoreError::UnknownTenant(tenant_id));
-                }
                 let registered = sqlx::query(
                     "INSERT INTO devices (device_id, tenant_id)
-                     VALUES (?, ?)
+                     SELECT ?, id
+                     FROM tenants
+                     WHERE id = ? AND status = 'active'
                      ON CONFLICT(device_id) DO UPDATE SET device_id = excluded.device_id
                      WHERE devices.tenant_id = excluded.tenant_id",
                 )
@@ -2530,6 +2522,16 @@ impl PlatformStore {
                 .execute(store.pool())
                 .await?;
                 if registered.rows_affected() != 1 {
+                    let tenant_is_active = sqlx::query_scalar::<_, i64>(
+                        "SELECT 1 FROM tenants WHERE id = ? AND status = 'active' LIMIT 1",
+                    )
+                    .bind(tenant_id.to_string())
+                    .fetch_optional(store.pool())
+                    .await?
+                    .is_some();
+                    if !tenant_is_active {
+                        return Err(PlatformStoreError::UnknownTenant(tenant_id));
+                    }
                     return Err(PlatformStoreError::DeviceTenantConflict {
                         device_id: device_id.to_owned(),
                         tenant_id,
@@ -2537,19 +2539,12 @@ impl PlatformStore {
                 }
             }
             Self::Timescale(pool) => {
-                let tenant_is_active = sqlx::query_scalar::<_, i32>(
-                    "SELECT 1 FROM tenants WHERE id = $1 AND status = 'active' LIMIT 1",
-                )
-                .bind(tenant_id)
-                .fetch_optional(pool)
-                .await?
-                .is_some();
-                if !tenant_is_active {
-                    return Err(PlatformStoreError::UnknownTenant(tenant_id));
-                }
                 let registered = sqlx::query(
                     "INSERT INTO devices (device_id, tenant_id)
-                     VALUES ($1, $2)
+                     SELECT $1, id
+                     FROM tenants
+                     WHERE id = $2 AND status = 'active'
+                     FOR UPDATE OF tenants
                      ON CONFLICT(device_id) DO UPDATE SET device_id = EXCLUDED.device_id
                      WHERE devices.tenant_id = EXCLUDED.tenant_id",
                 )
@@ -2558,6 +2553,16 @@ impl PlatformStore {
                 .execute(pool)
                 .await?;
                 if registered.rows_affected() != 1 {
+                    let tenant_is_active = sqlx::query_scalar::<_, i32>(
+                        "SELECT 1 FROM tenants WHERE id = $1 AND status = 'active' LIMIT 1",
+                    )
+                    .bind(tenant_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .is_some();
+                    if !tenant_is_active {
+                        return Err(PlatformStoreError::UnknownTenant(tenant_id));
+                    }
                     return Err(PlatformStoreError::DeviceTenantConflict {
                         device_id: device_id.to_owned(),
                         tenant_id,
@@ -2693,9 +2698,11 @@ impl PlatformStore {
                 "SELECT 1
                      FROM device_tokens
                      JOIN devices ON devices.device_id = device_tokens.device_id
+                     JOIN tenants ON tenants.id = devices.tenant_id
                      WHERE device_tokens.id = ?
                        AND device_tokens.device_id = ?
                        AND devices.tenant_id = ?
+                       AND tenants.status = 'active'
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL
                        AND devices.gateway_device_id IS NULL",
@@ -2710,9 +2717,11 @@ impl PlatformStore {
                 "SELECT 1
                      FROM device_tokens
                      JOIN devices ON devices.device_id = device_tokens.device_id
+                     JOIN tenants ON tenants.id = devices.tenant_id
                      WHERE device_tokens.id = $1
                        AND device_tokens.device_id = $2
                        AND devices.tenant_id = $3
+                       AND tenants.status = 'active'
                        AND device_tokens.revoked_at IS NULL
                        AND devices.deleted_at IS NULL
                        AND devices.gateway_device_id IS NULL",
@@ -2744,9 +2753,11 @@ impl PlatformStore {
                      FROM device_tokens
                      JOIN devices AS gateways
                        ON gateways.device_id = device_tokens.device_id
+                     JOIN tenants ON tenants.id = gateways.tenant_id
                      WHERE device_tokens.id = ?
                        AND device_tokens.device_id = ?
                        AND gateways.tenant_id = ?
+                       AND tenants.status = 'active'
                        AND device_tokens.revoked_at IS NULL
                        AND gateways.deleted_at IS NULL
                        AND gateways.is_gateway = 1
@@ -2775,9 +2786,11 @@ impl PlatformStore {
                      FROM device_tokens
                      JOIN devices AS gateways
                        ON gateways.device_id = device_tokens.device_id
+                     JOIN tenants ON tenants.id = gateways.tenant_id
                      WHERE device_tokens.id = $1
                        AND device_tokens.device_id = $2
                        AND gateways.tenant_id = $3
+                       AND tenants.status = 'active'
                        AND device_tokens.revoked_at IS NULL
                        AND gateways.deleted_at IS NULL
                        AND gateways.is_gateway = TRUE
