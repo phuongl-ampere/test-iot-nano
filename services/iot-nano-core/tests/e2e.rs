@@ -17,6 +17,9 @@ use iot_nano_core::{
 };
 use iot_stream::{LocalStream, StreamConfig};
 use sqlx::Row;
+use uuid::Uuid;
+
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 struct TestBroker {
     child: Child,
@@ -92,6 +95,7 @@ async fn simulated_telemetry_flows_from_mqtt_to_timescaledb() {
         CoreStreamConsumer::new(Arc::new(stream.clone()), "timescaledb-writer", "e2e-writer");
     let mut runtime = MqttRuntime::new(
         MqttRuntimeConfig {
+            tenant_id: TEST_TENANT_ID,
             client_id: "e2e-ingest".to_owned(),
             broker_host: "127.0.0.1".to_owned(),
             broker_port: broker.port,

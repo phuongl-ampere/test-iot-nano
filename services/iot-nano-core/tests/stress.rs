@@ -17,6 +17,7 @@ use sqlx::{PgPool, query, query_scalar};
 use uuid::Uuid;
 
 static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 fn database_url() -> String {
     env::var("DATABASE_URL")
@@ -105,6 +106,7 @@ async fn configured_events_drain_to_telemetry_and_alert_groups() {
         };
         stream
             .append(TelemetryMessage {
+                tenant_id: TEST_TENANT_ID,
                 topic: format!("iot/v1/devices/{device_id}/telemetry"),
                 payload: serde_json::to_vec(&event).unwrap(),
                 event,

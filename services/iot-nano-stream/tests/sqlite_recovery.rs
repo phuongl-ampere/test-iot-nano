@@ -11,9 +11,12 @@ use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 fn message(device_id: &str, sequence: u64) -> TelemetryMessage {
     let now = Utc::now();
     TelemetryMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: format!("iot/v1/devices/{device_id}/telemetry"),
         payload: format!(r#"{{"sequence":{sequence}}}"#).into_bytes(),
         event: TelemetryEvent {

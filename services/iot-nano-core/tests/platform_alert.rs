@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 const DEVICE_ID: &str = "esp-000123";
 const TOPIC: &str = "iot/v1/devices/esp-000123/telemetry";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 static TEST_EPOCH: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 
 #[derive(Clone)]
@@ -186,6 +187,7 @@ fn at(seconds: i64) -> DateTime<Utc> {
 
 fn telemetry(value: f64, received_at: DateTime<Utc>) -> TelemetryMessage {
     TelemetryMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: TOPIC.to_owned(),
         payload: Vec::new(),
         event: TelemetryEvent {
@@ -203,6 +205,7 @@ fn telemetry(value: f64, received_at: DateTime<Utc>) -> TelemetryMessage {
 
 fn gateway_heartbeat(received_at: DateTime<Utc>) -> GatewayMessage {
     GatewayMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: "iot/v1/gateways/gateway-1/events".to_owned(),
         payload: Vec::new(),
         gateway_event: GatewayEvent {

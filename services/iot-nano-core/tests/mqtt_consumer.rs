@@ -18,6 +18,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const TOPIC: &str = "iot/v1/devices/esp-000123/telemetry";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 struct TestBroker {
     child: Child,
@@ -85,7 +86,7 @@ fn telemetry_payload(device_id: &str) -> Vec<u8> {
 async fn valid_mqtt_payload_is_durably_appended_to_the_stream() {
     let tempdir = tempfile::tempdir().unwrap();
     let stream = stream(&tempdir).await;
-    let consumer = MqttStreamProducer::new(Arc::new(stream.clone()));
+    let consumer = MqttStreamProducer::new(TEST_TENANT_ID, Arc::new(stream.clone()));
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
 
     let outcome = consumer
@@ -102,7 +103,7 @@ async fn valid_mqtt_payload_is_durably_appended_to_the_stream() {
 async fn device_id_mismatch_is_rejected_without_appending_to_the_stream() {
     let tempdir = tempfile::tempdir().unwrap();
     let stream = stream(&tempdir).await;
-    let consumer = MqttStreamProducer::new(Arc::new(stream.clone()));
+    let consumer = MqttStreamProducer::new(TEST_TENANT_ID, Arc::new(stream.clone()));
     let now = Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 1).unwrap();
 
     let outcome = consumer
@@ -129,6 +130,7 @@ async fn manual_ack_runtime_persists_a_qos_one_publish_before_acknowledging_it()
     let stream = stream(&tempdir).await;
     let mut runtime = MqttRuntime::new(
         MqttRuntimeConfig {
+            tenant_id: TEST_TENANT_ID,
             client_id: "ingest-runtime-test".to_owned(),
             broker_host: "127.0.0.1".to_owned(),
             broker_port: broker.port,

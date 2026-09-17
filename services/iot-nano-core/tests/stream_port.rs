@@ -15,6 +15,8 @@ use iot_stream::{
 };
 use serde_json::json;
 
+const TEST_TENANT_ID: uuid::Uuid = uuid::Uuid::from_u128(1);
+
 #[derive(Clone)]
 struct CommitCheckingStream {
     records: Arc<Vec<ClaimedRecord>>,
@@ -119,6 +121,7 @@ async fn sqlite_writer_commits_before_acknowledging_the_claim() {
             partition: PartitionId::new(0),
             offset: 0,
             message: TelemetryMessage {
+                tenant_id: TEST_TENANT_ID,
                 topic: "iot/v1/devices/esp-000123/telemetry".to_owned(),
                 payload: br#"{"sequence":1}"#.to_vec(),
                 event,
@@ -163,6 +166,7 @@ async fn heartbeat_renews_an_active_inflight_claim_before_acknowledgement() {
     };
     stream
         .append(TelemetryMessage {
+            tenant_id: TEST_TENANT_ID,
             topic: "iot/v1/devices/esp-000123/telemetry".to_owned(),
             payload: serde_json::to_vec(&event).unwrap(),
             event,

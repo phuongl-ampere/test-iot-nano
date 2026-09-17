@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 const TOPIC: &str = "iot/v1/devices/esp-000123/telemetry";
 const GATEWAY_TOPIC: &str = "v1/gateways/me/telemetry";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 // Every test targets the same TimescaleDB database and resets shared tables.
 static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -101,6 +102,7 @@ async fn flush_once_commits_stream_deduplicated_events_and_advances_group_offset
     for _ in 0..2 {
         stream
             .append(TelemetryMessage {
+                tenant_id: TEST_TENANT_ID,
                 topic: TOPIC.to_owned(),
                 payload: br#"{"sequence":1842}"#.to_vec(),
                 event: event.clone(),
@@ -141,6 +143,7 @@ async fn writer_persists_gateway_child_telemetry_and_one_receipt() {
     event.device_id = "child-001".to_owned();
     event.gateway_device_id = Some("gateway-001".to_owned());
     let gateway_message = GatewayMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: GATEWAY_TOPIC.to_owned(),
         payload: br#"{"kind":"child_telemetry"}"#.to_vec(),
         gateway_event: GatewayEvent {
@@ -164,8 +167,10 @@ async fn writer_persists_gateway_child_telemetry_and_one_receipt() {
     let result = writer.flush_once(&consumer, now).await.unwrap();
 
     let gateway_device_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT gateway_device_id FROM telemetry WHERE device_id = 'child-001'",
+        "SELECT gateway_device_id FROM telemetry
+         WHERE tenant_id = $1 AND device_id = 'child-001'",
     )
+    .bind(TEST_TENANT_ID)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -198,6 +203,7 @@ async fn sqlite_writer_commits_stream_records_and_rollups() {
     let (stream, consumer) = consumer(&tempdir, now).await;
     stream
         .append(TelemetryMessage {
+            tenant_id: TEST_TENANT_ID,
             topic: TOPIC.to_owned(),
             payload: br#"{"sequence":1842}"#.to_vec(),
             event: event(),
@@ -235,6 +241,7 @@ async fn sqlite_writer_acknowledges_gateway_records_without_writing_telemetry() 
     let (stream, consumer) = consumer(&tempdir, now).await;
     stream
         .append(GatewayMessage {
+            tenant_id: TEST_TENANT_ID,
             topic: "iot/v1/gateways/gateway-001/events".to_owned(),
             payload: br#"{"kind":"heartbeat"}"#.to_vec(),
             gateway_event: GatewayEvent {
@@ -269,8 +276,9 @@ async fn sqlite_writer_acknowledges_gateway_records_without_writing_telemetry() 
     let gateway_last_seen = sqlx::query_scalar::<_, Option<String>>(
         "SELECT last_seen_at
          FROM device_runtime_state
-         WHERE device_id = 'gateway-001'",
+         WHERE tenant_id = ? AND device_id = 'gateway-001'",
     )
+    .bind(TEST_TENANT_ID.to_string())
     .fetch_optional(store.pool())
     .await
     .unwrap()
@@ -296,6 +304,7 @@ async fn sqlite_writer_persists_canonical_child_telemetry_and_one_gateway_receip
     child_event.device_id = "child-001".to_owned();
     child_event.gateway_device_id = Some("gateway-001".to_owned());
     let gateway_message = GatewayMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: "iot/v1/gateways/gateway-001/events".to_owned(),
         payload: br#"{"kind":"child_telemetry"}"#.to_vec(),
         gateway_event: GatewayEvent {
@@ -318,8 +327,10 @@ async fn sqlite_writer_persists_canonical_child_telemetry_and_one_gateway_receip
     let writer = iot_nano_core::SqliteTelemetryWriter::new(store.clone(), 1_000);
     let result = writer.flush_once(&consumer, now).await.unwrap();
     let row = sqlx::query(
-        "SELECT device_id, gateway_device_id FROM telemetry WHERE device_id = 'child-001'",
+        "SELECT device_id, gateway_device_id FROM telemetry
+         WHERE tenant_id = ? AND device_id = 'child-001'",
     )
+    .bind(TEST_TENANT_ID.to_string())
     .fetch_one(store.pool())
     .await
     .unwrap();
@@ -357,6 +368,7 @@ async fn sqlite_writer_marks_disconnected_gateway_child_unavailable() {
     let (stream, consumer) = consumer(&tempdir, now).await;
     stream
         .append(GatewayMessage {
+            tenant_id: TEST_TENANT_ID,
             topic: "iot/v1/gateways/gateway-001/events".to_owned(),
             payload: br#"{"kind":"disconnect"}"#.to_vec(),
             gateway_event: GatewayEvent {
@@ -383,8 +395,9 @@ async fn sqlite_writer_marks_disconnected_gateway_child_unavailable() {
     let quality = sqlx::query_scalar::<_, Option<String>>(
         "SELECT gateway_read_quality
          FROM device_runtime_state
-         WHERE device_id = 'child-001'",
+         WHERE tenant_id = ? AND device_id = 'child-001'",
     )
+    .bind(TEST_TENANT_ID.to_string())
     .fetch_one(store.pool())
     .await
     .unwrap();
@@ -404,6 +417,7 @@ async fn writer_does_not_advance_group_offset_when_database_conversion_fails() {
     let event = event_with_sequence(u64::MAX);
     stream
         .append(TelemetryMessage {
+            tenant_id: TEST_TENANT_ID,
             topic: TOPIC.to_owned(),
             payload: br#"{"sequence":1842}"#.to_vec(),
             event,

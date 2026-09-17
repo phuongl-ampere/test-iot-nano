@@ -10,8 +10,11 @@ use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 fn message() -> TelemetryMessage {
     TelemetryMessage {
+        tenant_id: TEST_TENANT_ID,
         topic: "iot/v1/devices/esp-000123/telemetry".to_owned(),
         payload: br#"{"temperature_c":26.4}"#.to_vec(),
         event: TelemetryEvent {
