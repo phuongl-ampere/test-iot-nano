@@ -1372,6 +1372,7 @@ pub trait DeviceTokenRepository: Send + Sync {
     >;
     fn provision_owned_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         device: NewOwnedDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
@@ -1435,11 +1436,12 @@ impl DeviceTokenRepository for PlatformStore {
 
     fn provision_owned_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         device: NewOwnedDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
     > {
-        Box::pin(async move { provision_owned_device_token(self, device).await })
+        Box::pin(async move { provision_owned_device_token(self, tenant_id, device).await })
     }
 
     fn create_device_token<'a>(
@@ -2920,25 +2922,42 @@ async fn provision_device_token(
 
 async fn provision_owned_device_token(
     store: &PlatformStore,
+    tenant_id: Uuid,
     device: NewOwnedDeviceToken,
 ) -> Result<DeviceTokenRecord, DeviceTokenRepositoryError> {
     let device_id = Uuid::now_v7().to_string();
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
-            let tenant_id =
-                sqlx::query_scalar::<_, String>("SELECT tenant_id FROM users WHERE id = ?")
-                    .bind(device.owner_user_id.to_string())
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                    .ok_or(DeviceTokenRepositoryError::DeviceNotFound)?;
+            let owner_exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ? AND tenant_id = ?)",
+            )
+            .bind(device.owner_user_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !owner_exists {
+                return Err(DeviceTokenRepositoryError::DeviceNotFound);
+            }
+            if let Some(asset_id) = device.asset_id {
+                let asset_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?)",
+                )
+                .bind(asset_id.to_string())
+                .bind(tenant_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+                if !asset_exists {
+                    return Err(DeviceTokenRepositoryError::DeviceNotFound);
+                }
+            }
             sqlx::query(
                 "INSERT INTO devices (
                      device_id, tenant_id, display_name, owner_user_id, asset_id, claimed_at
                  ) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(&device_id)
-            .bind(tenant_id)
+            .bind(tenant_id.to_string())
             .bind(&device.display_name)
             .bind(device.owner_user_id.to_string())
             .bind(device.asset_id.map(|id| id.to_string()))
@@ -2952,12 +2971,28 @@ async fn provision_owned_device_token(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            let tenant_id =
-                sqlx::query_scalar::<_, Uuid>("SELECT tenant_id FROM users WHERE id = $1")
-                    .bind(device.owner_user_id)
-                    .fetch_optional(&mut *transaction)
-                    .await?
-                    .ok_or(DeviceTokenRepositoryError::DeviceNotFound)?;
+            let owner_exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2)",
+            )
+            .bind(device.owner_user_id)
+            .bind(tenant_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !owner_exists {
+                return Err(DeviceTokenRepositoryError::DeviceNotFound);
+            }
+            if let Some(asset_id) = device.asset_id {
+                let asset_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)",
+                )
+                .bind(asset_id)
+                .bind(tenant_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                if !asset_exists {
+                    return Err(DeviceTokenRepositoryError::DeviceNotFound);
+                }
+            }
             sqlx::query(
                 "INSERT INTO devices (
                      device_id, tenant_id, display_name, owner_user_id, asset_id, claimed_at
@@ -2991,10 +3026,17 @@ async fn create_device_token(
             sqlx::query(
                 "UPDATE device_tokens
                  SET revoked_at = ?
-                 WHERE device_id = ? AND revoked_at IS NULL",
+                 WHERE device_id = ? AND revoked_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = device_tokens.device_id
+                         AND devices.tenant_id = ?
+                         AND devices.deleted_at IS NULL
+                   )",
             )
             .bind(Utc::now().to_rfc3339())
             .bind(device_id)
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
             let record = insert_sqlite_device_token(&mut transaction, device_id, token).await?;
@@ -3007,9 +3049,16 @@ async fn create_device_token(
             sqlx::query(
                 "UPDATE device_tokens
                  SET revoked_at = now()
-                 WHERE device_id = $1 AND revoked_at IS NULL",
+                 WHERE device_id = $1 AND revoked_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = device_tokens.device_id
+                         AND devices.tenant_id = $2
+                         AND devices.deleted_at IS NULL
+                   )",
             )
             .bind(device_id)
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
             let record = insert_timescale_device_token(&mut transaction, device_id, token).await?;
@@ -3106,10 +3155,19 @@ async fn rotate_device_token(
                 sqlite_active_token_device_id(&mut transaction, tenant_id, token_id).await?;
             ensure_sqlite_token_eligible(&mut transaction, tenant_id, &device_id).await?;
             sqlx::query(
-                "UPDATE device_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                "UPDATE device_tokens
+                 SET revoked_at = ?
+                 WHERE id = ? AND revoked_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = device_tokens.device_id
+                         AND devices.tenant_id = ?
+                         AND devices.deleted_at IS NULL
+                   )",
             )
             .bind(Utc::now().to_rfc3339())
             .bind(token_id.to_string())
+            .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
             let record = insert_sqlite_device_token(&mut transaction, &device_id, token).await?;
@@ -3122,9 +3180,18 @@ async fn rotate_device_token(
                 timescale_active_token_device_id(&mut transaction, tenant_id, token_id).await?;
             ensure_timescale_token_eligible(&mut transaction, tenant_id, &device_id).await?;
             sqlx::query(
-                "UPDATE device_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+                "UPDATE device_tokens
+                 SET revoked_at = now()
+                 WHERE id = $1 AND revoked_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM devices
+                       WHERE devices.device_id = device_tokens.device_id
+                         AND devices.tenant_id = $2
+                         AND devices.deleted_at IS NULL
+                   )",
             )
             .bind(token_id)
+            .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
             let record = insert_timescale_device_token(&mut transaction, &device_id, token).await?;

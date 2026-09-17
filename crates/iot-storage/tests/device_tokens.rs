@@ -236,6 +236,27 @@ async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_
         DeviceTokenRepositoryError::TokenNotFound
     ));
 
+    assert!(
+        DeviceTokenRepository::list_device_tokens(&store, other_tenant_id, &issued.device_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        DeviceTokenRepository::active_device_token(&store, other_tenant_id, issued.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let revoke_error =
+        DeviceTokenRepository::revoke_device_token(&store, other_tenant_id, issued.id)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        revoke_error,
+        DeviceTokenRepositoryError::TokenNotFound
+    ));
+
     assert_eq!(
         DeviceTokenRepository::active_device_token(&store, tenant_id, issued.id)
             .await
@@ -392,6 +413,7 @@ async fn sqlite_device_token_repository_provisions_owned_devices_and_identity_re
 
     let issued = DeviceTokenRepository::provision_owned_device_token(
         &store,
+        tenant_id,
         NewOwnedDeviceToken {
             display_name: "Owned device".to_owned(),
             owner_user_id,
@@ -422,6 +444,89 @@ async fn sqlite_device_token_repository_provisions_owned_devices_and_identity_re
 }
 
 #[tokio::test]
+async fn sqlite_owned_token_provision_rejects_cross_tenant_references() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = provisioning_tenant_id();
+    let other_tenant_id = Uuid::from_u128(10_009);
+    let owner_user_id = Uuid::now_v7();
+    let other_owner_user_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'other-device-tokens', 'active')",
+    )
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'cross-tenant-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(owner_user_id.to_string())
+    .bind(tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'other-cross-tenant-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(other_owner_user_id.to_string())
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'other tenant asset')")
+        .bind(asset_id.to_string())
+        .bind(other_tenant_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let error = DeviceTokenRepository::provision_owned_device_token(
+        &store,
+        tenant_id,
+        NewOwnedDeviceToken {
+            display_name: "Cross-tenant owned device".to_owned(),
+            owner_user_id,
+            asset_id: Some(asset_id),
+            token: token("cross-tenant-owned-token"),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, DeviceTokenRepositoryError::DeviceNotFound));
+
+    let cross_tenant_owner_error = DeviceTokenRepository::provision_owned_device_token(
+        &store,
+        tenant_id,
+        NewOwnedDeviceToken {
+            display_name: "Cross-tenant owner device".to_owned(),
+            owner_user_id: other_owner_user_id,
+            asset_id: None,
+            token: token("cross-tenant-owner-token"),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        cross_tenant_owner_error,
+        DeviceTokenRepositoryError::DeviceNotFound
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM devices")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
     let (_lock, store) = timescale_store().await;
@@ -441,6 +546,44 @@ async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
     )
     .await
     .unwrap();
+    let other_tenant_id = Uuid::from_u128(10_009);
+    assert!(
+        DeviceTokenRepository::list_device_tokens(&store, other_tenant_id, "token-history")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        DeviceTokenRepository::active_device_token(&store, other_tenant_id, first.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        DeviceTokenRepository::rotate_device_token(
+            &store,
+            other_tenant_id,
+            first.id,
+            token("timescale-cross-tenant-rotate"),
+        )
+        .await
+        .unwrap_err(),
+        DeviceTokenRepositoryError::TokenNotFound
+    ));
+    assert!(matches!(
+        DeviceTokenRepository::revoke_device_token(&store, other_tenant_id, first.id)
+            .await
+            .unwrap_err(),
+        DeviceTokenRepositoryError::TokenNotFound
+    ));
+    assert_eq!(
+        DeviceTokenRepository::active_device_token(&store, tenant_id, first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        first.id
+    );
     let rotated = DeviceTokenRepository::rotate_device_token(
         &store,
         tenant_id,
@@ -496,6 +639,7 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
 
     let issued = DeviceTokenRepository::provision_owned_device_token(
         &store,
+        tenant_id,
         NewOwnedDeviceToken {
             display_name: "Owned device".to_owned(),
             owner_user_id,
