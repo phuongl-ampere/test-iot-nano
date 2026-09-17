@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, Utc};
 use iot_core::TelemetryEvent;
 use iot_nano_stream::{
-    AcknowledgeRequest, ClaimRequest, GroupStart, LocalStream, StreamConfig, StreamError,
-    StreamMessage, TelemetryMessage,
+    AcknowledgeRequest, ClaimRequest, GatewayEvent, GatewayEventKind, GatewayMessage, GroupStart,
+    LocalStream, StreamConfig, StreamError, StreamMessage, TelemetryMessage,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -30,6 +30,44 @@ fn message(device_id: &str, sequence: u64) -> TelemetryMessage {
         },
         received_at: now,
     }
+}
+
+fn gateway_message() -> GatewayMessage {
+    let now = Utc::now();
+    GatewayMessage {
+        tenant_id: TEST_TENANT_ID,
+        topic: "iot/v1/gateways/gateway-a/events".to_owned(),
+        payload: br#"{\"kind\":\"heartbeat\"}"#.to_vec(),
+        gateway_event: GatewayEvent {
+            schema_version: 1,
+            gateway_device_id: "gateway-a".to_owned(),
+            child_device_id: None,
+            token_id: Uuid::from_u128(2),
+            session_id: Some("session-a".to_owned()),
+            event_kind: GatewayEventKind::Heartbeat,
+            event_at: now,
+            payload: json!({}),
+            idempotency_key: "gateway-a:heartbeat:1".to_owned(),
+        },
+        telemetry_event: None,
+        received_at: now,
+    }
+}
+
+fn legacy_payload_without_tenant_id(message: StreamMessage) -> String {
+    let mut payload = serde_json::to_value(message).unwrap();
+    payload["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tenant_id");
+    serde_json::to_string(&payload).unwrap()
+}
+
+fn replace_durable_payload(path: &std::path::Path, payload: String) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute("UPDATE stream_records SET payload_json = ?1", [payload])
+        .unwrap();
 }
 
 fn claim(group: &str, member_id: &str) -> ClaimRequest {
@@ -59,6 +97,75 @@ async fn append_is_visible_after_stream_sqlite_reopen() {
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].offset, receipt.offset);
     assert_eq!(claimed[0].partition, receipt.partition);
+    assert_eq!(claimed[0].message.tenant_id(), TEST_TENANT_ID);
+}
+
+#[tokio::test]
+async fn claim_rejects_legacy_telemetry_payload_without_tenant_id() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("stream.sqlite");
+    let telemetry = message("device-a", 1);
+    let legacy_payload = legacy_payload_without_tenant_id(StreamMessage::from(telemetry.clone()));
+    let stream = LocalStream::open(StreamConfig::sqlite(&path))
+        .await
+        .unwrap();
+    stream.append(telemetry).await.unwrap();
+    drop(stream);
+    replace_durable_payload(&path, legacy_payload);
+
+    let stream = LocalStream::open(StreamConfig::sqlite(&path))
+        .await
+        .unwrap();
+    let error = stream.claim(claim("writer", "writer-a")).await.unwrap_err();
+
+    assert!(matches!(
+        &error,
+        StreamError::ResetRequiredDurableRecord {
+            record_type: "telemetry"
+        }
+    ));
+    assert!(
+        error.to_string().contains("reset the development stream"),
+        "unexpected stream error: {error}"
+    );
+    assert!(
+        error.to_string().contains("telemetry"),
+        "unexpected stream error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn claim_rejects_legacy_gateway_payload_without_tenant_id() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("stream.sqlite");
+    let gateway = gateway_message();
+    let legacy_payload = legacy_payload_without_tenant_id(StreamMessage::from(gateway.clone()));
+    let stream = LocalStream::open(StreamConfig::sqlite(&path))
+        .await
+        .unwrap();
+    stream.append(gateway).await.unwrap();
+    drop(stream);
+    replace_durable_payload(&path, legacy_payload);
+
+    let stream = LocalStream::open(StreamConfig::sqlite(&path))
+        .await
+        .unwrap();
+    let error = stream.claim(claim("writer", "writer-a")).await.unwrap_err();
+
+    assert!(matches!(
+        &error,
+        StreamError::ResetRequiredDurableRecord {
+            record_type: "gateway"
+        }
+    ));
+    assert!(
+        error.to_string().contains("reset the development stream"),
+        "unexpected stream error: {error}"
+    );
+    assert!(
+        error.to_string().contains("gateway"),
+        "unexpected stream error: {error}"
+    );
 }
 
 #[tokio::test]

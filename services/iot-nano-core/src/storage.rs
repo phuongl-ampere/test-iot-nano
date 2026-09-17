@@ -1,15 +1,41 @@
 #![forbid(unsafe_code)]
 
+use std::{fs, path::Path, time::Duration};
+
 use chrono::{DateTime, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use iot_sqldb_common::{SqlitePoolError, open_owned_sqlite_pool};
 use serde_json::Value;
-use sqlx::{Row, Sqlite, SqlitePool, Transaction, sqlite::SqliteRow};
+use sqlx::{
+    Row, Sqlite, SqlitePool, Transaction,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
+};
 use thiserror::Error;
 
 const CORE_SQLITE_APPLICATION_ID: i64 = 0x434F_5231;
 
 const SQLITE_SCHEMA: &str = include_str!("core_sqlite_schema.sql");
+
+const CORE_SQLITE_SCHEMA_TABLES: &[&str] = &[
+    "telemetry",
+    "device_runtime_state",
+    "gateway_event_receipts",
+    "telemetry_rollups_5m",
+    "telemetry_rollups_1h",
+    "alert_rules",
+    "alert_rule_event_evaluations",
+    "alert_incidents",
+    "notification_outbox",
+    "command_outbox",
+];
+
+const CORE_SQLITE_TENANT_TABLES: &[&str] = &[
+    "telemetry",
+    "device_runtime_state",
+    "gateway_event_receipts",
+    "telemetry_rollups_5m",
+    "telemetry_rollups_1h",
+];
 
 #[derive(Clone)]
 pub struct CoreSqliteStore {
@@ -78,6 +104,81 @@ pub struct RetentionResult {
     pub resolved_incident_rows: u64,
 }
 
+async fn pre_tenant_core_sqlite_table(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
+    let tables = sqlx::query_scalar::<_, String>(
+        "SELECT name
+         FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    let core_tables = tables
+        .into_iter()
+        .filter(|table| CORE_SQLITE_SCHEMA_TABLES.contains(&table.as_str()))
+        .collect::<Vec<_>>();
+    let Some(first_table) = core_tables.first() else {
+        return Ok(None);
+    };
+    if !core_tables
+        .iter()
+        .any(|table| table.as_str() == "telemetry")
+    {
+        return Ok(Some(first_table.clone()));
+    }
+    for &table in CORE_SQLITE_TENANT_TABLES {
+        if core_tables
+            .iter()
+            .any(|existing| existing.as_str() == table)
+        {
+            let has_tenant_id: i64 = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pragma_table_info(?) WHERE name = 'tenant_id'
+                 )",
+            )
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
+            if has_tenant_id == 0 {
+                return Ok(Some(table.to_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn reject_pre_tenant_core_sqlite(
+    path: &Path,
+    busy_timeout_ms: u64,
+) -> Result<(), CoreSqliteStoreError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(SqlitePoolError::Io(error).into()),
+    };
+    if !metadata.is_file() {
+        return Err(CoreSqliteStoreError::InvalidConfiguration);
+    }
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(Duration::from_millis(busy_timeout_ms));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let table = pre_tenant_core_sqlite_table(&pool).await;
+    pool.close().await;
+    if let Some(table) = table? {
+        return Err(CoreSqliteStoreError::ResetRequired { table });
+    }
+    Ok(())
+}
+
 impl CoreSqliteStore {
     pub async fn open(configuration: &StorageConfiguration) -> Result<Self, CoreSqliteStoreError> {
         if configuration.storage != DatabaseStorage::Sqlite {
@@ -87,6 +188,7 @@ impl CoreSqliteStore {
             .sqlite_path
             .as_ref()
             .ok_or(CoreSqliteStoreError::InvalidConfiguration)?;
+        reject_pre_tenant_core_sqlite(path, configuration.sqlite_busy_timeout_ms).await?;
         let pool = open_owned_sqlite_pool(
             path,
             configuration.sqlite_busy_timeout_ms,
@@ -946,6 +1048,10 @@ pub enum CoreSqliteStoreError {
     InvalidConfiguration,
     #[error("SQLite file belongs to another service")]
     ForeignOwnership,
+    #[error(
+        "core SQLite schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
+    )]
+    ResetRequired { table: String },
     #[error("invalid command outbox state: {0}")]
     InvalidCommandState(String),
     #[error("invalid command outbox {column} timestamp: {value}")]

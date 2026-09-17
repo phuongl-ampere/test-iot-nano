@@ -174,7 +174,21 @@ pub struct AppendReceipt {
 }
 
 pub(crate) fn decode_message(payload: &str) -> Result<StreamMessage, StreamError> {
-    let message = serde_json::from_str::<StreamMessage>(payload)?;
+    let record: Value = serde_json::from_str(payload)?;
+    let record_type = match record.get("record_type").and_then(Value::as_str) {
+        Some("telemetry") => Some("telemetry"),
+        Some("gateway") => Some("gateway"),
+        _ => None,
+    };
+    if let Some(record_type) = record_type
+        && record
+            .get("message")
+            .and_then(Value::as_object)
+            .is_some_and(|message| !message.contains_key("tenant_id"))
+    {
+        return Err(StreamError::ResetRequiredDurableRecord { record_type });
+    }
+    let message = serde_json::from_value::<StreamMessage>(record)?;
     message.validate()?;
     Ok(message)
 }

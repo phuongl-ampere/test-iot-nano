@@ -648,5 +648,8 @@ fn writer_work_error(error: WriterError) -> WorkError {
         WriterError::Database(error) => WorkError::Storage(error.to_string()),
         WriterError::Sqlite(error) => WorkError::Storage(error.to_string()),
         WriterError::Platform(error) => WorkError::Storage(error.to_string()),
+        WriterError::ResetRequiredTimescaleSchema { table } => WorkError::Storage(format!(
+            "core Timescale schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
+        )),
     }
 }

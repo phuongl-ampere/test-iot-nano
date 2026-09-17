@@ -5,12 +5,29 @@ use iot_storage::{
     TelemetryRepository,
 };
 use iot_stream::{GatewayEventKind, GatewayMessage, StreamError, StreamMessage};
-use sqlx::{Executor, PgPool, Postgres, Transaction, postgres::PgPoolOptions};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 use thiserror::Error;
 
 use crate::{ClaimedBatch, CoreStreamConsumer};
 
 const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_core.sql")];
+
+const TIMESCALE_CORE_SCHEMA_TABLES: &[&str] = &[
+    "device_runtime_state",
+    "telemetry",
+    "alert_rules",
+    "alert_rule_event_evaluations",
+    "alert_incidents",
+    "notification_outbox",
+    "command_outbox",
+    "gateway_event_receipts",
+];
+
+const TIMESCALE_CORE_TENANT_TABLES: &[&str] = &[
+    "device_runtime_state",
+    "telemetry",
+    "gateway_event_receipts",
+];
 
 #[derive(Debug, Clone)]
 pub struct TelemetryWriter {
@@ -47,13 +64,20 @@ pub enum WriterError {
     Sqlite(#[from] CoreSqliteStoreError),
     #[error(transparent)]
     Platform(#[from] PlatformStoreError),
+    #[error(
+        "core Timescale schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
+    )]
+    ResetRequiredTimescaleSchema { table: String },
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), WriterError> {
-    sqlx::query("CREATE SCHEMA IF NOT EXISTS iot_nano_core")
-        .execute(pool)
-        .await?;
     let mut connection = pool.acquire().await?;
+    if let Some(table) = pre_tenant_core_timescale_table(&mut connection).await? {
+        return Err(WriterError::ResetRequiredTimescaleSchema { table });
+    }
+    connection
+        .execute("CREATE SCHEMA IF NOT EXISTS iot_nano_core")
+        .await?;
     connection
         .execute("SET search_path TO iot_nano_core")
         .await?;
@@ -61,6 +85,55 @@ pub async fn migrate(pool: &PgPool) -> Result<(), WriterError> {
         sqlx::raw_sql(*migration).execute(&mut *connection).await?;
     }
     Ok(())
+}
+
+async fn pre_tenant_core_timescale_table(
+    connection: &mut PgConnection,
+) -> Result<Option<String>, sqlx::Error> {
+    let tables = sqlx::query_scalar::<_, String>(
+        "SELECT table_name
+         FROM information_schema.tables
+         WHERE table_schema = 'iot_nano_core' AND table_type = 'BASE TABLE'
+         ORDER BY table_name",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    let core_tables = tables
+        .into_iter()
+        .filter(|table| TIMESCALE_CORE_SCHEMA_TABLES.contains(&table.as_str()))
+        .collect::<Vec<_>>();
+    let Some(first_table) = core_tables.first() else {
+        return Ok(None);
+    };
+    if !core_tables
+        .iter()
+        .any(|table| table.as_str() == "telemetry")
+    {
+        return Ok(Some(first_table.clone()));
+    }
+    for &table in TIMESCALE_CORE_TENANT_TABLES {
+        if core_tables
+            .iter()
+            .any(|existing| existing.as_str() == table)
+        {
+            let has_tenant_id: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM information_schema.columns
+                     WHERE table_schema = 'iot_nano_core'
+                       AND table_name = $1
+                       AND column_name = 'tenant_id'
+                 )",
+            )
+            .bind(table)
+            .fetch_one(&mut *connection)
+            .await?;
+            if !has_tenant_id {
+                return Ok(Some(table.to_owned()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub async fn connect_core_database(database_url: &str) -> Result<PgPool, sqlx::Error> {

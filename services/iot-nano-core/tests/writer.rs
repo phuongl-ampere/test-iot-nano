@@ -601,6 +601,65 @@ async fn migration_owns_the_core_schema_without_api_tables() {
 }
 
 #[tokio::test]
+#[ignore = "requires DATABASE_URL for an isolated TimescaleDB test database"]
+async fn timescale_migration_rejects_pre_tenant_core_schema_without_partial_replay() {
+    let _database_lock = DATABASE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _database_file_lock = lock_database_file();
+    let pool = connect_core_database(&database_url()).await.unwrap();
+    sqlx::query(
+        "DROP SCHEMA IF EXISTS iot_nano_core CASCADE;
+         CREATE SCHEMA iot_nano_core;
+         CREATE TABLE iot_nano_core.telemetry (
+             event_at TIMESTAMPTZ NOT NULL,
+             device_id TEXT NOT NULL,
+             boot_id UUID NOT NULL,
+             sequence BIGINT NOT NULL
+         );",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = migrate(&pool).await.unwrap_err();
+    assert!(
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains("telemetry"),
+        "unexpected migration error: {error}"
+    );
+
+    let runtime_state_table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('iot_nano_core.device_runtime_state') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let tenant_id_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM information_schema.columns
+             WHERE table_schema = 'iot_nano_core'
+               AND table_name = 'telemetry'
+               AND column_name = 'tenant_id'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert!(!runtime_state_table_exists);
+    assert!(!tenant_id_column_exists);
+    sqlx::query("DROP SCHEMA iot_nano_core CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    migrate(&pool).await.unwrap();
+}
+
+#[tokio::test]
 async fn core_pool_does_not_resolve_public_metadata_tables() {
     let _database_lock = DATABASE_TEST_LOCK
         .lock()

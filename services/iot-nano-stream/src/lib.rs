@@ -87,6 +87,10 @@ pub enum StreamError {
     ForeignTable { table: String },
     #[error("stream store is corrupt: {0}")]
     CorruptStore(String),
+    #[error(
+        "durable {record_type} stream record predates tenant support; reset the development stream before starting iot-nano"
+    )]
+    ResetRequiredDurableRecord { record_type: &'static str },
     #[error("invalid consumer group {kind}: {value:?}")]
     InvalidGroupIdentifier { kind: &'static str, value: String },
     #[error("consumer member {member_id:?} is not active in group {group:?}")]

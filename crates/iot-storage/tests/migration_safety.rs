@@ -111,6 +111,135 @@ async fn sqlite_current_schema_does_not_create_a_pre_migration_backup() {
 }
 
 #[tokio::test]
+async fn sqlite_open_rejects_pre_tenant_platform_schema_without_partial_migration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pre-tenant-platform.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE devices (
+             device_id TEXT PRIMARY KEY,
+             display_name TEXT
+         );",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+
+    let error = match PlatformStore::open(&sqlite_configuration(path.clone())).await {
+        Ok(_) => panic!("pre-tenant platform schema was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains("devices"),
+        "unexpected migration error: {error}"
+    );
+
+    let mut connection = SqliteConnection::connect(&format!("sqlite://{}?mode=rw", path.display()))
+        .await
+        .unwrap();
+    let tenants_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tenants'
+         )",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    let tenant_id_column_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pragma_table_info('devices') WHERE name = 'tenant_id'
+         )",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+
+    assert_eq!(tenants_table_exists, 0);
+    assert_eq!(tenant_id_column_exists, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_pre_tenant_platform_schema_without_partial_migration() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    common::reset_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE SCHEMA iot_nano;
+         CREATE TABLE iot_nano.devices (
+             device_id TEXT PRIMARY KEY,
+             display_name TEXT
+         );",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    let error = match PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    {
+        Ok(_) => panic!("pre-tenant platform schema was accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains("devices"),
+        "unexpected migration error: {error}"
+    );
+
+    let tenants_table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('iot_nano.tenants') IS NOT NULL")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+    let tenant_id_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM information_schema.columns
+             WHERE table_schema = 'iot_nano'
+               AND table_name = 'devices'
+               AND column_name = 'tenant_id'
+         )",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+
+    assert!(!tenants_table_exists);
+    assert!(!tenant_id_column_exists);
+    common::reset_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn sqlite_backup_preserves_committed_platform_data() {
     let directory = tempfile::tempdir().unwrap();
     let platform_path = directory.path().join("platform.sqlite");
@@ -221,7 +350,7 @@ async fn sqlite_backup_is_a_coherent_snapshot_during_an_atomic_write() {
 }
 
 #[tokio::test]
-async fn sqlite_migration_rejects_duplicate_root_asset_names_without_mutating_data() {
+async fn sqlite_open_rejects_pre_tenant_asset_schema_without_mutating_data() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("duplicate-root-assets.sqlite");
     let mut connection =
@@ -249,13 +378,15 @@ async fn sqlite_migration_rejects_duplicate_root_asset_names_without_mutating_da
     .unwrap();
 
     let error = match PlatformStore::open(&sqlite_configuration(path)).await {
-        Ok(_) => panic!("migration accepted duplicate root asset names"),
+        Ok(_) => panic!("pre-tenant platform schema was accepted"),
         Err(error) => error,
     };
     assert!(
-        error
-            .to_string()
-            .contains("duplicate root asset name \"Duplicate root\""),
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains("assets"),
         "unexpected migration error: {error}"
     );
     assert_eq!(
@@ -272,7 +403,7 @@ async fn sqlite_migration_rejects_duplicate_root_asset_names_without_mutating_da
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
-async fn timescale_migration_rejects_duplicate_root_asset_names_without_mutating_data() {
+async fn timescale_open_rejects_pre_tenant_asset_schema_without_mutating_data() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
     let mut connection = PgConnection::connect(&database_url).await.unwrap();
@@ -317,13 +448,15 @@ async fn timescale_migration_rejects_duplicate_root_asset_names_without_mutating
     })
     .await
     {
-        Ok(_) => panic!("migration accepted duplicate root asset names"),
+        Ok(_) => panic!("pre-tenant platform schema was accepted"),
         Err(error) => error,
     };
     assert!(
-        error
-            .to_string()
-            .contains("duplicate root asset name \"Duplicate Timescale root\""),
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains("assets"),
         "unexpected migration error: {error}"
     );
     assert_eq!(
