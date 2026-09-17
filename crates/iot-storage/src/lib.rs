@@ -573,6 +573,10 @@ pub enum GatewayIngestValidationError {
 pub enum PlatformStoreError {
     #[error("platform storage configuration is incomplete")]
     InvalidConfiguration,
+    #[error(
+        "platform Timescale schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
+    )]
+    ResetRequiredTimescaleSchema { table: String },
     #[error(transparent)]
     Sqlite(#[from] SqliteStoreError),
     #[error(transparent)]
@@ -2509,65 +2513,61 @@ impl PlatformStore {
     ) -> Result<(), PlatformStoreError> {
         match self {
             Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                let tenant_status =
+                    sqlx::query_scalar::<_, String>("SELECT status FROM tenants WHERE id = ?")
+                        .bind(tenant_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if tenant_status.as_deref() != Some("active") {
+                    return Err(PlatformStoreError::UnknownTenant(tenant_id));
+                }
                 let registered = sqlx::query(
                     "INSERT INTO devices (device_id, tenant_id)
-                     SELECT ?, id
-                     FROM tenants
-                     WHERE id = ? AND status = 'active'
+                     VALUES (?, ?)
                      ON CONFLICT(device_id) DO UPDATE SET device_id = excluded.device_id
                      WHERE devices.tenant_id = excluded.tenant_id",
                 )
                 .bind(device_id)
                 .bind(tenant_id.to_string())
-                .execute(store.pool())
+                .execute(&mut *transaction)
                 .await?;
                 if registered.rows_affected() != 1 {
-                    let tenant_is_active = sqlx::query_scalar::<_, i64>(
-                        "SELECT 1 FROM tenants WHERE id = ? AND status = 'active' LIMIT 1",
-                    )
-                    .bind(tenant_id.to_string())
-                    .fetch_optional(store.pool())
-                    .await?
-                    .is_some();
-                    if !tenant_is_active {
-                        return Err(PlatformStoreError::UnknownTenant(tenant_id));
-                    }
                     return Err(PlatformStoreError::DeviceTenantConflict {
                         device_id: device_id.to_owned(),
                         tenant_id,
                     });
                 }
+                transaction.commit().await?;
             }
             Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                let tenant_status = sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM tenants WHERE id = $1 FOR UPDATE",
+                )
+                .bind(tenant_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                if tenant_status.as_deref() != Some("active") {
+                    return Err(PlatformStoreError::UnknownTenant(tenant_id));
+                }
                 let registered = sqlx::query(
                     "INSERT INTO devices (device_id, tenant_id)
-                     SELECT $1, id
-                     FROM tenants
-                     WHERE id = $2 AND status = 'active'
-                     FOR UPDATE OF tenants
+                     VALUES ($1, $2)
                      ON CONFLICT(device_id) DO UPDATE SET device_id = EXCLUDED.device_id
                      WHERE devices.tenant_id = EXCLUDED.tenant_id",
                 )
                 .bind(device_id)
                 .bind(tenant_id)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await?;
                 if registered.rows_affected() != 1 {
-                    let tenant_is_active = sqlx::query_scalar::<_, i32>(
-                        "SELECT 1 FROM tenants WHERE id = $1 AND status = 'active' LIMIT 1",
-                    )
-                    .bind(tenant_id)
-                    .fetch_optional(pool)
-                    .await?
-                    .is_some();
-                    if !tenant_is_active {
-                        return Err(PlatformStoreError::UnknownTenant(tenant_id));
-                    }
                     return Err(PlatformStoreError::DeviceTenantConflict {
                         device_id: device_id.to_owned(),
                         tenant_id,
                     });
                 }
+                transaction.commit().await?;
             }
         }
         Ok(())
@@ -7320,11 +7320,14 @@ fn validate_alert_rule(rule: &AlertRule) -> Result<AlertRule, PlatformStoreError
     Ok(rule.clone())
 }
 
-async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
+async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), PlatformStoreError> {
     let mut transaction = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('iot_nano:migrate'))")
         .execute(&mut *transaction)
         .await?;
+    if let Some(table) = pre_tenant_platform_timescale_table(&mut transaction).await? {
+        return Err(PlatformStoreError::ResetRequiredTimescaleSchema { table });
+    }
     sqlx::query("CREATE SCHEMA IF NOT EXISTS iot_nano")
         .execute(&mut *transaction)
         .await?;
@@ -7337,7 +7340,8 @@ async fn migrate_platform_timescale(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(PLATFORM_POSTGRES_SCHEMA)
         .execute(&mut *transaction)
         .await?;
-    transaction.commit().await
+    transaction.commit().await?;
+    Ok(())
 }
 
 fn postgres_command_outbox_record(row: PgRow) -> Result<CommandOutboxRecord, PlatformStoreError> {
@@ -7511,6 +7515,223 @@ pub struct RetentionResult {
     pub resolved_incident_rows: u64,
 }
 
+const SQLITE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
+    "devices",
+    "telemetry",
+    "gateway_event_receipts",
+    "telemetry_rollups_5m",
+    "telemetry_rollups_1h",
+    "api_access_tokens",
+    "system_accounts",
+    "tenants",
+    "tenant_accounts",
+    "users",
+    "user_app_grants",
+    "applications",
+    "application_redirect_uris",
+    "oauth_client_secrets",
+    "oauth_authorization_codes",
+    "oauth_access_tokens",
+    "asset_profiles",
+    "device_profiles",
+    "assets",
+    "resource_shares",
+    "resource_grants",
+    "audit_events",
+    "device_claim_codes",
+    "device_tokens",
+    "alert_rules",
+    "alert_rule_event_evaluations",
+    "alert_incidents",
+    "notification_outbox",
+    "command_outbox",
+];
+
+const SQLITE_PLATFORM_TENANT_TABLES: &[&str] = &[
+    "devices",
+    "telemetry",
+    "gateway_event_receipts",
+    "telemetry_rollups_5m",
+    "telemetry_rollups_1h",
+    "tenant_accounts",
+    "users",
+    "applications",
+    "application_redirect_uris",
+    "oauth_client_secrets",
+    "oauth_authorization_codes",
+    "oauth_access_tokens",
+    "assets",
+    "resource_grants",
+];
+
+const TIMESCALE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
+    "api_access_tokens",
+    "system_accounts",
+    "tenants",
+    "tenant_accounts",
+    "users",
+    "user_app_grants",
+    "applications",
+    "application_redirect_uris",
+    "oauth_client_secrets",
+    "oauth_authorization_codes",
+    "oauth_access_tokens",
+    "asset_profiles",
+    "device_profiles",
+    "assets",
+    "devices",
+    "device_tokens",
+    "resource_shares",
+    "resource_grants",
+    "audit_events",
+    "device_claim_codes",
+    "device_runtime_state",
+    "telemetry",
+    "alert_rules",
+    "alert_rule_event_evaluations",
+    "alert_incidents",
+    "notification_outbox",
+    "command_outbox",
+    "gateway_event_receipts",
+];
+
+const TIMESCALE_PLATFORM_TENANT_TABLES: &[&str] = &[
+    "tenant_accounts",
+    "users",
+    "applications",
+    "application_redirect_uris",
+    "oauth_client_secrets",
+    "oauth_authorization_codes",
+    "oauth_access_tokens",
+    "assets",
+    "devices",
+    "resource_grants",
+    "device_runtime_state",
+    "telemetry",
+    "gateway_event_receipts",
+];
+
+async fn pre_tenant_platform_sqlite_table(
+    pool: &SqlitePool,
+) -> Result<Option<String>, sqlx::Error> {
+    let tables = sqlx::query_scalar::<_, String>(
+        "SELECT name
+         FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    let platform_tables = tables
+        .into_iter()
+        .filter(|table| SQLITE_PLATFORM_SCHEMA_TABLES.contains(&table.as_str()))
+        .collect::<Vec<_>>();
+    let Some(first_table) = platform_tables.first() else {
+        return Ok(None);
+    };
+    if !platform_tables
+        .iter()
+        .any(|table| table.as_str() == "tenants")
+    {
+        return Ok(Some(first_table.clone()));
+    }
+    for &table in SQLITE_PLATFORM_TENANT_TABLES {
+        if platform_tables
+            .iter()
+            .any(|existing| existing.as_str() == table)
+        {
+            let has_tenant_id: i64 = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pragma_table_info(?) WHERE name = 'tenant_id'
+                 )",
+            )
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
+            if has_tenant_id == 0 {
+                return Ok(Some(table.to_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn reject_pre_tenant_platform_sqlite(
+    path: &Path,
+    busy_timeout_ms: u64,
+) -> Result<(), SqliteStoreError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(SqliteStoreError::Filesystem(error)),
+    };
+    if !metadata.is_file() {
+        return Err(SqliteStoreError::InvalidConfiguration);
+    }
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlite_backup_connect_options(path, busy_timeout_ms))
+        .await?;
+    let table = pre_tenant_platform_sqlite_table(&pool).await;
+    pool.close().await;
+    if let Some(table) = table? {
+        return Err(SqliteStoreError::ResetRequired { table });
+    }
+    Ok(())
+}
+
+async fn pre_tenant_platform_timescale_table(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<Option<String>, sqlx::Error> {
+    let tables = sqlx::query_scalar::<_, String>(
+        "SELECT table_name
+         FROM information_schema.tables
+         WHERE table_schema = 'iot_nano' AND table_type = 'BASE TABLE'
+         ORDER BY table_name",
+    )
+    .fetch_all(&mut **transaction)
+    .await?;
+    let platform_tables = tables
+        .into_iter()
+        .filter(|table| TIMESCALE_PLATFORM_SCHEMA_TABLES.contains(&table.as_str()))
+        .collect::<Vec<_>>();
+    let Some(first_table) = platform_tables.first() else {
+        return Ok(None);
+    };
+    if !platform_tables
+        .iter()
+        .any(|table| table.as_str() == "tenants")
+    {
+        return Ok(Some(first_table.clone()));
+    }
+    for &table in TIMESCALE_PLATFORM_TENANT_TABLES {
+        if platform_tables
+            .iter()
+            .any(|existing| existing.as_str() == table)
+        {
+            let has_tenant_id: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM information_schema.columns
+                     WHERE table_schema = 'iot_nano'
+                       AND table_name = $1
+                       AND column_name = 'tenant_id'
+                 )",
+            )
+            .bind(table)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if !has_tenant_id {
+                return Ok(Some(table.to_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn sqlite_connect_options(
     path: &Path,
     busy_timeout_ms: u64,
@@ -7597,6 +7818,7 @@ impl SqliteStore {
             .sqlite_path
             .as_ref()
             .ok_or(SqliteStoreError::InvalidConfiguration)?;
+        reject_pre_tenant_platform_sqlite(path, configuration.sqlite_busy_timeout_ms).await?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -9117,6 +9339,10 @@ pub enum SqliteStoreError {
     SequenceOverflow,
     #[error("telemetry measurements cannot be serialized")]
     Serialization(#[source] serde_json::Error),
+    #[error(
+        "platform SQLite schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
+    )]
+    ResetRequired { table: String },
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]

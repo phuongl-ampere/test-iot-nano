@@ -5,7 +5,7 @@ use iot_storage::{
     NewTenant, NewTenantAccount, PlatformStore, PlatformStoreError, TelemetryRepository,
     TenantIdentityRepository, TopologyRepository,
 };
-use sqlx::{Connection, PgConnection, PgPool, Row};
+use sqlx::{AssertSqlSafe, Connection, PgConnection, PgPool, Row};
 
 mod common;
 
@@ -753,6 +753,55 @@ async fn platform_store_scopes_sqlite_registration_and_telemetry_to_the_explicit
         TopologyRepository::register_device(&store, tenant_b, &event.device_id).await,
         Err(PlatformStoreError::DeviceTenantConflict { .. })
     ));
+}
+
+#[tokio::test]
+async fn sqlite_registration_conflict_uses_the_active_tenant_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    let tenant_a = create_tenant(&store, "tenant-race-a").await;
+    let tenant_b = create_tenant(&store, "tenant-race-b").await;
+    TopologyRepository::register_device(&store, tenant_b, "tenant-race-device")
+        .await
+        .unwrap();
+
+    let trigger = format!(
+        "CREATE TRIGGER suspend_tenant_before_registration_conflict
+         BEFORE INSERT ON devices
+         WHEN NEW.device_id = 'tenant-race-device'
+         BEGIN
+             UPDATE tenants SET status = 'suspended' WHERE id = '{tenant_a}';
+         END"
+    );
+    sqlx::query(AssertSqlSafe(trigger))
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        TopologyRepository::register_device(&store, tenant_a, "tenant-race-device").await,
+        Err(PlatformStoreError::DeviceTenantConflict { tenant_id, .. }) if tenant_id == tenant_a
+    ));
+    TenantIdentityRepository::suspend_tenant(&store, "tenant-race-a")
+        .await
+        .unwrap();
+    assert!(matches!(
+        TopologyRepository::register_device(&store, tenant_a, "suspended-device").await,
+        Err(PlatformStoreError::UnknownTenant(id)) if id == tenant_a
+    ));
+    let suspended_device_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE device_id = 'suspended-device'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(suspended_device_count, 0);
 }
 
 #[tokio::test]
