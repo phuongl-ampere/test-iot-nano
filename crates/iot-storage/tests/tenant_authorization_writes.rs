@@ -1,6 +1,6 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    NewResourcePermission, NewUserGroup, PlatformStore, ResourcePermission,
+    NewResourcePermission, NewUserGroup, PermissionCreator, PlatformStore, ResourcePermission,
     TenantAuthorizationError,
 };
 use serde_json::json;
@@ -91,7 +91,7 @@ fn direct_device_permission() -> NewResourcePermission {
         device_id: Some(DEVICE_A.to_owned()),
         permission: ResourcePermission::Viewer,
         inherit_children: false,
-        created_by_user_id: CREATOR_A,
+        created_by: PermissionCreator::User(CREATOR_A),
     }
 }
 
@@ -133,7 +133,7 @@ async fn sqlite_tenant_authorization_writes_create_direct_and_group_permissions(
             device_id: None,
             permission: ResourcePermission::Manager,
             inherit_children: true,
-            created_by_user_id: CREATOR_A,
+            created_by: PermissionCreator::User(CREATOR_A),
         })
         .await
         .unwrap();
@@ -242,7 +242,7 @@ async fn sqlite_tenant_authorization_writes_reject_cross_tenant_and_invalid_perm
     assert!(matches!(
         store
             .create_resource_permission(NewResourcePermission {
-                created_by_user_id: USER_B,
+                created_by: PermissionCreator::User(USER_B),
                 ..direct_device_permission()
             })
             .await,

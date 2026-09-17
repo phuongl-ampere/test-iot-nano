@@ -204,7 +204,8 @@ CREATE TABLE IF NOT EXISTS tenant_accounts (
     status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
     credential_version INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (id, tenant_id)
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -406,7 +407,8 @@ CREATE TABLE IF NOT EXISTS resource_permissions (
     device_id TEXT,
     permission TEXT NOT NULL CHECK (permission IN ('viewer', 'manager')),
     inherit_children INTEGER NOT NULL DEFAULT 0 CHECK (inherit_children IN (0, 1)),
-    created_by_user_id TEXT NOT NULL,
+    created_by_user_id TEXT,
+    created_by_tenant_account_id TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     revoked_at TEXT,
     CHECK (
@@ -416,6 +418,10 @@ CREATE TABLE IF NOT EXISTS resource_permissions (
     CHECK (
         (asset_id IS NOT NULL AND device_id IS NULL)
         OR (asset_id IS NULL AND device_id IS NOT NULL)
+    ),
+    CHECK (
+        (created_by_user_id IS NOT NULL AND created_by_tenant_account_id IS NULL)
+        OR (created_by_user_id IS NULL AND created_by_tenant_account_id IS NOT NULL)
     ),
     CHECK (device_id IS NULL OR inherit_children = 0),
     FOREIGN KEY (subject_user_id, tenant_id)
@@ -427,7 +433,9 @@ CREATE TABLE IF NOT EXISTS resource_permissions (
     FOREIGN KEY (device_id, tenant_id)
         REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (created_by_user_id, tenant_id)
-        REFERENCES users(id, tenant_id) ON DELETE RESTRICT
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (created_by_tenant_account_id, tenant_id)
+        REFERENCES tenant_accounts(id, tenant_id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS resource_permissions_active_device_user_index
     ON resource_permissions (tenant_id, device_id, subject_user_id)
@@ -1624,6 +1632,12 @@ pub struct UserGroup {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionCreator {
+    User(uuid::Uuid),
+    TenantAccount(uuid::Uuid),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewResourcePermission {
     pub tenant_id: uuid::Uuid,
@@ -1633,7 +1647,7 @@ pub struct NewResourcePermission {
     pub device_id: Option<String>,
     pub permission: ResourcePermission,
     pub inherit_children: bool,
-    pub created_by_user_id: uuid::Uuid,
+    pub created_by: PermissionCreator,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1646,7 +1660,7 @@ pub struct ResourcePermissionRecord {
     pub device_id: Option<String>,
     pub permission: ResourcePermission,
     pub inherit_children: bool,
-    pub created_by_user_id: uuid::Uuid,
+    pub created_by: PermissionCreator,
 }
 
 #[derive(Debug, Error)]
@@ -1657,6 +1671,11 @@ pub enum TenantAuthorizationError {
     UserNotFound {
         tenant_id: uuid::Uuid,
         user_id: uuid::Uuid,
+    },
+    #[error("tenant account {tenant_account_id} does not belong to tenant {tenant_id}")]
+    TenantAccountNotFound {
+        tenant_id: uuid::Uuid,
+        tenant_account_id: uuid::Uuid,
     },
     #[error("group {group_id} does not belong to tenant {tenant_id}")]
     GroupNotFound {
@@ -3546,6 +3565,8 @@ impl PlatformStore {
     ) -> Result<ResourcePermissionRecord, TenantAuthorizationError> {
         validate_new_resource_permission(&permission)?;
         let id = uuid::Uuid::now_v7();
+        let (created_by_user_id, created_by_tenant_account_id) =
+            permission_creator_ids(permission.created_by);
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -3553,8 +3574,8 @@ impl PlatformStore {
                 sqlx::query(
                     "INSERT INTO resource_permissions (
                         id, tenant_id, subject_user_id, subject_group_id, asset_id, device_id,
-                        permission, inherit_children, created_by_user_id
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        permission, inherit_children, created_by_user_id, created_by_tenant_account_id
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(id.to_string())
                 .bind(permission.tenant_id.to_string())
@@ -3564,7 +3585,8 @@ impl PlatformStore {
                 .bind(permission.device_id.as_deref())
                 .bind(permission.permission.as_str())
                 .bind(i64::from(permission.inherit_children))
-                .bind(permission.created_by_user_id.to_string())
+                .bind(created_by_user_id.map(|value| value.to_string()))
+                .bind(created_by_tenant_account_id.map(|value| value.to_string()))
                 .execute(&mut *transaction)
                 .await?;
                 transaction.commit().await?;
@@ -3575,8 +3597,8 @@ impl PlatformStore {
                 sqlx::query(
                     "INSERT INTO resource_permissions (
                         id, tenant_id, subject_user_id, subject_group_id, asset_id, device_id,
-                        permission, inherit_children, created_by_user_id
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                        permission, inherit_children, created_by_user_id, created_by_tenant_account_id
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 )
                 .bind(id)
                 .bind(permission.tenant_id)
@@ -3586,7 +3608,8 @@ impl PlatformStore {
                 .bind(permission.device_id.as_deref())
                 .bind(permission.permission.as_str())
                 .bind(permission.inherit_children)
-                .bind(permission.created_by_user_id)
+                .bind(created_by_user_id)
+                .bind(created_by_tenant_account_id)
                 .execute(&mut *transaction)
                 .await?;
                 transaction.commit().await?;
@@ -3601,7 +3624,7 @@ impl PlatformStore {
             device_id: permission.device_id,
             permission: permission.permission,
             inherit_children: permission.inherit_children,
-            created_by_user_id: permission.created_by_user_id,
+            created_by: permission.created_by,
         })
     }
 
@@ -8519,6 +8542,13 @@ fn validate_new_resource_permission(
     Ok(())
 }
 
+fn permission_creator_ids(creator: PermissionCreator) -> (Option<uuid::Uuid>, Option<uuid::Uuid>) {
+    match creator {
+        PermissionCreator::User(user_id) => (Some(user_id), None),
+        PermissionCreator::TenantAccount(tenant_account_id) => (None, Some(tenant_account_id)),
+    }
+}
+
 async fn sqlite_tenant_uuid_record_exists(
     transaction: &mut Transaction<'_, Sqlite>,
     query: &'static str,
@@ -8549,6 +8579,28 @@ async fn sqlite_require_tenant_user(
         Ok(())
     } else {
         Err(TenantAuthorizationError::UserNotFound { tenant_id, user_id })
+    }
+}
+
+async fn sqlite_require_tenant_account(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    tenant_account_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if sqlite_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM tenant_accounts WHERE id = ? AND tenant_id = ?",
+        tenant_id,
+        tenant_account_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::TenantAccountNotFound {
+            tenant_id,
+            tenant_account_id,
+        })
     }
 }
 
@@ -8644,12 +8696,15 @@ async fn sqlite_validate_permission_references(
     transaction: &mut Transaction<'_, Sqlite>,
     permission: &NewResourcePermission,
 ) -> Result<(), TenantAuthorizationError> {
-    sqlite_require_tenant_user(
-        transaction,
-        permission.tenant_id,
-        permission.created_by_user_id,
-    )
-    .await?;
+    match permission.created_by {
+        PermissionCreator::User(user_id) => {
+            sqlite_require_tenant_user(transaction, permission.tenant_id, user_id).await?
+        }
+        PermissionCreator::TenantAccount(tenant_account_id) => {
+            sqlite_require_tenant_account(transaction, permission.tenant_id, tenant_account_id)
+                .await?
+        }
+    }
     if let Some(user_id) = permission.subject_user_id {
         sqlite_require_tenant_user(transaction, permission.tenant_id, user_id).await?;
     }
@@ -8695,6 +8750,28 @@ async fn timescale_require_tenant_user(
         Ok(())
     } else {
         Err(TenantAuthorizationError::UserNotFound { tenant_id, user_id })
+    }
+}
+
+async fn timescale_require_tenant_account(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    tenant_account_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if timescale_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM tenant_accounts WHERE id = $1 AND tenant_id = $2",
+        tenant_id,
+        tenant_account_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::TenantAccountNotFound {
+            tenant_id,
+            tenant_account_id,
+        })
     }
 }
 
@@ -8791,12 +8868,15 @@ async fn timescale_validate_permission_references(
     transaction: &mut Transaction<'_, Postgres>,
     permission: &NewResourcePermission,
 ) -> Result<(), TenantAuthorizationError> {
-    timescale_require_tenant_user(
-        transaction,
-        permission.tenant_id,
-        permission.created_by_user_id,
-    )
-    .await?;
+    match permission.created_by {
+        PermissionCreator::User(user_id) => {
+            timescale_require_tenant_user(transaction, permission.tenant_id, user_id).await?
+        }
+        PermissionCreator::TenantAccount(tenant_account_id) => {
+            timescale_require_tenant_account(transaction, permission.tenant_id, tenant_account_id)
+                .await?
+        }
+    }
     if let Some(user_id) = permission.subject_user_id {
         timescale_require_tenant_user(transaction, permission.tenant_id, user_id).await?;
     }

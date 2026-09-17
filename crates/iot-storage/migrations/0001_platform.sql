@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS tenant_accounts (
     status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
     credential_version INTEGER NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, tenant_id)
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -280,7 +281,8 @@ CREATE TABLE IF NOT EXISTS resource_permissions (
     device_id TEXT,
     permission TEXT NOT NULL CHECK (permission IN ('viewer', 'manager')),
     inherit_children BOOLEAN NOT NULL DEFAULT FALSE,
-    created_by_user_id UUID NOT NULL,
+    created_by_user_id UUID,
+    created_by_tenant_account_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at TIMESTAMPTZ,
     CHECK (
@@ -290,6 +292,10 @@ CREATE TABLE IF NOT EXISTS resource_permissions (
     CHECK (
         (asset_id IS NOT NULL AND device_id IS NULL)
         OR (asset_id IS NULL AND device_id IS NOT NULL)
+    ),
+    CHECK (
+        (created_by_user_id IS NOT NULL AND created_by_tenant_account_id IS NULL)
+        OR (created_by_user_id IS NULL AND created_by_tenant_account_id IS NOT NULL)
     ),
     CHECK (device_id IS NULL OR inherit_children = FALSE),
     FOREIGN KEY (subject_user_id, tenant_id)
@@ -301,7 +307,9 @@ CREATE TABLE IF NOT EXISTS resource_permissions (
     FOREIGN KEY (device_id, tenant_id)
         REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (created_by_user_id, tenant_id)
-        REFERENCES users(id, tenant_id) ON DELETE RESTRICT
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (created_by_tenant_account_id, tenant_id)
+        REFERENCES tenant_accounts(id, tenant_id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS resource_permissions_active_device_user_index
     ON resource_permissions (tenant_id, device_id, subject_user_id)
