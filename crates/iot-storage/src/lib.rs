@@ -414,24 +414,6 @@ CREATE INDEX IF NOT EXISTS resource_grants_grantee_index
 CREATE INDEX IF NOT EXISTS resource_grants_tenant_id_index
     ON resource_grants (tenant_id, id);
 
-CREATE TABLE IF NOT EXISTS audit_events (
-    id TEXT PRIMARY KEY,
-    actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-    actor_account_class TEXT NOT NULL
-        CHECK (actor_account_class IN ('system', 'admin', 'user')),
-    resource_type TEXT NOT NULL,
-    resource_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    before_value TEXT,
-    after_value TEXT,
-    request_id TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS audit_events_resource_index
-    ON audit_events (resource_type, resource_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS audit_events_actor_index
-    ON audit_events (actor_user_id, created_at DESC);
-
 CREATE TABLE IF NOT EXISTS device_tokens (
     id TEXT PRIMARY KEY,
     device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
@@ -8027,7 +8009,6 @@ const SQLITE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
     "assets",
     "resource_shares",
     "resource_grants",
-    "audit_events",
     "device_tokens",
     "alert_rules",
     "alert_rule_event_evaluations",
@@ -8080,7 +8061,6 @@ const TIMESCALE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
     "device_tokens",
     "resource_shares",
     "resource_grants",
-    "audit_events",
     "device_runtime_state",
     "telemetry",
     "alert_rules",
@@ -9756,24 +9736,7 @@ async fn migrate_resource_authorization_schema(pool: &SqlitePool) -> Result<(), 
          CREATE INDEX IF NOT EXISTS resource_shares_target_state_index
              ON resource_shares (target_user_id, state, created_at DESC);
          CREATE INDEX IF NOT EXISTS resource_shares_resource_state_index
-             ON resource_shares (resource_type, resource_id, state);
-         CREATE TABLE IF NOT EXISTS audit_events (
-             id TEXT PRIMARY KEY,
-             actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-             actor_account_class TEXT NOT NULL
-                 CHECK (actor_account_class IN ('system', 'admin', 'user')),
-             resource_type TEXT NOT NULL,
-             resource_id TEXT NOT NULL,
-             action TEXT NOT NULL,
-             before_value TEXT,
-             after_value TEXT,
-             request_id TEXT,
-             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-         );
-         CREATE INDEX IF NOT EXISTS audit_events_resource_index
-             ON audit_events (resource_type, resource_id, created_at DESC);
-         CREATE INDEX IF NOT EXISTS audit_events_actor_index
-             ON audit_events (actor_user_id, created_at DESC);",
+             ON resource_shares (resource_type, resource_id, state);",
     )
     .execute(pool)
     .await
