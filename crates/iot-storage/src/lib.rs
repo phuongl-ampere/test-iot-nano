@@ -9684,8 +9684,23 @@ async fn sqlite_tenant_account_creator_attribution_constraints_are_complete(
 async fn sqlite_resource_permission_creator_attribution_constraints_are_complete(
     pool: &SqlitePool,
 ) -> Result<bool, sqlx::Error> {
-    if !sqlite_table_has_column_named(pool, "resource_permissions", "created_by_tenant_account_id")
+    if !sqlite_table_column_is_nullable(pool, "resource_permissions", "created_by_user_id").await?
+        || !sqlite_table_column_is_nullable(
+            pool,
+            "resource_permissions",
+            "created_by_tenant_account_id",
+        )
         .await?
+    {
+        return Ok(false);
+    }
+    if !sqlite_table_has_composite_foreign_key(
+        pool,
+        "resource_permissions",
+        "users",
+        &[("created_by_user_id", "id"), ("tenant_id", "tenant_id")],
+    )
+    .await?
     {
         return Ok(false);
     }
@@ -9705,23 +9720,23 @@ async fn sqlite_resource_permission_creator_attribution_constraints_are_complete
     sqlite_table_has_creator_attribution_xor_check(pool, "resource_permissions").await
 }
 
-async fn sqlite_table_has_column_named(
+async fn sqlite_table_column_is_nullable(
     pool: &SqlitePool,
     table: &str,
     column_name: &str,
 ) -> Result<bool, sqlx::Error> {
-    let exists: i64 = sqlx::query_scalar(
+    let is_nullable: i64 = sqlx::query_scalar(
         "SELECT EXISTS (
              SELECT 1
              FROM pragma_table_info(?)
-             WHERE name = ?
+             WHERE name = ? AND \"notnull\" = 0
          )",
     )
     .bind(table)
     .bind(column_name)
     .fetch_one(pool)
     .await?;
-    Ok(exists != 0)
+    Ok(is_nullable != 0)
 }
 
 async fn sqlite_table_has_unique_columns(
@@ -10042,10 +10057,26 @@ async fn timescale_tenant_account_creator_attribution_constraints_are_complete(
 async fn timescale_resource_permission_creator_attribution_constraints_are_complete(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<bool, sqlx::Error> {
-    if !timescale_table_has_column_named(
+    if !timescale_table_column_is_nullable(
         transaction,
         "resource_permissions",
-        "created_by_tenant_account_id",
+        "created_by_user_id",
+    )
+    .await?
+        || !timescale_table_column_is_nullable(
+            transaction,
+            "resource_permissions",
+            "created_by_tenant_account_id",
+        )
+        .await?
+    {
+        return Ok(false);
+    }
+    if !timescale_table_has_composite_foreign_key(
+        transaction,
+        "resource_permissions",
+        "users",
+        &[("created_by_user_id", "id"), ("tenant_id", "tenant_id")],
     )
     .await?
     {
@@ -10102,7 +10133,7 @@ async fn timescale_table_has_unique_columns(
     }))
 }
 
-async fn timescale_table_has_column_named(
+async fn timescale_table_column_is_nullable(
     transaction: &mut Transaction<'_, Postgres>,
     table: &str,
     column_name: &str,
@@ -10119,6 +10150,7 @@ async fn timescale_table_has_column_named(
                AND attribute.attname = $2
                AND attribute.attnum > 0
                AND NOT attribute.attisdropped
+               AND NOT attribute.attnotnull
          )",
     )
     .bind(table)
