@@ -3,10 +3,10 @@ use std::env;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_storage::{
-    CommandLifecycleRepository, CommandOutboxState, NewCommandOutboxEntry, PlatformStore,
-    PlatformStoreError, SqliteStore,
+    CommandOutboxState, NewCommandOutboxEntry, PlatformStore, PlatformStoreError, SqliteStore,
+    SqliteStoreError,
 };
-use sqlx::{Connection, PgConnection, Row};
+use sqlx::{Connection, PgConnection};
 
 mod common;
 
@@ -86,6 +86,7 @@ fn at(seconds: i64) -> DateTime<Utc> {
 fn command(id: &str, now: DateTime<Utc>, expires_at: DateTime<Utc>) -> NewCommandOutboxEntry {
     NewCommandOutboxEntry {
         id: id.to_owned(),
+        tenant_id: test_tenant_id(),
         device_id: "device-1".to_owned(),
         method: "sample_now".to_owned(),
         params: r#"{"source":"test"}"#.to_owned(),
@@ -93,6 +94,40 @@ fn command(id: &str, now: DateTime<Utc>, expires_at: DateTime<Utc>) -> NewComman
         expires_at,
         next_attempt_at: now,
     }
+}
+
+async fn register_tenant_device_and_token(
+    store: &SqliteStore,
+    tenant_id: uuid::Uuid,
+    slug: &str,
+    device_id: &str,
+    token_id: &str,
+) {
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, ?, 'active', '{}')",
+    )
+    .bind(tenant_id.to_string())
+    .bind(slug)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
+        .bind(device_id)
+        .bind(tenant_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO device_tokens (id, device_id, token_prefix, token_hash)
+         VALUES (?, ?, ?, 'unused-in-storage-tests')",
+    )
+    .bind(token_id)
+    .bind(device_id)
+    .bind(format!("iotd_{token_id}"))
+    .execute(store.pool())
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -107,8 +142,8 @@ async fn sqlite_command_outbox_claim_leases_a_command_only_once() {
     let first_store = store.clone();
     let second_store = store.clone();
     let (first, second) = tokio::join!(
-        first_store.claim_commands(now, now + Duration::seconds(30), 1),
-        second_store.claim_commands(now, now + Duration::seconds(30), 1),
+        first_store.claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1),
+        second_store.claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1),
     );
     let first = first.unwrap();
     let second = second.unwrap();
@@ -120,7 +155,7 @@ async fn sqlite_command_outbox_claim_leases_a_command_only_once() {
     assert_eq!(claimed[0].attempt_count, 1);
     assert_eq!(
         store
-            .claim_commands(now, now + Duration::seconds(30), 1)
+            .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1)
             .await
             .unwrap(),
         Vec::new()
@@ -138,13 +173,19 @@ async fn sqlite_command_outbox_preserves_created_at_across_lifecycle_transitions
     let enqueued = store.enqueue_command(entry).await.unwrap();
     let created_at = enqueued.created_at;
     let claimed = store
-        .claim_commands(issued_at, issued_at + Duration::seconds(30), 1)
+        .claim_commands(
+            test_tenant_id(),
+            issued_at,
+            issued_at + Duration::seconds(30),
+            1,
+        )
         .await
         .unwrap()
         .pop()
         .unwrap();
     let released = store
         .release_command_for_retry(
+            test_tenant_id(),
             command_id,
             "broker unavailable",
             issued_at + Duration::seconds(2),
@@ -154,6 +195,7 @@ async fn sqlite_command_outbox_preserves_created_at_across_lifecycle_transitions
         .unwrap();
     let reclaimed = store
         .claim_commands(
+            test_tenant_id(),
             issued_at + Duration::seconds(2),
             issued_at + Duration::seconds(32),
             1,
@@ -163,12 +205,17 @@ async fn sqlite_command_outbox_preserves_created_at_across_lifecycle_transitions
         .pop()
         .unwrap();
     let published = store
-        .mark_command_published(command_id, issued_at + Duration::seconds(3))
+        .mark_command_published(
+            test_tenant_id(),
+            command_id,
+            issued_at + Duration::seconds(3),
+        )
         .await
         .unwrap()
         .unwrap();
     let responded = store
         .mark_command_responded(
+            test_tenant_id(),
             command_id,
             "device-1",
             "active-token",
@@ -188,43 +235,6 @@ async fn sqlite_command_outbox_preserves_created_at_across_lifecycle_transitions
 }
 
 #[tokio::test]
-async fn sqlite_command_lifecycle_repository_marks_legacy_string_ids_failed() {
-    let (_directory, sqlite) = store().await;
-    let platform = PlatformStore::Sqlite(sqlite);
-    let now = at(1_800_000_000);
-    let command_id = "legacy-invalid-command-id";
-    sqlx::query(
-        "INSERT INTO command_outbox (
-            id, device_id, method, params, mode, state, expires_at, next_attempt_at
-         ) VALUES (?, 'device-1', 'sample_now', '{}', 'one_way', 'queued', ?, ?)",
-    )
-    .bind(command_id)
-    .bind((now + Duration::minutes(5)).to_rfc3339())
-    .bind(now.to_rfc3339())
-    .execute(platform.sqlite_pool().unwrap())
-    .await
-    .unwrap();
-    CommandLifecycleRepository::claim_commands(&platform, now, now + Duration::seconds(30), 1)
-        .await
-        .unwrap();
-
-    let failed = CommandLifecycleRepository::mark_legacy_command_failed(
-        &platform,
-        command_id,
-        "command ID is not a UUID",
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    assert_eq!(failed.state, CommandOutboxState::Failed);
-    assert_eq!(
-        failed.last_error.as_deref(),
-        Some("command ID is not a UUID")
-    );
-}
-
-#[tokio::test]
 async fn sqlite_platform_store_command_lifecycle_port_claims_a_command() {
     let (_directory, sqlite) = store().await;
     let platform = PlatformStore::Sqlite(sqlite);
@@ -236,7 +246,7 @@ async fn sqlite_platform_store_command_lifecycle_port_claims_a_command() {
         .unwrap();
 
     let claimed = platform
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
 
@@ -260,11 +270,13 @@ async fn sqlite_platform_store_command_lifecycle_port_accepts_typed_command_ids(
         .await
         .unwrap();
     platform
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
 
-    let published = platform.mark_command_published(command_id, now).await;
+    let published = platform
+        .mark_command_published(test_tenant_id(), command_id, now)
+        .await;
 
     assert_eq!(
         published.unwrap().unwrap().state,
@@ -289,13 +301,18 @@ async fn sqlite_command_outbox_expire_marks_queued_and_leased_commands() {
         .await
         .unwrap();
     let leased = store
-        .claim_commands(now - Duration::minutes(1), now + Duration::minutes(1), 1)
+        .claim_commands(
+            test_tenant_id(),
+            now - Duration::minutes(1),
+            now + Duration::minutes(1),
+            1,
+        )
         .await
         .unwrap();
     assert_eq!(leased[0].id, "leased");
 
     let expired = store
-        .expire_commands(now + Duration::seconds(1))
+        .expire_commands(test_tenant_id(), now + Duration::seconds(1))
         .await
         .unwrap();
 
@@ -307,7 +324,12 @@ async fn sqlite_command_outbox_expire_marks_queued_and_leased_commands() {
     );
     assert_eq!(
         store
-            .claim_commands(now + Duration::seconds(1), now + Duration::minutes(1), 10,)
+            .claim_commands(
+                test_tenant_id(),
+                now + Duration::seconds(1),
+                now + Duration::minutes(1),
+                10,
+            )
             .await
             .unwrap(),
         Vec::new()
@@ -323,13 +345,18 @@ async fn sqlite_command_outbox_reclaims_an_expired_lease_before_command_expiry()
         .await
         .unwrap();
     let first = store
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
     assert_eq!(first[0].attempt_count, 1);
 
     let reclaimed = store
-        .claim_commands(now + Duration::seconds(30), now + Duration::minutes(1), 1)
+        .claim_commands(
+            test_tenant_id(),
+            now + Duration::seconds(30),
+            now + Duration::minutes(1),
+            1,
+        )
         .await
         .unwrap();
 
@@ -351,18 +378,18 @@ async fn sqlite_command_outbox_marks_leased_commands_published_or_failed() {
     }
 
     let claimed = store
-        .claim_commands(now, now + Duration::seconds(30), 2)
+        .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 2)
         .await
         .unwrap();
     assert_eq!(claimed.len(), 2);
 
     let published = store
-        .mark_command_published("published", now + Duration::seconds(1))
+        .mark_command_published(test_tenant_id(), "published", now + Duration::seconds(1))
         .await
         .unwrap()
         .unwrap();
     let failed = store
-        .mark_command_failed("failed", "broker unavailable")
+        .mark_command_failed(test_tenant_id(), "failed", "broker unavailable")
         .await
         .unwrap()
         .unwrap();
@@ -374,7 +401,7 @@ async fn sqlite_command_outbox_marks_leased_commands_published_or_failed() {
     assert!(failed.lease_until.is_none());
     assert!(
         store
-            .mark_command_published("failed", now + Duration::seconds(2))
+            .mark_command_published(test_tenant_id(), "failed", now + Duration::seconds(2))
             .await
             .unwrap()
             .is_none()
@@ -389,17 +416,18 @@ async fn sqlite_command_outbox_records_one_two_way_response_after_broker_publica
     entry.mode = RpcMode::TwoWay;
     store.enqueue_command(entry).await.unwrap();
     store
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
     store
-        .mark_command_published("two-way", now + Duration::seconds(1))
+        .mark_command_published(test_tenant_id(), "two-way", now + Duration::seconds(1))
         .await
         .unwrap()
         .unwrap();
 
     let responded = store
         .mark_command_responded(
+            test_tenant_id(),
             "two-way",
             "device-1",
             "active-token",
@@ -419,6 +447,7 @@ async fn sqlite_command_outbox_records_one_two_way_response_after_broker_publica
     assert_eq!(responded.responded_at, Some(now + Duration::seconds(2)));
     let retry = store
         .mark_command_responded(
+            test_tenant_id(),
             "two-way",
             "device-1",
             "active-token",
@@ -432,6 +461,7 @@ async fn sqlite_command_outbox_records_one_two_way_response_after_broker_publica
     assert!(
         store
             .mark_command_responded(
+                test_tenant_id(),
                 "two-way",
                 "device-1",
                 "active-token",
@@ -445,7 +475,118 @@ async fn sqlite_command_outbox_records_one_two_way_response_after_broker_publica
 }
 
 #[tokio::test]
-async fn sqlite_open_upgrades_a_legacy_command_outbox_without_losing_commands() {
+async fn sqlite_command_outbox_scopes_issue_claim_and_response_to_tenant() {
+    let (_directory, store) = store().await;
+    let platform = PlatformStore::Sqlite(store.clone());
+    let tenant_a = test_tenant_id();
+    let tenant_b = uuid::Uuid::from_u128(2);
+    register_tenant_device_and_token(
+        &store,
+        tenant_b,
+        "command-outbox-b",
+        "device-2",
+        "active-token-b",
+    )
+    .await;
+    let now = at(1_800_000_000);
+    let tenant_a_token = uuid::Uuid::from_u128(3);
+    sqlx::query(
+        "UPDATE device_tokens
+         SET id = ?, token_prefix = 'iotd_tenant_a_token'
+         WHERE id = 'active-token'",
+    )
+    .bind(tenant_a_token.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let cross_tenant_issue_id = uuid::Uuid::now_v7();
+    let mut cross_tenant_issue = command(
+        &cross_tenant_issue_id.to_string(),
+        now,
+        now + Duration::minutes(5),
+    );
+    cross_tenant_issue.tenant_id = tenant_b;
+    assert!(matches!(
+        platform.enqueue_command(cross_tenant_issue).await,
+        Err(PlatformStoreError::UnknownDevice(device_id)) if device_id == "device-1"
+    ));
+
+    let tenant_a_command_id = uuid::Uuid::now_v7();
+    let mut tenant_a_command = command(
+        &tenant_a_command_id.to_string(),
+        now,
+        now + Duration::minutes(5),
+    );
+    tenant_a_command.tenant_id = tenant_a;
+    tenant_a_command.mode = RpcMode::TwoWay;
+    platform.enqueue_command(tenant_a_command).await.unwrap();
+
+    let tenant_b_command_id = uuid::Uuid::now_v7();
+    let mut tenant_b_command = command(
+        &tenant_b_command_id.to_string(),
+        now,
+        now + Duration::minutes(5),
+    );
+    tenant_b_command.tenant_id = tenant_b;
+    tenant_b_command.device_id = "device-2".to_owned();
+    platform.enqueue_command(tenant_b_command).await.unwrap();
+
+    let claimed_by_b = platform
+        .claim_commands(tenant_b, now, now + Duration::seconds(30), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed_by_b.len(), 1);
+    assert_eq!(claimed_by_b[0].id, tenant_b_command_id.to_string());
+    assert_eq!(claimed_by_b[0].tenant_id, tenant_b);
+
+    let claimed_by_a = platform
+        .claim_commands(tenant_a, now, now + Duration::seconds(30), 10)
+        .await
+        .unwrap();
+    assert_eq!(claimed_by_a.len(), 1);
+    assert_eq!(claimed_by_a[0].id, tenant_a_command_id.to_string());
+    assert_eq!(claimed_by_a[0].tenant_id, tenant_a);
+    platform
+        .mark_command_published(tenant_a, tenant_a_command_id, now + Duration::seconds(1))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        platform
+            .mark_command_responded(
+                tenant_b,
+                tenant_a_command_id,
+                "device-1",
+                tenant_a_token,
+                r#"{"ok":true}"#,
+                now + Duration::seconds(2),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        platform
+            .mark_command_responded(
+                tenant_a,
+                tenant_a_command_id,
+                "device-1",
+                tenant_a_token,
+                r#"{"ok":true}"#,
+                now + Duration::seconds(2),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        CommandOutboxState::Responded
+    );
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_a_legacy_command_outbox_without_tenant_scope() {
     let directory = tempfile::tempdir().unwrap();
     let configuration = StorageConfiguration {
         storage: DatabaseStorage::Sqlite,
@@ -454,10 +595,14 @@ async fn sqlite_open_upgrades_a_legacy_command_outbox_without_losing_commands() 
         sqlite_busy_timeout_ms: 5_000,
     };
     let store = SqliteStore::open(&configuration).await.unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('legacy-device')")
-        .execute(store.pool())
-        .await
-        .unwrap();
+    register_tenant_device_and_token(
+        &store,
+        test_tenant_id(),
+        "command-outbox-legacy",
+        "legacy-device",
+        "legacy-token",
+    )
+    .await;
     sqlx::raw_sql(
         "DROP INDEX command_outbox_due_index;
          DROP INDEX command_outbox_expiring_index;
@@ -489,31 +634,10 @@ async fn sqlite_open_upgrades_a_legacy_command_outbox_without_losing_commands() 
     .unwrap();
     drop(store);
 
-    let upgraded = SqliteStore::open(&configuration).await.unwrap();
-    let row = sqlx::query(
-        "SELECT mode, state, response, responded_at
-         FROM command_outbox
-         WHERE id = 'legacy-command'",
-    )
-    .fetch_one(upgraded.pool())
-    .await
-    .unwrap();
-
-    assert_eq!(row.try_get::<String, _>("mode").unwrap(), "one_way");
-    assert_eq!(
-        row.try_get::<String, _>("state").unwrap(),
-        "published_to_broker"
-    );
-    assert!(
-        row.try_get::<Option<String>, _>("response")
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        row.try_get::<Option<String>, _>("responded_at")
-            .unwrap()
-            .is_none()
-    );
+    assert!(matches!(
+        SqliteStore::open(&configuration).await,
+        Err(SqliteStoreError::ResetRequired { table }) if table == "command_outbox"
+    ));
 }
 
 #[tokio::test]
@@ -568,16 +692,6 @@ async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transiti
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
-    assert!(matches!(
-        CommandLifecycleRepository::mark_legacy_command_failed(
-            &store,
-            "not-a-uuid",
-            "command ID is not a UUID",
-        )
-        .await,
-        Err(PlatformStoreError::InvalidCommandId(command_id)) if command_id == "not-a-uuid"
-    ));
-
     let now = Utc::now() + Duration::seconds(1);
     let response_id = uuid::Uuid::now_v7();
     let mut response_command = command(&response_id.to_string(), now, now + Duration::minutes(5));
@@ -587,13 +701,14 @@ async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transiti
     let created_at = enqueued.created_at;
 
     let claimed = store
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1)
         .await
         .unwrap()
         .pop()
         .unwrap();
     let released = store
         .release_command_for_retry(
+            test_tenant_id(),
             response_id,
             "temporary broker failure",
             now + Duration::seconds(1),
@@ -602,18 +717,24 @@ async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transiti
         .unwrap()
         .unwrap();
     let reclaimed = store
-        .claim_commands(now + Duration::seconds(1), now + Duration::seconds(31), 1)
+        .claim_commands(
+            test_tenant_id(),
+            now + Duration::seconds(1),
+            now + Duration::seconds(31),
+            1,
+        )
         .await
         .unwrap()
         .pop()
         .unwrap();
     let published = store
-        .mark_command_published(response_id, now + Duration::seconds(2))
+        .mark_command_published(test_tenant_id(), response_id, now + Duration::seconds(2))
         .await
         .unwrap()
         .unwrap();
     let responded = store
         .mark_command_responded(
+            test_tenant_id(),
             response_id,
             device_id,
             token_id,
@@ -635,13 +756,13 @@ async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transiti
     failed_command.device_id = device_id.to_owned();
     let failed_enqueued = store.enqueue_command(failed_command).await.unwrap();
     let failed_claimed = store
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(test_tenant_id(), now, now + Duration::seconds(30), 1)
         .await
         .unwrap()
         .pop()
         .unwrap();
     let failed = store
-        .mark_command_failed(failed_id, "broker unavailable")
+        .mark_command_failed(test_tenant_id(), failed_id, "broker unavailable")
         .await
         .unwrap()
         .unwrap();
@@ -656,7 +777,7 @@ async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transiti
     );
     expired_command.device_id = device_id.to_owned();
     let expired_enqueued = store.enqueue_command(expired_command).await.unwrap();
-    let expired = store.expire_commands(now).await.unwrap();
+    let expired = store.expire_commands(test_tenant_id(), now).await.unwrap();
     let expired = expired
         .iter()
         .find(|record| record.id == expired_id.to_string())

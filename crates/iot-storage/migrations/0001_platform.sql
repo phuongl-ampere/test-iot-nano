@@ -384,18 +384,27 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
 );
 CREATE INDEX IF NOT EXISTS notification_outbox_due_index ON notification_outbox (state, next_attempt_at) WHERE state = 'pending';
 CREATE TABLE IF NOT EXISTS command_outbox (
-    id UUID PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    device_id TEXT NOT NULL,
     method TEXT NOT NULL CHECK (btrim(method) <> ''), params JSONB NOT NULL DEFAULT '{}'::jsonb,
     mode TEXT NOT NULL DEFAULT 'one_way' CHECK (mode IN ('one_way', 'two_way')),
     state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'leased', 'published_to_broker', 'responded', 'expired', 'failed')),
     expires_at TIMESTAMPTZ NOT NULL, next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(), lease_until TIMESTAMPTZ,
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0), last_error TEXT, published_at TIMESTAMPTZ,
-    response JSONB, responded_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    response JSONB, responded_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT command_outbox_tenant_device_fkey
+        FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS command_outbox_due_index ON command_outbox (state, next_attempt_at) WHERE state = 'queued';
-CREATE INDEX IF NOT EXISTS command_outbox_expiring_index ON command_outbox (expires_at) WHERE state IN ('queued', 'leased');
-CREATE INDEX IF NOT EXISTS command_outbox_two_way_expiring_index ON command_outbox (expires_at)
+CREATE INDEX IF NOT EXISTS command_outbox_due_index
+    ON command_outbox (tenant_id, state, next_attempt_at) WHERE state = 'queued';
+CREATE INDEX IF NOT EXISTS command_outbox_expiring_index
+    ON command_outbox (tenant_id, expires_at) WHERE state IN ('queued', 'leased');
+CREATE INDEX IF NOT EXISTS command_outbox_two_way_expiring_index ON command_outbox (tenant_id, expires_at)
     WHERE state = 'published_to_broker' AND mode = 'two_way';
+CREATE INDEX IF NOT EXISTS command_outbox_tenant_device_index
+    ON command_outbox (tenant_id, device_id);
 
 CREATE TABLE IF NOT EXISTS gateway_event_receipts (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
