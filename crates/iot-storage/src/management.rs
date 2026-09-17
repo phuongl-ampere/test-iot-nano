@@ -1364,6 +1364,7 @@ impl From<sqlx::Error> for DeviceTokenRepositoryError {
 pub trait DeviceTokenRepository: Send + Sync {
     fn provision_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         display_name: &'a str,
         token: NewDeviceToken,
     ) -> Pin<
@@ -1377,6 +1378,7 @@ pub trait DeviceTokenRepository: Send + Sync {
     >;
     fn create_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
         token: NewDeviceToken,
     ) -> Pin<
@@ -1384,6 +1386,7 @@ pub trait DeviceTokenRepository: Send + Sync {
     >;
     fn list_device_tokens<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
     ) -> Pin<
         Box<
@@ -1394,6 +1397,7 @@ pub trait DeviceTokenRepository: Send + Sync {
     >;
     fn active_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         token_id: Uuid,
     ) -> Pin<
         Box<
@@ -1404,6 +1408,7 @@ pub trait DeviceTokenRepository: Send + Sync {
     >;
     fn rotate_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         token_id: Uuid,
         token: NewDeviceToken,
     ) -> Pin<
@@ -1411,6 +1416,7 @@ pub trait DeviceTokenRepository: Send + Sync {
     >;
     fn revoke_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         token_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), DeviceTokenRepositoryError>> + Send + 'a>>;
 }
@@ -1418,12 +1424,13 @@ pub trait DeviceTokenRepository: Send + Sync {
 impl DeviceTokenRepository for PlatformStore {
     fn provision_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         display_name: &'a str,
         token: NewDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
     > {
-        Box::pin(async move { provision_device_token(self, display_name, token).await })
+        Box::pin(async move { provision_device_token(self, tenant_id, display_name, token).await })
     }
 
     fn provision_owned_device_token<'a>(
@@ -1437,16 +1444,18 @@ impl DeviceTokenRepository for PlatformStore {
 
     fn create_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
         token: NewDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
     > {
-        Box::pin(async move { create_device_token(self, device_id, token).await })
+        Box::pin(async move { create_device_token(self, tenant_id, device_id, token).await })
     }
 
     fn list_device_tokens<'a>(
         &'a self,
+        tenant_id: Uuid,
         device_id: &'a str,
     ) -> Pin<
         Box<
@@ -1455,11 +1464,12 @@ impl DeviceTokenRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { list_device_tokens(self, device_id).await })
+        Box::pin(async move { list_device_tokens(self, tenant_id, device_id).await })
     }
 
     fn active_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         token_id: Uuid,
     ) -> Pin<
         Box<
@@ -1468,24 +1478,26 @@ impl DeviceTokenRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(async move { active_device_token(self, token_id).await })
+        Box::pin(async move { active_device_token(self, tenant_id, token_id).await })
     }
 
     fn rotate_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         token_id: Uuid,
         token: NewDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
     > {
-        Box::pin(async move { rotate_device_token(self, token_id, token).await })
+        Box::pin(async move { rotate_device_token(self, tenant_id, token_id, token).await })
     }
 
     fn revoke_device_token<'a>(
         &'a self,
+        tenant_id: Uuid,
         token_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), DeviceTokenRepositoryError>> + Send + 'a>> {
-        Box::pin(async move { revoke_device_token(self, token_id).await })
+        Box::pin(async move { revoke_device_token(self, tenant_id, token_id).await })
     }
 }
 
@@ -1982,19 +1994,20 @@ fn is_management_asset_sibling_name_unique_violation(
 ) -> bool {
     match database_error.code().as_deref() {
         Some("23505") => {
-            database_error.constraint() == Some("assets_parent_asset_id_name_key")
-                || database_error.constraint() == Some("assets_root_name_unique_index")
+            database_error.constraint() == Some("assets_tenant_id_parent_asset_id_name_key")
+                || database_error.constraint() == Some("assets_tenant_root_name_unique_index")
                 || database_error
                     .message()
-                    .contains("assets_parent_asset_id_name_key")
+                    .contains("assets_tenant_id_parent_asset_id_name_key")
                 || database_error
                     .message()
-                    .contains("assets_root_name_unique_index")
+                    .contains("assets_tenant_root_name_unique_index")
         }
         Some("19") | Some("2067") => {
             let message = database_error.message();
-            message.contains("UNIQUE constraint failed: assets.parent_asset_id, assets.name")
-                || message.contains("UNIQUE constraint failed: assets.name")
+            message.contains(
+                "UNIQUE constraint failed: assets.tenant_id, assets.parent_asset_id, assets.name",
+            ) || message.contains("UNIQUE constraint failed: assets.tenant_id, assets.name")
         }
         _ => false,
     }
@@ -2866,6 +2879,7 @@ async fn validate_timescale_references(
 
 async fn provision_device_token(
     store: &PlatformStore,
+    tenant_id: Uuid,
     display_name: &str,
     token: NewDeviceToken,
 ) -> Result<DeviceTokenRecord, DeviceTokenRepositoryError> {
@@ -2874,10 +2888,11 @@ async fn provision_device_token(
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
             sqlx::query(
-                "INSERT INTO devices (device_id, display_name)
-                 VALUES (?, ?)",
+                "INSERT INTO devices (device_id, tenant_id, display_name)
+                 VALUES (?, ?, ?)",
             )
             .bind(&device_id)
+            .bind(tenant_id.to_string())
             .bind(display_name)
             .execute(&mut *transaction)
             .await?;
@@ -2888,10 +2903,11 @@ async fn provision_device_token(
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
             sqlx::query(
-                "INSERT INTO devices (device_id, display_name)
-                 VALUES ($1, $2)",
+                "INSERT INTO devices (device_id, tenant_id, display_name)
+                 VALUES ($1, $2, $3)",
             )
             .bind(&device_id)
+            .bind(tenant_id)
             .bind(display_name)
             .execute(&mut *transaction)
             .await?;
@@ -2910,12 +2926,19 @@ async fn provision_owned_device_token(
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
+            let tenant_id =
+                sqlx::query_scalar::<_, String>("SELECT tenant_id FROM users WHERE id = ?")
+                    .bind(device.owner_user_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .ok_or(DeviceTokenRepositoryError::DeviceNotFound)?;
             sqlx::query(
                 "INSERT INTO devices (
-                     device_id, display_name, owner_user_id, asset_id, claimed_at
-                 ) VALUES (?, ?, ?, ?, ?)",
+                     device_id, tenant_id, display_name, owner_user_id, asset_id, claimed_at
+                 ) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(&device_id)
+            .bind(tenant_id)
             .bind(&device.display_name)
             .bind(device.owner_user_id.to_string())
             .bind(device.asset_id.map(|id| id.to_string()))
@@ -2929,12 +2952,19 @@ async fn provision_owned_device_token(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            let tenant_id =
+                sqlx::query_scalar::<_, Uuid>("SELECT tenant_id FROM users WHERE id = $1")
+                    .bind(device.owner_user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .ok_or(DeviceTokenRepositoryError::DeviceNotFound)?;
             sqlx::query(
                 "INSERT INTO devices (
-                     device_id, display_name, owner_user_id, asset_id, claimed_at
-                 ) VALUES ($1, $2, $3, $4, now())",
+                     device_id, tenant_id, display_name, owner_user_id, asset_id, claimed_at
+                 ) VALUES ($1, $2, $3, $4, $5, now())",
             )
             .bind(&device_id)
+            .bind(tenant_id)
             .bind(&device.display_name)
             .bind(device.owner_user_id)
             .bind(device.asset_id)
@@ -2950,13 +2980,14 @@ async fn provision_owned_device_token(
 
 async fn create_device_token(
     store: &PlatformStore,
+    tenant_id: Uuid,
     device_id: &str,
     token: NewDeviceToken,
 ) -> Result<DeviceTokenRecord, DeviceTokenRepositoryError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
-            ensure_sqlite_token_eligible(&mut transaction, device_id).await?;
+            ensure_sqlite_token_eligible(&mut transaction, tenant_id, device_id).await?;
             sqlx::query(
                 "UPDATE device_tokens
                  SET revoked_at = ?
@@ -2972,7 +3003,7 @@ async fn create_device_token(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            ensure_timescale_token_eligible(&mut transaction, device_id).await?;
+            ensure_timescale_token_eligible(&mut transaction, tenant_id, device_id).await?;
             sqlx::query(
                 "UPDATE device_tokens
                  SET revoked_at = now()
@@ -2990,29 +3021,34 @@ async fn create_device_token(
 
 async fn list_device_tokens(
     store: &PlatformStore,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<Vec<DeviceTokenRecord>, DeviceTokenRepositoryError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let rows = sqlx::query(
-                "SELECT id, device_id, token_prefix, created_at, last_used_at, revoked_at
-                 FROM device_tokens
-                 WHERE device_id = ?
-                 ORDER BY created_at DESC, id DESC",
+                "SELECT dt.id, dt.device_id, dt.token_prefix, dt.created_at, dt.last_used_at, dt.revoked_at
+                 FROM device_tokens dt
+                 INNER JOIN devices d ON d.device_id = dt.device_id
+                 WHERE dt.device_id = ? AND d.tenant_id = ? AND d.deleted_at IS NULL
+                 ORDER BY dt.created_at DESC, dt.id DESC",
             )
             .bind(device_id)
+            .bind(tenant_id.to_string())
             .fetch_all(store.pool())
             .await?;
             rows.into_iter().map(sqlite_device_token_record).collect()
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "SELECT id, device_id, token_prefix, created_at, last_used_at, revoked_at
-                 FROM device_tokens
-                 WHERE device_id = $1
-                 ORDER BY created_at DESC, id DESC",
+                "SELECT dt.id, dt.device_id, dt.token_prefix, dt.created_at, dt.last_used_at, dt.revoked_at
+                 FROM device_tokens dt
+                 INNER JOIN devices d ON d.device_id = dt.device_id
+                 WHERE dt.device_id = $1 AND d.tenant_id = $2 AND d.deleted_at IS NULL
+                 ORDER BY dt.created_at DESC, dt.id DESC",
             )
             .bind(device_id)
+            .bind(tenant_id)
             .fetch_all(pool)
             .await?;
             rows.into_iter()
@@ -3024,25 +3060,32 @@ async fn list_device_tokens(
 
 async fn active_device_token(
     store: &PlatformStore,
+    tenant_id: Uuid,
     token_id: Uuid,
 ) -> Result<Option<DeviceTokenRecord>, DeviceTokenRepositoryError> {
     match store {
         PlatformStore::Sqlite(store) => sqlx::query(
-            "SELECT id, device_id, token_prefix, created_at, last_used_at, revoked_at
-             FROM device_tokens
-             WHERE id = ? AND revoked_at IS NULL",
+            "SELECT dt.id, dt.device_id, dt.token_prefix, dt.created_at, dt.last_used_at, dt.revoked_at
+             FROM device_tokens dt
+             INNER JOIN devices d ON d.device_id = dt.device_id
+             WHERE dt.id = ? AND dt.revoked_at IS NULL
+               AND d.tenant_id = ? AND d.deleted_at IS NULL",
         )
         .bind(token_id.to_string())
+        .bind(tenant_id.to_string())
         .fetch_optional(store.pool())
         .await?
         .map(sqlite_device_token_record)
         .transpose(),
         PlatformStore::Timescale(pool) => sqlx::query(
-            "SELECT id, device_id, token_prefix, created_at, last_used_at, revoked_at
-             FROM device_tokens
-             WHERE id = $1 AND revoked_at IS NULL",
+            "SELECT dt.id, dt.device_id, dt.token_prefix, dt.created_at, dt.last_used_at, dt.revoked_at
+             FROM device_tokens dt
+             INNER JOIN devices d ON d.device_id = dt.device_id
+             WHERE dt.id = $1 AND dt.revoked_at IS NULL
+               AND d.tenant_id = $2 AND d.deleted_at IS NULL",
         )
         .bind(token_id)
+        .bind(tenant_id)
         .fetch_optional(pool)
         .await?
         .map(timescale_device_token_record)
@@ -3052,14 +3095,16 @@ async fn active_device_token(
 
 async fn rotate_device_token(
     store: &PlatformStore,
+    tenant_id: Uuid,
     token_id: Uuid,
     token: NewDeviceToken,
 ) -> Result<DeviceTokenRecord, DeviceTokenRepositoryError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
-            let device_id = sqlite_active_token_device_id(&mut transaction, token_id).await?;
-            ensure_sqlite_token_eligible(&mut transaction, &device_id).await?;
+            let device_id =
+                sqlite_active_token_device_id(&mut transaction, tenant_id, token_id).await?;
+            ensure_sqlite_token_eligible(&mut transaction, tenant_id, &device_id).await?;
             sqlx::query(
                 "UPDATE device_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
             )
@@ -3073,8 +3118,9 @@ async fn rotate_device_token(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
-            let device_id = timescale_active_token_device_id(&mut transaction, token_id).await?;
-            ensure_timescale_token_eligible(&mut transaction, &device_id).await?;
+            let device_id =
+                timescale_active_token_device_id(&mut transaction, tenant_id, token_id).await?;
+            ensure_timescale_token_eligible(&mut transaction, tenant_id, &device_id).await?;
             sqlx::query(
                 "UPDATE device_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
             )
@@ -3090,21 +3136,40 @@ async fn rotate_device_token(
 
 async fn revoke_device_token(
     store: &PlatformStore,
+    tenant_id: Uuid,
     token_id: Uuid,
 ) -> Result<(), DeviceTokenRepositoryError> {
     let revoked = match store {
         PlatformStore::Sqlite(store) => sqlx::query(
-            "UPDATE device_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            "UPDATE device_tokens
+             SET revoked_at = ?
+             WHERE id = ? AND revoked_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM devices
+                   WHERE devices.device_id = device_tokens.device_id
+                     AND devices.tenant_id = ?
+                     AND devices.deleted_at IS NULL
+               )",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(token_id.to_string())
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await?
         .rows_affected(),
         PlatformStore::Timescale(pool) => sqlx::query(
-            "UPDATE device_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+            "UPDATE device_tokens
+             SET revoked_at = now()
+             WHERE id = $1 AND revoked_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM devices
+                   WHERE devices.device_id = device_tokens.device_id
+                     AND devices.tenant_id = $2
+                     AND devices.deleted_at IS NULL
+               )",
         )
         .bind(token_id)
+        .bind(tenant_id)
         .execute(pool)
         .await?
         .rows_affected(),
@@ -3118,13 +3183,17 @@ async fn revoke_device_token(
 
 async fn sqlite_active_token_device_id(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     token_id: Uuid,
 ) -> Result<String, DeviceTokenRepositoryError> {
     sqlx::query_scalar(
-        "SELECT device_id FROM device_tokens
-         WHERE id = ? AND revoked_at IS NULL",
+        "SELECT dt.device_id FROM device_tokens dt
+         INNER JOIN devices d ON d.device_id = dt.device_id
+         WHERE dt.id = ? AND dt.revoked_at IS NULL
+           AND d.tenant_id = ? AND d.deleted_at IS NULL",
     )
     .bind(token_id.to_string())
+    .bind(tenant_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(DeviceTokenRepositoryError::TokenNotFound)
@@ -3132,14 +3201,18 @@ async fn sqlite_active_token_device_id(
 
 async fn timescale_active_token_device_id(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     token_id: Uuid,
 ) -> Result<String, DeviceTokenRepositoryError> {
     sqlx::query_scalar(
-        "SELECT device_id FROM device_tokens
-         WHERE id = $1 AND revoked_at IS NULL
+        "SELECT dt.device_id FROM device_tokens dt
+         INNER JOIN devices d ON d.device_id = dt.device_id
+         WHERE dt.id = $1 AND dt.revoked_at IS NULL
+           AND d.tenant_id = $2 AND d.deleted_at IS NULL
          FOR UPDATE",
     )
     .bind(token_id)
+    .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(DeviceTokenRepositoryError::TokenNotFound)
@@ -3147,14 +3220,16 @@ async fn timescale_active_token_device_id(
 
 async fn ensure_sqlite_token_eligible(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<(), DeviceTokenRepositoryError> {
     let gateway_device_id = sqlx::query_scalar::<_, Option<String>>(
         "SELECT gateway_device_id
          FROM devices
-         WHERE device_id = ? AND deleted_at IS NULL",
+         WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
     )
     .bind(device_id)
+    .bind(tenant_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(DeviceTokenRepositoryError::DeviceNotFound)?;
@@ -3167,15 +3242,17 @@ async fn ensure_sqlite_token_eligible(
 
 async fn ensure_timescale_token_eligible(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<(), DeviceTokenRepositoryError> {
     let gateway_device_id = sqlx::query_scalar::<_, Option<String>>(
         "SELECT gateway_device_id
          FROM devices
-         WHERE device_id = $1 AND deleted_at IS NULL
+         WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
          FOR UPDATE",
     )
     .bind(device_id)
+    .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(DeviceTokenRepositoryError::DeviceNotFound)?;

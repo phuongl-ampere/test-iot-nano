@@ -41,11 +41,19 @@ pub enum DeviceTokenStoreError {
 pub async fn provision_platform_device_token(
     store: &PlatformStore,
     vault: &TokenVault,
+    tenant_id: Uuid,
     display_name: &str,
 ) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
     for _ in 0..8 {
         let (token, material) = new_platform_token(vault)?;
-        match DeviceTokenRepository::provision_device_token(store, display_name, material).await {
+        match DeviceTokenRepository::provision_device_token(
+            store,
+            tenant_id,
+            display_name,
+            material,
+        )
+        .await
+        {
             Ok(record) => return Ok(platform_token_response(record, token)),
             Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
             Err(error) => return Err(device_token_repository_error(error)),
@@ -57,11 +65,14 @@ pub async fn provision_platform_device_token(
 pub async fn create_platform_device_token(
     store: &PlatformStore,
     vault: &TokenVault,
+    tenant_id: Uuid,
     device_id: &str,
 ) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
     for _ in 0..8 {
         let (token, material) = new_platform_token(vault)?;
-        match DeviceTokenRepository::create_device_token(store, device_id, material).await {
+        match DeviceTokenRepository::create_device_token(store, tenant_id, device_id, material)
+            .await
+        {
             Ok(record) => return Ok(platform_token_response(record, token)),
             Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
             Err(error) => return Err(device_token_repository_error(error)),

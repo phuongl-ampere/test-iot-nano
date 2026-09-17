@@ -2000,7 +2000,7 @@ async fn create_application(
     request: Request,
 ) -> Result<(StatusCode, Json<ApplicationResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: CreateApplicationRequest = management_request_json(&state, request).await?;
     let app_id = request
         .app_id
@@ -2018,11 +2018,12 @@ async fn create_application(
     if request.launch_url.is_empty() || request.allowed_scopes.is_empty() {
         return Err(ManagementSessionError::BadRequest);
     }
-    let _lease = authorize_management_mutation(&state, &headers).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let application = ApplicationRepository::upsert_application(
         state.store.as_ref(),
         NewApplication {
             app_id,
+            tenant_id: tenant.tenant_id,
             kind,
             launch_url: request.launch_url,
             client_id,
@@ -2041,6 +2042,7 @@ async fn create_application(
             state.store.as_ref(),
             NewOAuthClientSecret {
                 app_id: application.app_id.clone(),
+                tenant_id: application.tenant_id,
                 client_secret,
             },
         )
@@ -2061,16 +2063,21 @@ async fn provision_device(
     request: Request,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
     let headers = request.headers().clone();
-    require_management_admin(&state.session_verifier, &headers)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ProvisionDeviceRequest = management_request_json(&state, request).await?;
     let display_name = request.display_name.trim();
     if display_name.is_empty() || display_name.len() > 128 {
         return Err(ManagementSessionError::BadRequest);
     }
-    let _lease = authorize_management_mutation(&state, &headers).await?;
-    let token = provision_platform_device_token(&state.store, &state.token_vault, display_name)
-        .await
-        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let token = provision_platform_device_token(
+        &state.store,
+        &state.token_vault,
+        tenant.tenant_id,
+        display_name,
+    )
+    .await
+    .map_err(|_| ManagementSessionError::Unavailable)?;
     Ok((StatusCode::CREATED, Json(token)))
 }
 
@@ -2694,12 +2701,15 @@ fn require_tenant_account(
     session_verifier: &ManagementSessionVerifier,
     headers: &HeaderMap,
 ) -> Result<TenantSession, ManagementSessionError> {
-    if session_id(headers).is_none() {
-        return Err(ManagementSessionError::Unauthorized);
+    if let Some(tenant) = session_verifier.tenant_session(headers) {
+        return Ok(tenant);
     }
-    session_verifier
-        .tenant_session(headers)
-        .ok_or(ManagementSessionError::Forbidden)
+    match session_verifier.authorization(headers) {
+        ManagementAuthorization::Unauthenticated => Err(ManagementSessionError::Unauthorized),
+        ManagementAuthorization::Admin
+        | ManagementAuthorization::System
+        | ManagementAuthorization::Forbidden => Err(ManagementSessionError::Forbidden),
+    }
 }
 
 async fn management_request_json<T>(
@@ -2732,11 +2742,16 @@ async fn create_device_token(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
-    require_management_admin(&state.session_verifier, &headers)?;
-    let _lease = authorize_management_mutation(&state, &headers).await?;
-    let token = create_platform_device_token(&state.store, &state.token_vault, &device_id)
-        .await
-        .map_err(management_device_token_error)?;
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let token = create_platform_device_token(
+        &state.store,
+        &state.token_vault,
+        tenant.tenant_id,
+        &device_id,
+    )
+    .await
+    .map_err(management_device_token_error)?;
     Ok((StatusCode::CREATED, Json(token)))
 }
 

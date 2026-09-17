@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 mod common;
 
+fn provisioning_tenant_id() -> Uuid {
+    Uuid::from_u128(10_008)
+}
+
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -21,6 +25,11 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'device-tokens', 'active')")
+        .bind(provisioning_tenant_id().to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
     (directory, store)
 }
 
@@ -51,6 +60,11 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
     })
     .await
     .unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES ($1, 'device-tokens', 'active')")
+        .bind(provisioning_tenant_id())
+        .execute(store.timescale_pool().unwrap())
+        .await
+        .unwrap();
     (
         TimescaleTestLock {
             _connection: connection,
@@ -83,12 +97,16 @@ fn generated_token() -> (String, NewDeviceToken) {
 async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_children() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
+    let tenant_id = provisioning_tenant_id();
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway) VALUES
-             ('token-direct', 0),
-             ('token-gateway', 1),
-             ('token-child', 0)",
+        "INSERT INTO devices (device_id, tenant_id, is_gateway) VALUES
+             ('token-direct', ?, 0),
+             ('token-gateway', ?, 1),
+             ('token-child', ?, 0)",
     )
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
     .execute(pool)
     .await
     .unwrap();
@@ -103,6 +121,7 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
 
     let provisioned = DeviceTokenRepository::provision_device_token(
         &store,
+        tenant_id,
         "Provisioned device",
         token("provisioned-token"),
     )
@@ -122,6 +141,7 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
 
     let first = DeviceTokenRepository::create_device_token(
         &store,
+        tenant_id,
         "token-direct",
         token("direct-token-one"),
     )
@@ -129,6 +149,7 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
     .unwrap();
     let replacement = DeviceTokenRepository::create_device_token(
         &store,
+        tenant_id,
         "token-direct",
         token("direct-token-two"),
     )
@@ -148,10 +169,14 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
         true
     );
 
-    let child_error =
-        DeviceTokenRepository::create_device_token(&store, "token-child", token("child-token"))
-            .await
-            .unwrap_err();
+    let child_error = DeviceTokenRepository::create_device_token(
+        &store,
+        tenant_id,
+        "token-child",
+        token("child-token"),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(
         child_error,
         DeviceTokenRepositoryError::GatewayChild
@@ -159,6 +184,7 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
 
     let missing_error = DeviceTokenRepository::create_device_token(
         &store,
+        tenant_id,
         "missing-device",
         token("missing-token"),
     )
@@ -171,16 +197,69 @@ async fn sqlite_device_token_repository_provisions_rotates_and_rejects_gateway_c
 }
 
 #[tokio::test]
+async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_rotation() {
+    let (_directory, store) = sqlite_store().await;
+    let tenant_id = provisioning_tenant_id();
+    let other_tenant_id = Uuid::from_u128(10_009);
+    let issued = DeviceTokenRepository::provision_device_token(
+        &store,
+        tenant_id,
+        "Tenant A device",
+        token("tenant-a-token"),
+    )
+    .await
+    .unwrap();
+
+    let issuance_error = DeviceTokenRepository::create_device_token(
+        &store,
+        other_tenant_id,
+        &issued.device_id,
+        token("cross-tenant-issue"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        issuance_error,
+        DeviceTokenRepositoryError::DeviceNotFound
+    ));
+
+    let rotation_error = DeviceTokenRepository::rotate_device_token(
+        &store,
+        other_tenant_id,
+        issued.id,
+        token("cross-tenant-rotate"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        rotation_error,
+        DeviceTokenRepositoryError::TokenNotFound
+    ));
+
+    assert_eq!(
+        DeviceTokenRepository::active_device_token(&store, tenant_id, issued.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        issued.id
+    );
+}
+
+#[tokio::test]
 async fn sqlite_device_token_repository_reports_prefix_conflicts_without_revoking_active_tokens() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('token-conflict')")
+    let tenant_id = provisioning_tenant_id();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('token-conflict', ?)")
+        .bind(tenant_id.to_string())
         .execute(pool)
         .await
         .unwrap();
 
     let active = DeviceTokenRepository::create_device_token(
         &store,
+        tenant_id,
         "token-conflict",
         token("conflict-active"),
     )
@@ -188,6 +267,7 @@ async fn sqlite_device_token_repository_reports_prefix_conflicts_without_revokin
     .unwrap();
     let conflict = DeviceTokenRepository::create_device_token(
         &store,
+        tenant_id,
         "token-conflict",
         NewDeviceToken {
             id: Uuid::now_v7(),
@@ -218,27 +298,31 @@ async fn sqlite_device_token_repository_reports_prefix_conflicts_without_revokin
 async fn sqlite_device_token_repository_lists_rotates_and_revokes_opaque_history() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('token-history')")
+    let tenant_id = provisioning_tenant_id();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('token-history', ?)")
+        .bind(tenant_id.to_string())
         .execute(pool)
         .await
         .unwrap();
 
     let first = DeviceTokenRepository::create_device_token(
         &store,
+        tenant_id,
         "token-history",
         token("history-token-one"),
     )
     .await
     .unwrap();
-    let initial_history = DeviceTokenRepository::list_device_tokens(&store, "token-history")
-        .await
-        .unwrap();
+    let initial_history =
+        DeviceTokenRepository::list_device_tokens(&store, tenant_id, "token-history")
+            .await
+            .unwrap();
     assert_eq!(initial_history.len(), 1);
     assert_eq!(initial_history[0].id, first.id);
     assert_eq!(initial_history[0].token_prefix, "history-token-one");
     assert!(initial_history[0].revoked_at.is_none());
     assert_eq!(
-        DeviceTokenRepository::active_device_token(&store, first.id)
+        DeviceTokenRepository::active_device_token(&store, tenant_id, first.id)
             .await
             .unwrap()
             .unwrap()
@@ -246,19 +330,23 @@ async fn sqlite_device_token_repository_lists_rotates_and_revokes_opaque_history
         "token-history"
     );
 
-    let rotated =
-        DeviceTokenRepository::rotate_device_token(&store, first.id, token("history-token-two"))
-            .await
-            .unwrap();
+    let rotated = DeviceTokenRepository::rotate_device_token(
+        &store,
+        tenant_id,
+        first.id,
+        token("history-token-two"),
+    )
+    .await
+    .unwrap();
     assert_eq!(rotated.token_prefix, "history-token-two");
     assert!(
-        DeviceTokenRepository::active_device_token(&store, first.id)
+        DeviceTokenRepository::active_device_token(&store, tenant_id, first.id)
             .await
             .unwrap()
             .is_none()
     );
 
-    let history = DeviceTokenRepository::list_device_tokens(&store, "token-history")
+    let history = DeviceTokenRepository::list_device_tokens(&store, tenant_id, "token-history")
         .await
         .unwrap();
     assert_eq!(history.len(), 2);
@@ -267,11 +355,11 @@ async fn sqlite_device_token_repository_lists_rotates_and_revokes_opaque_history
     assert_eq!(history[1].id, first.id);
     assert!(history[1].revoked_at.is_some());
 
-    DeviceTokenRepository::revoke_device_token(&store, rotated.id)
+    DeviceTokenRepository::revoke_device_token(&store, tenant_id, rotated.id)
         .await
         .unwrap();
     assert!(
-        DeviceTokenRepository::active_device_token(&store, rotated.id)
+        DeviceTokenRepository::active_device_token(&store, tenant_id, rotated.id)
             .await
             .unwrap()
             .is_none()
@@ -282,18 +370,21 @@ async fn sqlite_device_token_repository_lists_rotates_and_revokes_opaque_history
 async fn sqlite_device_token_repository_provisions_owned_devices_and_identity_resolves_them() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
+    let tenant_id = provisioning_tenant_id();
     let owner_user_id = Uuid::now_v7();
     let asset_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES (?, 'token-owner', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'token-owner', 'unused', 'viewer', 'user')",
     )
     .bind(owner_user_id.to_string())
+    .bind(tenant_id.to_string())
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO assets (id, name) VALUES (?, 'token asset')")
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'token asset')")
         .bind(asset_id.to_string())
+        .bind(tenant_id.to_string())
         .execute(pool)
         .await
         .unwrap();
@@ -310,17 +401,18 @@ async fn sqlite_device_token_repository_provisions_owned_devices_and_identity_re
     )
     .await
     .unwrap();
-    let ownership: (String, String, Option<String>) = sqlx::query_as(
-        "SELECT owner_user_id, asset_id, claimed_at
+    let ownership: (String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT tenant_id, owner_user_id, asset_id, claimed_at
          FROM devices WHERE device_id = ?",
     )
     .bind(&issued.device_id)
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(ownership.0, owner_user_id.to_string());
-    assert_eq!(ownership.1, asset_id.to_string());
-    assert!(ownership.2.is_some());
+    assert_eq!(ownership.0, tenant_id.to_string());
+    assert_eq!(ownership.1, owner_user_id.to_string());
+    assert_eq!(ownership.2, asset_id.to_string());
+    assert!(ownership.3.is_some());
 
     let resolved = IdentityRepository::resolve_active_device_token(&store, &raw_token)
         .await
@@ -334,13 +426,16 @@ async fn sqlite_device_token_repository_provisions_owned_devices_and_identity_re
 async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
     let (_lock, store) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('token-history')")
+    let tenant_id = provisioning_tenant_id();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('token-history', $1)")
+        .bind(tenant_id)
         .execute(pool)
         .await
         .unwrap();
 
     let first = DeviceTokenRepository::create_device_token(
         &store,
+        tenant_id,
         "token-history",
         token("timescale-history-token-one"),
     )
@@ -348,12 +443,13 @@ async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
     .unwrap();
     let rotated = DeviceTokenRepository::rotate_device_token(
         &store,
+        tenant_id,
         first.id,
         token("timescale-history-token-two"),
     )
     .await
     .unwrap();
-    let history = DeviceTokenRepository::list_device_tokens(&store, "token-history")
+    let history = DeviceTokenRepository::list_device_tokens(&store, tenant_id, "token-history")
         .await
         .unwrap();
     assert_eq!(history.len(), 2);
@@ -362,11 +458,11 @@ async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
     assert_eq!(history[1].id, first.id);
     assert!(history[1].revoked_at.is_some());
 
-    DeviceTokenRepository::revoke_device_token(&store, rotated.id)
+    DeviceTokenRepository::revoke_device_token(&store, tenant_id, rotated.id)
         .await
         .unwrap();
     assert!(
-        DeviceTokenRepository::active_device_token(&store, rotated.id)
+        DeviceTokenRepository::active_device_token(&store, tenant_id, rotated.id)
             .await
             .unwrap()
             .is_none()
@@ -378,18 +474,21 @@ async fn timescale_device_token_repository_matches_sqlite_lifecycle_contract() {
 async fn timescale_device_token_repository_provisions_owned_devices_and_identity_resolves_them() {
     let (_lock, store) = timescale_store().await;
     let pool = store.timescale_pool().unwrap();
+    let tenant_id = provisioning_tenant_id();
     let owner_user_id = Uuid::now_v7();
     let asset_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES ($1, 'token-owner', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'token-owner', 'unused', 'viewer', 'user')",
     )
     .bind(owner_user_id)
+    .bind(tenant_id)
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO assets (id, name) VALUES ($1, 'token asset')")
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES ($1, $2, 'token asset')")
         .bind(asset_id)
+        .bind(tenant_id)
         .execute(pool)
         .await
         .unwrap();
@@ -406,17 +505,18 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
     )
     .await
     .unwrap();
-    let ownership: (Uuid, Uuid, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
-        "SELECT owner_user_id, asset_id, claimed_at
+    let ownership: (Uuid, Uuid, Uuid, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT tenant_id, owner_user_id, asset_id, claimed_at
          FROM devices WHERE device_id = $1",
     )
     .bind(&issued.device_id)
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(ownership.0, owner_user_id);
-    assert_eq!(ownership.1, asset_id);
-    assert!(ownership.2.is_some());
+    assert_eq!(ownership.0, tenant_id);
+    assert_eq!(ownership.1, owner_user_id);
+    assert_eq!(ownership.2, asset_id);
+    assert!(ownership.3.is_some());
 
     let resolved = IdentityRepository::resolve_active_device_token(&store, &raw_token)
         .await

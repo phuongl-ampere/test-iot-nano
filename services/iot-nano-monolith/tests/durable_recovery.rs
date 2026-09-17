@@ -553,15 +553,24 @@ fn claim(group: &str, member_id: &str) -> ClaimRequest {
 }
 
 async fn provision_device_token(runtime: &MonolithRuntime, device_id: &str) -> String {
-    runtime
-        .platform()
-        .unwrap()
-        .register_device(device_id)
+    let store = runtime.platform().unwrap();
+    let tenant_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, ?, 'active')")
+        .bind(tenant_id.to_string())
+        .bind(format!("durable-recovery-{tenant_id}"))
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
+        .bind(device_id)
+        .bind(tenant_id.to_string())
+        .execute(store.sqlite_pool().unwrap())
         .await
         .unwrap();
     create_platform_device_token(
-        runtime.platform().unwrap(),
+        store,
         &TokenVault::from_key_material("durable-recovery-device-token-key-material-0001"),
+        tenant_id,
         device_id,
     )
     .await

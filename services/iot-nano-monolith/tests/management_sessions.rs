@@ -104,6 +104,56 @@ async fn seed_tenant_admin_users(store: &PlatformStore) {
     }
 }
 
+async fn tenant_account_cookie(router: &axum::Router) -> String {
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+async fn management_user_cookie(router: &axum::Router, username: &str, password: &str) -> String {
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "username": username, "password": password }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn management_login_issues_a_cookie_used_by_the_oauth_session_verifier_and_logout_revokes_it()
 {
@@ -554,7 +604,7 @@ async fn bootstrap_system_creates_the_only_initial_system_account_and_enables_sy
 }
 
 #[tokio::test]
-async fn management_admin_can_register_an_oauth_application() {
+async fn tenant_account_registers_tenant_bound_oauth_applications_and_denies_user_sessions() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         PlatformStore::open(&StorageConfiguration {
@@ -579,6 +629,96 @@ async fn management_admin_can_register_an_oauth_application() {
         .oneshot(
             Request::builder()
                 .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/applications")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(
+                    r#"{"app_id":"alpha-client-app","kind":"full_stack","launch_url":"https://client.example.test","client_id":"alpha-client","redirect_uris":["https://client.example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true,"client_secret":"alpha-client-secret"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let application_tenant_id: String =
+        sqlx::query_scalar("SELECT tenant_id FROM applications WHERE app_id = 'alpha-client-app'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    let expected_tenant_id: String =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(application_tenant_id, expected_tenant_id);
+
+    let user_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let user_cookie = user_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let denied = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/applications")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, user_cookie)
+                .body(Body::from(
+                    r#"{"app_id":"user-client-app","kind":"full_stack","launch_url":"https://user.example.test","client_id":"user-client","redirect_uris":["https://user.example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn legacy_management_admin_cannot_provision_a_device_token() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
                 .uri("/api/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
@@ -598,54 +738,6 @@ async fn management_admin_can_register_an_oauth_application() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/applications")
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, cookie)
-                .body(Body::from(
-                    r#"{"app_id":"alpha-client-app","kind":"full_stack","launch_url":"https://client.example.test","client_id":"alpha-client","redirect_uris":["https://client.example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true,"client_secret":"alpha-client-secret"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let applications: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM applications WHERE app_id = 'alpha-client-app'")
-            .fetch_one(store.sqlite_pool().unwrap())
-            .await
-            .unwrap();
-    assert_eq!(applications, 1);
-}
-
-#[tokio::test]
-async fn management_admin_can_provision_a_device_token() {
-    let (_directory, management) = management_session_router().await;
-    let router = management.router;
-    let login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap();
-    let provisioned = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
                 .uri("/api/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, cookie)
@@ -654,44 +746,37 @@ async fn management_admin_can_provision_a_device_token() {
         )
         .await
         .unwrap();
-    assert_eq!(provisioned.status(), StatusCode::CREATED);
-    let payload: serde_json::Value = serde_json::from_slice(
-        &axum::body::to_bytes(provisioned.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        payload["token"]
-            .as_str()
-            .is_some_and(|token| !token.is_empty())
-    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn management_admin_can_rotate_an_existing_device_token() {
-    let (_directory, management) = management_session_router().await;
+async fn tenant_account_provisions_tenant_bound_devices_and_denies_user_sessions() {
+    let (_directory, store, management) = management_session_router_with_store().await;
     let router = management.router;
-    let login = router
+
+    let tenant_login = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                    r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    let cookie = login.headers()[SET_COOKIE]
+    assert_eq!(tenant_login.status(), StatusCode::OK);
+    let tenant_cookie = tenant_login.headers()[SET_COOKIE]
         .to_str()
         .unwrap()
         .split(';')
         .next()
-        .unwrap();
+        .unwrap()
+        .to_owned();
+
     let provisioned = router
         .clone()
         .oneshot(
@@ -699,7 +784,87 @@ async fn management_admin_can_rotate_an_existing_device_token() {
                 .method("POST")
                 .uri("/api/management/devices")
                 .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, cookie)
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    r#"{"display_name":"Tenant Provisioned Device"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::CREATED);
+    let provisioned: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(provisioned.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let device_id = provisioned["device_id"].as_str().unwrap();
+    let stored_tenant_id: String =
+        sqlx::query_scalar("SELECT tenant_id FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    let expected_tenant_id: String =
+        sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(stored_tenant_id, expected_tenant_id);
+
+    for (username, password) in [("admin", "NanoAdmin@1234"), ("viewer", "NanoView@1234")] {
+        let login = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "username": username, "password": password }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/management/devices")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(COOKIE, cookie)
+                    .body(Body::from(r#"{"display_name":"Denied Device"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{username}");
+    }
+}
+
+#[tokio::test]
+async fn tenant_account_can_rotate_an_existing_device_token() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let cookie = tenant_account_cookie(&router).await;
+    let provisioned = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Rotated Device"}"#))
                 .unwrap(),
         )
@@ -742,30 +907,10 @@ async fn management_admin_can_rotate_an_existing_device_token() {
 }
 
 #[tokio::test]
-async fn management_admin_manages_devices_through_the_typed_storage_port() {
+async fn tenant_account_manages_devices_through_the_typed_storage_port() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
-    let login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let cookie = tenant_account_cookie(&router).await;
 
     let gateway = router
         .clone()
@@ -1152,7 +1297,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
 }
 
 #[tokio::test]
-async fn management_device_routes_require_an_admin_and_map_typed_errors() {
+async fn management_device_routes_require_a_tenant_account_and_map_typed_errors() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
 
@@ -1169,27 +1314,7 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
-    let viewer_login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"viewer","password":"NanoView@1234"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let viewer_cookie = viewer_login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let viewer_cookie = management_user_cookie(&router, "viewer", "NanoView@1234").await;
     let viewer = router
         .clone()
         .oneshot(
@@ -1204,27 +1329,22 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
         .unwrap();
     assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
 
-    let admin_login = router
+    let admin_cookie = management_user_cookie(&router, "admin", "NanoAdmin@1234").await;
+    let legacy_admin = router
         .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
-                ))
+                .method("GET")
+                .uri("/api/management/devices")
+                .header(COOKIE, &admin_cookie)
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    let admin_cookie = admin_login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    assert_eq!(legacy_admin.status(), StatusCode::FORBIDDEN);
+
+    let tenant_cookie = tenant_account_cookie(&router).await;
 
     let invalid_id = router
         .clone()
@@ -1233,7 +1353,7 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
                 .method("PUT")
                 .uri("/api/management/devices/not.valid")
                 .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &admin_cookie)
+                .header(COOKIE, &tenant_cookie)
                 .body(Body::from(r#"{"display_name":"Device"}"#))
                 .unwrap(),
         )
@@ -1247,7 +1367,7 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
             Request::builder()
                 .method("DELETE")
                 .uri("/api/management/devices/missing-device")
-                .header(COOKIE, &admin_cookie)
+                .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1262,7 +1382,7 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
                 .method("POST")
                 .uri("/api/management/devices")
                 .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &admin_cookie)
+                .header(COOKIE, &tenant_cookie)
                 .body(Body::from(r#"{"display_name":"Gateway"}"#))
                 .unwrap(),
         )
@@ -1281,7 +1401,7 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
                 .method("PUT")
                 .uri(format!("/api/management/devices/{gateway_id}"))
                 .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, admin_cookie)
+                .header(COOKIE, tenant_cookie)
                 .body(Body::from(
                     json!({
                         "display_name": "Gateway",
@@ -1297,7 +1417,7 @@ async fn management_device_routes_require_an_admin_and_map_typed_errors() {
 }
 
 #[tokio::test]
-async fn management_mutations_require_admin_and_map_token_errors() {
+async fn tenant_account_management_mutations_map_token_errors() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
 
@@ -1355,27 +1475,7 @@ async fn management_mutations_require_admin_and_map_token_errors() {
         .unwrap();
     assert_eq!(malformed_anonymous.status(), StatusCode::UNAUTHORIZED);
 
-    let viewer_login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"viewer","password":"NanoView@1234"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let viewer_cookie = viewer_login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let viewer_cookie = management_user_cookie(&router, "viewer", "NanoView@1234").await;
     let malformed_viewer = router
         .clone()
         .oneshot(
@@ -1391,27 +1491,22 @@ async fn management_mutations_require_admin_and_map_token_errors() {
         .unwrap();
     assert_eq!(malformed_viewer.status(), StatusCode::FORBIDDEN);
 
-    let login = router
+    let admin_cookie = management_user_cookie(&router, "admin", "NanoAdmin@1234").await;
+    let legacy_admin = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
-                ))
+                .uri("/api/management/devices/missing-device/tokens")
+                .header(COOKIE, &admin_cookie)
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    let cookie = login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    assert_eq!(legacy_admin.status(), StatusCode::FORBIDDEN);
+
+    let cookie = tenant_account_cookie(&router).await;
 
     let missing = router
         .clone()
@@ -1491,27 +1586,7 @@ async fn management_mutations_require_admin_and_map_token_errors() {
 async fn management_mutation_reports_unavailable_when_the_store_closes_after_login() {
     let (_directory, store, management) = management_session_router_with_store().await;
     let router = management.router;
-    let login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let cookie = tenant_account_cookie(&router).await;
     store.sqlite_pool().unwrap().close().await;
 
     for request in [
@@ -1566,27 +1641,7 @@ async fn management_mutation_reports_unavailable_when_the_store_closes_after_log
 async fn management_mutation_preserves_json_rejection_semantics_after_authorization() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
-    let login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let cookie = login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let cookie = tenant_account_cookie(&router).await;
 
     let missing_content_type = router
         .clone()
@@ -1625,27 +1680,8 @@ async fn management_mutation_preserves_json_rejection_semantics_after_authorizat
 async fn management_mutation_authorization_precedes_json_rejection_for_every_body_route() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
-    let viewer_login = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/auth/login")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"username":"viewer","password":"NanoView@1234"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let viewer_cookie = viewer_login.headers()[SET_COOKIE]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
+    let viewer_cookie = management_user_cookie(&router, "viewer", "NanoView@1234").await;
+    let admin_cookie = management_user_cookie(&router, "admin", "NanoAdmin@1234").await;
 
     for (method, path) in [
         ("POST", "/api/management/applications"),
@@ -1668,20 +1704,22 @@ async fn management_mutation_authorization_precedes_json_rejection_for_every_bod
             .unwrap();
         assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{path}");
 
-        let viewer = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header(CONTENT_TYPE, "application/json")
-                    .header(COOKIE, &viewer_cookie)
-                    .body(Body::from("{"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(viewer.status(), StatusCode::FORBIDDEN, "{path}");
+        for cookie in [&viewer_cookie, &admin_cookie] {
+            let user = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header(COOKIE, cookie)
+                        .body(Body::from("{"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(user.status(), StatusCode::FORBIDDEN, "{path}");
+        }
     }
 }
 
