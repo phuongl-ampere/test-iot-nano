@@ -33,6 +33,7 @@ const LIST_DIRECT_DEVICE_A: &str = "list-a-direct";
 const LIST_GROUP_DEVICE_A: &str = "list-b-group";
 const LIST_INHERITED_DEVICE_A: &str = "list-c-inherited";
 const LIST_MOVED_DEVICE_A: &str = "list-d-moved";
+const LIST_INHERITED_ONLY_MOVED_DEVICE_A: &str = "list-e-inherited-only-moved";
 
 fn subject(user_id: Uuid, tenant_id: Uuid, account_class: AccountClass) -> AuthorizationSubject {
     AuthorizationSubject {
@@ -529,6 +530,119 @@ async fn sqlite_authorized_device_list_tracks_effective_access_across_a_move() {
             .unwrap()
             .map(|device| device.device_id),
         Some(LIST_MOVED_DEVICE_A.to_owned())
+    );
+}
+
+#[tokio::test]
+async fn sqlite_device_detachment_removes_inherited_only_detail_and_list_access() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_identities(pool).await;
+    insert_asset(
+        pool,
+        LIST_ROOT_ASSET_A,
+        TENANT_A,
+        "inherited-only-root",
+        None,
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        LIST_CHILD_ASSET_A,
+        TENANT_A,
+        "inherited-only-child",
+        Some(LIST_ROOT_ASSET_A),
+        None,
+    )
+    .await;
+    insert_device(
+        pool,
+        LIST_INHERITED_ONLY_MOVED_DEVICE_A,
+        TENANT_A,
+        Some(LIST_CHILD_ASSET_A),
+        None,
+    )
+    .await;
+    insert_group_member(pool, TENANT_A, GROUP_A, OTHER_USER_A, USER_A).await;
+    insert_permission(
+        pool,
+        "inherited-only-group-manager",
+        TENANT_A,
+        None,
+        Some(GROUP_A),
+        Some(LIST_ROOT_ASSET_A),
+        None,
+        ResourcePermission::Manager,
+        true,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+
+    let user = subject(USER_A, TENANT_A, AccountClass::User);
+    assert_device_permission(
+        &store,
+        &user,
+        LIST_INHERITED_ONLY_MOVED_DEVICE_A,
+        Some(ResourcePermission::Manager),
+    )
+    .await;
+    assert_eq!(
+        store
+            .authorized_device(&user, LIST_INHERITED_ONLY_MOVED_DEVICE_A)
+            .await
+            .unwrap()
+            .map(|device| device.device_id),
+        Some(LIST_INHERITED_ONLY_MOVED_DEVICE_A.to_owned()),
+    );
+    assert_eq!(
+        store
+            .list_authorized_devices(&user, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.device_id.as_str(), entry.access))
+            .collect::<Vec<_>>(),
+        vec![(
+            LIST_INHERITED_ONLY_MOVED_DEVICE_A,
+            access(
+                ResourcePermission::Manager,
+                ResourceAccessSource::InheritedGroup,
+            ),
+        )],
+    );
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        TENANT_A,
+        LIST_INHERITED_ONLY_MOVED_DEVICE_A,
+        UpdateManagementDevice {
+            display_name: "detached inherited-only device".to_owned(),
+            asset_id: None,
+            device_profile_id: None,
+            attributes: None,
+            topology: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_device_permission(&store, &user, LIST_INHERITED_ONLY_MOVED_DEVICE_A, None).await;
+    assert!(
+        store
+            .authorized_device(&user, LIST_INHERITED_ONLY_MOVED_DEVICE_A)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !store
+            .list_authorized_devices(&user, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.device_id == LIST_INHERITED_ONLY_MOVED_DEVICE_A)
     );
 }
 
