@@ -52,6 +52,19 @@ fn assert_foreign_key_violation(error: sqlx::Error) {
     );
 }
 
+async fn sqlite_schema_sql(pool: &sqlx::SqlitePool, object_type: &str, name: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT sql
+         FROM sqlite_master
+         WHERE type = ? AND name = ?",
+    )
+    .bind(object_type)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 fn telemetry(device_id: &str, sequence: u64) -> TelemetryEvent {
     TelemetryEvent {
         schema_version: 1,
@@ -569,8 +582,7 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "oauth_access_tokens",
             "oauth_authorization_codes",
             "oauth_client_secrets",
-            "resource_grants",
-            "resource_shares",
+            "resource_permissions",
             "system_accounts",
             "telemetry",
             "telemetry_rollups_1h",
@@ -578,9 +590,125 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "tenant_accounts",
             "tenants",
             "user_app_grants",
+            "user_group_members",
+            "user_groups",
             "users",
         ]
     );
+
+    let legacy_tables = sqlx::query(
+        "SELECT name
+         FROM sqlite_master
+         WHERE type = 'table'
+           AND name IN ('resource_grants', 'resource_shares')
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(legacy_tables.is_empty());
+
+    let user_groups_sql = sqlite_schema_sql(pool, "table", "user_groups").await;
+    assert!(
+        user_groups_sql
+            .contains("tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT")
+    );
+    assert!(user_groups_sql.contains("FOREIGN KEY (owner_user_id, tenant_id)"));
+    assert!(user_groups_sql.contains("REFERENCES users(id, tenant_id) ON DELETE RESTRICT"));
+
+    let user_group_members_sql = sqlite_schema_sql(pool, "table", "user_group_members").await;
+    assert!(
+        user_group_members_sql
+            .contains("tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT")
+    );
+    assert!(user_group_members_sql.contains("PRIMARY KEY (group_id, user_id)"));
+    assert!(user_group_members_sql.contains("FOREIGN KEY (group_id, tenant_id)"));
+    assert!(
+        user_group_members_sql.contains("REFERENCES user_groups(id, tenant_id) ON DELETE CASCADE")
+    );
+    assert!(user_group_members_sql.contains("FOREIGN KEY (user_id, tenant_id)"));
+    assert!(user_group_members_sql.contains("REFERENCES users(id, tenant_id) ON DELETE CASCADE"));
+
+    let user_group_members_index =
+        sqlite_schema_sql(pool, "index", "user_group_members_tenant_user_group_index").await;
+    assert!(
+        user_group_members_index.contains("ON user_group_members (tenant_id, user_id, group_id)")
+    );
+
+    let resource_permissions_sql = sqlite_schema_sql(pool, "table", "resource_permissions").await;
+    assert!(
+        resource_permissions_sql
+            .contains("tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT")
+    );
+    assert!(resource_permissions_sql.contains("revoked_at TEXT"));
+    assert!(resource_permissions_sql.contains(
+        "CHECK (
+        (subject_user_id IS NOT NULL AND subject_group_id IS NULL)
+        OR (subject_user_id IS NULL AND subject_group_id IS NOT NULL)
+    )"
+    ));
+    assert!(resource_permissions_sql.contains(
+        "CHECK (
+        (asset_id IS NOT NULL AND device_id IS NULL)
+        OR (asset_id IS NULL AND device_id IS NOT NULL)
+    )"
+    ));
+    assert!(resource_permissions_sql.contains("CHECK (device_id IS NULL OR inherit_children = 0)"));
+    assert!(resource_permissions_sql.contains("FOREIGN KEY (subject_user_id, tenant_id)"));
+    assert!(resource_permissions_sql.contains("FOREIGN KEY (subject_group_id, tenant_id)"));
+    assert!(resource_permissions_sql.contains("FOREIGN KEY (asset_id, tenant_id)"));
+    assert!(resource_permissions_sql.contains("FOREIGN KEY (device_id, tenant_id)"));
+    assert!(resource_permissions_sql.contains("FOREIGN KEY (created_by_user_id, tenant_id)"));
+
+    let active_permission_indexes = sqlx::query(
+        "SELECT name, sql
+         FROM sqlite_master
+         WHERE type = 'index'
+           AND tbl_name = 'resource_permissions'
+           AND name LIKE 'resource_permissions_active_%'
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| (row.get::<String, _>("name"), row.get::<String, _>("sql")))
+    .collect::<Vec<_>>();
+    let expected_active_permission_indexes = [
+        (
+            "resource_permissions_active_asset_group_index",
+            "ON resource_permissions (tenant_id, asset_id, subject_group_id)",
+            "WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_group_id IS NOT NULL",
+        ),
+        (
+            "resource_permissions_active_asset_user_index",
+            "ON resource_permissions (tenant_id, asset_id, subject_user_id)",
+            "WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_user_id IS NOT NULL",
+        ),
+        (
+            "resource_permissions_active_device_group_index",
+            "ON resource_permissions (tenant_id, device_id, subject_group_id)",
+            "WHERE revoked_at IS NULL AND device_id IS NOT NULL AND subject_group_id IS NOT NULL",
+        ),
+        (
+            "resource_permissions_active_device_user_index",
+            "ON resource_permissions (tenant_id, device_id, subject_user_id)",
+            "WHERE revoked_at IS NULL AND device_id IS NOT NULL AND subject_user_id IS NOT NULL",
+        ),
+    ];
+    assert_eq!(
+        active_permission_indexes.len(),
+        expected_active_permission_indexes.len()
+    );
+    for ((name, index_sql), (expected_name, expected_columns, expected_active_predicate)) in
+        active_permission_indexes
+            .iter()
+            .zip(expected_active_permission_indexes)
+    {
+        assert_eq!(name, expected_name);
+        assert!(index_sql.contains(expected_columns));
+        assert!(index_sql.contains(expected_active_predicate));
+    }
 }
 
 #[tokio::test]
