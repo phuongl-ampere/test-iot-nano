@@ -1,0 +1,25 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}My Workspace | IoT Nano{% endblock %}
+{% block account_kind %}User Account{% endblock %}
+{% block navigation_label %}Workspace navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link active" href="/app">Workspace</a>
+  <a class="nav-link" href="/app/devices">Devices</a>
+  <a class="nav-link" href="/app/assets">Assets</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">User Account</p>
+    <h1>My Workspace</h1>
+    <p>Authorized devices and assets.</p>
+  </section>
+  <section class="summary-grid" aria-label="Workspace summary">
+    <article class="summary-item"><span>Devices</span><strong>--</strong></article>
+    <article class="summary-item"><span>Assets</span><strong>--</strong></article>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Authorized resources</h2></header>
+    <p class="empty-state">Data will appear after the authorization contract is connected.</p>
+  </section>
+{% endblock %}

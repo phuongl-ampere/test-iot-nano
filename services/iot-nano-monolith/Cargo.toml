@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+askama = "0.14.0"
 axum.workspace = true
 clap.workspace = true
 chrono.workspace = true

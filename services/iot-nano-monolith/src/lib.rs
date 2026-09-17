@@ -4,6 +4,7 @@ mod adapters;
 mod cache;
 mod config;
 mod management;
+mod platform_ui;
 mod readiness;
 mod runtime;
 
@@ -16,5 +17,8 @@ pub use config::{
     ConfigError, MonolithConfig, RETIRED_ENVIRONMENT_NAMES, validate_retired_environment,
 };
 pub use management::{BootstrapSystemError, ManagementSessionRouter, bootstrap_system};
+pub use platform_ui::{
+    PlatformUiIdentity, PlatformUiRenderer, SystemLayout, TenantLayout, UserLayout,
+};
 pub use readiness::Readiness;
 pub use runtime::{MonolithRuntime, ShutdownError, StartupError};

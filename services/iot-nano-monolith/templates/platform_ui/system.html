@@ -1,0 +1,26 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}System Console | IoT Nano{% endblock %}
+{% block account_kind %}System Account{% endblock %}
+{% block navigation_label %}System navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link active" href="/system">Overview</a>
+  <a class="nav-link" href="/system/tenants">Tenants</a>
+  <a class="nav-link" href="/system/infrastructure">Infrastructure</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">System Account</p>
+    <h1>System Console</h1>
+    <p>Platform lifecycle and runtime status.</p>
+  </section>
+  <section class="summary-grid" aria-label="System summary">
+    <article class="summary-item"><span>Tenants</span><strong>--</strong></article>
+    <article class="summary-item"><span>Migration</span><strong>--</strong></article>
+    <article class="summary-item"><span>Listeners</span><strong>--</strong></article>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Tenant lifecycle</h2></header>
+    <p class="empty-state">Data will appear after the route contract is connected.</p>
+  </section>
+{% endblock %}

@@ -1,0 +1,29 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Tenant Console | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link active" href="/tenant">Overview</a>
+  <a class="nav-link" href="/tenant/users">Users</a>
+  <a class="nav-link" href="/tenant/assets">Assets</a>
+  <a class="nav-link" href="/tenant/devices">Devices</a>
+  <a class="nav-link" href="/tenant/profiles">Profiles</a>
+  <a class="nav-link" href="/tenant/settings">Settings</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Tenant Console</h1>
+    <p>Tenant setup and operational resources.</p>
+  </section>
+  <section class="summary-grid" aria-label="Tenant summary">
+    <article class="summary-item"><span>Users</span><strong>--</strong></article>
+    <article class="summary-item"><span>Assets</span><strong>--</strong></article>
+    <article class="summary-item"><span>Devices</span><strong>--</strong></article>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Tenant activity</h2></header>
+    <p class="empty-state">Data will appear after the route contract is connected.</p>
+  </section>
+{% endblock %}

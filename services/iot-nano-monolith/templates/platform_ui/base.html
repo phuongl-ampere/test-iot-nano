@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}IoT Nano{% endblock %}</title>
+    <style>{{ stylesheet|safe }}</style>
+  </head>
+  <body>
+    <div class="console-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="IoT Nano">
+          <span class="brand-mark">IN</span>
+          <span>
+            <strong>IoT Nano</strong>
+            <small>{% block account_kind %}{% endblock %}</small>
+          </span>
+        </div>
+        <div class="account-label">{{ identity.label }}</div>
+      </header>
+      <div class="console-body">
+        <aside class="sidebar">
+          <nav class="side-nav" aria-label="{% block navigation_label %}Platform{% endblock %}">
+            {% block navigation %}{% endblock %}
+          </nav>
+        </aside>
+        <main class="content">
+          {% block content %}{% endblock %}
+        </main>
+      </div>
+    </div>
+  </body>
+</html>
