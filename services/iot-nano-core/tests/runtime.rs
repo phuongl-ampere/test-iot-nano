@@ -476,22 +476,25 @@ async fn seed_platform_notification(store: &PlatformStore, now: chrono::DateTime
     let pool = store.sqlite_pool().expect("runtime test uses SQLite");
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, window_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, window_seconds,
             for_seconds, resolve_after_seconds, reopen_grace_seconds, severity,
             reminder_interval_seconds
-         ) VALUES (?, 'Runtime rule', 'temperature_c', 'event_threshold', 'gt', 40, 0,
+         ) VALUES (?, ?, 'Runtime rule', 'temperature_c', 'event_threshold', 'gt', 40, 0,
                    0, 0, 3600, 'warning', 86400)",
     )
     .bind(rule_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO alert_incidents (
-            id, rule_id, device_id, status, condition_started_at, opened_at, state_version
-         ) VALUES (?, ?, 'runtime-device', 'open', ?, ?, 1)",
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at,
+            state_version
+         ) VALUES (?, ?, ?, 'runtime-device', 'open', ?, ?, 1)",
     )
     .bind(incident_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
     .bind(rule_id.to_string())
     .bind(now.to_rfc3339())
     .bind(now.to_rfc3339())
@@ -500,10 +503,11 @@ async fn seed_platform_notification(store: &PlatformStore, now: chrono::DateTime
     .unwrap();
     sqlx::query(
         "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-         ) VALUES (?, ?, 'opened', ?, 'subject', 'body', ?)",
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES (?, ?, ?, 'opened', ?, 'subject', 'body', ?)",
     )
     .bind(notification_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
     .bind(incident_id.to_string())
     .bind(format!("runtime-{notification_id}"))
     .bind(now.to_rfc3339())
@@ -529,6 +533,7 @@ async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
         .store
         .enqueue_command(PlatformCommand {
             id: command_id.to_string(),
+            tenant_id: TEST_TENANT_ID,
             device_id: "runtime-device".to_owned(),
             method: "sample_now".to_owned(),
             params: "{}".to_owned(),
@@ -541,15 +546,38 @@ async fn command_worker_keeps_runtime_live_and_releases_unavailable_command() {
     let pool = config.store.sqlite_pool().unwrap().clone();
 
     let runtime = CoreRuntime::start(config).await.unwrap();
-    sleep(Duration::from_millis(30)).await;
-
-    assert!(runtime.ready());
-    let row =
-        sqlx::query("SELECT state, last_error, next_attempt_at FROM command_outbox WHERE id = ?")
+    let row = timeout(Duration::from_secs(1), async {
+        loop {
+            let row = sqlx::query(
+                "SELECT state, last_error, next_attempt_at
+                 FROM command_outbox
+                 WHERE id = ?
+                   AND tenant_id = ?
+                   AND state = 'queued'
+                   AND last_error IS NOT NULL
+                   AND last_error <> ''",
+            )
             .bind(command_id.to_string())
-            .fetch_one(&pool)
+            .bind(TEST_TENANT_ID.to_string())
+            .fetch_optional(&pool)
             .await
             .unwrap();
+            if let Some(row) = row {
+                let next_attempt_at =
+                    chrono::DateTime::parse_from_rfc3339(&row.get::<String, _>("next_attempt_at"))
+                        .unwrap()
+                        .with_timezone(&Utc);
+                if next_attempt_at > original_next_attempt_at {
+                    return row;
+                }
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the core command worker did not record an unavailable-command retry");
+
+    assert!(runtime.ready());
     assert_eq!(
         row.get::<String, _>("state"),
         "queued",
@@ -588,6 +616,7 @@ async fn command_worker_handoff_waits_for_an_in_flight_claim_then_drains_remaini
         .store
         .enqueue_command(PlatformCommand {
             id: first_command_id.to_string(),
+            tenant_id: TEST_TENANT_ID,
             device_id: "runtime-device".to_owned(),
             method: "sample_now".to_owned(),
             params: "{}".to_owned(),
@@ -613,10 +642,12 @@ async fn command_worker_handoff_waits_for_an_in_flight_claim_then_drains_remaini
     let now = Utc::now();
     sqlx::query(
         "INSERT INTO command_outbox (
-            id, device_id, method, params, mode, created_at, expires_at, next_attempt_at
-         ) VALUES (?, 'runtime-device', 'sample_now', '{}', 'one_way', ?, ?, ?)",
+            id, tenant_id, device_id, method, params, mode, created_at, expires_at,
+            next_attempt_at
+         ) VALUES (?, ?, 'runtime-device', 'sample_now', '{}', 'one_way', ?, ?, ?)",
     )
     .bind(second_command_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
     .bind(now.to_rfc3339())
     .bind((now + chrono::Duration::minutes(5)).to_rfc3339())
     .bind(now.to_rfc3339())
@@ -673,9 +704,12 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
 
     assert!(runtime.ready());
     let row = sqlx::query(
-        "SELECT state, last_error, next_attempt_at FROM notification_outbox WHERE id = ?",
+        "SELECT state, last_error, next_attempt_at
+         FROM notification_outbox
+         WHERE id = ? AND tenant_id = ?",
     )
     .bind(notification_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -699,8 +733,9 @@ async fn notification_worker_keeps_runtime_live_and_releases_send_failure() {
 }
 
 async fn command_outbox_state(pool: &sqlx::SqlitePool, command_id: Uuid) -> String {
-    sqlx::query_scalar("SELECT state FROM command_outbox WHERE id = ?")
+    sqlx::query_scalar("SELECT state FROM command_outbox WHERE id = ? AND tenant_id = ?")
         .bind(command_id.to_string())
+        .bind(TEST_TENANT_ID.to_string())
         .fetch_one(pool)
         .await
         .unwrap()

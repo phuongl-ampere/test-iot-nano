@@ -1722,10 +1722,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "device-simulator",
- "fs2",
  "iot-core",
  "iot-nano-stream",
- "iot-sqldb-common",
  "iot-storage",
  "lettre",
  "rumqttc",

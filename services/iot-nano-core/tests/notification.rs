@@ -1,28 +1,59 @@
-use std::{
-    env,
-    fs::{File, OpenOptions},
-    future::Future,
-    path::Path,
-    pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
-    time::Duration as StdDuration,
-};
+use std::{future::Future, path::Path, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, Utc};
-use fs2::FileExt;
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_nano_core::CoreSqliteStore;
 use iot_nano_core::{
-    EmailSender, NotificationDispatcher, NotificationError, PlatformNotificationDispatcher,
-    SmtpConfig, SmtpConfigInput, SqliteNotificationDispatcher, connect_core_database,
-    load_live_smtp_config, migrate,
+    EmailSender, NotificationError, PlatformNotificationDispatcher, SmtpConfig, SmtpConfigInput,
+    load_live_smtp_config,
 };
 use iot_storage::{NotificationRepository, PlatformStore};
-use sqlx::{PgPool, Row, SqlitePool};
+use sqlx::{Connection, PgConnection, Row};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-static DATABASE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const PLATFORM_TENANT_ID: Uuid = Uuid::from_u128(1);
+
+struct TimescaleTestLock {
+    _connection: PgConnection,
+}
+
+async fn timescale_platform_store() -> (TimescaleTestLock, PlatformStore) {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    sqlx::query("SELECT pg_advisory_lock(hashtext('iot_nano:platform-storage-test'))")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("DROP SCHEMA IF EXISTS iot_nano CASCADE")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+
+    (
+        TimescaleTestLock {
+            _connection: connection,
+        },
+        store,
+    )
+}
 
 #[derive(Clone)]
 struct FailingSender;
@@ -88,115 +119,6 @@ impl EmailSender for InFlightFailingSender {
     }
 }
 
-async fn prepared_pool() -> PgPool {
-    let database_url = env::var("DATABASE_URL")
-        .expect("DATABASE_URL must point to the local TimescaleDB test database");
-    let pool = connect_core_database(&database_url).await.unwrap();
-    migrate(&pool).await.unwrap();
-    sqlx::query(
-        "TRUNCATE gateway_event_receipts, command_outbox, notification_outbox, alert_rule_event_evaluations, alert_incidents, alert_rules, telemetry, device_runtime_state CASCADE",
-    )
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool
-}
-
-fn lock_database_file() -> File {
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(env::temp_dir().join("rush-iot-nano-timescaledb-tests.lock"))
-        .unwrap();
-    file.lock_exclusive().unwrap();
-    file
-}
-
-async fn seed_outbox(pool: &PgPool, now: DateTime<Utc>) -> Uuid {
-    let rule_id = Uuid::new_v4();
-    let incident_id = Uuid::new_v4();
-    let outbox_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, window_seconds,
-            for_seconds, resolve_after_seconds, reopen_grace_seconds, severity,
-            reminder_interval_seconds
-         ) VALUES ($1, 'High average', 'temperature_c', 'window_average', 'gt', 40.0, 300,
-                   0, 0, 3600, 'warning', 86400)",
-    )
-    .bind(rule_id)
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO alert_incidents (
-            id, rule_id, device_id, status, condition_started_at, opened_at, state_version
-         ) VALUES ($1, $2, 'esp-000123', 'open', $3, $3, 1)",
-    )
-    .bind(incident_id)
-    .bind(rule_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-         ) VALUES ($1, $2, 'opened', 'notification-test', 'subject', 'body', $3)",
-    )
-    .bind(outbox_id)
-    .bind(incident_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .unwrap();
-    outbox_id
-}
-
-async fn seed_sqlite_outbox(pool: &SqlitePool, now: DateTime<Utc>) -> String {
-    let rule_id = Uuid::new_v4().to_string();
-    let incident_id = Uuid::new_v4().to_string();
-    let outbox_id = Uuid::new_v4().to_string();
-    let timestamp = now.to_rfc3339();
-    sqlx::query(
-        "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, window_seconds,
-            for_seconds, resolve_after_seconds, reopen_grace_seconds, severity,
-            reminder_interval_seconds
-         ) VALUES (?, 'High average', 'temperature_c', 'window_average', 'gt', 40.0, 300,
-                   0, 0, 3600, 'warning', 86400)",
-    )
-    .bind(&rule_id)
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO alert_incidents (
-            id, rule_id, device_id, status, condition_started_at, opened_at, state_version
-         ) VALUES (?, ?, 'esp-000123', 'open', ?, ?, 1)",
-    )
-    .bind(&incident_id)
-    .bind(&rule_id)
-    .bind(&timestamp)
-    .bind(&timestamp)
-    .execute(pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-         ) VALUES (?, ?, 'opened', 'sqlite-notification-test', 'subject', 'body', ?)",
-    )
-    .bind(&outbox_id)
-    .bind(&incident_id)
-    .bind(&timestamp)
-    .execute(pool)
-    .await
-    .unwrap();
-    outbox_id
-}
-
 async fn platform_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -210,38 +132,58 @@ async fn platform_store() -> (tempfile::TempDir, PlatformStore) {
     (directory, store)
 }
 
-async fn seed_platform_outbox(store: &PlatformStore, id: Uuid, now: DateTime<Utc>) {
+async fn seed_platform_outbox(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    id: Uuid,
+    now: DateTime<Utc>,
+) {
     let pool = store.sqlite_pool().unwrap();
     let rule_id = Uuid::new_v4();
     let incident_id = Uuid::new_v4();
+    let device_id = format!("notification-device-{tenant_id}");
     let timestamp = now.to_rfc3339();
     sqlx::query(
+        "INSERT OR IGNORE INTO tenants (id, slug, status, metadata)
+         VALUES (?, ?, 'active', '{}')",
+    )
+    .bind(tenant_id.to_string())
+    .bind(format!("notification-dispatcher-{tenant_id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    store.register_device(tenant_id, &device_id).await.unwrap();
+    sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold
-         ) VALUES (?, ?, 'temperature_c', 'event_threshold', 'gt', 30)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold
+         ) VALUES (?, ?, ?, 'temperature_c', 'event_threshold', 'gt', 30)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id.to_string())
     .bind(format!("rule-{id}"))
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO alert_incidents (
-            id, rule_id, device_id, status, condition_started_at
-         ) VALUES (?, ?, 'notification-device', 'open', ?)",
+            id, tenant_id, rule_id, device_id, status, condition_started_at
+         ) VALUES (?, ?, ?, ?, 'open', ?)",
     )
     .bind(incident_id.to_string())
+    .bind(tenant_id.to_string())
     .bind(rule_id.to_string())
+    .bind(&device_id)
     .bind(&timestamp)
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-         ) VALUES (?, ?, 'opened', ?, 'subject', 'body', ?)",
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES (?, ?, ?, 'opened', ?, 'subject', 'body', ?)",
     )
     .bind(id.to_string())
+    .bind(tenant_id.to_string())
     .bind(incident_id.to_string())
     .bind(format!("dedupe-{id}"))
     .bind(timestamp)
@@ -250,13 +192,98 @@ async fn seed_platform_outbox(store: &PlatformStore, id: Uuid, now: DateTime<Utc
     .unwrap();
 }
 
+async fn register_timescale_platform_tenant(store: &PlatformStore, tenant_id: Uuid, slug: &str) {
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES ($1, $2, 'active', '{}'::jsonb)",
+    )
+    .bind(tenant_id)
+    .bind(slug)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    store
+        .register_device(
+            tenant_id,
+            &format!("timescale-notification-device-{tenant_id}"),
+        )
+        .await
+        .unwrap();
+}
+
+async fn seed_timescale_platform_outbox(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    id: Uuid,
+    now: DateTime<Utc>,
+) {
+    let pool = store.timescale_pool().unwrap();
+    let rule_id = Uuid::new_v4();
+    let incident_id = Uuid::new_v4();
+    let device_id = format!("timescale-notification-device-{tenant_id}");
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold
+         ) VALUES ($1, $2, $3, $4, 'temperature_c', 'event_threshold', 'gt', 30)",
+    )
+    .bind(rule_id)
+    .bind(tenant_id)
+    .bind(format!("timescale-rule-{id}"))
+    .bind(&device_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, tenant_id, rule_id, device_id, status, condition_started_at
+         ) VALUES ($1, $2, $3, $4, 'open', $5)",
+    )
+    .bind(incident_id)
+    .bind(tenant_id)
+    .bind(rule_id)
+    .bind(&device_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO notification_outbox (
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES ($1, $2, $3, 'opened', $4, 'subject', 'body', $5)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(incident_id)
+    .bind(format!("timescale-dedupe-{id}"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn timescale_notification_state(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    notification_id: Uuid,
+) -> String {
+    sqlx::query_scalar(
+        "SELECT state
+         FROM notification_outbox
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_id)
+    .bind(notification_id)
+    .fetch_one(store.timescale_pool().unwrap())
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn platform_dispatcher_marks_a_platform_outbox_row_sent() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();
-    seed_platform_outbox(&store, Uuid::new_v4(), now).await;
-    let dispatcher =
-        PlatformNotificationDispatcher::new(std::sync::Arc::new(store), SuccessfulSender, 10);
+    seed_platform_outbox(&store, PLATFORM_TENANT_ID, Uuid::new_v4(), now).await;
+    let dispatcher = PlatformNotificationDispatcher::new(Arc::new(store), SuccessfulSender, 10);
 
     let result = dispatcher.dispatch_once(now).await.unwrap();
 
@@ -266,13 +293,265 @@ async fn platform_dispatcher_marks_a_platform_outbox_row_sent() {
 }
 
 #[tokio::test]
+async fn platform_dispatcher_enforces_a_global_batch_bound_and_rotates_tenants() {
+    let (_directory, store) = platform_store().await;
+    let tenant_a = PLATFORM_TENANT_ID;
+    let tenant_b = Uuid::from_u128(2);
+    let tenant_c = Uuid::from_u128(3);
+    let now = Utc::now();
+    for tenant_id in [tenant_a, tenant_b, tenant_c] {
+        seed_platform_outbox(&store, tenant_id, Uuid::new_v4(), now).await;
+        seed_platform_outbox(&store, tenant_id, Uuid::new_v4(), now).await;
+    }
+    let mut non_ready_notifications = Vec::new();
+    for offset in 0_u128..10 {
+        let tenant_id = Uuid::from_u128(100 + offset);
+        let notification_id = Uuid::new_v4();
+        let leased = offset % 2 == 1;
+        seed_platform_outbox(&store, tenant_id, notification_id, now).await;
+        if leased {
+            sqlx::query(
+                "UPDATE notification_outbox
+                 SET state = 'leased', lease_until = ?
+                 WHERE tenant_id = ? AND id = ?",
+            )
+            .bind((now + Duration::hours(1)).to_rfc3339())
+            .bind(tenant_id.to_string())
+            .bind(notification_id.to_string())
+            .execute(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        } else {
+            sqlx::query(
+                "UPDATE notification_outbox
+                 SET next_attempt_at = ?
+                 WHERE tenant_id = ? AND id = ?",
+            )
+            .bind((now + Duration::hours(1)).to_rfc3339())
+            .bind(tenant_id.to_string())
+            .bind(notification_id.to_string())
+            .execute(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        }
+        non_ready_notifications.push((
+            tenant_id,
+            notification_id,
+            if leased { "leased" } else { "pending" },
+        ));
+    }
+    let dispatcher =
+        PlatformNotificationDispatcher::new(Arc::new(store.clone()), SuccessfulSender, 2);
+
+    let first = dispatcher.dispatch_once(now).await.unwrap();
+
+    assert_eq!(first.claimed, 2);
+    assert_eq!(first.sent, 2);
+    assert!(first.claimed <= 2);
+    assert!(first.sent <= 2);
+    let first_sent_tenants = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT tenant_id
+         FROM notification_outbox
+         WHERE state = 'sent'
+         ORDER BY tenant_id",
+    )
+    .fetch_all(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    assert_eq!(
+        first_sent_tenants,
+        vec![tenant_a.to_string(), tenant_b.to_string()]
+    );
+
+    let second = dispatcher
+        .dispatch_once(now + Duration::seconds(1))
+        .await
+        .unwrap();
+
+    assert_eq!(second.claimed, 2);
+    assert_eq!(second.sent, 2);
+    assert!(second.claimed <= 2);
+    assert!(second.sent <= 2);
+    let sent_by_tenant = sqlx::query_as::<_, (String, i64)>(
+        "SELECT tenant_id, COUNT(*)
+         FROM notification_outbox
+         WHERE state = 'sent'
+         GROUP BY tenant_id
+         ORDER BY tenant_id",
+    )
+    .fetch_all(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    assert_eq!(
+        sent_by_tenant,
+        vec![
+            (tenant_a.to_string(), 2),
+            (tenant_b.to_string(), 1),
+            (tenant_c.to_string(), 1),
+        ]
+    );
+    for (tenant_id, notification_id, expected_state) in non_ready_notifications {
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state
+             FROM notification_outbox
+             WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(notification_id.to_string())
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+        assert_eq!(state, expected_state);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_platform_dispatcher_enforces_a_global_batch_bound_rotates_ready_tenants_and_filters_unready_leases()
+ {
+    let (_lock, store) = timescale_platform_store().await;
+    let tenant_a = PLATFORM_TENANT_ID;
+    let tenant_b = Uuid::from_u128(2);
+    let tenant_c = Uuid::from_u128(3);
+    for (tenant_id, slug) in [
+        (tenant_a, "timescale-notification-a"),
+        (tenant_b, "timescale-notification-b"),
+        (tenant_c, "timescale-notification-c"),
+    ] {
+        register_timescale_platform_tenant(&store, tenant_id, slug).await;
+    }
+    let now = Utc::now();
+
+    let reclaimable_id = Uuid::now_v7();
+    seed_timescale_platform_outbox(&store, tenant_a, reclaimable_id, now).await;
+    sqlx::query(
+        "UPDATE notification_outbox
+         SET state = 'leased', lease_until = $1
+         WHERE tenant_id = $2 AND id = $3",
+    )
+    .bind(now - Duration::seconds(1))
+    .bind(tenant_a)
+    .bind(reclaimable_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+
+    let a_queued_id = Uuid::now_v7();
+    seed_timescale_platform_outbox(&store, tenant_a, a_queued_id, now).await;
+    sqlx::query(
+        "UPDATE notification_outbox
+         SET next_attempt_at = $1
+         WHERE tenant_id = $2 AND id = $3",
+    )
+    .bind(now + Duration::milliseconds(1))
+    .bind(tenant_a)
+    .bind(a_queued_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+
+    let b_id = Uuid::now_v7();
+    seed_timescale_platform_outbox(&store, tenant_b, b_id, now).await;
+    let c_id = Uuid::now_v7();
+    seed_timescale_platform_outbox(&store, tenant_c, c_id, now).await;
+
+    let future_tenant = Uuid::from_u128(100);
+    let future_id = Uuid::now_v7();
+    register_timescale_platform_tenant(&store, future_tenant, "timescale-notification-future")
+        .await;
+    seed_timescale_platform_outbox(&store, future_tenant, future_id, now).await;
+    sqlx::query(
+        "UPDATE notification_outbox
+         SET next_attempt_at = $1
+         WHERE tenant_id = $2 AND id = $3",
+    )
+    .bind(now + Duration::hours(1))
+    .bind(future_tenant)
+    .bind(future_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+
+    let active_lease_tenant = Uuid::from_u128(101);
+    let active_lease_id = Uuid::now_v7();
+    register_timescale_platform_tenant(
+        &store,
+        active_lease_tenant,
+        "timescale-notification-active-lease",
+    )
+    .await;
+    seed_timescale_platform_outbox(&store, active_lease_tenant, active_lease_id, now).await;
+    sqlx::query(
+        "UPDATE notification_outbox
+         SET state = 'leased', lease_until = $1
+         WHERE tenant_id = $2 AND id = $3",
+    )
+    .bind(now + Duration::hours(1))
+    .bind(active_lease_tenant)
+    .bind(active_lease_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+
+    let dispatcher =
+        PlatformNotificationDispatcher::new(Arc::new(store.clone()), SuccessfulSender, 2);
+
+    let first = dispatcher.dispatch_once(now).await.unwrap();
+    assert_eq!(first.claimed, 2);
+    assert_eq!(first.sent, 2);
+    assert!(first.claimed <= 2);
+    assert!(first.sent <= 2);
+    assert_eq!(
+        timescale_notification_state(&store, tenant_a, reclaimable_id).await,
+        "sent"
+    );
+    assert_eq!(
+        timescale_notification_state(&store, tenant_b, b_id).await,
+        "sent"
+    );
+    assert_eq!(
+        timescale_notification_state(&store, tenant_a, a_queued_id).await,
+        "pending"
+    );
+    assert_eq!(
+        timescale_notification_state(&store, tenant_c, c_id).await,
+        "pending"
+    );
+
+    let second = dispatcher
+        .dispatch_once(now + Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(second.claimed, 2);
+    assert_eq!(second.sent, 2);
+    assert!(second.claimed <= 2);
+    assert!(second.sent <= 2);
+    assert_eq!(
+        timescale_notification_state(&store, tenant_c, c_id).await,
+        "sent"
+    );
+    assert_eq!(
+        timescale_notification_state(&store, tenant_a, a_queued_id).await,
+        "sent"
+    );
+    assert_eq!(
+        timescale_notification_state(&store, future_tenant, future_id).await,
+        "pending"
+    );
+    assert_eq!(
+        timescale_notification_state(&store, active_lease_tenant, active_lease_id).await,
+        "leased"
+    );
+}
+
+#[tokio::test]
 async fn platform_dispatcher_releases_failed_delivery_with_exponential_backoff() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();
     let id = Uuid::new_v4();
-    seed_platform_outbox(&store, id, now).await;
+    seed_platform_outbox(&store, PLATFORM_TENANT_ID, id, now).await;
     let dispatcher =
-        PlatformNotificationDispatcher::new(std::sync::Arc::new(store.clone()), FailingSender, 10)
+        PlatformNotificationDispatcher::new(Arc::new(store.clone()), FailingSender, 10)
             .with_delivery_policy(
                 Duration::seconds(120),
                 Duration::seconds(7),
@@ -308,7 +587,7 @@ async fn platform_dispatcher_does_not_count_a_retry_after_lease_reclaim() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();
     let id = Uuid::new_v4();
-    seed_platform_outbox(&store, id, now).await;
+    seed_platform_outbox(&store, PLATFORM_TENANT_ID, id, now).await;
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let dispatcher = PlatformNotificationDispatcher::new(
@@ -331,6 +610,7 @@ async fn platform_dispatcher_does_not_count_a_retry_after_lease_reclaim() {
     let reclaimed_at = now + Duration::seconds(2);
     let reclaimed = NotificationRepository::claim_notifications(
         &store,
+        PLATFORM_TENANT_ID,
         reclaimed_at,
         reclaimed_at + Duration::seconds(30),
         1,
@@ -368,10 +648,9 @@ async fn platform_dispatcher_releases_timed_out_delivery() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();
     let id = Uuid::new_v4();
-    seed_platform_outbox(&store, id, now).await;
-    let dispatcher =
-        PlatformNotificationDispatcher::new(std::sync::Arc::new(store.clone()), SlowSender, 10)
-            .with_timeout(StdDuration::from_millis(1));
+    seed_platform_outbox(&store, PLATFORM_TENANT_ID, id, now).await;
+    let dispatcher = PlatformNotificationDispatcher::new(Arc::new(store.clone()), SlowSender, 10)
+        .with_timeout(StdDuration::from_millis(1));
 
     let result = dispatcher.dispatch_once(now).await.unwrap();
     let row = sqlx::query(
@@ -398,15 +677,20 @@ async fn platform_dispatcher_does_not_claim_a_still_leased_notification() {
     let (_directory, store) = platform_store().await;
     let now = Utc::now();
     let id = Uuid::new_v4();
-    seed_platform_outbox(&store, id, now).await;
+    seed_platform_outbox(&store, PLATFORM_TENANT_ID, id, now).await;
     let lease_until = now + Duration::seconds(30);
-    let claimed = NotificationRepository::claim_notifications(&store, now, lease_until, 1)
-        .await
-        .unwrap();
+    let claimed = NotificationRepository::claim_notifications(
+        &store,
+        PLATFORM_TENANT_ID,
+        now,
+        lease_until,
+        1,
+    )
+    .await
+    .unwrap();
     assert_eq!(claimed.len(), 1);
 
-    let dispatcher =
-        PlatformNotificationDispatcher::new(std::sync::Arc::new(store), SuccessfulSender, 10);
+    let dispatcher = PlatformNotificationDispatcher::new(Arc::new(store), SuccessfulSender, 10);
     let result = dispatcher.dispatch_once(now).await.unwrap();
 
     assert_eq!(result.claimed, 0);
@@ -419,9 +703,10 @@ async fn platform_dispatcher_reclaims_an_expired_lease() {
     let (_directory, store) = platform_store().await;
     let claim_time = Utc::now() - Duration::seconds(31);
     let id = Uuid::new_v4();
-    seed_platform_outbox(&store, id, claim_time).await;
+    seed_platform_outbox(&store, PLATFORM_TENANT_ID, id, claim_time).await;
     let claimed = NotificationRepository::claim_notifications(
         &store,
+        PLATFORM_TENANT_ID,
         claim_time,
         claim_time + Duration::seconds(1),
         1,
@@ -430,11 +715,8 @@ async fn platform_dispatcher_reclaims_an_expired_lease() {
     .unwrap();
     assert_eq!(claimed.len(), 1);
 
-    let dispatcher = PlatformNotificationDispatcher::new(
-        std::sync::Arc::new(store.clone()),
-        SuccessfulSender,
-        10,
-    );
+    let dispatcher =
+        PlatformNotificationDispatcher::new(Arc::new(store.clone()), SuccessfulSender, 10);
     let now = claim_time + Duration::seconds(31);
     let result = dispatcher.dispatch_once(now).await.unwrap();
 
@@ -447,262 +729,6 @@ async fn platform_dispatcher_reclaims_an_expired_lease() {
     assert_eq!(result.claimed, 1);
     assert_eq!(result.sent, 1);
     assert_eq!(state, "sent");
-}
-
-#[tokio::test]
-async fn sqlite_dispatcher_marks_a_sent_outbox_row_delivered() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = CoreSqliteStore::open(&StorageConfiguration {
-        storage: DatabaseStorage::Sqlite,
-        database_url: None,
-        sqlite_path: Some(directory.path().join("rush.db")),
-        sqlite_busy_timeout_ms: 5_000,
-    })
-    .await
-    .unwrap();
-    let now = Utc::now();
-    let outbox_id = seed_sqlite_outbox(store.pool(), now).await;
-    let dispatcher = SqliteNotificationDispatcher::new(store.pool().clone(), SuccessfulSender, 10);
-
-    let result = dispatcher.dispatch_once(now).await.unwrap();
-
-    let row = sqlx::query(
-        "SELECT state, attempt_count, sent_at, lease_until
-         FROM notification_outbox
-         WHERE id = ?",
-    )
-    .bind(outbox_id)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-
-    assert_eq!(result.claimed, 1);
-    assert_eq!(result.sent, 1);
-    assert_eq!(result.retried, 0);
-    assert_eq!(row.get::<String, _>("state"), "sent");
-    assert_eq!(row.get::<i64, _>("attempt_count"), 1);
-    assert!(row.get::<Option<String>, _>("sent_at").is_some());
-    assert!(row.get::<Option<String>, _>("lease_until").is_none());
-}
-
-#[tokio::test]
-async fn sqlite_dispatcher_reclaims_an_expired_lease_and_delivers_it() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = CoreSqliteStore::open(&StorageConfiguration {
-        storage: DatabaseStorage::Sqlite,
-        database_url: None,
-        sqlite_path: Some(directory.path().join("rush.db")),
-        sqlite_busy_timeout_ms: 5_000,
-    })
-    .await
-    .unwrap();
-    let now = Utc::now();
-    let outbox_id = seed_sqlite_outbox(store.pool(), now).await;
-    sqlx::query(
-        "UPDATE notification_outbox
-         SET state = 'leased', attempt_count = 1, lease_until = ?
-         WHERE id = ?",
-    )
-    .bind((now - Duration::seconds(1)).to_rfc3339())
-    .bind(&outbox_id)
-    .execute(store.pool())
-    .await
-    .unwrap();
-    let dispatcher = SqliteNotificationDispatcher::new(store.pool().clone(), SuccessfulSender, 10);
-
-    let result = dispatcher.dispatch_once(now).await.unwrap();
-
-    let row = sqlx::query(
-        "SELECT state, attempt_count, sent_at, lease_until
-         FROM notification_outbox
-         WHERE id = ?",
-    )
-    .bind(outbox_id)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-
-    assert_eq!(result.claimed, 1);
-    assert_eq!(result.sent, 1);
-    assert_eq!(result.retried, 0);
-    assert_eq!(row.get::<String, _>("state"), "sent");
-    assert_eq!(row.get::<i64, _>("attempt_count"), 2);
-    assert!(row.get::<Option<String>, _>("sent_at").is_some());
-    assert!(row.get::<Option<String>, _>("lease_until").is_none());
-}
-
-#[tokio::test]
-async fn sqlite_dispatcher_releases_a_failed_outbox_row_for_retry() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = CoreSqliteStore::open(&StorageConfiguration {
-        storage: DatabaseStorage::Sqlite,
-        database_url: None,
-        sqlite_path: Some(directory.path().join("rush.db")),
-        sqlite_busy_timeout_ms: 5_000,
-    })
-    .await
-    .unwrap();
-    let now = Utc::now();
-    let outbox_id = seed_sqlite_outbox(store.pool(), now).await;
-    let dispatcher = SqliteNotificationDispatcher::new(store.pool().clone(), FailingSender, 10)
-        .with_delivery_policy(
-            Duration::seconds(120),
-            Duration::seconds(7),
-            Duration::seconds(60),
-        );
-
-    let result = dispatcher.dispatch_once(now).await.unwrap();
-
-    let row = sqlx::query(
-        "SELECT state, attempt_count, next_attempt_at, lease_until, last_error
-         FROM notification_outbox
-         WHERE id = ?",
-    )
-    .bind(outbox_id)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-
-    assert_eq!(result.claimed, 1);
-    assert_eq!(result.sent, 0);
-    assert_eq!(result.retried, 1);
-    assert_eq!(row.get::<String, _>("state"), "pending");
-    assert_eq!(row.get::<i64, _>("attempt_count"), 1);
-    assert_eq!(
-        row.get::<String, _>("next_attempt_at"),
-        (now + Duration::seconds(7)).to_rfc3339()
-    );
-    assert!(row.get::<Option<String>, _>("lease_until").is_none());
-    assert_eq!(
-        row.get::<Option<String>, _>("last_error").as_deref(),
-        Some("test SMTP failure")
-    );
-}
-
-#[tokio::test]
-async fn sqlite_dispatcher_releases_a_timed_out_outbox_row_for_retry() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = CoreSqliteStore::open(&StorageConfiguration {
-        storage: DatabaseStorage::Sqlite,
-        database_url: None,
-        sqlite_path: Some(directory.path().join("rush.db")),
-        sqlite_busy_timeout_ms: 5_000,
-    })
-    .await
-    .unwrap();
-    let now = Utc::now();
-    let outbox_id = seed_sqlite_outbox(store.pool(), now).await;
-    let dispatcher = SqliteNotificationDispatcher::new(store.pool().clone(), SlowSender, 10)
-        .with_timeout(StdDuration::from_millis(1));
-
-    let result = dispatcher.dispatch_once(now).await.unwrap();
-
-    let row = sqlx::query(
-        "SELECT state, attempt_count, lease_until, last_error
-         FROM notification_outbox
-         WHERE id = ?",
-    )
-    .bind(outbox_id)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-
-    assert_eq!(result.claimed, 1);
-    assert_eq!(result.sent, 0);
-    assert_eq!(result.retried, 1);
-    assert_eq!(row.get::<String, _>("state"), "pending");
-    assert_eq!(row.get::<i64, _>("attempt_count"), 1);
-    assert!(row.get::<Option<String>, _>("lease_until").is_none());
-    assert_eq!(
-        row.get::<Option<String>, _>("last_error").as_deref(),
-        Some("SMTP send timed out")
-    );
-}
-
-#[tokio::test]
-async fn failed_email_returns_leased_outbox_row_to_pending_with_backoff() {
-    let _database_lock = DATABASE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _database_file_lock = lock_database_file();
-    let pool = prepared_pool().await;
-    let now = Utc::now();
-    let outbox_id = seed_outbox(&pool, now).await;
-    let dispatcher = NotificationDispatcher::new(pool.clone(), FailingSender, 10);
-
-    dispatcher.dispatch_once(now).await.unwrap();
-
-    let row = sqlx::query(
-        "SELECT state, attempt_count, next_attempt_at, lease_until
-         FROM notification_outbox
-         WHERE id = $1",
-    )
-    .bind(outbox_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(row.get::<String, _>("state"), "pending");
-    assert_eq!(row.get::<i32, _>("attempt_count"), 1);
-    assert!(row.get::<DateTime<Utc>, _>("next_attempt_at") > now);
-    assert!(row.get::<Option<DateTime<Utc>>, _>("lease_until").is_none());
-}
-
-#[tokio::test]
-async fn successful_email_marks_outbox_row_sent() {
-    let _database_lock = DATABASE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _database_file_lock = lock_database_file();
-    let pool = prepared_pool().await;
-    let now = Utc::now();
-    let outbox_id = seed_outbox(&pool, now).await;
-    let dispatcher = NotificationDispatcher::new(pool.clone(), SuccessfulSender, 10);
-
-    let result = dispatcher.dispatch_once(now).await.unwrap();
-
-    let row = sqlx::query(
-        "SELECT state, sent_at, lease_until
-         FROM notification_outbox
-         WHERE id = $1",
-    )
-    .bind(outbox_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(result.sent, 1);
-    assert_eq!(row.get::<String, _>("state"), "sent");
-    assert!(row.get::<Option<DateTime<Utc>>, _>("sent_at").is_some());
-    assert!(row.get::<Option<DateTime<Utc>>, _>("lease_until").is_none());
-}
-
-#[tokio::test]
-async fn notification_delivery_policy_controls_the_retry_delay() {
-    let _database_lock = DATABASE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _database_file_lock = lock_database_file();
-    let pool = prepared_pool().await;
-    let now = Utc::now();
-    let outbox_id = seed_outbox(&pool, now).await;
-    let dispatcher = NotificationDispatcher::new(pool.clone(), FailingSender, 10)
-        .with_delivery_policy(
-            Duration::seconds(120),
-            Duration::seconds(7),
-            Duration::seconds(60),
-        );
-
-    dispatcher.dispatch_once(now).await.unwrap();
-
-    let next_attempt_at = sqlx::query_scalar::<_, DateTime<Utc>>(
-        "SELECT next_attempt_at FROM notification_outbox WHERE id = $1",
-    )
-    .bind(outbox_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(next_attempt_at, now + Duration::seconds(7));
 }
 
 #[test]

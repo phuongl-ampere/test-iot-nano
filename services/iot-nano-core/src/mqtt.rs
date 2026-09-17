@@ -259,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn durable_append_completes_before_acknowledgement_starts() {
         let stream = BlockingAppendStream::new();
-        let producer = MqttStreamProducer::new(Arc::new(stream.clone()));
+        let producer = MqttStreamProducer::new(Uuid::from_u128(1), Arc::new(stream.clone()));
         let acknowledged = Arc::new(AtomicBool::new(false));
         let now = Utc.with_ymd_and_hms(2026, 9, 12, 0, 0, 0).unwrap();
         let event = TelemetryEvent {

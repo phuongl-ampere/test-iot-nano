@@ -13,6 +13,58 @@ mod common;
 
 const TIMESCALE_TEST_URL: &str = "postgres://iot:iot@127.0.0.1:54329/iot_nano_test_platform";
 
+fn tenant_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
+
+async fn seed_tenant_and_devices(store: &PlatformStore, slug: &str) {
+    let device_ids = ["device-1", "device-2", "device-a", "device-b"];
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query(
+                "INSERT OR IGNORE INTO tenants (id, slug, status, metadata)
+                 VALUES (?, ?, 'active', '{}')",
+            )
+            .bind(tenant_id().to_string())
+            .bind(slug)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            for device_id in device_ids {
+                sqlx::query("INSERT OR IGNORE INTO devices (device_id, tenant_id) VALUES (?, ?)")
+                    .bind(device_id)
+                    .bind(tenant_id().to_string())
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            }
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES ($1, $2, 'active', '{}'::jsonb)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(tenant_id())
+            .bind(slug)
+            .execute(pool)
+            .await
+            .unwrap();
+            for device_id in device_ids {
+                sqlx::query(
+                    "INSERT INTO devices (device_id, tenant_id) VALUES ($1, $2)
+                     ON CONFLICT (device_id) DO NOTHING",
+                )
+                .bind(device_id)
+                .bind(tenant_id())
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+}
+
 async fn store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -23,6 +75,7 @@ async fn store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    seed_tenant_and_devices(&store, "alert-evaluation").await;
     (directory, store)
 }
 
@@ -50,6 +103,7 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
     })
     .await
     .unwrap();
+    seed_tenant_and_devices(&store, "alert-evaluation-timescale").await;
     (connection, store)
 }
 
@@ -72,6 +126,7 @@ fn event_for_device(
     AlertEvaluationEvent {
         event_at: at,
         received_at: at,
+        tenant_id: tenant_id(),
         device_id: device_id.to_owned(),
         boot_id,
         sequence,
@@ -86,16 +141,18 @@ async fn insert_sqlite_window_telemetry(
     sequence: i64,
     measurements: &str,
 ) {
-    sqlx::query("INSERT OR IGNORE INTO devices (device_id) VALUES (?)")
+    sqlx::query("INSERT OR IGNORE INTO devices (device_id, tenant_id) VALUES (?, ?)")
         .bind(device_id)
+        .bind(tenant_id().to_string())
         .execute(store.sqlite_pool().unwrap())
         .await
         .unwrap();
     sqlx::query(
         "INSERT INTO telemetry (
-            event_at, received_at, device_id, boot_id, sequence, measurements, topic
-         ) VALUES (?, ?, ?, 'window-boot', ?, ?, 'test')",
+            tenant_id, event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, ?, 'window-boot', ?, ?, 'test')",
     )
+    .bind(tenant_id().to_string())
     .bind(event_at)
     .bind(event_at)
     .bind(device_id)
@@ -125,16 +182,21 @@ async fn insert_timescale_window_telemetry(
     sequence: i64,
     measurements: &str,
 ) {
-    sqlx::query("INSERT INTO devices (device_id) VALUES ($1) ON CONFLICT DO NOTHING")
-        .bind(device_id)
-        .execute(store.timescale_pool().unwrap())
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id) VALUES ($1, $2)
+         ON CONFLICT (device_id) DO NOTHING",
+    )
+    .bind(device_id)
+    .bind(tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO telemetry (
-            event_at, received_at, device_id, boot_id, sequence, measurements, topic
-         ) VALUES ($1, $1, $2, $3, $4, $5::jsonb, 'test')",
+            tenant_id, event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $2, $2, $3, $4, $5, $6::jsonb, 'test')",
     )
+    .bind(tenant_id())
     .bind(event_at)
     .bind(device_id)
     .bind(uuid::Uuid::nil())
@@ -162,12 +224,13 @@ async fn sqlite_window_evaluation_uses_semantic_inclusive_ranges_and_finite_json
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
             window_seconds, for_seconds
-         ) VALUES (?, 'temperature average high', 'device-1', 'temperature_c',
+         ) VALUES (?, ?, 'temperature average high', 'device-1', 'temperature_c',
                    'window_average', 'gt', 30, 60, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -238,12 +301,13 @@ async fn sqlite_window_evaluation_keeps_near_max_finite_averages_finite() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
             window_seconds, for_seconds
-         ) VALUES (?, 'temperature average high', 'device-1', 'temperature_c',
+         ) VALUES (?, ?, 'temperature average high', 'device-1', 'temperature_c',
                    'window_average', 'gt', 1.6e308, 60, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -283,12 +347,13 @@ async fn sqlite_window_evaluation_accepts_min_i64_json_integer() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
             window_seconds, for_seconds
-         ) VALUES (?, 'temperature average low', 'device-1', 'temperature_c',
+         ) VALUES (?, ?, 'temperature average low', 'device-1', 'temperature_c',
                    'window_average', 'lt', -9.0e18, 60, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -326,12 +391,13 @@ async fn sqlite_window_evaluation_handles_all_zero_finite_averages() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
             window_seconds, for_seconds
-         ) VALUES (?, 'temperature average nonnegative', 'device-1', 'temperature_c',
+         ) VALUES (?, ?, 'temperature average nonnegative', 'device-1', 'temperature_c',
                    'window_average', 'gte', 0, 60, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -385,12 +451,13 @@ async fn sqlite_window_evaluation_selects_wildcard_and_scoped_devices_and_exclud
     ] {
         sqlx::query(
             "INSERT INTO alert_rules (
-                id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+                id, tenant_id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
                 window_seconds, for_seconds, archived_at
-             ) VALUES (?, 'temperature average high', ?, ?, 'temperature_c',
+             ) VALUES (?, ?, 'temperature average high', ?, ?, 'temperature_c',
                        'window_average', 'gt', 30, 60, 0, ?)",
         )
         .bind(rule_id.to_string())
+        .bind(tenant_id().to_string())
         .bind(enabled)
         .bind(device_id)
         .bind(archived_at)
@@ -463,10 +530,11 @@ async fn sqlite_window_evaluation_without_valid_samples_is_a_noop() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds
-         ) VALUES (?, 'humidity average high', 'humidity_pct', 'window_average', 'gt', 90, 60, 0)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds
+         ) VALUES (?, ?, 'humidity average high', 'humidity_pct', 'window_average', 'gt', 90, 60, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -509,12 +577,13 @@ async fn sqlite_window_samples_preserve_pending_recovery_notification_and_reopen
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds,
             resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
-         ) VALUES (?, 'temperature average high', 'temperature_c', 'window_average', 'gt', 30,
+         ) VALUES (?, ?, 'temperature average high', 'temperature_c', 'window_average', 'gt', 30,
                    60, 120, 120, 600, 120)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -610,10 +679,11 @@ async fn sqlite_evaluation_opens_an_immediate_event_incident_atomically() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -621,6 +691,7 @@ async fn sqlite_evaluation_opens_an_immediate_event_incident_atomically() {
     let event = AlertEvaluationEvent {
         event_at: at,
         received_at: at,
+        tenant_id: tenant_id(),
         device_id: "device-1".to_owned(),
         boot_id: uuid::Uuid::now_v7(),
         sequence: 1,
@@ -663,10 +734,11 @@ async fn sqlite_duplicate_event_is_a_complete_noop() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -674,6 +746,7 @@ async fn sqlite_duplicate_event_is_a_complete_noop() {
     let event = AlertEvaluationEvent {
         event_at: at,
         received_at: at,
+        tenant_id: tenant_id(),
         device_id: "device-1".to_owned(),
         boot_id: uuid::Uuid::now_v7(),
         sequence: 7,
@@ -708,10 +781,11 @@ async fn sqlite_positive_duration_breach_opens_at_the_exact_boundary() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -784,10 +858,11 @@ async fn sqlite_normal_event_deletes_a_pending_incident() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -831,11 +906,12 @@ async fn sqlite_unacknowledged_open_breach_sends_a_versioned_reminder_when_due()
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             reminder_interval_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 60)",
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -891,11 +967,12 @@ async fn sqlite_open_normal_starts_recovery_and_resolves_at_the_exact_boundary()
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 60)",
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -985,11 +1062,12 @@ async fn sqlite_reopen_within_grace_reuses_the_incident_and_beyond_grace_creates
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds, reopen_grace_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60)",
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -1088,11 +1166,12 @@ async fn sqlite_acknowledged_open_suppresses_reminders_but_still_resolves() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds, reminder_interval_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60)",
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -1154,11 +1233,12 @@ async fn sqlite_hysteresis_indeterminate_event_leaves_an_open_incident_unchanged
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds, hysteresis
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 2)",
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 2)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -1206,10 +1286,11 @@ async fn sqlite_notification_conflict_rolls_back_event_claim_and_transition() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -1226,10 +1307,11 @@ async fn sqlite_notification_conflict_rolls_back_event_claim_and_transition() {
     let dedupe_key = format!("incident:{incident_id}:opened:1");
     sqlx::query(
         "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
-         ) VALUES (?, ?, 'opened', ?, 'conflict', 'conflict', ?, ?)",
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
+         ) VALUES (?, ?, ?, 'opened', ?, 'conflict', 'conflict', ?, ?)",
     )
     .bind(uuid::Uuid::now_v7().to_string())
+    .bind(tenant_id().to_string())
     .bind(&incident_id)
     .bind(&dedupe_key)
     .bind(start.to_rfc3339())
@@ -1314,11 +1396,12 @@ async fn sqlite_evaluates_only_matching_enabled_rules_with_finite_json_numbers()
     ] {
         sqlx::query(
             "INSERT INTO alert_rules (
-                id, name, enabled, device_id, metric_key, rule_type, comparison, threshold, for_seconds,
+                id, tenant_id, name, enabled, device_id, metric_key, rule_type, comparison, threshold, for_seconds,
                 archived_at
-             ) VALUES (?, ?, ?, ?, 'temperature_c', 'event_threshold', 'gt', 30, 0, ?)",
+             ) VALUES (?, ?, ?, ?, ?, 'temperature_c', 'event_threshold', 'gt', 30, 0, ?)",
         )
         .bind(id.to_string())
+        .bind(tenant_id().to_string())
         .bind(name)
         .bind(enabled)
         .bind(device_id)
@@ -1347,6 +1430,7 @@ async fn sqlite_evaluates_only_matching_enabled_rules_with_finite_json_numbers()
     let nonnumeric = AlertEvaluationEvent {
         event_at: nonnumeric_at,
         received_at: nonnumeric_at,
+        tenant_id: tenant_id(),
         device_id: "device-1".to_owned(),
         boot_id,
         sequence: 2,
@@ -1400,15 +1484,191 @@ async fn sqlite_evaluates_only_matching_enabled_rules_with_finite_json_numbers()
 }
 
 #[tokio::test]
+async fn sqlite_event_and_window_evaluations_do_not_cross_tenant_boundaries() {
+    let (_directory, store) = store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_b = uuid::Uuid::from_u128(2);
+    let tenant_b_event_device = "tenant-b-event-device";
+    let tenant_b_window_device = "tenant-b-window-device";
+    let event_open_rule_id = uuid::Uuid::now_v7();
+    let event_resolve_rule_id = uuid::Uuid::now_v7();
+    let window_rule_id = uuid::Uuid::now_v7();
+    let resolve_incident_id = uuid::Uuid::now_v7();
+    let at = Utc.timestamp_opt(1_700_000_850, 0).unwrap();
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'alert-evaluation-tenant-b', 'active')",
+    )
+    .bind(tenant_b.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?), (?, ?)")
+        .bind(tenant_b_event_device)
+        .bind(tenant_b.to_string())
+        .bind(tenant_b_window_device)
+        .bind(tenant_b.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
+            for_seconds, resolve_after_seconds
+         ) VALUES
+            (?, ?, 'tenant B event open', ?, 'temperature_c', 'event_threshold', 'gt', 30, 0, 0),
+            (?, ?, 'tenant B event resolve', ?, 'temperature_c', 'event_threshold', 'gt', 10, 0, 0)",
+    )
+    .bind(event_open_rule_id.to_string())
+    .bind(tenant_b.to_string())
+    .bind(tenant_b_event_device)
+    .bind(event_resolve_rule_id.to_string())
+    .bind(tenant_b.to_string())
+    .bind(tenant_b_event_device)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, window_seconds,
+            for_seconds
+         ) VALUES (?, ?, 'tenant B window', 'temperature_c', 'window_average', 'gt', 30, 60, 0)",
+    )
+    .bind(window_rule_id.to_string())
+    .bind(tenant_b.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at
+         ) VALUES (?, ?, ?, ?, 'open', ?, ?)",
+    )
+    .bind(resolve_incident_id.to_string())
+    .bind(tenant_b.to_string())
+    .bind(event_resolve_rule_id.to_string())
+    .bind(tenant_b_event_device)
+    .bind(at.to_rfc3339())
+    .bind(at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // A malformed upstream event must not be able to target a device owned by tenant B.
+    let boot_id = uuid::Uuid::now_v7();
+    let breach = event_for_device(at, 1, 31.0, boot_id, tenant_b_event_device);
+    let normal_at = at + Duration::seconds(1);
+    let normal = event_for_device(normal_at, 2, 0.0, boot_id, tenant_b_event_device);
+    assert_eq!(
+        store
+            .evaluate_alert_events(&[breach, normal], normal_at)
+            .await
+            .unwrap(),
+        AlertEvaluationResult::default()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_rule_event_evaluations WHERE tenant_id = ?",
+        )
+        .bind(tenant_b.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents WHERE tenant_id = ? AND rule_id = ?",
+        )
+        .bind(tenant_b.to_string())
+        .bind(event_open_rule_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE id = ?")
+            .bind(resolve_incident_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        "open"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_outbox WHERE tenant_id = ?",
+        )
+        .bind(tenant_b.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    insert_sqlite_window_telemetry(
+        &store,
+        &at.to_rfc3339(),
+        "device-1",
+        1,
+        r#"{"temperature_c":31}"#,
+    )
+    .await;
+    sqlx::query(
+        r#"INSERT INTO telemetry (
+            tenant_id, event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, ?, 'tenant-b-window-boot', 1, '{"temperature_c":32}', 'test')"#,
+    )
+    .bind(tenant_b.to_string())
+    .bind(at.to_rfc3339())
+    .bind(at.to_rfc3339())
+    .bind(tenant_b_window_device)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store.evaluate_alert_windows(at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents WHERE tenant_id = ? AND rule_id = ?",
+        )
+        .bind(tenant_b.to_string())
+        .bind(window_rule_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT device_id FROM alert_incidents WHERE tenant_id = ? AND rule_id = ?",
+        )
+        .bind(tenant_b.to_string())
+        .bind(window_rule_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        tenant_b_window_device
+    );
+}
+
+#[tokio::test]
 async fn sqlite_canonicalizes_event_identity_and_keeps_legacy_u64_sequences() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -1465,11 +1725,12 @@ async fn sqlite_breach_clears_recovery_and_restarts_the_resolve_timer() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 60)",
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -1551,11 +1812,12 @@ async fn sqlite_within_grace_positive_duration_reopen_reuses_pending_incident() 
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds, reopen_grace_seconds
-         ) VALUES (?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60, 0, 60)",
+         ) VALUES (?, ?, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 60, 0, 60)",
     )
     .bind(rule_id.to_string())
+    .bind(tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -1638,11 +1900,12 @@ async fn timescale_concurrent_distinct_events_serialize_first_incident_transitio
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
-         ) VALUES ($1, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
+         ) VALUES ($1, $2, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -1707,11 +1970,12 @@ async fn timescale_opposite_ordered_event_batches_do_not_deadlock() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
-         ) VALUES ($1, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
+         ) VALUES ($1, $2, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -1795,11 +2059,12 @@ async fn timescale_event_evaluation_matches_sqlite_state_sequence_and_duplicate_
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
             resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
-         ) VALUES ($1, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
+         ) VALUES ($1, $2, 'temperature high', 'temperature_c', 'event_threshold', 'gt', 30, 0, 0, 60, 60)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -1941,12 +2206,13 @@ async fn timescale_window_evaluation_matches_sqlite_state_sequence_and_finite_sa
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold, window_seconds,
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold, window_seconds,
             for_seconds, resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
-         ) VALUES ($1, 'temperature average high', 'device-1', 'temperature_c',
+         ) VALUES ($1, $2, 'temperature average high', 'device-1', 'temperature_c',
                    'window_average', 'gt', 30, 60, 0, 120, 600, 120)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -2040,12 +2306,13 @@ async fn timescale_concurrent_multi_device_window_evaluations_do_not_deadlock() 
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds,
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, window_seconds, for_seconds,
             resolve_after_seconds, reopen_grace_seconds, reminder_interval_seconds
-         ) VALUES ($1, 'temperature average high', 'temperature_c', 'window_average', 'gt', 30,
+         ) VALUES ($1, $2, 'temperature average high', 'temperature_c', 'window_average', 'gt', 30,
                    60, 0, 120, 600, 60)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -2112,12 +2379,13 @@ async fn timescale_window_evaluation_keeps_near_max_finite_averages_finite() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
             window_seconds, for_seconds
-         ) VALUES ($1, 'temperature average high', 'device-1', 'temperature_c',
-                   'window_average', 'gt', $2, 60, 0)",
+         ) VALUES ($1, $2, 'temperature average high', 'device-1', 'temperature_c',
+                   'window_average', 'gt', $3, 60, 0)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .bind(1.6e308_f64)
     .execute(store.timescale_pool().unwrap())
     .await
@@ -2159,12 +2427,13 @@ async fn timescale_window_evaluation_accepts_min_i64_json_integer() {
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold,
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
             window_seconds, for_seconds
-         ) VALUES ($1, 'temperature average low', 'device-1', 'temperature_c',
-                   'window_average', 'lt', $2, 60, 0)",
+         ) VALUES ($1, $2, 'temperature average low', 'device-1', 'temperature_c',
+                   'window_average', 'lt', $3, 60, 0)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .bind(-9.0e18_f64)
     .execute(store.timescale_pool().unwrap())
     .await
@@ -2195,4 +2464,168 @@ async fn timescale_window_evaluation_accepts_min_i64_json_integer() {
             .unwrap();
     assert!(last_value.is_finite());
     assert!(last_value < -9.0e18);
+}
+
+#[tokio::test]
+#[ignore = "requires the guarded disposable Timescale URL"]
+async fn timescale_event_and_window_evaluations_do_not_cross_tenant_boundaries() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let tenant_b = uuid::Uuid::from_u128(2);
+    let tenant_b_event_device = "tenant-b-timescale-event-device";
+    let tenant_b_window_device = "tenant-b-timescale-window-device";
+    let event_open_rule_id = uuid::Uuid::now_v7();
+    let event_resolve_rule_id = uuid::Uuid::now_v7();
+    let window_rule_id = uuid::Uuid::now_v7();
+    let resolve_incident_id = uuid::Uuid::now_v7();
+    let at = Utc.timestamp_opt(1_700_003_700, 0).unwrap();
+
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES ($1, $2, 'active')")
+        .bind(tenant_b)
+        .bind("alert-evaluation-timescale-tenant-b")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ($1, $2), ($3, $2)")
+        .bind(tenant_b_event_device)
+        .bind(tenant_b)
+        .bind(tenant_b_window_device)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold,
+            for_seconds, resolve_after_seconds
+         ) VALUES
+            ($1, $2, 'tenant B event open', $3, 'temperature_c', 'event_threshold', 'gt', 30, 0, 0),
+            ($4, $2, 'tenant B event resolve', $3, 'temperature_c', 'event_threshold', 'gt', 10, 0, 0)",
+    )
+    .bind(event_open_rule_id)
+    .bind(tenant_b)
+    .bind(tenant_b_event_device)
+    .bind(event_resolve_rule_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold, window_seconds,
+            for_seconds
+         ) VALUES ($1, $2, 'tenant B window', 'temperature_c', 'window_average', 'gt', 30, 60, 0)",
+    )
+    .bind(window_rule_id)
+    .bind(tenant_b)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at
+         ) VALUES ($1, $2, $3, $4, 'open', $5, $5)",
+    )
+    .bind(resolve_incident_id)
+    .bind(tenant_b)
+    .bind(event_resolve_rule_id)
+    .bind(tenant_b_event_device)
+    .bind(at)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let boot_id = uuid::Uuid::now_v7();
+    let breach = event_for_device(at, 1, 31.0, boot_id, tenant_b_event_device);
+    let normal_at = at + Duration::seconds(1);
+    let normal = event_for_device(normal_at, 2, 0.0, boot_id, tenant_b_event_device);
+    assert_eq!(
+        store
+            .evaluate_alert_events(&[breach, normal], normal_at)
+            .await
+            .unwrap(),
+        AlertEvaluationResult::default()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_rule_event_evaluations WHERE tenant_id = $1",
+        )
+        .bind(tenant_b)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents WHERE tenant_id = $1 AND rule_id = $2",
+        )
+        .bind(tenant_b)
+        .bind(event_open_rule_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM alert_incidents WHERE id = $1")
+            .bind(resolve_incident_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        "open"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM notification_outbox WHERE tenant_id = $1",
+        )
+        .bind(tenant_b)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    insert_timescale_window_telemetry(&store, at, "device-1", 1, r#"{"temperature_c":31}"#).await;
+    sqlx::query(
+        "INSERT INTO telemetry (
+            tenant_id, event_at, received_at, device_id, boot_id, sequence, measurements, topic
+         ) VALUES ($1, $2, $2, $3, $4, 1, $5::jsonb, 'test')",
+    )
+    .bind(tenant_b)
+    .bind(at)
+    .bind(tenant_b_window_device)
+    .bind(uuid::Uuid::now_v7())
+    .bind(r#"{"temperature_c":32}"#)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store.evaluate_alert_windows(at).await.unwrap(),
+        AlertEvaluationResult {
+            evaluated: 1,
+            opened: 1,
+            ..AlertEvaluationResult::default()
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents WHERE tenant_id = $1 AND rule_id = $2",
+        )
+        .bind(tenant_b)
+        .bind(window_rule_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT device_id FROM alert_incidents WHERE tenant_id = $1 AND rule_id = $2",
+        )
+        .bind(tenant_b)
+        .bind(window_rule_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        tenant_b_window_device
+    );
 }

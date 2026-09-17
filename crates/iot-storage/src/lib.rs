@@ -463,6 +463,7 @@ CREATE INDEX IF NOT EXISTS device_tokens_active_prefix_index
 
 CREATE TABLE IF NOT EXISTS alert_rules (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     device_id TEXT,
@@ -479,24 +480,36 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     reminder_interval_seconds INTEGER NOT NULL DEFAULT 86400,
     archived_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (id, tenant_id),
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS alert_rules_enabled_kind_device_index
-    ON alert_rules (rule_type, device_id)
+    ON alert_rules (tenant_id, rule_type, device_id)
     WHERE enabled = 1;
+CREATE INDEX IF NOT EXISTS alert_rules_active_index
+    ON alert_rules (tenant_id, created_at DESC, id)
+    WHERE archived_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS alert_rule_event_evaluations (
-    rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    rule_id TEXT NOT NULL,
     event_at TEXT NOT NULL,
     device_id TEXT NOT NULL,
     boot_id TEXT NOT NULL,
     sequence TEXT NOT NULL,
-    PRIMARY KEY (rule_id, event_at, device_id, boot_id, sequence)
+    PRIMARY KEY (tenant_id, rule_id, event_at, device_id, boot_id, sequence),
+    FOREIGN KEY (rule_id, tenant_id)
+        REFERENCES alert_rules(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS alert_incidents (
     id TEXT PRIMARY KEY,
-    rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE RESTRICT,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    rule_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     status TEXT NOT NULL,
     condition_started_at TEXT NOT NULL,
@@ -510,17 +523,25 @@ CREATE TABLE IF NOT EXISTS alert_incidents (
     last_reminder_at TEXT,
     state_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (id, tenant_id),
+    FOREIGN KEY (rule_id, tenant_id)
+        REFERENCES alert_rules(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS alert_incidents_active_rule_device_index
-    ON alert_incidents (rule_id, device_id)
+    ON alert_incidents (tenant_id, rule_id, device_id)
     WHERE status IN ('pending', 'open');
+CREATE INDEX IF NOT EXISTS alert_incidents_status_updated_index
+    ON alert_incidents (tenant_id, status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS notification_outbox (
     id TEXT PRIMARY KEY,
-    incident_id TEXT NOT NULL REFERENCES alert_incidents(id) ON DELETE CASCADE,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    incident_id TEXT NOT NULL,
     kind TEXT NOT NULL,
-    dedupe_key TEXT NOT NULL UNIQUE,
+    dedupe_key TEXT NOT NULL,
     subject TEXT NOT NULL,
     body TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'pending',
@@ -529,10 +550,14 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     sent_at TEXT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, dedupe_key),
+    FOREIGN KEY (incident_id, tenant_id)
+        REFERENCES alert_incidents(id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS notification_outbox_due_index
-    ON notification_outbox (state, next_attempt_at)
+    ON notification_outbox (tenant_id, state, next_attempt_at)
     WHERE state = 'pending';
 
 CREATE TABLE IF NOT EXISTS command_outbox (
@@ -614,6 +639,10 @@ pub enum PlatformStoreError {
     CommandConflict(String),
     #[error("notification ID is not a UUID: {0:?}")]
     InvalidNotificationId(String),
+    #[error("notification tenant ID is not a UUID: {0:?}")]
+    InvalidNotificationTenantId(String),
+    #[error("notification tenant does not match its incident tenant")]
+    NotificationTenantMismatch,
     #[error("invalid notification outbox kind: {0:?}")]
     InvalidNotificationKind(String),
     #[error("invalid notification outbox state: {0:?}")]
@@ -627,6 +656,8 @@ pub enum PlatformStoreError {
     },
     #[error("incident ID is not a UUID: {0:?}")]
     InvalidIncidentId(String),
+    #[error("incident tenant ID is not a UUID: {0:?}")]
+    InvalidIncidentTenantId(String),
     #[error("invalid alert incident status: {0:?}")]
     InvalidIncidentStatus(String),
     #[error("invalid alert incident {column} timestamp: {value}")]
@@ -711,6 +742,8 @@ pub enum PlatformStoreError {
     OAuthAccessTokenDenied,
     #[error("alert rule ID must be a UUID, got {0:?}")]
     InvalidAlertRuleId(String),
+    #[error("alert rule tenant ID must be a UUID, got {0:?}")]
+    InvalidAlertRuleTenantId(String),
     #[error("invalid alert rule kind: {0:?}")]
     InvalidAlertRuleKind(String),
     #[error("invalid alert rule comparison: {0:?}")]
@@ -1068,6 +1101,7 @@ pub trait CommandRepository: Send + Sync {
 pub trait NotificationRepository: Send + Sync {
     fn claim_notifications<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
         lease_until: DateTime<Utc>,
         limit: u32,
@@ -1080,6 +1114,7 @@ pub trait NotificationRepository: Send + Sync {
     >;
     fn mark_notification_sent<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         notification_id: uuid::Uuid,
         expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
@@ -1092,6 +1127,7 @@ pub trait NotificationRepository: Send + Sync {
     >;
     fn release_notification_for_retry<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         notification_id: uuid::Uuid,
         expected_lease_until: DateTime<Utc>,
         error: &'a str,
@@ -1152,12 +1188,25 @@ pub trait CommandLifecycleRepository: Send + Sync {
                 + 'a,
         >,
     >;
-    fn expire_commands<'a>(
+    fn expire_due_commands<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
+        limit: u32,
     ) -> Pin<
         Box<dyn Future<Output = Result<Vec<CommandOutboxRecord>, PlatformStoreError>> + Send + 'a>,
+    >;
+    fn expire_command_if_elapsed<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        command_id: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
     >;
     fn mark_command_responded<'a>(
         &'a self,
@@ -1210,6 +1259,7 @@ pub trait TelemetryAggregateRepository: Send + Sync {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlertRule {
     pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
     pub name: String,
     pub enabled: bool,
     pub kind: AlertRuleKind,
@@ -1251,6 +1301,7 @@ pub enum AlertSeverity {
 pub struct AlertEvaluationEvent {
     pub event_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
+    pub tenant_id: uuid::Uuid,
     pub device_id: String,
     pub boot_id: uuid::Uuid,
     pub sequence: u64,
@@ -1276,20 +1327,6 @@ pub trait AlertEvaluationRepository: Send + Sync {
         &'a self,
         evaluated_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<AlertEvaluationResult, PlatformStoreError>> + Send + 'a>>;
-}
-
-pub trait AlertRepository: Send + Sync {
-    fn load_active_rules<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<AlertRule>, PlatformStoreError>> + Send + 'a>>;
-    fn claim_rule_event<'a>(
-        &'a self,
-        rule_id: uuid::Uuid,
-        event_at: DateTime<Utc>,
-        device_id: &'a str,
-        boot_id: uuid::Uuid,
-        sequence: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1321,6 +1358,7 @@ impl AlertIncidentStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewAlertIncident {
     pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
     pub rule_id: uuid::Uuid,
     pub device_id: String,
     pub status: AlertIncidentStatus,
@@ -1331,6 +1369,7 @@ pub struct NewAlertIncident {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlertIncident {
     pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
     pub rule_id: uuid::Uuid,
     pub device_id: String,
     pub status: AlertIncidentStatus,
@@ -1347,6 +1386,7 @@ pub struct AlertIncident {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewNotificationOutboxEntry {
     pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
     pub kind: NotificationKind,
     pub dedupe_key: String,
     pub subject: String,
@@ -1362,6 +1402,7 @@ pub trait AlertIncidentRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn update_incident_last_value<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         last_value: Option<f64>,
@@ -1369,12 +1410,14 @@ pub trait AlertIncidentRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn open_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         opened_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn open_incident_with_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         opened_at: DateTime<Utc>,
@@ -1382,18 +1425,21 @@ pub trait AlertIncidentRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn recover_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         recovery_started_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn resolve_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         resolved_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn resolve_incident_with_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         resolved_at: DateTime<Utc>,
@@ -1401,12 +1447,14 @@ pub trait AlertIncidentRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn remind_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         reminded_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn remind_incident_with_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         reminded_at: DateTime<Utc>,
@@ -1414,6 +1462,7 @@ pub trait AlertIncidentRepository: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>;
     fn enqueue_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         notification: NewNotificationOutboxEntry,
     ) -> Pin<
@@ -1659,86 +1708,6 @@ impl PlatformStore {
         match self {
             Self::Sqlite(_) => None,
             Self::Timescale(pool) => Some(pool),
-        }
-    }
-
-    pub async fn load_active_alert_rules(&self) -> Result<Vec<AlertRule>, PlatformStoreError> {
-        match self {
-            Self::Sqlite(store) => {
-                let rows = sqlx::query(
-                    "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison,
-                            threshold, window_seconds, for_seconds, resolve_after_seconds,
-                            reopen_grace_seconds, hysteresis, severity, reminder_interval_seconds
-                     FROM alert_rules
-                     WHERE enabled = 1 AND archived_at IS NULL
-                     ORDER BY created_at DESC, id",
-                )
-                .fetch_all(store.pool())
-                .await?;
-                rows.into_iter().map(sqlite_alert_rule_record).collect()
-            }
-            Self::Timescale(pool) => {
-                let rows = sqlx::query(
-                    "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison,
-                            threshold, window_seconds, for_seconds, resolve_after_seconds,
-                            reopen_grace_seconds, hysteresis, severity, reminder_interval_seconds
-                     FROM alert_rules
-                     WHERE enabled AND archived_at IS NULL
-                     ORDER BY created_at DESC, id",
-                )
-                .fetch_all(pool)
-                .await?;
-                rows.into_iter().map(postgres_alert_rule_record).collect()
-            }
-        }
-    }
-
-    pub async fn claim_alert_rule_event(
-        &self,
-        rule_id: uuid::Uuid,
-        event_at: DateTime<Utc>,
-        device_id: &str,
-        boot_id: uuid::Uuid,
-        sequence: u64,
-    ) -> Result<bool, PlatformStoreError> {
-        let event_at = canonical_postgres_timestamp(event_at);
-        match self {
-            Self::Sqlite(store) => {
-                let result = sqlx::query(
-                    "INSERT INTO alert_rule_event_evaluations
-                        (rule_id, event_at, device_id, boot_id, sequence)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence)
-                     DO NOTHING",
-                )
-                .bind(rule_id.to_string())
-                .bind(event_at.to_rfc3339())
-                .bind(device_id)
-                .bind(boot_id.to_string())
-                .bind(sequence.to_string())
-                .execute(store.pool())
-                .await?;
-                Ok(result.rows_affected() == 1)
-            }
-            Self::Timescale(pool) => {
-                let sequence = i64::try_from(sequence)
-                    .map_err(|_| PlatformStoreError::AlertRuleSequenceOverflow)?;
-                let result = sqlx::query(
-                    "INSERT INTO alert_rule_event_evaluations
-                        (rule_id, event_at, device_id, boot_id, sequence)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence)
-                     DO NOTHING",
-                )
-                .bind(rule_id)
-                .bind(event_at)
-                .bind(device_id)
-                .bind(boot_id)
-                .bind(sequence)
-                .execute(pool)
-                .await?;
-                Ok(result.rows_affected() == 1)
-            }
         }
     }
 
@@ -3330,36 +3299,42 @@ impl PlatformStore {
         }
     }
 
-    pub async fn command_tenants_with_open_commands(
+    pub async fn ready_command_tenants(
         &self,
+        now: DateTime<Utc>,
+        cursor: Option<uuid::Uuid>,
+        limit: u32,
     ) -> Result<Vec<uuid::Uuid>, PlatformStoreError> {
-        match self {
-            Self::Sqlite(store) => {
-                let tenant_ids = sqlx::query_scalar::<_, String>(
-                    "SELECT DISTINCT tenant_id FROM command_outbox
-                     WHERE state IN ('queued', 'leased')
-                        OR (state = 'published_to_broker' AND mode = 'two_way')
-                     ORDER BY tenant_id",
-                )
-                .fetch_all(store.pool())
-                .await?;
-                tenant_ids
-                    .into_iter()
-                    .map(|tenant_id| {
-                        uuid::Uuid::parse_str(&tenant_id)
-                            .map_err(|_| PlatformStoreError::InvalidCommandTenantId(tenant_id))
-                    })
-                    .collect()
-            }
-            Self::Timescale(pool) => Ok(sqlx::query_scalar::<_, uuid::Uuid>(
-                "SELECT DISTINCT tenant_id FROM command_outbox
-                 WHERE state IN ('queued', 'leased')
-                    OR (state = 'published_to_broker' AND mode = 'two_way')
-                 ORDER BY tenant_id",
-            )
-            .fetch_all(pool)
-            .await?),
+        if limit == 0 {
+            return Ok(Vec::new());
         }
+        let range = cursor.map_or(TenantCursorRange::All, TenantCursorRange::After);
+        let mut tenant_ids = match self {
+            Self::Sqlite(store) => {
+                sqlite_ready_command_tenants(store.pool(), now, range, limit).await?
+            }
+            Self::Timescale(pool) => {
+                timescale_ready_command_tenants(pool, now, range, limit).await?
+            }
+        };
+        if let Some(cursor) = cursor {
+            let remaining =
+                limit.saturating_sub(u32::try_from(tenant_ids.len()).unwrap_or(u32::MAX));
+            if remaining > 0 {
+                let wrap_range = TenantCursorRange::Through(cursor);
+                let wrapped = match self {
+                    Self::Sqlite(store) => {
+                        sqlite_ready_command_tenants(store.pool(), now, wrap_range, remaining)
+                            .await?
+                    }
+                    Self::Timescale(pool) => {
+                        timescale_ready_command_tenants(pool, now, wrap_range, remaining).await?
+                    }
+                };
+                tenant_ids.extend(wrapped);
+            }
+        }
+        Ok(tenant_ids)
     }
 
     pub async fn claim_commands(
@@ -3440,34 +3415,35 @@ impl PlatformStore {
         }
     }
 
-    pub async fn expire_commands(
+    pub async fn expire_due_commands(
         &self,
         tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
+        limit: u32,
     ) -> Result<Vec<CommandOutboxRecord>, PlatformStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         match self {
-            Self::Sqlite(store) => Ok(store.expire_commands(tenant_id, now).await?),
+            Self::Sqlite(store) => Ok(store.expire_due_commands(tenant_id, now, limit).await?),
             Self::Timescale(pool) => {
-                let rows = sqlx::query(
-                    "UPDATE command_outbox
-                     SET state = 'expired', lease_until = NULL
-                     WHERE tenant_id = $1
-                       AND (
-                            state IN ('queued', 'leased')
-                            OR (state = 'published_to_broker' AND mode = 'two_way')
-                           )
-                       AND expires_at <= $2
-                     RETURNING
-                        id, tenant_id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
-                        lease_until, attempt_count, last_error, published_at, response, responded_at",
-                )
-                .bind(tenant_id)
-                .bind(now)
-                .fetch_all(pool)
-                .await?;
-                rows.into_iter()
-                    .map(postgres_command_outbox_record)
-                    .collect()
+                expire_timescale_due_commands(pool, tenant_id, now, limit).await
+            }
+        }
+    }
+
+    pub async fn expire_command_if_elapsed(
+        &self,
+        tenant_id: uuid::Uuid,
+        command_id: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => Ok(store
+                .expire_command_if_elapsed(tenant_id, &command_id.to_string(), now)
+                .await?),
+            Self::Timescale(pool) => {
+                expire_timescale_command_if_elapsed(pool, tenant_id, command_id, now).await
             }
         }
     }
@@ -3549,31 +3525,80 @@ impl PlatformStore {
 
     pub async fn claim_notifications(
         &self,
+        tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
         lease_until: DateTime<Utc>,
         limit: u32,
     ) -> Result<Vec<NotificationOutboxRecord>, PlatformStoreError> {
         match self {
-            Self::Sqlite(store) => Ok(store.claim_notifications(now, lease_until, limit).await?),
+            Self::Sqlite(store) => Ok(store
+                .claim_notifications(tenant_id, now, lease_until, limit)
+                .await?),
             Self::Timescale(pool) => {
-                claim_timescale_notifications(pool, now, lease_until, limit).await
+                claim_timescale_notifications(pool, tenant_id, now, lease_until, limit).await
             }
         }
     }
 
+    pub async fn ready_notification_tenants(
+        &self,
+        now: DateTime<Utc>,
+        cursor: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> Result<Vec<uuid::Uuid>, PlatformStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let range = cursor.map_or(TenantCursorRange::All, TenantCursorRange::After);
+        let mut tenant_ids = match self {
+            Self::Sqlite(store) => {
+                sqlite_ready_notification_tenants(store.pool(), now, range, limit).await?
+            }
+            Self::Timescale(pool) => {
+                timescale_ready_notification_tenants(pool, now, range, limit).await?
+            }
+        };
+        if let Some(cursor) = cursor {
+            let remaining =
+                limit.saturating_sub(u32::try_from(tenant_ids.len()).unwrap_or(u32::MAX));
+            if remaining > 0 {
+                let wrap_range = TenantCursorRange::Through(cursor);
+                let wrapped = match self {
+                    Self::Sqlite(store) => {
+                        sqlite_ready_notification_tenants(store.pool(), now, wrap_range, remaining)
+                            .await?
+                    }
+                    Self::Timescale(pool) => {
+                        timescale_ready_notification_tenants(pool, now, wrap_range, remaining)
+                            .await?
+                    }
+                };
+                tenant_ids.extend(wrapped);
+            }
+        }
+        Ok(tenant_ids)
+    }
+
     pub async fn mark_notification_sent(
         &self,
+        tenant_id: uuid::Uuid,
         notification_id: uuid::Uuid,
         expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
     ) -> Result<Option<NotificationOutboxRecord>, PlatformStoreError> {
         match self {
             Self::Sqlite(store) => Ok(store
-                .mark_notification_sent(&notification_id.to_string(), expected_lease_until, sent_at)
+                .mark_notification_sent(
+                    tenant_id,
+                    &notification_id.to_string(),
+                    expected_lease_until,
+                    sent_at,
+                )
                 .await?),
             Self::Timescale(pool) => {
                 mark_timescale_notification_sent(
                     pool,
+                    tenant_id,
                     notification_id,
                     expected_lease_until,
                     sent_at,
@@ -3590,6 +3615,12 @@ impl PlatformStore {
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         let incident = canonical_incident(incident);
         let opened_notification = opened_notification.map(canonical_notification);
+        if opened_notification
+            .as_ref()
+            .is_some_and(|notification| notification.tenant_id != incident.tenant_id)
+        {
+            return Err(PlatformStoreError::NotificationTenantMismatch);
+        }
         match self {
             Self::Sqlite(store) => Ok(store.create_incident(incident, opened_notification).await?),
             Self::Timescale(pool) => {
@@ -3600,6 +3631,7 @@ impl PlatformStore {
 
     pub async fn update_incident_last_value(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         last_value: Option<f64>,
@@ -3608,6 +3640,7 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => Ok(store
                 .update_incident_last_value(
+                    tenant_id,
                     &incident_id.to_string(),
                     expected_version,
                     last_value,
@@ -3617,6 +3650,7 @@ impl PlatformStore {
             Self::Timescale(pool) => {
                 update_timescale_incident_last_value(
                     pool,
+                    tenant_id,
                     incident_id,
                     expected_version,
                     last_value,
@@ -3629,11 +3663,13 @@ impl PlatformStore {
 
     pub async fn open_incident(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         opened_at: DateTime<Utc>,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         self.update_incident_transition(
+            tenant_id,
             incident_id,
             expected_version,
             AlertIncidentTransition::Open(canonical_postgres_timestamp(opened_at)),
@@ -3643,12 +3679,14 @@ impl PlatformStore {
 
     pub async fn open_incident_with_notification(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         opened_at: DateTime<Utc>,
         notification: NewNotificationOutboxEntry,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         self.update_incident_transition_with_notification(
+            tenant_id,
             incident_id,
             expected_version,
             AlertIncidentTransition::Open(canonical_postgres_timestamp(opened_at)),
@@ -3659,11 +3697,13 @@ impl PlatformStore {
 
     pub async fn recover_incident(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         recovery_started_at: DateTime<Utc>,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         self.update_incident_transition(
+            tenant_id,
             incident_id,
             expected_version,
             AlertIncidentTransition::Recover(canonical_postgres_timestamp(recovery_started_at)),
@@ -3673,11 +3713,13 @@ impl PlatformStore {
 
     pub async fn resolve_incident(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         resolved_at: DateTime<Utc>,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         self.update_incident_transition(
+            tenant_id,
             incident_id,
             expected_version,
             AlertIncidentTransition::Resolve(canonical_postgres_timestamp(resolved_at)),
@@ -3687,12 +3729,14 @@ impl PlatformStore {
 
     pub async fn resolve_incident_with_notification(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         resolved_at: DateTime<Utc>,
         notification: NewNotificationOutboxEntry,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         self.update_incident_transition_with_notification(
+            tenant_id,
             incident_id,
             expected_version,
             AlertIncidentTransition::Resolve(canonical_postgres_timestamp(resolved_at)),
@@ -3703,11 +3747,13 @@ impl PlatformStore {
 
     pub async fn remind_incident(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         reminded_at: DateTime<Utc>,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         self.update_incident_transition(
+            tenant_id,
             incident_id,
             expected_version,
             AlertIncidentTransition::Remind(canonical_postgres_timestamp(reminded_at)),
@@ -3717,12 +3763,14 @@ impl PlatformStore {
 
     pub async fn remind_incident_with_notification(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         reminded_at: DateTime<Utc>,
         notification: NewNotificationOutboxEntry,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         self.update_incident_transition_with_notification(
+            tenant_id,
             incident_id,
             expected_version,
             AlertIncidentTransition::Remind(canonical_postgres_timestamp(reminded_at)),
@@ -3733,17 +3781,24 @@ impl PlatformStore {
 
     async fn update_incident_transition(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         transition: AlertIncidentTransition,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
         match self {
             Self::Sqlite(store) => Ok(store
-                .update_incident_transition(&incident_id.to_string(), expected_version, transition)
+                .update_incident_transition(
+                    tenant_id,
+                    &incident_id.to_string(),
+                    expected_version,
+                    transition,
+                )
                 .await?),
             Self::Timescale(pool) => {
                 update_timescale_incident_transition(
                     pool,
+                    tenant_id,
                     incident_id,
                     expected_version,
                     transition,
@@ -3755,14 +3810,19 @@ impl PlatformStore {
 
     async fn update_incident_transition_with_notification(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         transition: AlertIncidentTransition,
         notification: NewNotificationOutboxEntry,
     ) -> Result<Option<AlertIncident>, PlatformStoreError> {
+        if notification.tenant_id != tenant_id {
+            return Err(PlatformStoreError::NotificationTenantMismatch);
+        }
         match self {
             Self::Sqlite(store) => Ok(store
                 .update_incident_transition_with_notification(
+                    tenant_id,
                     &incident_id.to_string(),
                     expected_version,
                     transition,
@@ -3772,6 +3832,7 @@ impl PlatformStore {
             Self::Timescale(pool) => {
                 update_timescale_incident_transition_with_notification(
                     pool,
+                    tenant_id,
                     incident_id,
                     expected_version,
                     transition,
@@ -3784,22 +3845,27 @@ impl PlatformStore {
 
     pub async fn enqueue_notification(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         notification: NewNotificationOutboxEntry,
     ) -> Result<NotificationOutboxRecord, PlatformStoreError> {
         let notification = canonical_notification(notification);
+        if notification.tenant_id != tenant_id {
+            return Err(PlatformStoreError::NotificationTenantMismatch);
+        }
         match self {
             Self::Sqlite(store) => Ok(store
-                .enqueue_notification(&incident_id.to_string(), notification)
+                .enqueue_notification(tenant_id, &incident_id.to_string(), notification)
                 .await?),
             Self::Timescale(pool) => {
-                enqueue_timescale_notification(pool, incident_id, notification).await
+                enqueue_timescale_notification(pool, tenant_id, incident_id, notification).await
             }
         }
     }
 
     pub async fn release_notification_for_retry(
         &self,
+        tenant_id: uuid::Uuid,
         notification_id: uuid::Uuid,
         expected_lease_until: DateTime<Utc>,
         error: &str,
@@ -3808,6 +3874,7 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => Ok(store
                 .release_notification_for_retry(
+                    tenant_id,
                     &notification_id.to_string(),
                     expected_lease_until,
                     error,
@@ -3817,6 +3884,7 @@ impl PlatformStore {
             Self::Timescale(pool) => {
                 release_timescale_notification_for_retry(
                     pool,
+                    tenant_id,
                     notification_id,
                     expected_lease_until,
                     error,
@@ -4591,6 +4659,192 @@ async fn timescale_tenant_device_is_locked(
     .map(|device| device.is_some())
 }
 
+#[derive(Clone, Copy)]
+enum TenantCursorRange {
+    All,
+    After(uuid::Uuid),
+    Through(uuid::Uuid),
+}
+
+impl TenantCursorRange {
+    fn kind(self) -> i64 {
+        match self {
+            Self::All => 0,
+            Self::After(_) => 1,
+            Self::Through(_) => 2,
+        }
+    }
+
+    fn sqlite_cursor(self) -> String {
+        match self {
+            Self::All => String::new(),
+            Self::After(cursor) | Self::Through(cursor) => cursor.to_string(),
+        }
+    }
+
+    fn timescale_cursor(self) -> Option<uuid::Uuid> {
+        match self {
+            Self::All => None,
+            Self::After(cursor) | Self::Through(cursor) => Some(cursor),
+        }
+    }
+}
+
+async fn sqlite_ready_command_tenants(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    range: TenantCursorRange,
+    limit: u32,
+) -> Result<Vec<uuid::Uuid>, PlatformStoreError> {
+    let now = now.to_rfc3339();
+    let range_kind = range.kind();
+    let cursor = range.sqlite_cursor();
+    let tenant_ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT tenant_id
+         FROM command_outbox
+         WHERE (
+                (state = 'queued' AND next_attempt_at <= ?)
+                OR (state = 'leased' AND lease_until <= ?)
+                OR (
+                    (state IN ('queued', 'leased')
+                     OR (state = 'published_to_broker' AND mode = 'two_way'))
+                    AND expires_at <= ?
+                )
+               )
+           AND (
+                ? = 0
+                OR (? = 1 AND tenant_id > ?)
+                OR (? = 2 AND tenant_id <= ?)
+               )
+         ORDER BY tenant_id
+         LIMIT ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(range_kind)
+    .bind(range_kind)
+    .bind(&cursor)
+    .bind(range_kind)
+    .bind(&cursor)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?;
+    tenant_ids
+        .into_iter()
+        .map(|tenant_id| {
+            uuid::Uuid::parse_str(&tenant_id)
+                .map_err(|_| PlatformStoreError::InvalidCommandTenantId(tenant_id))
+        })
+        .collect()
+}
+
+async fn timescale_ready_command_tenants(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    range: TenantCursorRange,
+    limit: u32,
+) -> Result<Vec<uuid::Uuid>, PlatformStoreError> {
+    Ok(sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT DISTINCT tenant_id
+         FROM command_outbox
+         WHERE (
+                (state = 'queued' AND next_attempt_at <= $1)
+                OR (state = 'leased' AND lease_until <= $1)
+                OR (
+                    (state IN ('queued', 'leased')
+                     OR (state = 'published_to_broker' AND mode = 'two_way'))
+                    AND expires_at <= $1
+                )
+               )
+           AND (
+                $2 = 0
+                OR ($2 = 1 AND tenant_id > $3)
+                OR ($2 = 2 AND tenant_id <= $3)
+               )
+         ORDER BY tenant_id
+         LIMIT $4",
+    )
+    .bind(now)
+    .bind(range.kind())
+    .bind(range.timescale_cursor())
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn sqlite_ready_notification_tenants(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    range: TenantCursorRange,
+    limit: u32,
+) -> Result<Vec<uuid::Uuid>, PlatformStoreError> {
+    let now = now.to_rfc3339();
+    let range_kind = range.kind();
+    let cursor = range.sqlite_cursor();
+    let tenant_ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT tenant_id
+         FROM notification_outbox
+         WHERE (
+                (state = 'pending' AND next_attempt_at <= ?)
+                OR (state = 'leased' AND lease_until <= ?)
+               )
+           AND (
+                ? = 0
+                OR (? = 1 AND tenant_id > ?)
+                OR (? = 2 AND tenant_id <= ?)
+               )
+         ORDER BY tenant_id
+         LIMIT ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(range_kind)
+    .bind(range_kind)
+    .bind(&cursor)
+    .bind(range_kind)
+    .bind(&cursor)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?;
+    tenant_ids
+        .into_iter()
+        .map(|tenant_id| {
+            uuid::Uuid::parse_str(&tenant_id)
+                .map_err(|_| PlatformStoreError::InvalidNotificationTenantId(tenant_id))
+        })
+        .collect()
+}
+
+async fn timescale_ready_notification_tenants(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    range: TenantCursorRange,
+    limit: u32,
+) -> Result<Vec<uuid::Uuid>, PlatformStoreError> {
+    Ok(sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT DISTINCT tenant_id
+         FROM notification_outbox
+         WHERE (
+                (state = 'pending' AND next_attempt_at <= $1)
+                OR (state = 'leased' AND lease_until <= $1)
+               )
+           AND (
+                $2 = 0
+                OR ($2 = 1 AND tenant_id > $3)
+                OR ($2 = 2 AND tenant_id <= $3)
+               )
+         ORDER BY tenant_id
+         LIMIT $4",
+    )
+    .bind(now)
+    .bind(range.kind())
+    .bind(range.timescale_cursor())
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?)
+}
+
 async fn claim_timescale_commands(
     pool: &PgPool,
     tenant_id: uuid::Uuid,
@@ -4638,8 +4892,90 @@ async fn claim_timescale_commands(
         .collect()
 }
 
+async fn expire_timescale_due_commands(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    now: DateTime<Utc>,
+    limit: u32,
+) -> Result<Vec<CommandOutboxRecord>, PlatformStoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "WITH expired AS (
+            SELECT id
+            FROM command_outbox
+            WHERE tenant_id = $1
+              AND (
+                    state IN ('queued', 'leased')
+                    OR (state = 'published_to_broker' AND mode = 'two_way')
+                  )
+              AND expires_at <= $2
+            ORDER BY expires_at, created_at, id
+            FOR UPDATE SKIP LOCKED
+            LIMIT $3
+         )
+         UPDATE command_outbox AS command
+         SET state = 'expired',
+             lease_until = NULL
+         FROM expired
+         WHERE command.id = expired.id
+           AND command.tenant_id = $1
+           AND (
+                command.state IN ('queued', 'leased')
+                OR (command.state = 'published_to_broker' AND command.mode = 'two_way')
+               )
+           AND command.expires_at <= $2
+         RETURNING
+            command.id, command.tenant_id, command.device_id, command.method, command.params,
+            command.mode, command.state, command.created_at, command.expires_at,
+            command.next_attempt_at, command.lease_until, command.attempt_count,
+            command.last_error, command.published_at, command.response, command.responded_at",
+    )
+    .bind(tenant_id)
+    .bind(now)
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(postgres_command_outbox_record)
+        .collect()
+}
+
+async fn expire_timescale_command_if_elapsed(
+    pool: &PgPool,
+    tenant_id: uuid::Uuid,
+    command_id: uuid::Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
+    let row = sqlx::query(
+        "UPDATE command_outbox AS command
+         SET state = 'expired',
+             lease_until = NULL
+         WHERE command.id = $1
+           AND command.tenant_id = $2
+           AND (
+                command.state IN ('queued', 'leased')
+                OR (command.state = 'published_to_broker' AND command.mode = 'two_way')
+               )
+           AND command.expires_at <= $3
+         RETURNING
+            command.id, command.tenant_id, command.device_id, command.method, command.params,
+            command.mode, command.state, command.created_at, command.expires_at,
+            command.next_attempt_at, command.lease_until, command.attempt_count,
+            command.last_error, command.published_at, command.response, command.responded_at",
+    )
+    .bind(command_id)
+    .bind(tenant_id)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    row.map(postgres_command_outbox_record).transpose()
+}
+
 async fn claim_timescale_notifications(
     pool: &PgPool,
+    tenant_id: uuid::Uuid,
     now: DateTime<Utc>,
     lease_until: DateTime<Utc>,
     limit: u32,
@@ -4651,24 +4987,26 @@ async fn claim_timescale_notifications(
         "WITH due AS (
             SELECT id
             FROM notification_outbox
-            WHERE (state = 'pending' AND next_attempt_at <= $1)
-               OR (state = 'leased' AND lease_until <= $1)
+            WHERE tenant_id = $1
+              AND ((state = 'pending' AND next_attempt_at <= $2)
+                OR (state = 'leased' AND lease_until <= $2))
             ORDER BY next_attempt_at, created_at, id
             FOR UPDATE SKIP LOCKED
-            LIMIT $2
+            LIMIT $3
          )
          UPDATE notification_outbox AS notification
          SET state = 'leased',
-             lease_until = $3,
+             lease_until = $4,
              attempt_count = notification.attempt_count + 1
          FROM due
-         WHERE notification.id = due.id
+         WHERE notification.id = due.id AND notification.tenant_id = $1
          RETURNING
-            notification.id, notification.incident_id, notification.kind,
+            notification.id, notification.tenant_id, notification.incident_id, notification.kind,
             notification.dedupe_key, notification.subject, notification.body,
             notification.state, notification.next_attempt_at, notification.lease_until,
             notification.attempt_count, notification.last_error, notification.sent_at",
     )
+    .bind(tenant_id)
     .bind(now)
     .bind(i64::from(limit))
     .bind(lease_until)
@@ -4687,11 +5025,12 @@ async fn create_timescale_incident(
     let mut transaction = pool.begin().await?;
     let inserted = sqlx::query(
         "INSERT INTO alert_incidents (
-            id, rule_id, device_id, status, condition_started_at, opened_at, last_value
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at, last_value
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT DO NOTHING",
     )
     .bind(incident.id)
+    .bind(incident.tenant_id)
     .bind(incident.rule_id)
     .bind(&incident.device_id)
     .bind(incident.status.as_str())
@@ -4706,10 +5045,11 @@ async fn create_timescale_incident(
     if let Some(notification) = opened_notification {
         sqlx::query(
             "INSERT INTO notification_outbox (
-                id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(notification.id)
+        .bind(incident.tenant_id)
         .bind(incident.id)
         .bind(notification.kind.as_str())
         .bind(notification.dedupe_key)
@@ -4720,12 +5060,13 @@ async fn create_timescale_incident(
         .await?;
     }
     let row = sqlx::query(
-        "SELECT id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+        "SELECT id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                 opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                 state_version
-         FROM alert_incidents WHERE id = $1",
+         FROM alert_incidents WHERE id = $1 AND tenant_id = $2",
     )
     .bind(incident.id)
+    .bind(incident.tenant_id)
     .fetch_one(&mut *transaction)
     .await?;
     transaction.commit().await?;
@@ -4734,6 +5075,7 @@ async fn create_timescale_incident(
 
 async fn update_timescale_incident_last_value(
     pool: &PgPool,
+    tenant_id: uuid::Uuid,
     incident_id: uuid::Uuid,
     expected_version: i64,
     last_value: Option<f64>,
@@ -4742,8 +5084,8 @@ async fn update_timescale_incident_last_value(
     let row = sqlx::query(
         "UPDATE alert_incidents
          SET last_value = $1, state_version = state_version + 1, updated_at = $2
-         WHERE id = $3 AND state_version = $4 AND status IN ('pending', 'open')
-         RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+         WHERE id = $3 AND tenant_id = $5 AND state_version = $4 AND status IN ('pending', 'open')
+         RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                    opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                    state_version",
     )
@@ -4751,6 +5093,7 @@ async fn update_timescale_incident_last_value(
     .bind(updated_at)
     .bind(incident_id)
     .bind(expected_version)
+    .bind(tenant_id)
     .fetch_optional(pool)
     .await?;
     row.map(postgres_alert_incident_record).transpose()
@@ -4758,6 +5101,7 @@ async fn update_timescale_incident_last_value(
 
 async fn update_timescale_incident_transition(
     pool: &PgPool,
+    tenant_id: uuid::Uuid,
     incident_id: uuid::Uuid,
     expected_version: i64,
     transition: AlertIncidentTransition,
@@ -4767,8 +5111,8 @@ async fn update_timescale_incident_transition(
             "UPDATE alert_incidents
              SET status = 'open', opened_at = $1, updated_at = $1,
                  state_version = state_version + 1
-             WHERE id = $2 AND state_version = $3 AND status = 'pending'
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             WHERE id = $2 AND tenant_id = $4 AND state_version = $3 AND status = 'pending'
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         ),
@@ -4776,9 +5120,9 @@ async fn update_timescale_incident_transition(
             "UPDATE alert_incidents
              SET recovery_started_at = $1, updated_at = $1,
                  state_version = state_version + 1
-             WHERE id = $2 AND state_version = $3 AND status = 'open'
+             WHERE id = $2 AND tenant_id = $4 AND state_version = $3 AND status = 'open'
                    AND recovery_started_at IS NULL
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         ),
@@ -4787,8 +5131,8 @@ async fn update_timescale_incident_transition(
              SET status = 'resolved', resolved_at = $1,
                  recovery_started_at = COALESCE(recovery_started_at, $1), updated_at = $1,
                  state_version = state_version + 1
-             WHERE id = $2 AND state_version = $3 AND status = 'open'
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             WHERE id = $2 AND tenant_id = $4 AND state_version = $3 AND status = 'open'
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         ),
@@ -4796,8 +5140,8 @@ async fn update_timescale_incident_transition(
             "UPDATE alert_incidents
              SET last_reminder_at = $1, updated_at = $1,
                  state_version = state_version + 1
-             WHERE id = $2 AND state_version = $3 AND status = 'open'
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             WHERE id = $2 AND tenant_id = $4 AND state_version = $3 AND status = 'open'
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         ),
@@ -4806,6 +5150,7 @@ async fn update_timescale_incident_transition(
         .bind(transition.timestamp())
         .bind(incident_id)
         .bind(expected_version)
+        .bind(tenant_id)
         .fetch_optional(pool)
         .await?;
     row.map(postgres_alert_incident_record).transpose()
@@ -4813,6 +5158,7 @@ async fn update_timescale_incident_transition(
 
 async fn update_timescale_incident_transition_with_notification(
     pool: &PgPool,
+    tenant_id: uuid::Uuid,
     incident_id: uuid::Uuid,
     expected_version: i64,
     transition: AlertIncidentTransition,
@@ -4824,8 +5170,8 @@ async fn update_timescale_incident_transition_with_notification(
             "UPDATE alert_incidents
              SET status = 'open', opened_at = $1, updated_at = $1,
                  state_version = state_version + 1
-             WHERE id = $2 AND state_version = $3 AND status = 'pending'
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             WHERE id = $2 AND tenant_id = $4 AND state_version = $3 AND status = 'pending'
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         ),
@@ -4834,8 +5180,8 @@ async fn update_timescale_incident_transition_with_notification(
              SET status = 'resolved', resolved_at = $1,
                  recovery_started_at = COALESCE(recovery_started_at, $1), updated_at = $1,
                  state_version = state_version + 1
-             WHERE id = $2 AND state_version = $3 AND status = 'open'
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             WHERE id = $2 AND tenant_id = $4 AND state_version = $3 AND status = 'open'
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         ),
@@ -4843,8 +5189,8 @@ async fn update_timescale_incident_transition_with_notification(
             "UPDATE alert_incidents
              SET last_reminder_at = $1, updated_at = $1,
                  state_version = state_version + 1
-             WHERE id = $2 AND state_version = $3 AND status = 'open'
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             WHERE id = $2 AND tenant_id = $4 AND state_version = $3 AND status = 'open'
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         ),
@@ -4854,6 +5200,7 @@ async fn update_timescale_incident_transition_with_notification(
         .bind(transition.timestamp())
         .bind(incident_id)
         .bind(expected_version)
+        .bind(tenant_id)
         .fetch_optional(&mut *transaction)
         .await?;
     let Some(row) = row else {
@@ -4861,10 +5208,11 @@ async fn update_timescale_incident_transition_with_notification(
     };
     sqlx::query(
         "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(notification.id)
+    .bind(tenant_id)
     .bind(incident_id)
     .bind(notification.kind.as_str())
     .bind(notification.dedupe_key)
@@ -4879,16 +5227,18 @@ async fn update_timescale_incident_transition_with_notification(
 
 async fn enqueue_timescale_notification(
     pool: &PgPool,
+    tenant_id: uuid::Uuid,
     incident_id: uuid::Uuid,
     notification: NewNotificationOutboxEntry,
 ) -> Result<NotificationOutboxRecord, PlatformStoreError> {
     sqlx::query(
         "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (dedupe_key) DO NOTHING",
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (tenant_id, dedupe_key) DO NOTHING",
     )
     .bind(notification.id)
+    .bind(tenant_id)
     .bind(incident_id)
     .bind(notification.kind.as_str())
     .bind(&notification.dedupe_key)
@@ -4898,11 +5248,12 @@ async fn enqueue_timescale_notification(
     .execute(pool)
     .await?;
     let row = sqlx::query(
-        "SELECT id, incident_id, kind, dedupe_key, subject, body, state,
+        "SELECT id, tenant_id, incident_id, kind, dedupe_key, subject, body, state,
                 next_attempt_at, lease_until, attempt_count, last_error, sent_at
-         FROM notification_outbox WHERE dedupe_key = $1",
+         FROM notification_outbox WHERE dedupe_key = $1 AND tenant_id = $2",
     )
     .bind(notification.dedupe_key)
+    .bind(tenant_id)
     .fetch_one(pool)
     .await?;
     postgres_notification_outbox_record(row)
@@ -4910,6 +5261,7 @@ async fn enqueue_timescale_notification(
 
 async fn mark_timescale_notification_sent(
     pool: &PgPool,
+    tenant_id: uuid::Uuid,
     notification_id: uuid::Uuid,
     expected_lease_until: DateTime<Utc>,
     sent_at: DateTime<Utc>,
@@ -4917,13 +5269,14 @@ async fn mark_timescale_notification_sent(
     let row = sqlx::query(
         "UPDATE notification_outbox
          SET state = 'sent', sent_at = $1, lease_until = NULL
-         WHERE id = $2 AND state = 'leased' AND lease_until = $3
+         WHERE id = $2 AND tenant_id = $3 AND state = 'leased' AND lease_until = $4
          RETURNING
-            id, incident_id, kind, dedupe_key, subject, body, state,
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, state,
             next_attempt_at, lease_until, attempt_count, last_error, sent_at",
     )
     .bind(sent_at)
     .bind(notification_id)
+    .bind(tenant_id)
     .bind(expected_lease_until)
     .fetch_optional(pool)
     .await?;
@@ -4932,6 +5285,7 @@ async fn mark_timescale_notification_sent(
 
 async fn release_timescale_notification_for_retry(
     pool: &PgPool,
+    tenant_id: uuid::Uuid,
     notification_id: uuid::Uuid,
     expected_lease_until: DateTime<Utc>,
     error: &str,
@@ -4940,14 +5294,15 @@ async fn release_timescale_notification_for_retry(
     let row = sqlx::query(
         "UPDATE notification_outbox
          SET state = 'pending', next_attempt_at = $1, last_error = $2, lease_until = NULL
-         WHERE id = $3 AND state = 'leased' AND lease_until = $4
+         WHERE id = $3 AND tenant_id = $4 AND state = 'leased' AND lease_until = $5
          RETURNING
-            id, incident_id, kind, dedupe_key, subject, body, state,
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, state,
             next_attempt_at, lease_until, attempt_count, last_error, sent_at",
     )
     .bind(next_attempt_at)
     .bind(error)
     .bind(notification_id)
+    .bind(tenant_id)
     .bind(expected_lease_until)
     .fetch_optional(pool)
     .await?;
@@ -5157,10 +5512,11 @@ async fn insert_sqlite_event_notification(
     let created_at = created_at.to_rfc3339();
     sqlx::query(
         "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(uuid::Uuid::new_v4().to_string())
+    .bind(rule.tenant_id.to_string())
     .bind(incident_id.to_string())
     .bind(kind)
     .bind(dedupe_key)
@@ -5194,10 +5550,11 @@ async fn insert_timescale_event_notification(
     );
     sqlx::query(
         "INSERT INTO notification_outbox (
-            id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
+            id, tenant_id, incident_id, kind, dedupe_key, subject, body, created_at, next_attempt_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
     )
     .bind(uuid::Uuid::new_v4())
+    .bind(rule.tenant_id)
     .bind(incident_id)
     .bind(kind)
     .bind(dedupe_key)
@@ -5211,6 +5568,7 @@ async fn insert_timescale_event_notification(
 
 async fn load_sqlite_active_event_incident(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
     rule_id: uuid::Uuid,
     device_id: &str,
 ) -> Result<Option<EventIncident>, PlatformStoreError> {
@@ -5218,8 +5576,9 @@ async fn load_sqlite_active_event_incident(
         "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
                 last_reminder_at, state_version
          FROM alert_incidents
-         WHERE rule_id = ? AND device_id = ? AND status IN ('pending', 'open')",
+         WHERE tenant_id = ? AND rule_id = ? AND device_id = ? AND status IN ('pending', 'open')",
     )
+    .bind(tenant_id.to_string())
     .bind(rule_id.to_string())
     .bind(device_id)
     .fetch_optional(&mut **transaction)
@@ -5230,6 +5589,7 @@ async fn load_sqlite_active_event_incident(
 
 async fn load_timescale_active_event_incident(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
     rule_id: uuid::Uuid,
     device_id: &str,
 ) -> Result<Option<EventIncident>, PlatformStoreError> {
@@ -5237,9 +5597,10 @@ async fn load_timescale_active_event_incident(
         "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
                 last_reminder_at, state_version
          FROM alert_incidents
-         WHERE rule_id = $1 AND device_id = $2 AND status IN ('pending', 'open')
+         WHERE tenant_id = $1 AND rule_id = $2 AND device_id = $3 AND status IN ('pending', 'open')
          FOR UPDATE",
     )
+    .bind(tenant_id)
     .bind(rule_id)
     .bind(device_id)
     .fetch_optional(&mut **transaction)
@@ -5250,6 +5611,7 @@ async fn load_timescale_active_event_incident(
 
 async fn load_sqlite_recent_resolved_event_incident(
     transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
     rule_id: uuid::Uuid,
     device_id: &str,
     reopen_after: DateTime<Utc>,
@@ -5258,10 +5620,12 @@ async fn load_sqlite_recent_resolved_event_incident(
         "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
                 last_reminder_at, state_version
          FROM alert_incidents
-         WHERE rule_id = ? AND device_id = ? AND status = 'resolved' AND resolved_at >= ?
+         WHERE tenant_id = ? AND rule_id = ? AND device_id = ?
+           AND status = 'resolved' AND resolved_at >= ?
          ORDER BY resolved_at DESC
          LIMIT 1",
     )
+    .bind(tenant_id.to_string())
     .bind(rule_id.to_string())
     .bind(device_id)
     .bind(reopen_after.to_rfc3339())
@@ -5273,6 +5637,7 @@ async fn load_sqlite_recent_resolved_event_incident(
 
 async fn load_timescale_recent_resolved_event_incident(
     transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
     rule_id: uuid::Uuid,
     device_id: &str,
     reopen_after: DateTime<Utc>,
@@ -5281,11 +5646,13 @@ async fn load_timescale_recent_resolved_event_incident(
         "SELECT id, status, condition_started_at, recovery_started_at, acknowledged_at,
                 last_reminder_at, state_version
          FROM alert_incidents
-         WHERE rule_id = $1 AND device_id = $2 AND status = 'resolved' AND resolved_at >= $3
+         WHERE tenant_id = $1 AND rule_id = $2 AND device_id = $3
+           AND status = 'resolved' AND resolved_at >= $4
          ORDER BY resolved_at DESC
          LIMIT 1
          FOR UPDATE",
     )
+    .bind(tenant_id)
     .bind(rule_id)
     .bind(device_id)
     .bind(reopen_after)
@@ -5312,7 +5679,7 @@ async fn reopen_sqlite_event_incident(
                  opened_at = ?, resolved_at = NULL, acknowledged_at = NULL,
                  acknowledged_by = NULL, last_value = ?, last_notified_at = ?,
                  last_reminder_at = ?, state_version = ?, updated_at = ?
-             WHERE id = ?",
+             WHERE id = ? AND tenant_id = ?",
         )
         .bind(&at)
         .bind(&at)
@@ -5322,6 +5689,7 @@ async fn reopen_sqlite_event_incident(
         .bind(state_version)
         .bind(&at)
         .bind(incident.id.to_string())
+        .bind(rule.tenant_id.to_string())
         .execute(&mut **transaction)
         .await?;
         insert_sqlite_event_notification(
@@ -5345,12 +5713,13 @@ async fn reopen_sqlite_event_incident(
          SET status = 'pending', condition_started_at = ?, recovery_started_at = NULL,
              opened_at = NULL, resolved_at = NULL, acknowledged_at = NULL,
              acknowledged_by = NULL, last_value = ?, updated_at = ?
-         WHERE id = ?",
+         WHERE id = ? AND tenant_id = ?",
     )
     .bind(&at)
     .bind(value)
     .bind(&at)
     .bind(incident.id.to_string())
+    .bind(rule.tenant_id.to_string())
     .execute(&mut **transaction)
     .await?;
     Ok(EventTransition::default())
@@ -5372,12 +5741,13 @@ async fn reopen_timescale_event_incident(
                  opened_at = $2, resolved_at = NULL, acknowledged_at = NULL,
                  acknowledged_by = NULL, last_value = $3, last_notified_at = $2,
                  last_reminder_at = $2, state_version = $4, updated_at = $2
-             WHERE id = $1",
+             WHERE id = $1 AND tenant_id = $5",
         )
         .bind(incident.id)
         .bind(evaluated_at)
         .bind(value)
         .bind(state_version as i32)
+        .bind(rule.tenant_id)
         .execute(&mut **transaction)
         .await?;
         insert_timescale_event_notification(
@@ -5401,11 +5771,12 @@ async fn reopen_timescale_event_incident(
          SET status = 'pending', condition_started_at = $2, recovery_started_at = NULL,
              opened_at = NULL, resolved_at = NULL, acknowledged_at = NULL,
              acknowledged_by = NULL, last_value = $3, updated_at = $2
-         WHERE id = $1",
+         WHERE id = $1 AND tenant_id = $4",
     )
     .bind(incident.id)
     .bind(evaluated_at)
     .bind(value)
+    .bind(rule.tenant_id)
     .execute(&mut **transaction)
     .await?;
     Ok(EventTransition::default())
@@ -5423,12 +5794,14 @@ async fn evaluate_sqlite_event_transition(
     if condition != Some(true) {
         if condition == Some(false) {
             if let Some(incident) =
-                load_sqlite_active_event_incident(transaction, rule.id, device_id).await?
+                load_sqlite_active_event_incident(transaction, rule.tenant_id, rule.id, device_id)
+                    .await?
             {
                 match incident.status {
                     AlertIncidentStatus::Pending => {
-                        sqlx::query("DELETE FROM alert_incidents WHERE id = ?")
+                        sqlx::query("DELETE FROM alert_incidents WHERE id = ? AND tenant_id = ?")
                             .bind(incident.id.to_string())
+                            .bind(rule.tenant_id.to_string())
                             .execute(&mut **transaction)
                             .await?;
                     }
@@ -5442,7 +5815,7 @@ async fn evaluate_sqlite_event_transition(
                                  SET status = 'resolved', recovery_started_at = ?, resolved_at = ?,
                                      last_value = ?, last_notified_at = ?, state_version = ?,
                                      updated_at = ?
-                                 WHERE id = ?",
+                                 WHERE id = ? AND tenant_id = ?",
                             )
                             .bind(&at)
                             .bind(&at)
@@ -5451,6 +5824,7 @@ async fn evaluate_sqlite_event_transition(
                             .bind(state_version)
                             .bind(&at)
                             .bind(incident.id.to_string())
+                            .bind(rule.tenant_id.to_string())
                             .execute(&mut **transaction)
                             .await?;
                             insert_sqlite_event_notification(
@@ -5472,12 +5846,13 @@ async fn evaluate_sqlite_event_transition(
                         sqlx::query(
                             "UPDATE alert_incidents
                              SET recovery_started_at = ?, last_value = ?, updated_at = ?
-                             WHERE id = ?",
+                             WHERE id = ? AND tenant_id = ?",
                         )
                         .bind(recovery_started_at.to_rfc3339())
                         .bind(value)
                         .bind(&at)
                         .bind(incident.id.to_string())
+                        .bind(rule.tenant_id.to_string())
                         .execute(&mut **transaction)
                         .await?;
                     }
@@ -5487,10 +5862,12 @@ async fn evaluate_sqlite_event_transition(
         }
         return Ok(EventTransition::default());
     }
-    let Some(incident) = load_sqlite_active_event_incident(transaction, rule.id, device_id).await?
+    let Some(incident) =
+        load_sqlite_active_event_incident(transaction, rule.tenant_id, rule.id, device_id).await?
     else {
         if let Some(resolved) = load_sqlite_recent_resolved_event_incident(
             transaction,
+            rule.tenant_id,
             rule.id,
             device_id,
             evaluated_at - rule.reopen_grace,
@@ -5510,12 +5887,13 @@ async fn evaluate_sqlite_event_transition(
         let id = uuid::Uuid::new_v4();
         if rule.for_duration == ChronoDuration::zero() {
             sqlx::query(
-                "INSERT INTO alert_incidents (id, rule_id, device_id, status, condition_started_at,
+                "INSERT INTO alert_incidents (id, tenant_id, rule_id, device_id, status, condition_started_at,
                     opened_at, last_value, last_notified_at, last_reminder_at, state_version,
                     created_at, updated_at)
-                 VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, 1, ?, ?)",
+                 VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, 1, ?, ?)",
             )
             .bind(id.to_string())
+            .bind(rule.tenant_id.to_string())
             .bind(rule.id.to_string())
             .bind(device_id)
             .bind(&at)
@@ -5545,10 +5923,11 @@ async fn evaluate_sqlite_event_transition(
         }
         sqlx::query(
             "INSERT INTO alert_incidents (
-                id, rule_id, device_id, status, condition_started_at, last_value, created_at, updated_at
-             ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+                id, tenant_id, rule_id, device_id, status, condition_started_at, last_value, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
         )
         .bind(id.to_string())
+        .bind(rule.tenant_id.to_string())
         .bind(rule.id.to_string())
         .bind(device_id)
         .bind(&at)
@@ -5569,7 +5948,7 @@ async fn evaluate_sqlite_event_transition(
                      SET status = 'open', recovery_started_at = NULL, opened_at = ?,
                          last_value = ?, last_notified_at = ?, last_reminder_at = ?,
                          state_version = ?, updated_at = ?
-                     WHERE id = ?",
+                     WHERE id = ? AND tenant_id = ?",
                 )
                 .bind(&at)
                 .bind(value)
@@ -5578,6 +5957,7 @@ async fn evaluate_sqlite_event_transition(
                 .bind(state_version)
                 .bind(&at)
                 .bind(incident.id.to_string())
+                .bind(rule.tenant_id.to_string())
                 .execute(&mut **transaction)
                 .await?;
                 insert_sqlite_event_notification(
@@ -5596,10 +5976,11 @@ async fn evaluate_sqlite_event_transition(
                     ..EventTransition::default()
                 });
             }
-            sqlx::query("UPDATE alert_incidents SET last_value = ?, updated_at = ? WHERE id = ?")
+            sqlx::query("UPDATE alert_incidents SET last_value = ?, updated_at = ? WHERE id = ? AND tenant_id = ?")
                 .bind(value)
                 .bind(&at)
                 .bind(incident.id.to_string())
+                .bind(rule.tenant_id.to_string())
                 .execute(&mut **transaction)
                 .await?;
         }
@@ -5607,11 +5988,12 @@ async fn evaluate_sqlite_event_transition(
             sqlx::query(
                 "UPDATE alert_incidents
                  SET recovery_started_at = NULL, last_value = ?, updated_at = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND tenant_id = ?",
             )
             .bind(value)
             .bind(&at)
             .bind(incident.id.to_string())
+            .bind(rule.tenant_id.to_string())
             .execute(&mut **transaction)
             .await?;
             let due = incident.acknowledged_at.is_none()
@@ -5624,13 +6006,14 @@ async fn evaluate_sqlite_event_transition(
                     "UPDATE alert_incidents
                      SET last_reminder_at = ?, last_notified_at = ?, state_version = ?,
                          updated_at = ?
-                     WHERE id = ?",
+                     WHERE id = ? AND tenant_id = ?",
                 )
                 .bind(&at)
                 .bind(&at)
                 .bind(state_version)
                 .bind(&at)
                 .bind(incident.id.to_string())
+                .bind(rule.tenant_id.to_string())
                 .execute(&mut **transaction)
                 .await?;
                 insert_sqlite_event_notification(
@@ -5665,13 +6048,19 @@ async fn evaluate_timescale_event_transition(
     let condition = event_condition(rule, value);
     if condition != Some(true) {
         if condition == Some(false) {
-            if let Some(incident) =
-                load_timescale_active_event_incident(transaction, rule.id, device_id).await?
+            if let Some(incident) = load_timescale_active_event_incident(
+                transaction,
+                rule.tenant_id,
+                rule.id,
+                device_id,
+            )
+            .await?
             {
                 match incident.status {
                     AlertIncidentStatus::Pending => {
-                        sqlx::query("DELETE FROM alert_incidents WHERE id = $1")
+                        sqlx::query("DELETE FROM alert_incidents WHERE id = $1 AND tenant_id = $2")
                             .bind(incident.id)
+                            .bind(rule.tenant_id)
                             .execute(&mut **transaction)
                             .await?;
                     }
@@ -5685,12 +6074,13 @@ async fn evaluate_timescale_event_transition(
                                  SET status = 'resolved', recovery_started_at = $2, resolved_at = $2,
                                      last_value = $3, last_notified_at = $2, state_version = $4,
                                      updated_at = $2
-                                 WHERE id = $1",
+                                 WHERE id = $1 AND tenant_id = $5",
                             )
                             .bind(incident.id)
                             .bind(evaluated_at)
                             .bind(value)
                             .bind(state_version as i32)
+                            .bind(rule.tenant_id)
                             .execute(&mut **transaction)
                             .await?;
                             insert_timescale_event_notification(
@@ -5712,12 +6102,13 @@ async fn evaluate_timescale_event_transition(
                         sqlx::query(
                             "UPDATE alert_incidents
                              SET recovery_started_at = $2, last_value = $3, updated_at = $4
-                             WHERE id = $1",
+                             WHERE id = $1 AND tenant_id = $5",
                         )
                         .bind(incident.id)
                         .bind(recovery_started_at)
                         .bind(value)
                         .bind(evaluated_at)
+                        .bind(rule.tenant_id)
                         .execute(&mut **transaction)
                         .await?;
                     }
@@ -5728,10 +6119,12 @@ async fn evaluate_timescale_event_transition(
         return Ok(EventTransition::default());
     }
     let Some(incident) =
-        load_timescale_active_event_incident(transaction, rule.id, device_id).await?
+        load_timescale_active_event_incident(transaction, rule.tenant_id, rule.id, device_id)
+            .await?
     else {
         if let Some(resolved) = load_timescale_recent_resolved_event_incident(
             transaction,
+            rule.tenant_id,
             rule.id,
             device_id,
             evaluated_at - rule.reopen_grace,
@@ -5751,12 +6144,13 @@ async fn evaluate_timescale_event_transition(
         let id = uuid::Uuid::new_v4();
         if rule.for_duration == ChronoDuration::zero() {
             sqlx::query(
-                "INSERT INTO alert_incidents (id, rule_id, device_id, status, condition_started_at,
+                "INSERT INTO alert_incidents (id, tenant_id, rule_id, device_id, status, condition_started_at,
                     opened_at, last_value, last_notified_at, last_reminder_at, state_version,
                     created_at, updated_at)
-                 VALUES ($1, $2, $3, 'open', $4, $4, $5, $4, $4, 1, $4, $4)",
+                 VALUES ($1, $2, $3, $4, 'open', $5, $5, $6, $5, $5, 1, $5, $5)",
             )
             .bind(id)
+            .bind(rule.tenant_id)
             .bind(rule.id)
             .bind(device_id)
             .bind(evaluated_at)
@@ -5781,10 +6175,11 @@ async fn evaluate_timescale_event_transition(
         }
         sqlx::query(
             "INSERT INTO alert_incidents (
-                id, rule_id, device_id, status, condition_started_at, last_value, created_at, updated_at
-             ) VALUES ($1, $2, $3, 'pending', $4, $5, $4, $4)",
+                id, tenant_id, rule_id, device_id, status, condition_started_at, last_value, created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $5, $5)",
         )
         .bind(id)
+        .bind(rule.tenant_id)
         .bind(rule.id)
         .bind(device_id)
         .bind(evaluated_at)
@@ -5803,12 +6198,13 @@ async fn evaluate_timescale_event_transition(
                      SET status = 'open', recovery_started_at = NULL, opened_at = $2,
                          last_value = $3, last_notified_at = $2, last_reminder_at = $2,
                          state_version = $4, updated_at = $2
-                     WHERE id = $1",
+                     WHERE id = $1 AND tenant_id = $5",
                 )
                 .bind(incident.id)
                 .bind(evaluated_at)
                 .bind(value)
                 .bind(state_version as i32)
+                .bind(rule.tenant_id)
                 .execute(&mut **transaction)
                 .await?;
                 insert_timescale_event_notification(
@@ -5828,11 +6224,13 @@ async fn evaluate_timescale_event_transition(
                 });
             }
             sqlx::query(
-                "UPDATE alert_incidents SET last_value = $2, updated_at = $3 WHERE id = $1",
+                "UPDATE alert_incidents SET last_value = $2, updated_at = $3
+                 WHERE id = $1 AND tenant_id = $4",
             )
             .bind(incident.id)
             .bind(value)
             .bind(evaluated_at)
+            .bind(rule.tenant_id)
             .execute(&mut **transaction)
             .await?;
         }
@@ -5840,11 +6238,12 @@ async fn evaluate_timescale_event_transition(
             sqlx::query(
                 "UPDATE alert_incidents
                  SET recovery_started_at = NULL, last_value = $2, updated_at = $3
-                 WHERE id = $1",
+                 WHERE id = $1 AND tenant_id = $4",
             )
             .bind(incident.id)
             .bind(value)
             .bind(evaluated_at)
+            .bind(rule.tenant_id)
             .execute(&mut **transaction)
             .await?;
             let due = incident.acknowledged_at.is_none()
@@ -5857,11 +6256,12 @@ async fn evaluate_timescale_event_transition(
                     "UPDATE alert_incidents
                      SET last_reminder_at = $2, last_notified_at = $2, state_version = $3,
                          updated_at = $2
-                     WHERE id = $1",
+                     WHERE id = $1 AND tenant_id = $4",
                 )
                 .bind(incident.id)
                 .bind(evaluated_at)
                 .bind(state_version as i32)
+                .bind(rule.tenant_id)
                 .execute(&mut **transaction)
                 .await?;
                 insert_timescale_event_notification(
@@ -5892,7 +6292,7 @@ async fn evaluate_sqlite_alert_events(
 ) -> Result<AlertEvaluationResult, PlatformStoreError> {
     let mut transaction = store.pool.begin().await?;
     let rows = sqlx::query(
-        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+        "SELECT id, tenant_id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
                 window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
                 hysteresis, severity, reminder_interval_seconds
          FROM alert_rules WHERE enabled = 1 AND archived_at IS NULL
@@ -5907,10 +6307,11 @@ async fn evaluate_sqlite_alert_events(
     let mut result = AlertEvaluationResult::default();
     for event in events {
         for rule in &rules {
-            if rule
-                .device_id
-                .as_deref()
-                .is_some_and(|id| id != event.device_id)
+            if rule.tenant_id != event.tenant_id
+                || rule
+                    .device_id
+                    .as_deref()
+                    .is_some_and(|id| id != event.device_id)
             {
                 continue;
             }
@@ -5924,9 +6325,11 @@ async fn evaluate_sqlite_alert_events(
             };
             let claim = sqlx::query(
                 "INSERT INTO alert_rule_event_evaluations
-                 (rule_id, event_at, device_id, boot_id, sequence) VALUES (?, ?, ?, ?, ?)
-                 ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence) DO NOTHING",
+                 (tenant_id, rule_id, event_at, device_id, boot_id, sequence)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (tenant_id, rule_id, event_at, device_id, boot_id, sequence) DO NOTHING",
             )
+            .bind(rule.tenant_id.to_string())
             .bind(rule.id.to_string())
             .bind(canonical_postgres_timestamp(event.event_at).to_rfc3339())
             .bind(&event.device_id)
@@ -5961,7 +6364,7 @@ async fn evaluate_timescale_alert_events(
 ) -> Result<AlertEvaluationResult, PlatformStoreError> {
     let mut transaction = pool.begin().await?;
     let rows = sqlx::query(
-        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+        "SELECT id, tenant_id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
                 window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
                 hysteresis, severity, reminder_interval_seconds
          FROM alert_rules WHERE enabled AND archived_at IS NULL
@@ -5979,10 +6382,11 @@ async fn evaluate_timescale_alert_events(
     let mut lock_keys = Vec::new();
     for event in events {
         for rule in &rules {
-            if rule
-                .device_id
-                .as_deref()
-                .is_some_and(|id| id != event.device_id)
+            if rule.tenant_id != event.tenant_id
+                || rule
+                    .device_id
+                    .as_deref()
+                    .is_some_and(|id| id != event.device_id)
             {
                 continue;
             }
@@ -5992,15 +6396,17 @@ async fn evaluate_timescale_alert_events(
                 .and_then(serde_json::Value::as_f64)
                 .is_some_and(f64::is_finite)
             {
-                lock_keys.push((rule.id, event.device_id.clone()));
+                lock_keys.push((rule.tenant_id, rule.id, event.device_id.clone()));
             }
         }
     }
     lock_keys.sort_unstable();
     lock_keys.dedup();
-    for (rule_id, device_id) in lock_keys {
+    for (tenant_id, rule_id, device_id) in lock_keys {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("iot_nano:alert-event:{rule_id}:{device_id}"))
+            .bind(format!(
+                "iot_nano:alert-event:{tenant_id}:{rule_id}:{device_id}"
+            ))
             .execute(&mut *transaction)
             .await?;
     }
@@ -6008,10 +6414,11 @@ async fn evaluate_timescale_alert_events(
     let mut result = AlertEvaluationResult::default();
     for event in events {
         for rule in &rules {
-            if rule
-                .device_id
-                .as_deref()
-                .is_some_and(|id| id != event.device_id)
+            if rule.tenant_id != event.tenant_id
+                || rule
+                    .device_id
+                    .as_deref()
+                    .is_some_and(|id| id != event.device_id)
             {
                 continue;
             }
@@ -6025,8 +6432,8 @@ async fn evaluate_timescale_alert_events(
             };
             let sequence = i64::try_from(event.sequence)
                 .map_err(|_| PlatformStoreError::AlertRuleSequenceOverflow)?;
-            let claim = sqlx::query("INSERT INTO alert_rule_event_evaluations (rule_id, event_at, device_id, boot_id, sequence) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (rule_id, event_at, device_id, boot_id, sequence) DO NOTHING")
-                .bind(rule.id).bind(canonical_postgres_timestamp(event.event_at)).bind(&event.device_id).bind(event.boot_id).bind(sequence).execute(&mut *transaction).await?;
+            let claim = sqlx::query("INSERT INTO alert_rule_event_evaluations (tenant_id, rule_id, event_at, device_id, boot_id, sequence) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (tenant_id, rule_id, event_at, device_id, boot_id, sequence) DO NOTHING")
+                .bind(rule.tenant_id).bind(rule.id).bind(canonical_postgres_timestamp(event.event_at)).bind(&event.device_id).bind(event.boot_id).bind(sequence).execute(&mut *transaction).await?;
             if claim.rows_affected() == 0 {
                 continue;
             }
@@ -6060,7 +6467,7 @@ async fn sqlite_window_aggregates(
     let path = format!("$.{}", rule.metric_key);
     let rows = sqlx::query(
         "WITH canonical_telemetry AS (
-            SELECT device_id, measurements,
+            SELECT tenant_id, device_id, measurements,
                    CAST(unixepoch(event_at) AS INTEGER) * 1000000
                    + CASE
                        WHEN instr(event_at, '.') = 0 THEN 0
@@ -6102,7 +6509,8 @@ async fn sqlite_window_aggregates(
          finite_telemetry AS (
              SELECT device_id, json_extract(measurements, ?) AS finite_value
              FROM canonical_telemetry
-             WHERE event_at_micros >= ?
+             WHERE tenant_id = ?
+               AND event_at_micros >= ?
                AND event_at_micros <= ?
                AND (? IS NULL OR device_id = ?)
                AND json_type(measurements, ?) IN ('integer', 'real')
@@ -6127,6 +6535,7 @@ async fn sqlite_window_aggregates(
          ORDER BY finite_telemetry.device_id",
     )
     .bind(&path)
+    .bind(rule.tenant_id.to_string())
     .bind(from.timestamp_micros())
     .bind(evaluated_at.timestamp_micros())
     .bind(rule.device_id.as_deref())
@@ -6168,9 +6577,10 @@ async fn timescale_window_aggregates(
                         END
                     END AS finite_value
              FROM telemetry
-             WHERE event_at >= $2
-               AND event_at <= $3
-               AND ($4::text IS NULL OR device_id = $4)
+             WHERE tenant_id = $2
+               AND event_at >= $3
+               AND event_at <= $4
+               AND ($5::text IS NULL OR device_id = $5)
          )
          SELECT device_id, (AVG(finite_value))::double precision AS average
          FROM finite_telemetry
@@ -6179,6 +6589,7 @@ async fn timescale_window_aggregates(
          ORDER BY device_id",
     )
     .bind(&rule.metric_key)
+    .bind(rule.tenant_id)
     .bind(from)
     .bind(evaluated_at)
     .bind(rule.device_id.as_deref())
@@ -6200,7 +6611,7 @@ async fn evaluate_sqlite_alert_windows(
 ) -> Result<AlertEvaluationResult, PlatformStoreError> {
     let mut transaction = store.pool.begin().await?;
     let rows = sqlx::query(
-        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+        "SELECT id, tenant_id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
                 window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
                 hysteresis, severity, reminder_interval_seconds
          FROM alert_rules WHERE enabled = 1 AND archived_at IS NULL
@@ -6247,7 +6658,7 @@ async fn evaluate_timescale_alert_windows(
 ) -> Result<AlertEvaluationResult, PlatformStoreError> {
     let mut transaction = pool.begin().await?;
     let rows = sqlx::query(
-        "SELECT id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
+        "SELECT id, tenant_id, name, enabled, device_id, metric_key, rule_type, comparison, threshold,
                 window_seconds, for_seconds, resolve_after_seconds, reopen_grace_seconds,
                 hysteresis, severity, reminder_interval_seconds
          FROM alert_rules WHERE enabled AND archived_at IS NULL
@@ -6273,13 +6684,15 @@ async fn evaluate_timescale_alert_windows(
     // This prevents opposite window-batch orders from forming an advisory-lock cycle.
     let mut lock_keys: Vec<_> = evaluations
         .iter()
-        .map(|(rule, device_id, _)| (rule.id, device_id.clone()))
+        .map(|(rule, device_id, _)| (rule.tenant_id, rule.id, device_id.clone()))
         .collect();
     lock_keys.sort_unstable();
     lock_keys.dedup();
-    for (rule_id, device_id) in lock_keys {
+    for (tenant_id, rule_id, device_id) in lock_keys {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!("iot_nano:alert-window:{rule_id}:{device_id}"))
+            .bind(format!(
+                "iot_nano:alert-window:{tenant_id}:{rule_id}:{device_id}"
+            ))
             .execute(&mut *transaction)
             .await?;
     }
@@ -6343,28 +6756,6 @@ impl AlertIncidentTransition {
             | Self::Resolve(timestamp)
             | Self::Remind(timestamp) => *timestamp,
         }
-    }
-}
-
-impl AlertRepository for PlatformStore {
-    fn load_active_rules<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<AlertRule>, PlatformStoreError>> + Send + 'a>> {
-        Box::pin(async move { self.load_active_alert_rules().await })
-    }
-
-    fn claim_rule_event<'a>(
-        &'a self,
-        rule_id: uuid::Uuid,
-        event_at: DateTime<Utc>,
-        device_id: &'a str,
-        boot_id: uuid::Uuid,
-        sequence: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, PlatformStoreError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.claim_alert_rule_event(rule_id, event_at, device_id, boot_id, sequence)
-                .await
-        })
     }
 }
 
@@ -6524,14 +6915,34 @@ impl CommandLifecycleRepository for PlatformStore {
         })
     }
 
-    fn expire_commands<'a>(
+    fn expire_due_commands<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
+        limit: u32,
     ) -> Pin<
         Box<dyn Future<Output = Result<Vec<CommandOutboxRecord>, PlatformStoreError>> + Send + 'a>,
     > {
-        Box::pin(async move { PlatformStore::expire_commands(self, tenant_id, now).await })
+        Box::pin(
+            async move { PlatformStore::expire_due_commands(self, tenant_id, now, limit).await },
+        )
+    }
+
+    fn expire_command_if_elapsed<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        command_id: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<CommandOutboxRecord>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::expire_command_if_elapsed(self, tenant_id, command_id, now).await
+        })
     }
 
     fn mark_command_responded<'a>(
@@ -6689,6 +7100,7 @@ impl AlertIncidentRepository for PlatformStore {
 
     fn update_incident_last_value<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         last_value: Option<f64>,
@@ -6696,26 +7108,34 @@ impl AlertIncidentRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            self.update_incident_last_value(incident_id, expected_version, last_value, updated_at)
-                .await
+            self.update_incident_last_value(
+                tenant_id,
+                incident_id,
+                expected_version,
+                last_value,
+                updated_at,
+            )
+            .await
         })
     }
 
     fn open_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         opened_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            self.open_incident(incident_id, expected_version, opened_at)
+            self.open_incident(tenant_id, incident_id, expected_version, opened_at)
                 .await
         })
     }
 
     fn open_incident_with_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         opened_at: DateTime<Utc>,
@@ -6724,6 +7144,7 @@ impl AlertIncidentRepository for PlatformStore {
     {
         Box::pin(async move {
             self.open_incident_with_notification(
+                tenant_id,
                 incident_id,
                 expected_version,
                 opened_at,
@@ -6735,32 +7156,40 @@ impl AlertIncidentRepository for PlatformStore {
 
     fn recover_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         recovery_started_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            self.recover_incident(incident_id, expected_version, recovery_started_at)
-                .await
+            self.recover_incident(
+                tenant_id,
+                incident_id,
+                expected_version,
+                recovery_started_at,
+            )
+            .await
         })
     }
 
     fn resolve_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         resolved_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            self.resolve_incident(incident_id, expected_version, resolved_at)
+            self.resolve_incident(tenant_id, incident_id, expected_version, resolved_at)
                 .await
         })
     }
 
     fn resolve_incident_with_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         resolved_at: DateTime<Utc>,
@@ -6769,6 +7198,7 @@ impl AlertIncidentRepository for PlatformStore {
     {
         Box::pin(async move {
             self.resolve_incident_with_notification(
+                tenant_id,
                 incident_id,
                 expected_version,
                 resolved_at,
@@ -6780,19 +7210,21 @@ impl AlertIncidentRepository for PlatformStore {
 
     fn remind_incident<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         reminded_at: DateTime<Utc>,
     ) -> Pin<Box<dyn Future<Output = Result<Option<AlertIncident>, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            self.remind_incident(incident_id, expected_version, reminded_at)
+            self.remind_incident(tenant_id, incident_id, expected_version, reminded_at)
                 .await
         })
     }
 
     fn remind_incident_with_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         expected_version: i64,
         reminded_at: DateTime<Utc>,
@@ -6801,6 +7233,7 @@ impl AlertIncidentRepository for PlatformStore {
     {
         Box::pin(async move {
             self.remind_incident_with_notification(
+                tenant_id,
                 incident_id,
                 expected_version,
                 reminded_at,
@@ -6812,18 +7245,23 @@ impl AlertIncidentRepository for PlatformStore {
 
     fn enqueue_notification<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         incident_id: uuid::Uuid,
         notification: NewNotificationOutboxEntry,
     ) -> Pin<
         Box<dyn Future<Output = Result<NotificationOutboxRecord, PlatformStoreError>> + Send + 'a>,
     > {
-        Box::pin(async move { self.enqueue_notification(incident_id, notification).await })
+        Box::pin(async move {
+            self.enqueue_notification(tenant_id, incident_id, notification)
+                .await
+        })
     }
 }
 
 impl NotificationRepository for PlatformStore {
     fn claim_notifications<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
         lease_until: DateTime<Utc>,
         limit: u32,
@@ -6834,13 +7272,14 @@ impl NotificationRepository for PlatformStore {
                 + 'a,
         >,
     > {
-        Box::pin(
-            async move { PlatformStore::claim_notifications(self, now, lease_until, limit).await },
-        )
+        Box::pin(async move {
+            PlatformStore::claim_notifications(self, tenant_id, now, lease_until, limit).await
+        })
     }
 
     fn mark_notification_sent<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         notification_id: uuid::Uuid,
         expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
@@ -6854,6 +7293,7 @@ impl NotificationRepository for PlatformStore {
         Box::pin(async move {
             PlatformStore::mark_notification_sent(
                 self,
+                tenant_id,
                 notification_id,
                 expected_lease_until,
                 sent_at,
@@ -6864,6 +7304,7 @@ impl NotificationRepository for PlatformStore {
 
     fn release_notification_for_retry<'a>(
         &'a self,
+        tenant_id: uuid::Uuid,
         notification_id: uuid::Uuid,
         expected_lease_until: DateTime<Utc>,
         error: &'a str,
@@ -6878,6 +7319,7 @@ impl NotificationRepository for PlatformStore {
         Box::pin(async move {
             PlatformStore::release_notification_for_retry(
                 self,
+                tenant_id,
                 notification_id,
                 expected_lease_until,
                 error,
@@ -7225,8 +7667,11 @@ fn postgres_application_record(
 
 fn sqlite_alert_rule_record(row: SqliteRow) -> Result<AlertRule, PlatformStoreError> {
     let id: String = row.try_get("id")?;
+    let tenant_id: String = row.try_get("tenant_id")?;
     let rule = AlertRule {
         id: uuid::Uuid::parse_str(&id).map_err(|_| PlatformStoreError::InvalidAlertRuleId(id))?,
+        tenant_id: uuid::Uuid::parse_str(&tenant_id)
+            .map_err(|_| PlatformStoreError::InvalidAlertRuleTenantId(tenant_id))?,
         name: row.try_get("name")?,
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         kind: alert_rule_kind(&row.try_get::<String, _>("rule_type")?)?,
@@ -7254,6 +7699,7 @@ fn sqlite_alert_rule_record(row: SqliteRow) -> Result<AlertRule, PlatformStoreEr
 fn postgres_alert_rule_record(row: PgRow) -> Result<AlertRule, PlatformStoreError> {
     let rule = AlertRule {
         id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,
         enabled: row.try_get("enabled")?,
         kind: alert_rule_kind(&row.try_get::<String, _>("rule_type")?)?,
@@ -7425,6 +7871,7 @@ fn postgres_notification_outbox_record(
 ) -> Result<NotificationOutboxRecord, PlatformStoreError> {
     Ok(NotificationOutboxRecord {
         id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
         incident_id: row.try_get("incident_id")?,
         kind: NotificationKind::from_database(&row.try_get::<String, _>("kind")?)?,
         dedupe_key: row.try_get("dedupe_key")?,
@@ -7546,6 +7993,7 @@ impl NotificationOutboxState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationOutboxRecord {
     pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
     pub incident_id: uuid::Uuid,
     pub kind: NotificationKind,
     pub dedupe_key: String,
@@ -7619,6 +8067,10 @@ const SQLITE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "device_profiles",
     "assets",
     "resource_grants",
+    "alert_rules",
+    "alert_rule_event_evaluations",
+    "alert_incidents",
+    "notification_outbox",
     "command_outbox",
 ];
 
@@ -7670,6 +8122,10 @@ const TIMESCALE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "device_runtime_state",
     "telemetry",
     "gateway_event_receipts",
+    "alert_rules",
+    "alert_rule_event_evaluations",
+    "alert_incidents",
+    "notification_outbox",
     "command_outbox",
 ];
 
@@ -7702,20 +8158,198 @@ async fn pre_tenant_platform_sqlite_table(
             .iter()
             .any(|existing| existing.as_str() == table)
         {
-            let has_tenant_id: i64 = sqlx::query_scalar(
-                "SELECT EXISTS (
-                     SELECT 1 FROM pragma_table_info(?) WHERE name = 'tenant_id'
-                 )",
-            )
-            .bind(table)
-            .fetch_one(pool)
-            .await?;
-            if has_tenant_id == 0 {
+            if !sqlite_table_has_non_null_tenant_id(pool, table).await?
+                || !sqlite_tenant_constraints_are_complete(pool, table).await?
+            {
                 return Ok(Some(table.to_owned()));
             }
         }
     }
     Ok(None)
+}
+
+async fn sqlite_table_has_non_null_tenant_id(
+    pool: &SqlitePool,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    let has_tenant_id: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pragma_table_info(?)
+             WHERE name = 'tenant_id' AND \"notnull\" = 1
+         )",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await?;
+    Ok(has_tenant_id != 0)
+}
+
+async fn sqlite_tenant_constraints_are_complete(
+    pool: &SqlitePool,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    if !matches!(
+        table,
+        "alert_rules"
+            | "alert_rule_event_evaluations"
+            | "alert_incidents"
+            | "notification_outbox"
+            | "command_outbox"
+    ) {
+        return Ok(true);
+    }
+    if !sqlite_table_has_composite_foreign_key(pool, table, "tenants", &[("tenant_id", "id")])
+        .await?
+    {
+        return Ok(false);
+    }
+    let constraints = match table {
+        "alert_rules" => {
+            sqlite_table_has_composite_foreign_key(
+                pool,
+                table,
+                "devices",
+                &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+        }
+        "alert_rule_event_evaluations" => {
+            sqlite_table_has_composite_foreign_key(
+                pool,
+                table,
+                "alert_rules",
+                &[("rule_id", "id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+                && sqlite_table_has_composite_foreign_key(
+                    pool,
+                    table,
+                    "devices",
+                    &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+                )
+                .await?
+        }
+        "alert_incidents" => {
+            sqlite_table_has_composite_foreign_key(
+                pool,
+                table,
+                "alert_rules",
+                &[("rule_id", "id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+                && sqlite_table_has_composite_foreign_key(
+                    pool,
+                    table,
+                    "devices",
+                    &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+                )
+                .await?
+        }
+        "notification_outbox" => {
+            sqlite_table_has_composite_foreign_key(
+                pool,
+                table,
+                "alert_incidents",
+                &[("incident_id", "id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+                && sqlite_notification_dedupe_constraints_are_complete(pool, table).await?
+        }
+        "command_outbox" => {
+            sqlite_table_has_composite_foreign_key(
+                pool,
+                table,
+                "devices",
+                &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+        }
+        _ => true,
+    };
+    Ok(constraints)
+}
+
+async fn sqlite_table_has_composite_foreign_key(
+    pool: &SqlitePool,
+    table: &str,
+    target_table: &str,
+    columns: &[(&str, &str)],
+) -> Result<bool, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, \"table\" AS target_table, \"from\" AS source_column, \"to\" AS target_column
+         FROM pragma_foreign_key_list(?)
+         ORDER BY id, seq",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut foreign_keys: Vec<(i64, String, Vec<(String, String)>)> = Vec::new();
+    for row in rows {
+        let id: i64 = row.try_get("id")?;
+        let target: String = row.try_get("target_table")?;
+        let source_column: String = row.try_get("source_column")?;
+        let target_column: String = row.try_get("target_column")?;
+        if let Some((previous_id, _, mapped_columns)) = foreign_keys.last_mut()
+            && *previous_id == id
+        {
+            mapped_columns.push((source_column, target_column));
+        } else {
+            foreign_keys.push((id, target, vec![(source_column, target_column)]));
+        }
+    }
+    Ok(foreign_keys.iter().any(|(_, target, mapped_columns)| {
+        target == target_table
+            && mapped_columns
+                .iter()
+                .map(|(source, target)| (source.as_str(), target.as_str()))
+                .eq(columns.iter().copied())
+    }))
+}
+
+async fn sqlite_notification_dedupe_constraints_are_complete(
+    pool: &SqlitePool,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    let indexes = sqlx::query(
+        "SELECT name, \"partial\" AS is_partial
+         FROM pragma_index_list(?)
+         WHERE \"unique\" = 1",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut has_tenant_dedupe_key = false;
+    for index in indexes {
+        let index_name: String = index.try_get("name")?;
+        let is_partial: i64 = index.try_get("is_partial")?;
+        if is_partial != 0 {
+            return Ok(false);
+        }
+        let index_columns = sqlx::query("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+            .bind(index_name)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|row| row.try_get::<Option<String>, _>("name"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(index_columns) = index_columns.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(false);
+        };
+        if index_columns.iter().any(|column| column == "dedupe_key") {
+            if !index_columns.iter().any(|column| column == "tenant_id") {
+                return Ok(false);
+            }
+            if index_columns
+                .iter()
+                .map(String::as_str)
+                .eq(["tenant_id", "dedupe_key"].into_iter())
+            {
+                has_tenant_dedupe_key = true;
+            }
+        }
+    }
+    Ok(has_tenant_dedupe_key)
 }
 
 async fn pre_tenant_platform_timescale_table(
@@ -7747,24 +8381,268 @@ async fn pre_tenant_platform_timescale_table(
             .iter()
             .any(|existing| existing.as_str() == table)
         {
-            let has_tenant_id: bool = sqlx::query_scalar(
-                "SELECT EXISTS (
-                     SELECT 1
-                     FROM information_schema.columns
-                     WHERE table_schema = 'iot_nano'
-                       AND table_name = $1
-                       AND column_name = 'tenant_id'
-                 )",
-            )
-            .bind(table)
-            .fetch_one(&mut **transaction)
-            .await?;
-            if !has_tenant_id {
+            let has_tenant_id = timescale_table_has_non_null_tenant_id(transaction, table).await?;
+            let tenant_constraints_are_complete = if has_tenant_id {
+                timescale_tenant_constraints_are_complete(transaction, table).await?
+            } else {
+                false
+            };
+            if !has_tenant_id || !tenant_constraints_are_complete {
                 return Ok(Some(table.to_owned()));
             }
         }
     }
     Ok(None)
+}
+
+async fn timescale_table_has_non_null_tenant_id(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pg_catalog.pg_attribute AS attribute
+             JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid
+             JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = 'iot_nano'
+               AND relation.relname = $1
+               AND relation.relkind IN ('r', 'p')
+               AND attribute.attname = 'tenant_id'
+               AND attribute.attnum > 0
+               AND NOT attribute.attisdropped
+               AND attribute.attnotnull
+         )",
+    )
+    .bind(table)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
+async fn timescale_tenant_constraints_are_complete(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    if !matches!(
+        table,
+        "alert_rules"
+            | "alert_rule_event_evaluations"
+            | "alert_incidents"
+            | "notification_outbox"
+            | "command_outbox"
+    ) {
+        return Ok(true);
+    }
+    if !timescale_table_has_composite_foreign_key(
+        transaction,
+        table,
+        "tenants",
+        &[("tenant_id", "id")],
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    let constraints = match table {
+        "alert_rules" => {
+            timescale_table_has_composite_foreign_key(
+                transaction,
+                table,
+                "devices",
+                &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+        }
+        "alert_rule_event_evaluations" => {
+            timescale_table_has_composite_foreign_key(
+                transaction,
+                table,
+                "alert_rules",
+                &[("rule_id", "id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+                && timescale_table_has_composite_foreign_key(
+                    transaction,
+                    table,
+                    "devices",
+                    &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+                )
+                .await?
+        }
+        "alert_incidents" => {
+            timescale_table_has_composite_foreign_key(
+                transaction,
+                table,
+                "alert_rules",
+                &[("rule_id", "id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+                && timescale_table_has_composite_foreign_key(
+                    transaction,
+                    table,
+                    "devices",
+                    &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+                )
+                .await?
+        }
+        "notification_outbox" => {
+            timescale_table_has_composite_foreign_key(
+                transaction,
+                table,
+                "alert_incidents",
+                &[("incident_id", "id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+                && timescale_notification_dedupe_constraints_are_complete(transaction, table)
+                    .await?
+        }
+        "command_outbox" => {
+            timescale_table_has_composite_foreign_key(
+                transaction,
+                table,
+                "devices",
+                &[("device_id", "device_id"), ("tenant_id", "tenant_id")],
+            )
+            .await?
+        }
+        _ => true,
+    };
+    Ok(constraints)
+}
+
+async fn timescale_table_has_composite_foreign_key(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: &str,
+    target_table: &str,
+    columns: &[(&str, &str)],
+) -> Result<bool, sqlx::Error> {
+    let expected_columns = columns
+        .iter()
+        .map(|(source, target)| (source.to_string(), target.to_string()))
+        .collect::<Vec<_>>();
+    let foreign_keys = sqlx::query(
+        "SELECT array_agg(source_attribute.attname::text ORDER BY source_key.ordinality)
+                    AS source_columns,
+                array_agg(target_attribute.attname::text ORDER BY source_key.ordinality)
+                    AS target_columns
+         FROM pg_catalog.pg_constraint AS foreign_key
+         JOIN pg_catalog.pg_class AS source_relation ON source_relation.oid = foreign_key.conrelid
+         JOIN pg_catalog.pg_namespace AS source_namespace
+             ON source_namespace.oid = source_relation.relnamespace
+         JOIN pg_catalog.pg_class AS target_relation ON target_relation.oid = foreign_key.confrelid
+         JOIN pg_catalog.pg_namespace AS target_namespace
+             ON target_namespace.oid = target_relation.relnamespace
+         CROSS JOIN LATERAL unnest(foreign_key.conkey) WITH ORDINALITY
+             AS source_key(attnum, ordinality)
+         JOIN LATERAL unnest(foreign_key.confkey) WITH ORDINALITY
+             AS target_key(attnum, ordinality)
+             ON target_key.ordinality = source_key.ordinality
+         JOIN pg_catalog.pg_attribute AS source_attribute
+             ON source_attribute.attrelid = foreign_key.conrelid
+            AND source_attribute.attnum = source_key.attnum
+            AND NOT source_attribute.attisdropped
+         JOIN pg_catalog.pg_attribute AS target_attribute
+             ON target_attribute.attrelid = foreign_key.confrelid
+            AND target_attribute.attnum = target_key.attnum
+            AND NOT target_attribute.attisdropped
+         WHERE foreign_key.contype = 'f'
+           AND foreign_key.convalidated
+           AND source_namespace.nspname = 'iot_nano'
+           AND source_relation.relname = $1
+           AND target_namespace.nspname = 'iot_nano'
+           AND target_relation.relname = $2
+         GROUP BY foreign_key.oid",
+    )
+    .bind(table)
+    .bind(target_table)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    for foreign_key in foreign_keys {
+        let source_columns: Vec<String> = foreign_key.try_get("source_columns")?;
+        let target_columns: Vec<String> = foreign_key.try_get("target_columns")?;
+        let actual_columns = source_columns
+            .iter()
+            .cloned()
+            .zip(target_columns.iter().cloned())
+            .collect::<Vec<_>>();
+        if source_columns.len() == expected_columns.len()
+            && target_columns.len() == expected_columns.len()
+            && actual_columns
+                .iter()
+                .all(|column| expected_columns.contains(column))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn timescale_notification_dedupe_constraints_are_complete(
+    transaction: &mut Transaction<'_, Postgres>,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    let has_partial_or_expression_unique_index: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pg_catalog.pg_index AS index_row
+             JOIN pg_catalog.pg_class AS relation ON relation.oid = index_row.indrelid
+             JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = 'iot_nano'
+               AND relation.relname = $1
+               AND index_row.indisunique
+               AND index_row.indisvalid
+               AND index_row.indisready
+               AND index_row.indislive
+               AND (index_row.indpred IS NOT NULL OR index_row.indexprs IS NOT NULL)
+         )",
+    )
+    .bind(table)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if has_partial_or_expression_unique_index {
+        return Ok(false);
+    }
+    let indexes = sqlx::query(
+        "SELECT array_agg(attribute.attname::text ORDER BY key_column.ordinality) AS key_columns,
+                bool_or(index_row.indpred IS NOT NULL) AS is_partial
+         FROM pg_catalog.pg_index AS index_row
+         JOIN pg_catalog.pg_class AS relation ON relation.oid = index_row.indrelid
+         JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         CROSS JOIN LATERAL unnest(index_row.indkey) WITH ORDINALITY
+             AS key_column(attnum, ordinality)
+         JOIN pg_catalog.pg_attribute AS attribute
+             ON attribute.attrelid = index_row.indrelid
+            AND attribute.attnum = key_column.attnum
+            AND NOT attribute.attisdropped
+         WHERE namespace.nspname = 'iot_nano'
+           AND relation.relname = $1
+           AND index_row.indisunique
+           AND index_row.indisvalid
+           AND index_row.indisready
+           AND index_row.indislive
+           AND index_row.indexprs IS NULL
+           AND key_column.ordinality <= index_row.indnkeyatts
+         GROUP BY index_row.indexrelid",
+    )
+    .bind(table)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut has_tenant_dedupe_key = false;
+    for index in indexes {
+        let key_columns: Vec<String> = index.try_get("key_columns")?;
+        let is_partial: bool = index.try_get("is_partial")?;
+        if key_columns.iter().any(|column| column == "dedupe_key") {
+            if is_partial || !key_columns.iter().any(|column| column == "tenant_id") {
+                return Ok(false);
+            }
+            if key_columns == ["tenant_id", "dedupe_key"] {
+                has_tenant_dedupe_key = true;
+            }
+        }
+    }
+    Ok(has_tenant_dedupe_key)
 }
 
 fn sqlite_connect_options(
@@ -8057,6 +8935,7 @@ impl SqliteStore {
 
     pub async fn claim_notifications(
         &self,
+        tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
         lease_until: DateTime<Utc>,
         limit: u32,
@@ -8069,8 +8948,9 @@ impl SqliteStore {
             "WITH due AS (
                 SELECT id
                 FROM notification_outbox
-                WHERE (state = 'pending' AND next_attempt_at <= ?)
-                   OR (state = 'leased' AND lease_until <= ?)
+                WHERE tenant_id = ?
+                  AND ((state = 'pending' AND next_attempt_at <= ?)
+                    OR (state = 'leased' AND lease_until <= ?))
                 ORDER BY next_attempt_at, created_at, id
                 LIMIT ?
              )
@@ -8078,15 +8958,17 @@ impl SqliteStore {
              SET state = 'leased',
                  lease_until = ?,
                  attempt_count = attempt_count + 1
-             WHERE id IN (SELECT id FROM due)
+             WHERE tenant_id = ? AND id IN (SELECT id FROM due)
              RETURNING
-                id, incident_id, kind, dedupe_key, subject, body, state,
+                id, tenant_id, incident_id, kind, dedupe_key, subject, body, state,
                 next_attempt_at, lease_until, attempt_count, last_error, sent_at",
         )
+        .bind(tenant_id.to_string())
         .bind(&now)
         .bind(&now)
         .bind(i64::from(limit))
         .bind(lease_until.to_rfc3339())
+        .bind(tenant_id.to_string())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(notification_outbox_record).collect()
@@ -8100,11 +8982,12 @@ impl SqliteStore {
         let mut transaction = self.pool.begin().await?;
         let inserted = sqlx::query(
             "INSERT INTO alert_incidents (
-                id, rule_id, device_id, status, condition_started_at, opened_at, last_value
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at, last_value
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
         )
         .bind(incident.id.to_string())
+        .bind(incident.tenant_id.to_string())
         .bind(incident.rule_id.to_string())
         .bind(&incident.device_id)
         .bind(incident.status.as_str())
@@ -8122,10 +9005,11 @@ impl SqliteStore {
         if let Some(notification) = opened_notification {
             sqlx::query(
                 "INSERT INTO notification_outbox (
-                    id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(notification.id.to_string())
+            .bind(incident.tenant_id.to_string())
             .bind(incident.id.to_string())
             .bind(notification.kind.as_str())
             .bind(notification.dedupe_key)
@@ -8136,12 +9020,13 @@ impl SqliteStore {
             .await?;
         }
         let row = sqlx::query(
-            "SELECT id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+            "SELECT id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                     opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                     state_version
-             FROM alert_incidents WHERE id = ?",
+             FROM alert_incidents WHERE id = ? AND tenant_id = ?",
         )
         .bind(incident.id.to_string())
+        .bind(incident.tenant_id.to_string())
         .fetch_one(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -8150,6 +9035,7 @@ impl SqliteStore {
 
     async fn update_incident_last_value(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: &str,
         expected_version: i64,
         last_value: Option<f64>,
@@ -8158,14 +9044,15 @@ impl SqliteStore {
         let row = sqlx::query(
             "UPDATE alert_incidents
              SET last_value = ?, state_version = state_version + 1, updated_at = ?
-             WHERE id = ? AND state_version = ? AND status IN ('pending', 'open')
-             RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+             WHERE id = ? AND tenant_id = ? AND state_version = ? AND status IN ('pending', 'open')
+             RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                        opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                        state_version",
         )
         .bind(last_value)
         .bind(updated_at.to_rfc3339())
         .bind(incident_id)
+        .bind(tenant_id.to_string())
         .bind(expected_version)
         .fetch_optional(&self.pool)
         .await?;
@@ -8174,6 +9061,7 @@ impl SqliteStore {
 
     async fn update_incident_transition(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: &str,
         expected_version: i64,
         transition: AlertIncidentTransition,
@@ -8184,8 +9072,8 @@ impl SqliteStore {
                 "UPDATE alert_incidents
                  SET status = 'open', opened_at = ?, updated_at = ?,
                      state_version = state_version + 1
-                 WHERE id = ? AND state_version = ? AND status = 'pending'
-                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                 WHERE id = ? AND tenant_id = ? AND state_version = ? AND status = 'pending'
+                 RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
@@ -8195,9 +9083,9 @@ impl SqliteStore {
                 "UPDATE alert_incidents
                  SET recovery_started_at = ?, updated_at = ?,
                      state_version = state_version + 1
-                 WHERE id = ? AND state_version = ? AND status = 'open'
+                 WHERE id = ? AND tenant_id = ? AND state_version = ? AND status = 'open'
                        AND recovery_started_at IS NULL
-                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                 RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
@@ -8208,8 +9096,8 @@ impl SqliteStore {
                  SET status = 'resolved', resolved_at = ?,
                      recovery_started_at = COALESCE(recovery_started_at, ?), updated_at = ?,
                      state_version = state_version + 1
-                 WHERE id = ? AND state_version = ? AND status = 'open'
-                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                 WHERE id = ? AND tenant_id = ? AND state_version = ? AND status = 'open'
+                 RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
@@ -8220,8 +9108,8 @@ impl SqliteStore {
                 "UPDATE alert_incidents
                  SET last_reminder_at = ?, updated_at = ?,
                      state_version = state_version + 1
-                 WHERE id = ? AND state_version = ? AND status = 'open'
-                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                 WHERE id = ? AND tenant_id = ? AND state_version = ? AND status = 'open'
+                 RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
@@ -8230,6 +9118,7 @@ impl SqliteStore {
         };
         let row = query
             .bind(incident_id)
+            .bind(tenant_id.to_string())
             .bind(expected_version)
             .fetch_optional(&self.pool)
             .await?;
@@ -8238,6 +9127,7 @@ impl SqliteStore {
 
     async fn update_incident_transition_with_notification(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: &str,
         expected_version: i64,
         transition: AlertIncidentTransition,
@@ -8250,8 +9140,8 @@ impl SqliteStore {
                 "UPDATE alert_incidents
                  SET status = 'open', opened_at = ?, updated_at = ?,
                      state_version = state_version + 1
-                 WHERE id = ? AND state_version = ? AND status = 'pending'
-                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                 WHERE id = ? AND tenant_id = ? AND state_version = ? AND status = 'pending'
+                 RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
@@ -8262,8 +9152,8 @@ impl SqliteStore {
                  SET status = 'resolved', resolved_at = ?,
                      recovery_started_at = COALESCE(recovery_started_at, ?), updated_at = ?,
                      state_version = state_version + 1
-                 WHERE id = ? AND state_version = ? AND status = 'open'
-                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                 WHERE id = ? AND tenant_id = ? AND state_version = ? AND status = 'open'
+                 RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
@@ -8274,8 +9164,8 @@ impl SqliteStore {
                 "UPDATE alert_incidents
                  SET last_reminder_at = ?, updated_at = ?,
                      state_version = state_version + 1
-                 WHERE id = ? AND state_version = ? AND status = 'open'
-                 RETURNING id, rule_id, device_id, status, condition_started_at, recovery_started_at,
+                 WHERE id = ? AND tenant_id = ? AND state_version = ? AND status = 'open'
+                 RETURNING id, tenant_id, rule_id, device_id, status, condition_started_at, recovery_started_at,
                            opened_at, resolved_at, last_value, last_notified_at, last_reminder_at,
                            state_version",
             )
@@ -8285,6 +9175,7 @@ impl SqliteStore {
         };
         let row = query
             .bind(incident_id)
+            .bind(tenant_id.to_string())
             .bind(expected_version)
             .fetch_optional(&mut *transaction)
             .await?;
@@ -8293,10 +9184,11 @@ impl SqliteStore {
         };
         sqlx::query(
             "INSERT INTO notification_outbox (
-                id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(notification.id.to_string())
+        .bind(tenant_id.to_string())
         .bind(incident_id)
         .bind(notification.kind.as_str())
         .bind(notification.dedupe_key)
@@ -8311,16 +9203,18 @@ impl SqliteStore {
 
     async fn enqueue_notification(
         &self,
+        tenant_id: uuid::Uuid,
         incident_id: &str,
         notification: NewNotificationOutboxEntry,
     ) -> Result<NotificationOutboxRecord, PlatformStoreError> {
         sqlx::query(
             "INSERT INTO notification_outbox (
-                id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(dedupe_key) DO NOTHING",
+                id, tenant_id, incident_id, kind, dedupe_key, subject, body, next_attempt_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, dedupe_key) DO NOTHING",
         )
         .bind(notification.id.to_string())
+        .bind(tenant_id.to_string())
         .bind(incident_id)
         .bind(notification.kind.as_str())
         .bind(&notification.dedupe_key)
@@ -8330,11 +9224,12 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?;
         let row = sqlx::query(
-            "SELECT id, incident_id, kind, dedupe_key, subject, body, state,
+            "SELECT id, tenant_id, incident_id, kind, dedupe_key, subject, body, state,
                     next_attempt_at, lease_until, attempt_count, last_error, sent_at
-             FROM notification_outbox WHERE dedupe_key = ?",
+             FROM notification_outbox WHERE dedupe_key = ? AND tenant_id = ?",
         )
         .bind(notification.dedupe_key)
+        .bind(tenant_id.to_string())
         .fetch_one(&self.pool)
         .await?;
         notification_outbox_record(row)
@@ -8342,6 +9237,7 @@ impl SqliteStore {
 
     pub async fn mark_notification_sent(
         &self,
+        tenant_id: uuid::Uuid,
         notification_id: &str,
         expected_lease_until: DateTime<Utc>,
         sent_at: DateTime<Utc>,
@@ -8350,13 +9246,14 @@ impl SqliteStore {
         let row = sqlx::query(
             "UPDATE notification_outbox
              SET state = 'sent', sent_at = ?, lease_until = NULL
-             WHERE id = ? AND state = 'leased' AND lease_until = ?
+             WHERE id = ? AND tenant_id = ? AND state = 'leased' AND lease_until = ?
              RETURNING
-                id, incident_id, kind, dedupe_key, subject, body, state,
+                id, tenant_id, incident_id, kind, dedupe_key, subject, body, state,
                 next_attempt_at, lease_until, attempt_count, last_error, sent_at",
         )
         .bind(&sent_at)
         .bind(notification_id)
+        .bind(tenant_id.to_string())
         .bind(expected_lease_until.to_rfc3339())
         .fetch_optional(&self.pool)
         .await?;
@@ -8365,6 +9262,7 @@ impl SqliteStore {
 
     pub async fn release_notification_for_retry(
         &self,
+        tenant_id: uuid::Uuid,
         notification_id: &str,
         expected_lease_until: DateTime<Utc>,
         error: &str,
@@ -8374,44 +9272,97 @@ impl SqliteStore {
         let row = sqlx::query(
             "UPDATE notification_outbox
              SET state = 'pending', next_attempt_at = ?, last_error = ?, lease_until = NULL
-             WHERE id = ? AND state = 'leased' AND lease_until = ?
+             WHERE id = ? AND tenant_id = ? AND state = 'leased' AND lease_until = ?
              RETURNING
-                id, incident_id, kind, dedupe_key, subject, body, state,
+                id, tenant_id, incident_id, kind, dedupe_key, subject, body, state,
                 next_attempt_at, lease_until, attempt_count, last_error, sent_at",
         )
         .bind(&next_attempt_at)
         .bind(error)
         .bind(notification_id)
+        .bind(tenant_id.to_string())
         .bind(expected_lease_until.to_rfc3339())
         .fetch_optional(&self.pool)
         .await?;
         row.map(notification_outbox_record).transpose()
     }
 
-    pub async fn expire_commands(
+    pub async fn expire_due_commands(
         &self,
         tenant_id: uuid::Uuid,
         now: DateTime<Utc>,
+        limit: u32,
     ) -> Result<Vec<CommandOutboxRecord>, SqliteStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tenant_id = tenant_id.to_string();
+        let now = now.to_rfc3339();
+        // This single write statement selects and expires a bounded ordered set atomically.
         let rows = sqlx::query(
-            "UPDATE command_outbox
+            "WITH expired AS (
+                SELECT id
+                FROM command_outbox
+                WHERE tenant_id = ?
+                  AND (
+                        state IN ('queued', 'leased')
+                        OR (state = 'published_to_broker' AND mode = 'two_way')
+                      )
+                  AND expires_at <= ?
+                ORDER BY expires_at, created_at, id
+                LIMIT ?
+             )
+             UPDATE command_outbox AS command
              SET state = 'expired',
                  lease_until = NULL
-             WHERE tenant_id = ?
+             WHERE command.tenant_id = ?
+               AND command.id IN (SELECT id FROM expired)
                AND (
-                    state IN ('queued', 'leased')
-                    OR (state = 'published_to_broker' AND mode = 'two_way')
+                    command.state IN ('queued', 'leased')
+                    OR (command.state = 'published_to_broker' AND command.mode = 'two_way')
                    )
-               AND expires_at <= ?
+               AND command.expires_at <= ?
              RETURNING
                 id, tenant_id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
                 lease_until, attempt_count, last_error, published_at, response, responded_at",
         )
-        .bind(tenant_id.to_string())
-        .bind(now.to_rfc3339())
+        .bind(&tenant_id)
+        .bind(&now)
+        .bind(i64::from(limit))
+        .bind(&tenant_id)
+        .bind(&now)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(command_outbox_record).collect()
+    }
+
+    pub async fn expire_command_if_elapsed(
+        &self,
+        tenant_id: uuid::Uuid,
+        command_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CommandOutboxRecord>, SqliteStoreError> {
+        let row = sqlx::query(
+            "UPDATE command_outbox AS command
+             SET state = 'expired',
+                 lease_until = NULL
+             WHERE command.id = ?
+               AND command.tenant_id = ?
+               AND (
+                    command.state IN ('queued', 'leased')
+                    OR (command.state = 'published_to_broker' AND command.mode = 'two_way')
+                   )
+               AND command.expires_at <= ?
+             RETURNING
+                id, tenant_id, device_id, method, params, mode, state, created_at, expires_at, next_attempt_at,
+                lease_until, attempt_count, last_error, published_at, response, responded_at",
+        )
+        .bind(command_id)
+        .bind(tenant_id.to_string())
+        .bind(now.to_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(command_outbox_record).transpose()
     }
 
     pub async fn mark_command_responded(
@@ -8625,6 +9576,11 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), SqliteSt
             table: "command_outbox".to_owned(),
         });
     }
+    if sqlite_command_outbox_has_invalid_uuid_identifiers(pool).await? {
+        return Err(SqliteStoreError::ResetRequired {
+            table: "command_outbox".to_owned(),
+        });
+    }
     if column_names.iter().any(|name| name == "mode") {
         refresh_command_outbox_expiring_index(pool).await?;
         return Ok(());
@@ -8690,6 +9646,28 @@ async fn migrate_command_outbox_schema(pool: &SqlitePool) -> Result<(), SqliteSt
     .await?;
     transaction.commit().await?;
     Ok(refresh_command_outbox_expiring_index(pool).await?)
+}
+
+async fn sqlite_command_outbox_has_invalid_uuid_identifiers(
+    pool: &SqlitePool,
+) -> Result<bool, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT CAST(id AS TEXT) AS id, CAST(tenant_id AS TEXT) AS tenant_id
+         FROM command_outbox",
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let id: Option<String> = row.try_get("id")?;
+        let tenant_id: Option<String> = row.try_get("tenant_id")?;
+        let (Some(id), Some(tenant_id)) = (id, tenant_id) else {
+            return Ok(true);
+        };
+        if uuid::Uuid::parse_str(&id).is_err() || uuid::Uuid::parse_str(&tenant_id).is_err() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn migrate_root_asset_name_uniqueness(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -8906,9 +9884,12 @@ fn command_outbox_record(row: SqliteRow) -> Result<CommandOutboxRecord, SqliteSt
 
 fn sqlite_alert_incident_record(row: SqliteRow) -> Result<AlertIncident, PlatformStoreError> {
     let id: String = row.try_get("id")?;
+    let tenant_id: String = row.try_get("tenant_id")?;
     let rule_id: String = row.try_get("rule_id")?;
     Ok(AlertIncident {
         id: uuid::Uuid::parse_str(&id).map_err(|_| PlatformStoreError::InvalidIncidentId(id))?,
+        tenant_id: uuid::Uuid::parse_str(&tenant_id)
+            .map_err(|_| PlatformStoreError::InvalidIncidentTenantId(tenant_id))?,
         rule_id: uuid::Uuid::parse_str(&rule_id)
             .map_err(|_| PlatformStoreError::InvalidIncidentId(rule_id))?,
         device_id: row.try_get("device_id")?,
@@ -8927,6 +9908,7 @@ fn sqlite_alert_incident_record(row: SqliteRow) -> Result<AlertIncident, Platfor
 fn postgres_alert_incident_record(row: PgRow) -> Result<AlertIncident, PlatformStoreError> {
     Ok(AlertIncident {
         id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
         rule_id: row.try_get("rule_id")?,
         device_id: row.try_get("device_id")?,
         status: AlertIncidentStatus::from_database(&row.try_get::<String, _>("status")?)?,
@@ -8979,10 +9961,13 @@ fn notification_outbox_record(
     row: SqliteRow,
 ) -> Result<NotificationOutboxRecord, PlatformStoreError> {
     let id: String = row.try_get("id")?;
+    let tenant_id: String = row.try_get("tenant_id")?;
     let incident_id: String = row.try_get("incident_id")?;
     Ok(NotificationOutboxRecord {
         id: uuid::Uuid::parse_str(&id)
             .map_err(|_| PlatformStoreError::InvalidNotificationId(id))?,
+        tenant_id: uuid::Uuid::parse_str(&tenant_id)
+            .map_err(|_| PlatformStoreError::InvalidNotificationTenantId(tenant_id))?,
         incident_id: uuid::Uuid::parse_str(&incident_id)
             .map_err(|_| PlatformStoreError::InvalidNotificationId(incident_id))?,
         kind: NotificationKind::from_database(&row.try_get::<String, _>("kind")?)?,

@@ -152,11 +152,12 @@ async fn sqlite_public_application_grant_reads_telemetry_and_alerts() {
     let pool = store.sqlite_pool().unwrap();
     sqlx::query(
         "INSERT INTO telemetry (
-            event_at, received_at, device_id, boot_id, sequence, measurements, topic
-         ) VALUES (?, ?, ?, ?, ?, ?, 'public-observer')",
+            event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'public-observer')",
     )
     .bind(event_at.to_rfc3339())
     .bind(event_at.to_rfc3339())
+    .bind(test_tenant_id().to_string())
     .bind(&device.device_id)
     .bind(Uuid::now_v7().to_string())
     .bind(1_i64)
@@ -168,20 +169,22 @@ async fn sqlite_public_application_grant_reads_telemetry_and_alerts() {
     let alert_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, device_id, metric_key, rule_type, comparison, threshold
-         ) VALUES (?, 'Public observer rule', ?, 'temperature_c', 'event', 'gt', 25)",
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold
+         ) VALUES (?, ?, 'Public observer rule', ?, 'temperature_c', 'event_threshold', 'gt', 25)",
     )
     .bind(rule_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(&device.device_id)
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO alert_incidents (
-            id, rule_id, device_id, status, condition_started_at, opened_at, updated_at
-         ) VALUES (?, ?, ?, 'open', ?, ?, ?)",
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
     )
     .bind(alert_id.to_string())
+    .bind(test_tenant_id().to_string())
     .bind(rule_id.to_string())
     .bind(&device.device_id)
     .bind(event_at.to_rfc3339())
@@ -210,6 +213,345 @@ async fn sqlite_public_application_grant_reads_telemetry_and_alerts() {
     assert_eq!(telemetry[0].device_id, device.device_id);
     assert_eq!(alerts.len(), 1);
     assert_eq!(alerts[0].id, alert_id);
+}
+
+#[tokio::test]
+async fn sqlite_public_alerts_are_tenant_scoped_for_list_get_and_acknowledge() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_a_id = Uuid::now_v7();
+    let tenant_b_id = Uuid::now_v7();
+    let tenant_a_rule_id = Uuid::now_v7();
+    let tenant_b_rule_id = Uuid::now_v7();
+    let tenant_a_alert_id = Uuid::now_v7();
+    let tenant_b_alert_id = Uuid::now_v7();
+    let tenant_a_device_id = "public-alert-tenant-a-device";
+    let tenant_b_device_id = "public-alert-tenant-b-device";
+    let app_id = "public-alert-tenant-a-app";
+    let event_at = Utc::now();
+    let principal = PublicPrincipal {
+        tenant_id: tenant_a_id,
+        user_id: None,
+        app_id: app_id.to_owned(),
+        account_class: AccountClass::User,
+    };
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES
+            (?, 'public-alert-tenant-a', 'active'),
+            (?, 'public-alert-tenant-b', 'active')",
+    )
+    .bind(tenant_a_id.to_string())
+    .bind(tenant_b_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?), (?, ?)")
+        .bind(tenant_a_device_id)
+        .bind(tenant_a_id.to_string())
+        .bind(tenant_b_device_id)
+        .bind(tenant_b_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_grants (
+            id, tenant_id, resource_type, resource_id, grantee_type, grantee_id, permission
+         ) VALUES (?, ?, 'device', ?, 'application', ?, 'manager')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(tenant_a_id.to_string())
+    .bind(tenant_a_device_id)
+    .bind(app_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold
+         ) VALUES
+            (?, ?, 'Public alert tenant A rule', ?, 'temperature_c', 'event_threshold', 'gt', 25),
+            (?, ?, 'Public alert tenant B rule', ?, 'temperature_c', 'event_threshold', 'gt', 25)",
+    )
+    .bind(tenant_a_rule_id.to_string())
+    .bind(tenant_a_id.to_string())
+    .bind(tenant_a_device_id)
+    .bind(tenant_b_rule_id.to_string())
+    .bind(tenant_b_id.to_string())
+    .bind(tenant_b_device_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at, updated_at
+         ) VALUES
+            (?, ?, ?, ?, 'open', ?, ?, ?),
+            (?, ?, ?, ?, 'resolved', ?, ?, ?)",
+    )
+    .bind(tenant_a_alert_id.to_string())
+    .bind(tenant_a_id.to_string())
+    .bind(tenant_a_rule_id.to_string())
+    .bind(tenant_a_device_id)
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .bind(tenant_b_alert_id.to_string())
+    .bind(tenant_b_id.to_string())
+    .bind(tenant_b_rule_id.to_string())
+    .bind(tenant_b_device_id)
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Simulate a stale row that passes a device-only tenant join.
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE alert_incidents SET rule_id = ?, device_id = ? WHERE id = ?")
+        .bind(tenant_a_rule_id.to_string())
+        .bind(tenant_a_device_id)
+        .bind(tenant_b_alert_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    let alerts = PublicApiRepository::list_public_alerts(&store, &principal, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        alerts.iter().map(|alert| alert.id).collect::<Vec<_>>(),
+        [tenant_a_alert_id]
+    );
+    assert_eq!(
+        PublicApiRepository::get_public_alert(&store, &principal, tenant_b_alert_id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        PublicApiRepository::acknowledge_public_alert(
+            &store,
+            &principal,
+            tenant_b_alert_id,
+            "tenant-a-app",
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    let tenant_b_acknowledged_at: Option<String> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM alert_incidents WHERE id = ?")
+            .bind(tenant_b_alert_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(tenant_b_acknowledged_at, None);
+    assert_eq!(
+        PublicApiRepository::acknowledge_public_alert(
+            &store,
+            &principal,
+            tenant_a_alert_id,
+            "tenant-a-app",
+        )
+        .await
+        .unwrap()
+        .map(|alert| alert.id),
+        Some(tenant_a_alert_id)
+    );
+    let tenant_a_acknowledged_at: Option<String> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM alert_incidents WHERE id = ?")
+            .bind(tenant_a_alert_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(tenant_a_acknowledged_at.is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL and permission to set session_replication_role"]
+async fn timescale_public_alerts_are_tenant_scoped_for_list_get_and_acknowledge() {
+    let (mut lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let unique = Uuid::now_v7();
+    let tenant_a_id = Uuid::now_v7();
+    let tenant_b_id = Uuid::now_v7();
+    let tenant_a_rule_id = Uuid::now_v7();
+    let tenant_b_rule_id = Uuid::now_v7();
+    let tenant_a_alert_id = Uuid::now_v7();
+    let tenant_b_alert_id = Uuid::now_v7();
+    let tenant_a_device_id = format!("timescale-public-alert-tenant-a-{unique}");
+    let tenant_b_device_id = format!("timescale-public-alert-tenant-b-{unique}");
+    let app_id = format!("timescale-public-alert-tenant-a-app-{unique}");
+    let event_at = Utc::now();
+    let principal = PublicPrincipal {
+        tenant_id: tenant_a_id,
+        user_id: None,
+        app_id: app_id.clone(),
+        account_class: AccountClass::User,
+    };
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES
+            ($1, $2, 'active'),
+            ($3, $4, 'active')",
+    )
+    .bind(tenant_a_id)
+    .bind(format!("timescale-public-alert-tenant-a-{unique}"))
+    .bind(tenant_b_id)
+    .bind(format!("timescale-public-alert-tenant-b-{unique}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ($1, $2), ($3, $4)")
+        .bind(&tenant_a_device_id)
+        .bind(tenant_a_id)
+        .bind(&tenant_b_device_id)
+        .bind(tenant_b_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_grants (
+            id, tenant_id, resource_type, resource_id, grantee_type, grantee_id, permission
+         ) VALUES ($1, $2, 'device', $3, 'application', $4, 'manager')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tenant_a_id)
+    .bind(&tenant_a_device_id)
+    .bind(&app_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold
+         ) VALUES
+            ($1, $2, 'Timescale public alert tenant A rule', $3, 'temperature_c', 'event_threshold', 'gt', 25),
+            ($4, $5, 'Timescale public alert tenant B rule', $6, 'temperature_c', 'event_threshold', 'gt', 25)",
+    )
+    .bind(tenant_a_rule_id)
+    .bind(tenant_a_id)
+    .bind(&tenant_a_device_id)
+    .bind(tenant_b_rule_id)
+    .bind(tenant_b_id)
+    .bind(&tenant_b_device_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at, updated_at
+         ) VALUES
+            ($1, $2, $3, $4, 'open', $5, $5, $5),
+            ($6, $7, $8, $9, 'resolved', $5, $5, $5)",
+    )
+    .bind(tenant_a_alert_id)
+    .bind(tenant_a_id)
+    .bind(tenant_a_rule_id)
+    .bind(&tenant_a_device_id)
+    .bind(event_at)
+    .bind(tenant_b_alert_id)
+    .bind(tenant_b_id)
+    .bind(tenant_b_rule_id)
+    .bind(&tenant_b_device_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Simulate the same stale row that passes a device-only tenant join on SQLite.
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut lock)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE iot_nano.alert_incidents SET rule_id = $1, device_id = $2 WHERE id = $3")
+        .bind(tenant_a_rule_id)
+        .bind(&tenant_a_device_id)
+        .bind(tenant_b_alert_id)
+        .execute(&mut lock)
+        .await
+        .unwrap();
+    sqlx::query("SET session_replication_role = origin")
+        .execute(&mut lock)
+        .await
+        .unwrap();
+
+    let alerts = PublicApiRepository::list_public_alerts(&store, &principal, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        alerts.iter().map(|alert| alert.id).collect::<Vec<_>>(),
+        [tenant_a_alert_id]
+    );
+    assert_eq!(
+        PublicApiRepository::get_public_alert(&store, &principal, tenant_b_alert_id)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        PublicApiRepository::acknowledge_public_alert(
+            &store,
+            &principal,
+            tenant_b_alert_id,
+            "tenant-a-app",
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    let tenant_b_acknowledged_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM alert_incidents WHERE id = $1")
+            .bind(tenant_b_alert_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(tenant_b_acknowledged_at, None);
+    assert_eq!(
+        PublicApiRepository::acknowledge_public_alert(
+            &store,
+            &principal,
+            tenant_a_alert_id,
+            "tenant-a-app",
+        )
+        .await
+        .unwrap()
+        .map(|alert| alert.id),
+        Some(tenant_a_alert_id)
+    );
+    let tenant_a_acknowledged_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM alert_incidents WHERE id = $1")
+            .bind(tenant_a_alert_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(tenant_a_acknowledged_at.is_some());
+
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut lock)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE iot_nano.alert_incidents SET rule_id = $1, device_id = $2 WHERE id = $3")
+        .bind(tenant_b_rule_id)
+        .bind(&tenant_b_device_id)
+        .bind(tenant_b_alert_id)
+        .execute(&mut lock)
+        .await
+        .unwrap();
+    sqlx::query("SET session_replication_role = origin")
+        .execute(&mut lock)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

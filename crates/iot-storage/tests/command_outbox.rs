@@ -130,6 +130,57 @@ async fn register_tenant_device_and_token(
     .unwrap();
 }
 
+async fn assert_current_command_outbox_identifier_requires_reset(
+    path: std::path::PathBuf,
+    command_id: &str,
+    tenant_id: &str,
+) {
+    let configuration = StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(path),
+        sqlite_busy_timeout_ms: 5_000,
+    };
+    let store = SqliteStore::open(&configuration).await.unwrap();
+    register_tenant_device_and_token(
+        &store,
+        test_tenant_id(),
+        "command-outbox-current",
+        "current-device",
+        "current-token",
+    )
+    .await;
+    let mut connection = store.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO command_outbox (
+            id, tenant_id, device_id, method, params, mode, state, expires_at, next_attempt_at
+         ) VALUES (?, ?, 'current-device', 'sample_now', '{}', 'one_way', 'queued', ?, ?)",
+    )
+    .bind(command_id)
+    .bind(tenant_id)
+    .bind("2027-01-15T08:10:00Z")
+    .bind("2027-01-15T08:00:00Z")
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    drop(store);
+
+    assert!(matches!(
+        SqliteStore::open(&configuration).await,
+        Err(SqliteStoreError::ResetRequired { table }) if table == "command_outbox"
+    ));
+    assert!(matches!(
+        PlatformStore::open(&configuration).await,
+        Err(PlatformStoreError::Sqlite(SqliteStoreError::ResetRequired { table }))
+            if table == "command_outbox"
+    ));
+}
+
 #[tokio::test]
 async fn sqlite_command_outbox_claim_leases_a_command_only_once() {
     let (_directory, store) = store().await;
@@ -312,7 +363,7 @@ async fn sqlite_command_outbox_expire_marks_queued_and_leased_commands() {
     assert_eq!(leased[0].id, "leased");
 
     let expired = store
-        .expire_commands(test_tenant_id(), now + Duration::seconds(1))
+        .expire_due_commands(test_tenant_id(), now + Duration::seconds(1), 2)
         .await
         .unwrap();
 
@@ -334,6 +385,66 @@ async fn sqlite_command_outbox_expire_marks_queued_and_leased_commands() {
             .unwrap(),
         Vec::new()
     );
+}
+
+#[tokio::test]
+async fn sqlite_command_outbox_expires_due_commands_with_a_bounded_deterministic_selection() {
+    let (_directory, store) = store().await;
+    let now = at(1_800_000_000);
+    store
+        .enqueue_command(command("expired-earliest", now, now - Duration::seconds(3)))
+        .await
+        .unwrap();
+    store
+        .enqueue_command(command("expired-middle", now, now - Duration::seconds(2)))
+        .await
+        .unwrap();
+    store
+        .enqueue_command(command("expired-latest", now, now - Duration::seconds(1)))
+        .await
+        .unwrap();
+
+    let first = store
+        .expire_due_commands(test_tenant_id(), now, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM command_outbox WHERE id = 'expired-earliest'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap(),
+        "expired"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM command_outbox WHERE id = 'expired-middle'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap(),
+        "expired"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM command_outbox WHERE id = 'expired-latest'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap(),
+        "queued"
+    );
+
+    let second = store
+        .expire_due_commands(test_tenant_id(), now, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, "expired-latest");
 }
 
 #[tokio::test]
@@ -641,6 +752,26 @@ async fn sqlite_open_rejects_a_legacy_command_outbox_without_tenant_scope() {
 }
 
 #[tokio::test]
+async fn sqlite_open_rejects_current_command_outbox_with_invalid_identifiers() {
+    let directory = tempfile::tempdir().unwrap();
+    let valid_tenant_id = test_tenant_id().to_string();
+    let valid_command_id = uuid::Uuid::from_u128(2).to_string();
+
+    assert_current_command_outbox_identifier_requires_reset(
+        directory.path().join("invalid-command-id.db"),
+        "invalid-command-id",
+        &valid_tenant_id,
+    )
+    .await;
+    assert_current_command_outbox_identifier_requires_reset(
+        directory.path().join("invalid-tenant-id.db"),
+        &valid_command_id,
+        "invalid-tenant-id",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn sqlite_store_reopens_with_the_two_way_expiry_index() {
     let directory = tempfile::tempdir().unwrap();
     let configuration = StorageConfiguration {
@@ -777,7 +908,10 @@ async fn timescale_command_outbox_preserves_created_at_across_lifecycle_transiti
     );
     expired_command.device_id = device_id.to_owned();
     let expired_enqueued = store.enqueue_command(expired_command).await.unwrap();
-    let expired = store.expire_commands(test_tenant_id(), now).await.unwrap();
+    let expired = store
+        .expire_due_commands(test_tenant_id(), now, 1)
+        .await
+        .unwrap();
     let expired = expired
         .iter()
         .find(|record| record.id == expired_id.to_string())

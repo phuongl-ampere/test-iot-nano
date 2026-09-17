@@ -16,7 +16,6 @@ const SHARED_SCHEMA_HELPER_MARKERS: &[&str] = &[
 const SHARED_SCHEMA_TEST_FILES: &[&str] = &[
     "alert_evaluation.rs",
     "alert_incident.rs",
-    "alert_rule.rs",
     "application_registry.rs",
     "backend_contract.rs",
     "command_outbox.rs",
@@ -39,7 +38,6 @@ const SHARED_SCHEMA_TEST_FILES: &[&str] = &[
 const RESETTERS: &[(&str, &str)] = &[
     ("alert_evaluation.rs", "timescale_store"),
     ("alert_incident.rs", "timescale_store"),
-    ("alert_rule.rs", "timescale_store"),
     (
         "application_registry.rs",
         "timescale_application_registry_matches_sqlite_contract",
@@ -56,7 +54,15 @@ const RESETTERS: &[(&str, &str)] = &[
     ("management_users.rs", "timescale_store"),
     (
         "migration_safety.rs",
-        "timescale_migration_rejects_duplicate_root_asset_names_without_mutating_data",
+        "timescale_open_rejects_pre_tenant_platform_schema_without_partial_migration",
+    ),
+    (
+        "migration_safety.rs",
+        "timescale_open_rejects_partially_tenant_scoped_alert_schema",
+    ),
+    (
+        "migration_safety.rs",
+        "timescale_open_rejects_pre_tenant_asset_schema_without_mutating_data",
     ),
     ("notification_outbox.rs", "timescale_notification_store"),
     (
@@ -176,7 +182,7 @@ fn common_reset_helper_locks_before_dropping_the_shared_schema() {
 
 #[test]
 fn every_shared_schema_resetter_routes_through_the_common_reset_helper() {
-    assert_eq!(RESETTERS.len(), 19);
+    assert_eq!(RESETTERS.len(), 20);
     for (file_name, function_name) in RESETTERS {
         let source = read_test_source(file_name);
         let body = function_body(&source, function_name);

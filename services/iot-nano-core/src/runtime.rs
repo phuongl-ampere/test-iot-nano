@@ -645,11 +645,6 @@ fn worker_error(name: &'static str, error: impl std::fmt::Display) -> CoreRuntim
 fn writer_work_error(error: WriterError) -> WorkError {
     match error {
         WriterError::Stream(error) => WorkError::Stream(error.to_string()),
-        WriterError::Database(error) => WorkError::Storage(error.to_string()),
-        WriterError::Sqlite(error) => WorkError::Storage(error.to_string()),
         WriterError::Platform(error) => WorkError::Storage(error.to_string()),
-        WriterError::ResetRequiredTimescaleSchema { table } => WorkError::Storage(format!(
-            "core Timescale schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
-        )),
     }
 }

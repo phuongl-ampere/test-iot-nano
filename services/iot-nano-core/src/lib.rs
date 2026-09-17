@@ -6,17 +6,13 @@ mod metrics;
 mod mqtt;
 mod notification;
 mod runtime;
-mod storage;
 mod stream_port;
 mod writer;
 
-pub use alert::{
-    AlertError, AlertEvaluator, AlertFlushResult, PlatformAlertEvaluator, SqliteAlertEvaluator,
-};
+pub use alert::{AlertError, AlertFlushResult, PlatformAlertEvaluator};
 pub use command::{
-    CommandDispatchResult, CommandDispatcher, CommandError, CommandTransport,
-    CommandTransport as TransportRpcClient, CommandTransportError, PlatformCommandDispatcher,
-    SqliteCommandDispatcher, TransportRpcPublishRequest,
+    CommandDispatchResult, CommandError, CommandTransport, CommandTransport as TransportRpcClient,
+    CommandTransportError, PlatformCommandDispatcher, TransportRpcPublishRequest,
 };
 pub use metrics::IngestMetrics;
 pub use mqtt::{
@@ -24,17 +20,9 @@ pub use mqtt::{
     MqttStreamProducer,
 };
 pub use notification::{
-    EmailSender, NotificationDispatchResult, NotificationDispatcher, NotificationError,
-    PlatformNotificationDispatcher, ReloadingSmtpEmailSender, SmtpConfig, SmtpConfigInput,
-    SmtpEmailSender, SqliteNotificationDispatcher, load_live_smtp_config,
+    EmailSender, NotificationDispatchResult, NotificationError, PlatformNotificationDispatcher,
+    ReloadingSmtpEmailSender, SmtpConfig, SmtpConfigInput, SmtpEmailSender, load_live_smtp_config,
 };
 pub use runtime::{CoreRuntime, CoreRuntimeConfig, CoreRuntimeError, CoreRuntimeWorkerError};
-pub use storage::{
-    CommandOutboxRecord, CommandOutboxState, CoreSqliteStore, CoreSqliteStoreError,
-    NewCommandOutboxEntry, RetentionResult,
-};
 pub use stream_port::{ClaimedBatch, CoreStreamConsumer};
-pub use writer::{
-    FlushResult, PlatformTelemetryWriter, SqliteTelemetryWriter, TelemetryWriter, WriterError,
-    connect_core_database, migrate,
-};
+pub use writer::{FlushResult, PlatformTelemetryWriter, WriterError};

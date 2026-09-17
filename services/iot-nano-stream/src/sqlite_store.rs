@@ -14,6 +14,13 @@ use crate::{
 };
 
 const APPLICATION_ID: i32 = 0x4953_5453;
+const IDEMPOTENCY_KEY_FORMAT_METADATA_KEY: &str = "idempotency_key_format";
+const TENANT_SCOPED_IDEMPOTENCY_KEY_FORMAT: &str = "tenant_scoped_v1";
+
+enum IdempotencyKeyFormat {
+    ExistingTenantScoped,
+    InitializedEmpty,
+}
 
 pub(crate) struct SqliteStore {
     connection: Mutex<Connection>,
@@ -871,7 +878,12 @@ fn migrate(connection: &Connection, config: &StreamConfig) -> Result<(), StreamE
             ON stream_group_leases(inflight_until_ms);
         ",
     )?;
-    migrate_idempotency_tombstones(&transaction)?;
+    if matches!(
+        ensure_idempotency_key_format(&transaction)?,
+        IdempotencyKeyFormat::ExistingTenantScoped
+    ) {
+        migrate_idempotency_tombstones(&transaction)?;
+    }
     let stored_partitions: Option<String> = transaction
         .query_row(
             "SELECT value FROM stream_metadata WHERE key = 'partition_count'",
@@ -905,14 +917,7 @@ fn migrate(connection: &Connection, config: &StreamConfig) -> Result<(), StreamE
 }
 
 fn migrate_idempotency_tombstones(transaction: &Transaction<'_>) -> Result<(), StreamError> {
-    let mut statement = transaction.prepare("PRAGMA foreign_key_list(stream_idempotency)")?;
-    let references_records = statement
-        .query_map([], |row| row.get::<_, String>(2))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|table| table == "stream_records");
-    drop(statement);
-    if !references_records {
+    if !stream_idempotency_references_records(transaction)? {
         return Ok(());
     }
 
@@ -930,6 +935,63 @@ fn migrate_idempotency_tombstones(transaction: &Transaction<'_>) -> Result<(), S
         ",
     )?;
     Ok(())
+}
+
+fn ensure_idempotency_key_format(
+    transaction: &Transaction<'_>,
+) -> Result<IdempotencyKeyFormat, StreamError> {
+    let stored_format: Option<String> = transaction
+        .query_row(
+            "SELECT value FROM stream_metadata WHERE key = ?1",
+            [IDEMPOTENCY_KEY_FORMAT_METADATA_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match stored_format.as_deref() {
+        Some(format) if format == TENANT_SCOPED_IDEMPOTENCY_KEY_FORMAT => {
+            Ok(IdempotencyKeyFormat::ExistingTenantScoped)
+        }
+        Some(_) => Err(StreamError::ResetRequiredDurableRecord {
+            record_type: "idempotency",
+        }),
+        None => {
+            if stream_idempotency_references_records(transaction)? {
+                return Err(StreamError::ResetRequiredDurableRecord {
+                    record_type: "idempotency",
+                });
+            }
+            let has_idempotency_state: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stream_idempotency)",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_idempotency_state != 0 {
+                return Err(StreamError::ResetRequiredDurableRecord {
+                    record_type: "idempotency",
+                });
+            }
+            transaction.execute(
+                "INSERT INTO stream_metadata(key, value) VALUES (?1, ?2)",
+                params![
+                    IDEMPOTENCY_KEY_FORMAT_METADATA_KEY,
+                    TENANT_SCOPED_IDEMPOTENCY_KEY_FORMAT
+                ],
+            )?;
+            Ok(IdempotencyKeyFormat::InitializedEmpty)
+        }
+    }
+}
+
+fn stream_idempotency_references_records(
+    transaction: &Transaction<'_>,
+) -> Result<bool, StreamError> {
+    let mut statement = transaction.prepare("PRAGMA foreign_key_list(stream_idempotency)")?;
+    let references_records = statement
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|table| table == "stream_records");
+    Ok(references_records)
 }
 
 fn duration_millis(duration: Duration, name: &str) -> Result<i64, StreamError> {

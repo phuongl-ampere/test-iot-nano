@@ -8,6 +8,62 @@ use sqlx::{Connection, PgConnection};
 
 mod common;
 
+fn tenant_id() -> uuid::Uuid {
+    uuid::Uuid::from_u128(1)
+}
+
+async fn seed_tenant_and_devices(
+    store: &PlatformStore,
+    tenant_id: uuid::Uuid,
+    slug: &str,
+    device_ids: &[&str],
+) {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query(
+                "INSERT OR IGNORE INTO tenants (id, slug, status, metadata)
+                 VALUES (?, ?, 'active', '{}')",
+            )
+            .bind(tenant_id.to_string())
+            .bind(slug)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            for device_id in device_ids {
+                sqlx::query("INSERT OR IGNORE INTO devices (device_id, tenant_id) VALUES (?, ?)")
+                    .bind(device_id)
+                    .bind(tenant_id.to_string())
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            }
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query(
+                "INSERT INTO tenants (id, slug, status, metadata)
+                 VALUES ($1, $2, 'active', '{}'::jsonb)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .bind(slug)
+            .execute(pool)
+            .await
+            .unwrap();
+            for device_id in device_ids {
+                sqlx::query(
+                    "INSERT INTO devices (device_id, tenant_id) VALUES ($1, $2)
+                     ON CONFLICT (device_id) DO NOTHING",
+                )
+                .bind(device_id)
+                .bind(tenant_id)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+}
+
 async fn store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
     let platform = PlatformStore::open(&StorageConfiguration {
@@ -18,24 +74,43 @@ async fn store() -> (tempfile::TempDir, PlatformStore) {
     })
     .await
     .unwrap();
+    seed_tenant_and_devices(
+        &platform,
+        tenant_id(),
+        "alert-incident",
+        &[
+            "incident-device",
+            "second-device",
+            "rollback-device",
+            "direct-resolve-device",
+        ],
+    )
+    .await;
     (directory, platform)
 }
 
-async fn rule(store: &PlatformStore, id: uuid::Uuid) {
+async fn rule(store: &PlatformStore, tenant_id: uuid::Uuid, id: uuid::Uuid) {
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold
-         ) VALUES (?, 'incident-rule', 'temperature_c', 'event_threshold', 'gt', 30)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold
+         ) VALUES (?, ?, 'incident-rule', 'temperature_c', 'event_threshold', 'gt', 30)",
     )
     .bind(id.to_string())
+    .bind(tenant_id.to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
 }
 
-fn incident(rule_id: uuid::Uuid, id: uuid::Uuid, status: AlertIncidentStatus) -> NewAlertIncident {
+fn incident(
+    tenant_id: uuid::Uuid,
+    rule_id: uuid::Uuid,
+    id: uuid::Uuid,
+    status: AlertIncidentStatus,
+) -> NewAlertIncident {
     NewAlertIncident {
         id,
+        tenant_id,
         rule_id,
         device_id: "incident-device".to_owned(),
         status,
@@ -48,20 +123,27 @@ fn incident(rule_id: uuid::Uuid, id: uuid::Uuid, status: AlertIncidentStatus) ->
 async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
-    rule(&store, rule_id).await;
+    rule(&store, tenant_id(), rule_id).await;
 
     let pending = AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, uuid::Uuid::now_v7(), AlertIncidentStatus::Pending),
+        incident(
+            tenant_id(),
+            rule_id,
+            uuid::Uuid::now_v7(),
+            AlertIncidentStatus::Pending,
+        ),
         None,
     )
     .await
     .unwrap()
     .unwrap();
     assert_eq!(pending.status, AlertIncidentStatus::Pending);
+    assert_eq!(pending.tenant_id, tenant_id());
     assert_eq!(pending.state_version, 0);
     let duplicate_notification = NewNotificationOutboxEntry {
         id: uuid::Uuid::now_v7(),
+        tenant_id: tenant_id(),
         kind: NotificationKind::Opened,
         dedupe_key: "pending-duplicate-notification".to_owned(),
         subject: "duplicate".to_owned(),
@@ -71,7 +153,12 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
     assert!(
         AlertIncidentRepository::create_incident(
             &store,
-            incident(rule_id, uuid::Uuid::now_v7(), AlertIncidentStatus::Pending),
+            incident(
+                tenant_id(),
+                rule_id,
+                uuid::Uuid::now_v7(),
+                AlertIncidentStatus::Pending,
+            ),
             Some(duplicate_notification),
         )
         .await
@@ -92,6 +179,7 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
         &store,
         NewAlertIncident {
             id: open_id,
+            tenant_id: tenant_id(),
             rule_id,
             device_id: "second-device".to_owned(),
             status: AlertIncidentStatus::Open,
@@ -100,6 +188,7 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
         },
         Some(NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Opened,
             dedupe_key: "incident-opened:second-device".to_owned(),
             subject: "opened".to_owned(),
@@ -141,42 +230,56 @@ async fn sqlite_creates_pending_and_open_incidents_with_atomic_open_notification
 async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
-    rule(&store, rule_id).await;
+    rule(&store, tenant_id(), rule_id).await;
     let id = uuid::Uuid::now_v7();
     AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, id, AlertIncidentStatus::Pending),
+        incident(tenant_id(), rule_id, id, AlertIncidentStatus::Pending),
         None,
     )
     .await
     .unwrap();
 
-    let changed =
-        AlertIncidentRepository::update_incident_last_value(&store, id, 0, Some(32.0), Utc::now())
-            .await
-            .unwrap()
-            .unwrap();
+    let changed = AlertIncidentRepository::update_incident_last_value(
+        &store,
+        tenant_id(),
+        id,
+        0,
+        Some(32.0),
+        Utc::now(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(changed.state_version, 1);
     assert!(
-        AlertIncidentRepository::update_incident_last_value(&store, id, 0, Some(33.0), Utc::now(),)
-            .await
-            .unwrap()
-            .is_none()
+        AlertIncidentRepository::update_incident_last_value(
+            &store,
+            tenant_id(),
+            id,
+            0,
+            Some(33.0),
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
     assert!(
-        AlertIncidentRepository::resolve_incident(&store, id, 1, Utc::now())
+        AlertIncidentRepository::resolve_incident(&store, tenant_id(), id, 1, Utc::now())
             .await
             .unwrap()
             .is_none()
     );
 
-    let opened = AlertIncidentRepository::open_incident(&store, id, 1, Utc::now())
+    let opened = AlertIncidentRepository::open_incident(&store, tenant_id(), id, 1, Utc::now())
         .await
         .unwrap()
         .unwrap();
     let recovery_started_at = Utc::now().with_nanosecond(222_333_444).unwrap();
     let recovering = AlertIncidentRepository::recover_incident(
         &store,
+        tenant_id(),
         id,
         opened.state_version,
         recovery_started_at,
@@ -187,6 +290,7 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
     let recovery_started_at = recovering.recovery_started_at;
     let resolved = AlertIncidentRepository::resolve_incident(
         &store,
+        tenant_id(),
         id,
         recovering.state_version,
         recovery_started_at.unwrap() + Duration::seconds(1),
@@ -209,10 +313,64 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
         222_333_000
     );
     assert!(
-        AlertIncidentRepository::remind_incident(&store, id, resolved.state_version, Utc::now(),)
-            .await
-            .unwrap()
-            .is_none()
+        AlertIncidentRepository::remind_incident(
+            &store,
+            tenant_id(),
+            id,
+            resolved.state_version,
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_incident_mutation_cannot_cross_tenant_boundary() {
+    let (_directory, store) = store().await;
+    let other_tenant_id = uuid::Uuid::from_u128(2);
+    seed_tenant_and_devices(&store, other_tenant_id, "alert-incident-other", &[]).await;
+    let rule_id = uuid::Uuid::now_v7();
+    rule(&store, tenant_id(), rule_id).await;
+    let incident_id = uuid::Uuid::now_v7();
+    let created = AlertIncidentRepository::create_incident(
+        &store,
+        incident(
+            tenant_id(),
+            rule_id,
+            incident_id,
+            AlertIncidentStatus::Pending,
+        ),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        AlertIncidentRepository::update_incident_last_value(
+            &store,
+            other_tenant_id,
+            incident_id,
+            created.state_version,
+            Some(99.0),
+            Utc::now(),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT state_version FROM alert_incidents WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(incident_id.to_string())
+        .bind(tenant_id().to_string())
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        created.state_version
     );
 }
 
@@ -220,11 +378,16 @@ async fn sqlite_rejects_stale_versions_and_incompatible_incident_transitions() {
 async fn sqlite_opens_incident_and_enqueues_opened_notification_atomically() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
-    rule(&store, rule_id).await;
+    rule(&store, tenant_id(), rule_id).await;
     let incident_id = uuid::Uuid::now_v7();
     let created = AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, incident_id, AlertIncidentStatus::Pending),
+        incident(
+            tenant_id(),
+            rule_id,
+            incident_id,
+            AlertIncidentStatus::Pending,
+        ),
         None,
     )
     .await
@@ -234,11 +397,13 @@ async fn sqlite_opens_incident_and_enqueues_opened_notification_atomically() {
 
     let opened = AlertIncidentRepository::open_incident_with_notification(
         &store,
+        tenant_id(),
         incident_id,
         created.state_version,
         opened_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Opened,
             dedupe_key: "incident-opened:atomic".to_owned(),
             subject: "opened".to_owned(),
@@ -273,11 +438,16 @@ async fn sqlite_opens_incident_and_enqueues_opened_notification_atomically() {
 async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_atomically() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
-    rule(&store, rule_id).await;
+    rule(&store, tenant_id(), rule_id).await;
     let incident_id = uuid::Uuid::now_v7();
     let created = AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, incident_id, AlertIncidentStatus::Pending),
+        incident(
+            tenant_id(),
+            rule_id,
+            incident_id,
+            AlertIncidentStatus::Pending,
+        ),
         None,
     )
     .await
@@ -286,11 +456,13 @@ async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_ato
     let opened_at = Utc::now().with_nanosecond(987_654_321).unwrap();
     let opened = AlertIncidentRepository::open_incident_with_notification(
         &store,
+        tenant_id(),
         incident_id,
         created.state_version,
         opened_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Opened,
             dedupe_key: "incident-opened:rollback".to_owned(),
             subject: "opened".to_owned(),
@@ -306,11 +478,13 @@ async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_ato
     assert!(
         AlertIncidentRepository::open_incident_with_notification(
             &store,
+            tenant_id(),
             incident_id,
             created.state_version,
             opened_at,
             NewNotificationOutboxEntry {
                 id: uuid::Uuid::now_v7(),
+                tenant_id: tenant_id(),
                 kind: NotificationKind::Opened,
                 dedupe_key: "incident-opened:stale".to_owned(),
                 subject: "stale".to_owned(),
@@ -327,11 +501,13 @@ async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_ato
     assert!(
         AlertIncidentRepository::resolve_incident_with_notification(
             &store,
+            tenant_id(),
             incident_id,
             opened.state_version,
             resolved_at,
             NewNotificationOutboxEntry {
                 id: uuid::Uuid::now_v7(),
+                tenant_id: tenant_id(),
                 kind: NotificationKind::Resolved,
                 dedupe_key: "incident-opened:rollback".to_owned(),
                 subject: "duplicate".to_owned(),
@@ -353,11 +529,13 @@ async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_ato
     let reminded_at = Utc::now().with_nanosecond(444_555_666).unwrap();
     let reminded = AlertIncidentRepository::remind_incident_with_notification(
         &store,
+        tenant_id(),
         incident_id,
         opened.state_version,
         reminded_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Reminder,
             dedupe_key: "incident-reminder:atomic".to_owned(),
             subject: "reminder".to_owned(),
@@ -375,11 +553,13 @@ async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_ato
 
     let resolved = AlertIncidentRepository::resolve_incident_with_notification(
         &store,
+        tenant_id(),
         incident_id,
         reminded.state_version,
         resolved_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Resolved,
             dedupe_key: "incident-resolved:atomic".to_owned(),
             subject: "resolved".to_owned(),
@@ -400,11 +580,11 @@ async fn sqlite_notification_transitions_reject_stale_and_duplicate_requests_ato
 async fn sqlite_direct_resolution_sets_recovery_started_at() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
-    rule(&store, rule_id).await;
+    rule(&store, tenant_id(), rule_id).await;
     let id = uuid::Uuid::now_v7();
     let opened = AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, id, AlertIncidentStatus::Open),
+        incident(tenant_id(), rule_id, id, AlertIncidentStatus::Open),
         None,
     )
     .await
@@ -412,11 +592,16 @@ async fn sqlite_direct_resolution_sets_recovery_started_at() {
     .unwrap();
     let resolved_at = Utc::now() + Duration::seconds(1);
 
-    let resolved =
-        AlertIncidentRepository::resolve_incident(&store, id, opened.state_version, resolved_at)
-            .await
-            .unwrap()
-            .unwrap();
+    let resolved = AlertIncidentRepository::resolve_incident(
+        &store,
+        tenant_id(),
+        id,
+        opened.state_version,
+        resolved_at,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     assert_eq!(resolved.status, AlertIncidentStatus::Resolved);
     assert_eq!(resolved.recovery_started_at, Some(resolved_at));
@@ -426,29 +611,36 @@ async fn sqlite_direct_resolution_sets_recovery_started_at() {
 async fn sqlite_enqueue_notification_returns_original_for_exact_duplicate_key() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
-    rule(&store, rule_id).await;
+    rule(&store, tenant_id(), rule_id).await;
     let incident_id = uuid::Uuid::now_v7();
     AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, incident_id, AlertIncidentStatus::Open),
+        incident(tenant_id(), rule_id, incident_id, AlertIncidentStatus::Open),
         None,
     )
     .await
     .unwrap();
     let entry = NewNotificationOutboxEntry {
         id: uuid::Uuid::now_v7(),
+        tenant_id: tenant_id(),
         kind: NotificationKind::Reminder,
         dedupe_key: "incident-reminder:exact".to_owned(),
         subject: "subject".to_owned(),
         body: "body".to_owned(),
         next_attempt_at: Utc::now(),
     };
-    let first = AlertIncidentRepository::enqueue_notification(&store, incident_id, entry.clone())
-        .await
-        .unwrap();
-    let second = AlertIncidentRepository::enqueue_notification(&store, incident_id, entry)
-        .await
-        .unwrap();
+    let first = AlertIncidentRepository::enqueue_notification(
+        &store,
+        tenant_id(),
+        incident_id,
+        entry.clone(),
+    )
+    .await
+    .unwrap();
+    let second =
+        AlertIncidentRepository::enqueue_notification(&store, tenant_id(), incident_id, entry)
+            .await
+            .unwrap();
     assert_eq!(first, second);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM notification_outbox")
@@ -463,15 +655,21 @@ async fn sqlite_enqueue_notification_returns_original_for_exact_duplicate_key() 
 async fn sqlite_open_incident_rolls_back_when_opened_notification_conflicts() {
     let (_directory, store) = store().await;
     let rule_id = uuid::Uuid::now_v7();
-    rule(&store, rule_id).await;
+    rule(&store, tenant_id(), rule_id).await;
     let dedupe_key = "incident-opened:rollback";
     let first_id = uuid::Uuid::now_v7();
     let first_incident = uuid::Uuid::now_v7();
     AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, first_incident, AlertIncidentStatus::Open),
+        incident(
+            tenant_id(),
+            rule_id,
+            first_incident,
+            AlertIncidentStatus::Open,
+        ),
         Some(NewNotificationOutboxEntry {
             id: first_id,
+            tenant_id: tenant_id(),
             kind: NotificationKind::Opened,
             dedupe_key: dedupe_key.to_owned(),
             subject: "first".to_owned(),
@@ -483,7 +681,12 @@ async fn sqlite_open_incident_rolls_back_when_opened_notification_conflicts() {
     .unwrap();
 
     let second_incident = uuid::Uuid::now_v7();
-    let mut second = incident(rule_id, second_incident, AlertIncidentStatus::Open);
+    let mut second = incident(
+        tenant_id(),
+        rule_id,
+        second_incident,
+        AlertIncidentStatus::Open,
+    );
     second.device_id = "rollback-device".to_owned();
     assert!(
         AlertIncidentRepository::create_incident(
@@ -491,6 +694,7 @@ async fn sqlite_open_incident_rolls_back_when_opened_notification_conflicts() {
             second,
             Some(NewNotificationOutboxEntry {
                 id: uuid::Uuid::now_v7(),
+                tenant_id: tenant_id(),
                 kind: NotificationKind::Opened,
                 dedupe_key: dedupe_key.to_owned(),
                 subject: "second".to_owned(),
@@ -538,20 +742,33 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
 #[ignore = "requires a disposable Timescale URL"]
 async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_contract() {
     let (_lock, store) = timescale_store().await;
+    seed_tenant_and_devices(
+        &store,
+        tenant_id(),
+        "alert-incident-timescale",
+        &["incident-device", "direct-resolve-device"],
+    )
+    .await;
     let rule_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold
-         ) VALUES ($1, 'incident-rule', 'temperature_c', 'event_threshold', 'gt', 30)",
+            id, tenant_id, name, metric_key, rule_type, comparison, threshold
+         ) VALUES ($1, $2, 'incident-rule', 'temperature_c', 'event_threshold', 'gt', 30)",
     )
     .bind(rule_id)
+    .bind(tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
     let incident_id = uuid::Uuid::now_v7();
     let created = AlertIncidentRepository::create_incident(
         &store,
-        incident(rule_id, incident_id, AlertIncidentStatus::Pending),
+        incident(
+            tenant_id(),
+            rule_id,
+            incident_id,
+            AlertIncidentStatus::Pending,
+        ),
         None,
     )
     .await
@@ -561,9 +778,15 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     assert!(
         AlertIncidentRepository::create_incident(
             &store,
-            incident(rule_id, uuid::Uuid::now_v7(), AlertIncidentStatus::Pending),
+            incident(
+                tenant_id(),
+                rule_id,
+                uuid::Uuid::now_v7(),
+                AlertIncidentStatus::Pending,
+            ),
             Some(NewNotificationOutboxEntry {
                 id: uuid::Uuid::now_v7(),
+                tenant_id: tenant_id(),
                 kind: NotificationKind::Opened,
                 dedupe_key: "incident-pending:timescale-duplicate".to_owned(),
                 subject: "duplicate".to_owned(),
@@ -584,11 +807,13 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     );
     let opened = AlertIncidentRepository::open_incident_with_notification(
         &store,
+        tenant_id(),
         incident_id,
         created.state_version,
         opened_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Opened,
             dedupe_key: "incident-opened:timescale".to_owned(),
             subject: "opened".to_owned(),
@@ -618,11 +843,13 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     assert!(
         AlertIncidentRepository::remind_incident_with_notification(
             &store,
+            tenant_id(),
             incident_id,
             opened.state_version,
             opened_at + Duration::seconds(1),
             NewNotificationOutboxEntry {
                 id: uuid::Uuid::now_v7(),
+                tenant_id: tenant_id(),
                 kind: NotificationKind::Reminder,
                 dedupe_key: "incident-opened:timescale".to_owned(),
                 subject: "duplicate".to_owned(),
@@ -636,11 +863,13 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     assert!(
         AlertIncidentRepository::open_incident_with_notification(
             &store,
+            tenant_id(),
             incident_id,
             created.state_version,
             opened_at,
             NewNotificationOutboxEntry {
                 id: uuid::Uuid::now_v7(),
+                tenant_id: tenant_id(),
                 kind: NotificationKind::Opened,
                 dedupe_key: "incident-opened:timescale-stale".to_owned(),
                 subject: "stale".to_owned(),
@@ -655,11 +884,13 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     let reminded_at = Utc::now().with_nanosecond(222_333_444).unwrap();
     let reminded = AlertIncidentRepository::remind_incident_with_notification(
         &store,
+        tenant_id(),
         incident_id,
         opened.state_version,
         reminded_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Reminder,
             dedupe_key: "incident-reminder:timescale".to_owned(),
             subject: "reminder".to_owned(),
@@ -676,23 +907,33 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     );
     let notification = NewNotificationOutboxEntry {
         id: uuid::Uuid::now_v7(),
+        tenant_id: tenant_id(),
         kind: NotificationKind::Reminder,
         dedupe_key: "incident-reminder:timescale".to_owned(),
         subject: "subject".to_owned(),
         body: "body".to_owned(),
         next_attempt_at: Utc::now(),
     };
-    let first =
-        AlertIncidentRepository::enqueue_notification(&store, incident_id, notification.clone())
-            .await
-            .unwrap();
-    let second = AlertIncidentRepository::enqueue_notification(&store, incident_id, notification)
-        .await
-        .unwrap();
+    let first = AlertIncidentRepository::enqueue_notification(
+        &store,
+        tenant_id(),
+        incident_id,
+        notification.clone(),
+    )
+    .await
+    .unwrap();
+    let second = AlertIncidentRepository::enqueue_notification(
+        &store,
+        tenant_id(),
+        incident_id,
+        notification,
+    )
+    .await
+    .unwrap();
     assert_eq!(first, second);
 
     let direct_id = uuid::Uuid::now_v7();
-    let mut direct = incident(rule_id, direct_id, AlertIncidentStatus::Open);
+    let mut direct = incident(tenant_id(), rule_id, direct_id, AlertIncidentStatus::Open);
     direct.device_id = "direct-resolve-device".to_owned();
     let opened = AlertIncidentRepository::create_incident(&store, direct, None)
         .await
@@ -701,6 +942,7 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     let recovery_started_at = Utc::now().with_nanosecond(333_444_555).unwrap();
     let recovering = AlertIncidentRepository::recover_incident(
         &store,
+        tenant_id(),
         direct_id,
         opened.state_version,
         recovery_started_at,
@@ -711,11 +953,13 @@ async fn timescale_incident_repository_matches_sqlite_transition_and_dedupe_cont
     let resolved_at = recovery_started_at + Duration::seconds(1);
     let resolved = AlertIncidentRepository::resolve_incident_with_notification(
         &store,
+        tenant_id(),
         direct_id,
         recovering.state_version,
         resolved_at,
         NewNotificationOutboxEntry {
             id: uuid::Uuid::now_v7(),
+            tenant_id: tenant_id(),
             kind: NotificationKind::Resolved,
             dedupe_key: "incident-resolved:timescale".to_owned(),
             subject: "resolved".to_owned(),

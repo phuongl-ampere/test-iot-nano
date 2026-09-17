@@ -3,6 +3,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     time::Duration as StdDuration,
 };
 
@@ -12,9 +13,8 @@ use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox,
     transport::smtp::authentication::Credentials,
 };
-use sqlx::{PgPool, Row, SqlitePool};
 use thiserror::Error;
-use tokio::time::timeout;
+use tokio::{sync::Mutex, time::timeout};
 use uuid::Uuid;
 
 const DEFAULT_LEASE_DURATION: Duration = Duration::seconds(30);
@@ -28,7 +28,7 @@ pub trait EmailSender: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), NotificationError>> + Send + '_>>;
 }
 
-impl<T> EmailSender for std::sync::Arc<T>
+impl<T> EmailSender for Arc<T>
 where
     T: EmailSender + ?Sized,
 {
@@ -43,8 +43,6 @@ where
 
 #[derive(Debug, Error)]
 pub enum NotificationError {
-    #[error(transparent)]
-    Database(#[from] sqlx::Error),
     #[error(transparent)]
     PlatformStorage(#[from] PlatformStoreError),
     #[error("{0}")]
@@ -295,62 +293,26 @@ pub struct NotificationDispatchResult {
 
 #[derive(Clone)]
 pub struct PlatformNotificationDispatcher<S> {
-    store: std::sync::Arc<PlatformStore>,
+    store: Arc<PlatformStore>,
     sender: S,
     batch_size: usize,
+    tenant_cursor: Arc<Mutex<Option<Uuid>>>,
     send_timeout: StdDuration,
     lease_duration: Duration,
     retry_base: Duration,
     retry_max: Duration,
-}
-
-#[derive(Debug, Clone)]
-pub struct NotificationDispatcher<S> {
-    pool: PgPool,
-    sender: S,
-    batch_size: usize,
-    send_timeout: StdDuration,
-    lease_duration: Duration,
-    retry_base: Duration,
-    retry_max: Duration,
-}
-
-#[derive(Debug)]
-struct LeasedNotification {
-    id: Uuid,
-    subject: String,
-    body: String,
-    attempt_count: i32,
-}
-
-#[derive(Debug, Clone)]
-pub struct SqliteNotificationDispatcher<S> {
-    pool: SqlitePool,
-    sender: S,
-    batch_size: usize,
-    send_timeout: StdDuration,
-    lease_duration: Duration,
-    retry_base: Duration,
-    retry_max: Duration,
-}
-
-#[derive(Debug)]
-struct SqliteLeasedNotification {
-    id: String,
-    subject: String,
-    body: String,
-    attempt_count: i64,
 }
 
 impl<S> PlatformNotificationDispatcher<S>
 where
     S: EmailSender,
 {
-    pub fn new(store: std::sync::Arc<PlatformStore>, sender: S, batch_size: usize) -> Self {
+    pub fn new(store: Arc<PlatformStore>, sender: S, batch_size: usize) -> Self {
         Self {
             store,
             sender,
             batch_size: batch_size.max(1),
+            tenant_cursor: Arc::new(Mutex::new(None)),
             send_timeout: SMTP_SEND_TIMEOUT,
             lease_duration: DEFAULT_LEASE_DURATION,
             retry_base: Duration::seconds(1),
@@ -380,21 +342,51 @@ where
         now: DateTime<Utc>,
     ) -> Result<NotificationDispatchResult, NotificationError> {
         let lease_until = now + self.lease_duration;
-        let limit = u32::try_from(self.batch_size).unwrap_or(u32::MAX);
-        let leased = NotificationRepository::claim_notifications(
-            self.store.as_ref(),
-            now,
-            lease_until,
-            limit,
-        )
-        .await?;
         let mut result = NotificationDispatchResult {
-            claimed: leased.len(),
+            claimed: 0,
             sent: 0,
             retried: 0,
         };
+        let tenant_limit = u32::try_from(self.batch_size).unwrap_or(u32::MAX);
+        let tenant_ids = {
+            let mut cursor = self.tenant_cursor.lock().await;
+            let tenant_ids = self
+                .store
+                .ready_notification_tenants(now, *cursor, tenant_limit)
+                .await?;
+            if let Some(tenant_id) = tenant_ids.last().copied() {
+                *cursor = Some(tenant_id);
+            }
+            tenant_ids
+        };
+        if tenant_ids.is_empty() {
+            return Ok(result);
+        }
 
-        for notification in leased {
+        for tenant_id in tenant_ids {
+            let mut leased = NotificationRepository::claim_notifications(
+                self.store.as_ref(),
+                tenant_id,
+                now,
+                lease_until,
+                1,
+            )
+            .await?;
+            if leased.len() > 1 {
+                return Err(NotificationError::Configuration(format!(
+                    "notification claim for tenant {tenant_id} exceeded the fair-share limit"
+                )));
+            }
+            let Some(notification) = leased.pop() else {
+                continue;
+            };
+            result.claimed += 1;
+            if notification.tenant_id != tenant_id {
+                return Err(NotificationError::Configuration(format!(
+                    "claimed notification {} belongs to a different tenant",
+                    notification.id
+                )));
+            }
             let expected_lease_until = notification.lease_until.ok_or_else(|| {
                 NotificationError::Configuration(format!(
                     "claimed notification {} has no lease",
@@ -411,6 +403,7 @@ where
                 Ok(Ok(())) => {
                     if NotificationRepository::mark_notification_sent(
                         self.store.as_ref(),
+                        tenant_id,
                         notification.id,
                         expected_lease_until,
                         now,
@@ -424,6 +417,7 @@ where
                 Ok(Err(error)) => {
                     if self
                         .release_for_retry(
+                            tenant_id,
                             notification.id,
                             notification.attempt_count,
                             expected_lease_until,
@@ -438,6 +432,7 @@ where
                 Err(_) => {
                     if self
                         .release_for_retry(
+                            tenant_id,
                             notification.id,
                             notification.attempt_count,
                             expected_lease_until,
@@ -457,6 +452,7 @@ where
 
     async fn release_for_retry(
         &self,
+        tenant_id: Uuid,
         id: Uuid,
         attempt_count: i64,
         expected_lease_until: DateTime<Utc>,
@@ -472,6 +468,7 @@ where
             .min(self.retry_max.num_seconds().max(1));
         Ok(NotificationRepository::release_notification_for_retry(
             self.store.as_ref(),
+            tenant_id,
             id,
             expected_lease_until,
             &error.to_string(),
@@ -479,342 +476,6 @@ where
         )
         .await?
         .is_some())
-    }
-}
-
-impl<S> SqliteNotificationDispatcher<S>
-where
-    S: EmailSender,
-{
-    pub fn new(pool: SqlitePool, sender: S, batch_size: usize) -> Self {
-        Self {
-            pool,
-            sender,
-            batch_size: batch_size.max(1),
-            send_timeout: SMTP_SEND_TIMEOUT,
-            lease_duration: DEFAULT_LEASE_DURATION,
-            retry_base: Duration::seconds(1),
-            retry_max: Duration::seconds(3_600),
-        }
-    }
-
-    pub fn with_timeout(mut self, send_timeout: StdDuration) -> Self {
-        self.send_timeout = send_timeout;
-        self
-    }
-
-    pub fn with_delivery_policy(
-        mut self,
-        lease_duration: Duration,
-        retry_base: Duration,
-        retry_max: Duration,
-    ) -> Self {
-        self.lease_duration = lease_duration;
-        self.retry_base = retry_base;
-        self.retry_max = retry_max;
-        self
-    }
-
-    pub async fn dispatch_once(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<NotificationDispatchResult, NotificationError> {
-        let leased = self.claim_batch(now).await?;
-        let mut result = NotificationDispatchResult {
-            claimed: leased.len(),
-            sent: 0,
-            retried: 0,
-        };
-
-        for notification in leased {
-            match timeout(
-                self.send_timeout,
-                self.sender
-                    .send(notification.subject.clone(), notification.body.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    self.mark_sent(&notification.id, now).await?;
-                    result.sent += 1;
-                }
-                Ok(Err(error)) => {
-                    self.release_for_retry(
-                        &notification.id,
-                        notification.attempt_count,
-                        now,
-                        error,
-                    )
-                    .await?;
-                    result.retried += 1;
-                }
-                Err(_) => {
-                    self.release_for_retry(
-                        &notification.id,
-                        notification.attempt_count,
-                        now,
-                        NotificationError::Send("SMTP send timed out".to_owned()),
-                    )
-                    .await?;
-                    result.retried += 1;
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    async fn claim_batch(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<SqliteLeasedNotification>, NotificationError> {
-        let lease_until = (now + self.lease_duration).to_rfc3339();
-        let now = now.to_rfc3339();
-        let rows = sqlx::query(
-            "UPDATE notification_outbox
-             SET state = 'leased',
-                 lease_until = ?,
-                 attempt_count = attempt_count + 1
-             WHERE id IN (
-                 SELECT id
-                 FROM notification_outbox
-                 WHERE (state = 'pending'
-                        AND next_attempt_at <= ?
-                        AND (lease_until IS NULL OR lease_until <= ?))
-                    OR (state = 'leased' AND lease_until <= ?)
-                 ORDER BY next_attempt_at, created_at
-                 LIMIT ?
-             )
-             RETURNING id, subject, body, attempt_count",
-        )
-        .bind(lease_until)
-        .bind(&now)
-        .bind(&now)
-        .bind(now)
-        .bind(i64::try_from(self.batch_size).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(SqliteLeasedNotification {
-                    id: row.try_get("id")?,
-                    subject: row.try_get("subject")?,
-                    body: row.try_get("body")?,
-                    attempt_count: row.try_get("attempt_count")?,
-                })
-            })
-            .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(NotificationError::from)
-    }
-
-    async fn mark_sent(&self, id: &str, now: DateTime<Utc>) -> Result<(), NotificationError> {
-        sqlx::query(
-            "UPDATE notification_outbox
-             SET state = 'sent', sent_at = ?, lease_until = NULL, last_error = NULL
-             WHERE id = ? AND state = 'leased'",
-        )
-        .bind(now.to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn release_for_retry(
-        &self,
-        id: &str,
-        attempt_count: i64,
-        now: DateTime<Utc>,
-        error: NotificationError,
-    ) -> Result<(), NotificationError> {
-        let exponent = u32::try_from((attempt_count - 1).clamp(0, 11)).unwrap_or(0);
-        let delay_seconds = self
-            .retry_base
-            .num_seconds()
-            .max(1)
-            .saturating_mul(2_i64.pow(exponent))
-            .min(self.retry_max.num_seconds().max(1));
-        sqlx::query(
-            "UPDATE notification_outbox
-             SET state = 'pending',
-                 lease_until = NULL,
-                 next_attempt_at = ?,
-                 last_error = ?
-             WHERE id = ? AND state = 'leased'",
-        )
-        .bind((now + Duration::seconds(delay_seconds)).to_rfc3339())
-        .bind(error.to_string())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-}
-
-impl<S> NotificationDispatcher<S>
-where
-    S: EmailSender,
-{
-    pub fn new(pool: PgPool, sender: S, batch_size: usize) -> Self {
-        Self {
-            pool,
-            sender,
-            batch_size: batch_size.max(1),
-            send_timeout: SMTP_SEND_TIMEOUT,
-            lease_duration: DEFAULT_LEASE_DURATION,
-            retry_base: Duration::seconds(1),
-            retry_max: Duration::seconds(3_600),
-        }
-    }
-
-    pub fn with_timeout(mut self, send_timeout: StdDuration) -> Self {
-        self.send_timeout = send_timeout;
-        self
-    }
-
-    pub fn with_delivery_policy(
-        mut self,
-        lease_duration: Duration,
-        retry_base: Duration,
-        retry_max: Duration,
-    ) -> Self {
-        self.lease_duration = lease_duration;
-        self.retry_base = retry_base;
-        self.retry_max = retry_max;
-        self
-    }
-
-    pub async fn dispatch_once(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<NotificationDispatchResult, NotificationError> {
-        let leased = self.claim_batch(now).await?;
-        let mut result = NotificationDispatchResult {
-            claimed: leased.len(),
-            sent: 0,
-            retried: 0,
-        };
-
-        for notification in leased {
-            match timeout(
-                self.send_timeout,
-                self.sender
-                    .send(notification.subject.clone(), notification.body.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    self.mark_sent(notification.id, now).await?;
-                    result.sent += 1;
-                }
-                Ok(Err(error)) => {
-                    self.release_for_retry(notification.id, notification.attempt_count, now, error)
-                        .await?;
-                    result.retried += 1;
-                }
-                Err(_) => {
-                    self.release_for_retry(
-                        notification.id,
-                        notification.attempt_count,
-                        now,
-                        NotificationError::Send("SMTP send timed out".to_owned()),
-                    )
-                    .await?;
-                    result.retried += 1;
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    async fn claim_batch(
-        &self,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<LeasedNotification>, NotificationError> {
-        let mut transaction = self.pool.begin().await?;
-        let lease_until = now + self.lease_duration;
-        let rows = sqlx::query(
-            "WITH candidates AS (
-                SELECT id
-                FROM notification_outbox
-                WHERE state = 'pending'
-                  AND next_attempt_at <= $1
-                  AND (lease_until IS NULL OR lease_until <= $1)
-                ORDER BY next_attempt_at, created_at
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-             )
-             UPDATE notification_outbox AS outbox
-             SET state = 'leased',
-                 lease_until = $3,
-                 attempt_count = outbox.attempt_count + 1
-             FROM candidates
-             WHERE outbox.id = candidates.id
-             RETURNING outbox.id, outbox.subject, outbox.body, outbox.attempt_count",
-        )
-        .bind(now)
-        .bind(i64::try_from(self.batch_size).unwrap_or(i64::MAX))
-        .bind(lease_until)
-        .fetch_all(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-
-        rows.into_iter()
-            .map(|row| {
-                Ok(LeasedNotification {
-                    id: row.try_get("id")?,
-                    subject: row.try_get("subject")?,
-                    body: row.try_get("body")?,
-                    attempt_count: row.try_get("attempt_count")?,
-                })
-            })
-            .collect::<Result<Vec<_>, sqlx::Error>>()
-            .map_err(NotificationError::from)
-    }
-
-    async fn mark_sent(&self, id: Uuid, now: DateTime<Utc>) -> Result<(), NotificationError> {
-        sqlx::query(
-            "UPDATE notification_outbox
-             SET state = 'sent', sent_at = $2, lease_until = NULL, last_error = NULL
-             WHERE id = $1 AND state = 'leased'",
-        )
-        .bind(id)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn release_for_retry(
-        &self,
-        id: Uuid,
-        attempt_count: i32,
-        now: DateTime<Utc>,
-        error: NotificationError,
-    ) -> Result<(), NotificationError> {
-        let exponent = u32::try_from((attempt_count - 1).clamp(0, 11)).unwrap_or(0);
-        let delay_seconds = self
-            .retry_base
-            .num_seconds()
-            .max(1)
-            .saturating_mul(2_i64.pow(exponent))
-            .min(self.retry_max.num_seconds().max(1));
-        sqlx::query(
-            "UPDATE notification_outbox
-             SET state = 'pending',
-                 lease_until = NULL,
-                 next_attempt_at = $2,
-                 last_error = $3
-             WHERE id = $1 AND state = 'leased'",
-        )
-        .bind(id)
-        .bind(now + Duration::seconds(delay_seconds))
-        .bind(error.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 }
 

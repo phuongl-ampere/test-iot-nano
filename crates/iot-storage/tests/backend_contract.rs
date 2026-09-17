@@ -13,6 +13,7 @@ fn command(device_id: &str, id: &str, params: &str) -> NewCommandOutboxEntry {
     let now = Utc::now();
     NewCommandOutboxEntry {
         id: id.to_owned(),
+        tenant_id: test_tenant_id(),
         device_id: device_id.to_owned(),
         method: "switch_on".to_owned(),
         params: params.to_owned(),
@@ -135,23 +136,43 @@ fn lifecycle_command(id: uuid::Uuid) -> NewCommandOutboxEntry {
 }
 
 async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid) {
+    let tenant_id = test_tenant_id();
+    let other_tenant_id = uuid::Uuid::from_u128(2);
     let now = Utc::now() + Duration::seconds(1);
 
     let published_id = uuid::Uuid::now_v7();
     CommandRepository::enqueue_command(store, lifecycle_command(published_id))
         .await
         .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
+    CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        CommandLifecycleRepository::mark_command_published(
+            store,
+            other_tenant_id,
+            published_id,
+            now,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .is_none()
+    );
     let published =
-        CommandLifecycleRepository::mark_command_published(store, published_id, now).await;
+        CommandLifecycleRepository::mark_command_published(store, tenant_id, published_id, now)
+            .await;
     assert_eq!(
         published.unwrap().unwrap().state,
         CommandOutboxState::PublishedToBroker
     );
     assert!(
-        CommandLifecycleRepository::mark_command_published(store, published_id, now)
+        CommandLifecycleRepository::mark_command_published(store, tenant_id, published_id, now)
             .await
             .unwrap()
             .is_none()
@@ -161,17 +182,27 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     CommandRepository::enqueue_command(store, lifecycle_command(failed_id))
         .await
         .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
-        .await
-        .unwrap();
-    let failed =
-        CommandLifecycleRepository::mark_command_failed(store, failed_id, "broker unavailable")
-            .await
-            .unwrap()
-            .unwrap();
+    CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap();
+    let failed = CommandLifecycleRepository::mark_command_failed(
+        store,
+        tenant_id,
+        failed_id,
+        "broker unavailable",
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(failed.state, CommandOutboxState::Failed);
     assert!(
-        CommandLifecycleRepository::mark_command_published(store, failed_id, now)
+        CommandLifecycleRepository::mark_command_published(store, tenant_id, failed_id, now)
             .await
             .unwrap()
             .is_none()
@@ -181,11 +212,18 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     CommandRepository::enqueue_command(store, lifecycle_command(retry_id))
         .await
         .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
-        .await
-        .unwrap();
+    CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap();
     let retried = CommandLifecycleRepository::release_command_for_retry(
         store,
+        tenant_id,
         retry_id,
         "temporary broker failure",
         now + Duration::seconds(1),
@@ -200,10 +238,15 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     CommandRepository::enqueue_command(store, lifecycle_command(reclaimed_id))
         .await
         .unwrap();
-    let initially_leased =
-        CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 10)
-            .await
-            .unwrap();
+    let initially_leased = CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        10,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         initially_leased
             .iter()
@@ -214,6 +257,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     );
     let reclaimed = CommandLifecycleRepository::claim_commands(
         store,
+        tenant_id,
         now + Duration::seconds(30),
         now + Duration::minutes(1),
         10,
@@ -233,10 +277,16 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     CommandRepository::enqueue_command(store, response_command)
         .await
         .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 1)
-        .await
-        .unwrap();
-    CommandLifecycleRepository::mark_command_published(store, response_id, now)
+    CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        1,
+    )
+    .await
+    .unwrap();
+    CommandLifecycleRepository::mark_command_published(store, tenant_id, response_id, now)
         .await
         .unwrap()
         .unwrap();
@@ -244,6 +294,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     assert_eq!(
         CommandLifecycleRepository::mark_command_responded(
             store,
+            tenant_id,
             response_id,
             "lifecycle-device",
             mismatched_token_id,
@@ -257,6 +308,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     assert!(matches!(
         CommandLifecycleRepository::mark_command_responded(
             store,
+            tenant_id,
             response_id,
             "lifecycle-device",
             token_id,
@@ -268,6 +320,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     ));
     let responded = CommandLifecycleRepository::mark_command_responded(
         store,
+        tenant_id,
         response_id,
         "lifecycle-device",
         token_id,
@@ -279,6 +332,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     .unwrap();
     let response_retry = CommandLifecycleRepository::mark_command_responded(
         store,
+        tenant_id,
         response_id,
         "lifecycle-device",
         token_id,
@@ -303,9 +357,15 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     CommandRepository::enqueue_command(store, leased_expired)
         .await
         .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 10)
-        .await
-        .unwrap();
+    CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        10,
+    )
+    .await
+    .unwrap();
 
     let two_way_expired_id = uuid::Uuid::now_v7();
     let mut two_way_expired = lifecycle_command(two_way_expired_id);
@@ -314,18 +374,43 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     CommandRepository::enqueue_command(store, two_way_expired)
         .await
         .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 10)
-        .await
-        .unwrap();
-    CommandLifecycleRepository::mark_command_published(store, two_way_expired_id, now)
+    CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        10,
+    )
+    .await
+    .unwrap();
+    CommandLifecycleRepository::mark_command_published(store, tenant_id, two_way_expired_id, now)
         .await
         .unwrap()
         .unwrap();
 
-    let expired = CommandLifecycleRepository::expire_commands(store, now + Duration::seconds(2))
-        .await
-        .unwrap();
-    assert_eq!(expired.len(), 3);
+    let expired = CommandLifecycleRepository::expire_due_commands(
+        store,
+        tenant_id,
+        now + Duration::seconds(2),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(expired.len(), 2);
+    assert!(
+        expired
+            .iter()
+            .all(|record| record.state == CommandOutboxState::Expired)
+    );
+    let expired = CommandLifecycleRepository::expire_due_commands(
+        store,
+        tenant_id,
+        now + Duration::seconds(2),
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(expired.len(), 1);
     assert!(
         expired
             .iter()
@@ -334,6 +419,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     assert_eq!(
         CommandLifecycleRepository::mark_command_responded(
             store,
+            tenant_id,
             two_way_expired_id,
             "lifecycle-device",
             token_id,
@@ -351,10 +437,16 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     CommandRepository::enqueue_command(store, revoked_command)
         .await
         .unwrap();
-    CommandLifecycleRepository::claim_commands(store, now, now + Duration::seconds(30), 10)
-        .await
-        .unwrap();
-    CommandLifecycleRepository::mark_command_published(store, revoked_id, now)
+    CommandLifecycleRepository::claim_commands(
+        store,
+        tenant_id,
+        now,
+        now + Duration::seconds(30),
+        10,
+    )
+    .await
+    .unwrap();
+    CommandLifecycleRepository::mark_command_published(store, tenant_id, revoked_id, now)
         .await
         .unwrap()
         .unwrap();
@@ -379,6 +471,7 @@ async fn exercise_command_lifecycle(store: &PlatformStore, token_id: uuid::Uuid)
     assert_eq!(
         CommandLifecycleRepository::mark_command_responded(
             store,
+            tenant_id,
             revoked_id,
             "lifecycle-device",
             token_id,
@@ -510,6 +603,7 @@ async fn platform_store_enqueues_a_command_for_a_registered_sqlite_device() {
         &store,
         NewCommandOutboxEntry {
             id: uuid::Uuid::now_v7().to_string(),
+            tenant_id: test_tenant_id(),
             device_id: "platform-command-device".to_owned(),
             method: "switch_on".to_owned(),
             params: "{}".to_owned(),
@@ -975,6 +1069,7 @@ async fn platform_store_enqueues_a_command_for_a_registered_timescale_device() {
         &store,
         NewCommandOutboxEntry {
             id: uuid::Uuid::now_v7().to_string(),
+            tenant_id: test_tenant_id(),
             device_id: "platform-command-device".to_owned(),
             method: "switch_on".to_owned(),
             params: "{}".to_owned(),
@@ -1122,6 +1217,7 @@ async fn platform_store_migrates_timescale_into_the_iot_nano_schema() {
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn platform_store_timescale_schema_enforces_device_ownership() {
     let (_test_lock, store) = timescale_test_store().await;
+    ensure_test_tenant(&store).await;
     let pool = store.timescale_pool().unwrap();
 
     let constraints = sqlx::query(
@@ -1130,7 +1226,7 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
          FROM pg_constraint AS constraint_row
          JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
          WHERE constraint_row.conname IN (
-            'command_outbox_device_id_fkey',
+            'command_outbox_tenant_device_fkey',
             'device_runtime_state_device_id_fkey',
             'telemetry_device_id_fkey'
          )
@@ -1153,7 +1249,7 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
         [
             (
                 "command_outbox".to_owned(),
-                "command_outbox_device_id_fkey".to_owned(),
+                "command_outbox_tenant_device_fkey".to_owned(),
                 "c".to_owned(),
             ),
             (
@@ -1172,10 +1268,11 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
     let missing_device = "missing-device";
     let command_error = sqlx::query(
         "INSERT INTO command_outbox (
-            id, device_id, method, params, mode, expires_at, next_attempt_at
-         ) VALUES ($1, $2, 'switch_on', '{}'::jsonb, 'one_way', now(), now())",
+            id, tenant_id, device_id, method, params, mode, expires_at, next_attempt_at
+         ) VALUES ($1, $2, $3, 'switch_on', '{}'::jsonb, 'one_way', now(), now())",
     )
     .bind(uuid::Uuid::now_v7())
+    .bind(test_tenant_id())
     .bind(missing_device)
     .execute(pool)
     .await
@@ -1184,9 +1281,10 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
 
     let telemetry_error = sqlx::query(
         "INSERT INTO telemetry (
-            event_at, received_at, device_id, boot_id, sequence, measurements, topic
-         ) VALUES (now(), now(), $1, $2, 1, '{}'::jsonb, 'iot/v1/devices/telemetry')",
+            event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (now(), now(), $1, $2, $3, 1, '{}'::jsonb, 'iot/v1/devices/telemetry')",
     )
+    .bind(test_tenant_id())
     .bind(missing_device)
     .bind(uuid::Uuid::now_v7())
     .execute(pool)
@@ -1197,74 +1295,84 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
-async fn platform_store_repairs_legacy_timescale_device_ownership_foreign_keys() {
+async fn platform_store_rejects_timescale_schema_missing_command_outbox_tenant_device_foreign_key()
+{
     let (_test_lock, store) = timescale_test_store().await;
-    let pool = store.timescale_pool().unwrap();
+    let pool = store.timescale_pool().unwrap().clone();
+    let relation_before = sqlx::query(
+        "SELECT relation.oid::text AS relation_id, relation.relfilenode::text AS storage_id
+         FROM pg_class AS relation
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'iot_nano' AND relation.relname = 'command_outbox'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let relation_before = (
+        relation_before.get::<String, _>("relation_id"),
+        relation_before.get::<String, _>("storage_id"),
+    );
 
-    for statement in [
-        "ALTER TABLE command_outbox DROP CONSTRAINT command_outbox_device_id_fkey",
-        "ALTER TABLE device_runtime_state DROP CONSTRAINT device_runtime_state_device_id_fkey",
-        "ALTER TABLE telemetry DROP CONSTRAINT telemetry_device_id_fkey",
-    ] {
-        sqlx::query(statement).execute(pool).await.unwrap();
-    }
+    sqlx::query("ALTER TABLE command_outbox DROP CONSTRAINT command_outbox_tenant_device_fkey")
+        .execute(&pool)
+        .await
+        .unwrap();
     drop(store);
 
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL").unwrap();
-    let repaired_store = PlatformStore::open(&StorageConfiguration {
+    let open_result = PlatformStore::open(&StorageConfiguration {
         storage: DatabaseStorage::Timescale,
         database_url: Some(database_url),
         sqlite_path: None,
         sqlite_busy_timeout_ms: 5_000,
     })
+    .await;
+
+    match open_result {
+        Err(PlatformStoreError::ResetRequiredTimescaleSchema { table }) => {
+            assert_eq!(table, "command_outbox");
+        }
+        Err(error) => panic!("unexpected Timescale migration error: {error}"),
+        Ok(store) => {
+            drop(store);
+            panic!("missing command_outbox tenant device foreign key was accepted");
+        }
+    }
+
+    let relation_after = sqlx::query(
+        "SELECT relation.oid::text AS relation_id, relation.relfilenode::text AS storage_id
+         FROM pg_class AS relation
+         JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = 'iot_nano' AND relation.relname = 'command_outbox'",
+    )
+    .fetch_one(&pool)
     .await
     .unwrap();
-    let repaired_pool = repaired_store.timescale_pool().unwrap();
-
-    let constraints = sqlx::query(
-        "SELECT relation.relname AS table_name, constraint_row.conname,
-                constraint_row.confdeltype::text AS confdeltype
-         FROM pg_constraint AS constraint_row
-         JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
-         WHERE constraint_row.conname IN (
-            'command_outbox_device_id_fkey',
-            'device_runtime_state_device_id_fkey',
-            'telemetry_device_id_fkey'
-         )
-         ORDER BY relation.relname",
-    )
-    .fetch_all(repaired_pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|row| {
-        (
-            row.get::<String, _>("table_name"),
-            row.get::<String, _>("conname"),
-            row.get::<String, _>("confdeltype"),
-        )
-    })
-    .collect::<Vec<_>>();
-
+    let relation_after = (
+        relation_after.get::<String, _>("relation_id"),
+        relation_after.get::<String, _>("storage_id"),
+    );
     assert_eq!(
-        constraints,
-        [
-            (
-                "command_outbox".to_owned(),
-                "command_outbox_device_id_fkey".to_owned(),
-                "c".to_owned(),
-            ),
-            (
-                "device_runtime_state".to_owned(),
-                "device_runtime_state_device_id_fkey".to_owned(),
-                "c".to_owned(),
-            ),
-            (
-                "telemetry".to_owned(),
-                "telemetry_device_id_fkey".to_owned(),
-                "a".to_owned(),
-            ),
-        ]
+        relation_after, relation_before,
+        "reset-required startup must not rebuild command_outbox"
+    );
+    let constraint_still_missing: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (
+             SELECT 1
+             FROM pg_constraint AS constraint_row
+             JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+             JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = 'iot_nano'
+               AND relation.relname = 'command_outbox'
+               AND constraint_row.conname = 'command_outbox_tenant_device_fkey'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        constraint_still_missing,
+        "reset-required startup must not mutate the incompatible schema"
     );
 }
 

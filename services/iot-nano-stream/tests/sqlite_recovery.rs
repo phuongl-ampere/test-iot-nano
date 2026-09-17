@@ -89,6 +89,17 @@ async fn append_is_visible_after_stream_sqlite_reopen() {
     let receipt = first.append(message("device-a", 1)).await.unwrap();
     drop(first);
 
+    let connection = Connection::open(&path).unwrap();
+    let format: String = connection
+        .query_row(
+            "SELECT value FROM stream_metadata WHERE key = 'idempotency_key_format'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(format, "tenant_scoped_v1");
+    drop(connection);
+
     let reopened = LocalStream::open(StreamConfig::sqlite(&path))
         .await
         .unwrap();
@@ -189,6 +200,58 @@ async fn duplicate_idempotency_key_returns_the_original_record() {
 }
 
 #[tokio::test]
+async fn telemetry_idempotency_is_scoped_to_tenant() {
+    let directory = tempdir().unwrap();
+    let stream = LocalStream::open(StreamConfig::sqlite(directory.path().join("stream.sqlite")))
+        .await
+        .unwrap();
+    let tenant_a = message("device-a", 7);
+    let mut tenant_b = tenant_a.clone();
+    tenant_b.tenant_id = Uuid::from_u128(2);
+
+    let first = stream.append(tenant_a.clone()).await.unwrap();
+    let other_tenant = stream.append(tenant_b).await.unwrap();
+    let duplicate = stream.append(tenant_a).await.unwrap();
+
+    assert_ne!(other_tenant, first);
+    assert_eq!(duplicate, first);
+    assert_eq!(
+        stream
+            .claim(claim("writer", "writer-a"))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn gateway_idempotency_is_scoped_to_tenant() {
+    let directory = tempdir().unwrap();
+    let stream = LocalStream::open(StreamConfig::sqlite(directory.path().join("stream.sqlite")))
+        .await
+        .unwrap();
+    let tenant_a = gateway_message();
+    let mut tenant_b = tenant_a.clone();
+    tenant_b.tenant_id = Uuid::from_u128(2);
+
+    let first = stream.append(tenant_a.clone()).await.unwrap();
+    let other_tenant = stream.append(tenant_b).await.unwrap();
+    let duplicate = stream.append(tenant_a).await.unwrap();
+
+    assert_ne!(other_tenant, first);
+    assert_eq!(duplicate, first);
+    assert_eq!(
+        stream
+            .claim(claim("writer", "writer-a"))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn duplicate_idempotency_key_returns_the_original_receipt_after_retention() {
     let directory = tempdir().unwrap();
     let mut config = StreamConfig::sqlite(directory.path().join("stream.sqlite"));
@@ -206,7 +269,7 @@ async fn duplicate_idempotency_key_returns_the_original_receipt_after_retention(
 }
 
 #[tokio::test]
-async fn opening_a_legacy_stream_database_preserves_idempotency_tombstones() {
+async fn opening_a_legacy_stream_database_preserves_tenant_scoped_idempotency_tombstones() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("stream.sqlite");
     let mut config = StreamConfig::sqlite(&path);
@@ -239,7 +302,9 @@ async fn opening_a_legacy_stream_database_preserves_idempotency_tombstones() {
             "INSERT INTO stream_idempotency(idempotency_key, partition, offset)
              VALUES (?1, ?2, ?3)",
             rusqlite::params![
-                "telemetry:device-a:c9c04d99-4e01-4f94-82a8-9e229e47c093:7",
+                format!(
+                    "telemetry:{TEST_TENANT_ID}:device-a:c9c04d99-4e01-4f94-82a8-9e229e47c093:7"
+                ),
                 i64::from(original.partition.get()),
                 i64::try_from(original.offset).unwrap(),
             ],
@@ -248,9 +313,234 @@ async fn opening_a_legacy_stream_database_preserves_idempotency_tombstones() {
     drop(connection);
 
     let reopened = LocalStream::open(config).await.unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_list(stream_idempotency)")
+        .unwrap();
+    let foreign_key_targets = statement
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(statement);
+    assert!(foreign_key_targets.is_empty());
+    drop(connection);
     reopened.enforce_retention(Utc::now()).await.unwrap();
     let duplicate = reopened.append(message("device-a", 7)).await.unwrap();
     assert_eq!(duplicate, original);
+}
+
+#[tokio::test]
+async fn opening_stream_with_unmarked_nonempty_legacy_idempotency_state_requires_reset() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("stream.sqlite");
+    let config = StreamConfig::sqlite(&path);
+    let stream = LocalStream::open(config.clone()).await.unwrap();
+    let original = stream.append(message("device-a", 7)).await.unwrap();
+    drop(stream);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE stream_idempotency;
+            CREATE TABLE stream_idempotency (
+                idempotency_key TEXT PRIMARY KEY NOT NULL,
+                partition INTEGER NOT NULL,
+                offset INTEGER NOT NULL,
+                FOREIGN KEY (partition, offset)
+                    REFERENCES stream_records(partition, offset) ON DELETE CASCADE
+            );
+            ",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO stream_idempotency(idempotency_key, partition, offset)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                format!(
+                    "telemetry:{TEST_TENANT_ID}:device-a:c9c04d99-4e01-4f94-82a8-9e229e47c093:7"
+                ),
+                i64::from(original.partition.get()),
+                i64::try_from(original.offset).unwrap(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM stream_metadata WHERE key = 'idempotency_key_format'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match LocalStream::open(config).await {
+        Err(error) => error,
+        Ok(_) => panic!("unmarked idempotency state must require a stream reset"),
+    };
+
+    assert!(matches!(
+        error,
+        StreamError::ResetRequiredDurableRecord {
+            record_type: "idempotency"
+        }
+    ));
+    assert!(error.to_string().contains("reset the development stream"));
+
+    let connection = Connection::open(&path).unwrap();
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_list(stream_idempotency)")
+        .unwrap();
+    let foreign_key_targets = statement
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(statement);
+    assert_eq!(
+        foreign_key_targets,
+        vec!["stream_records".to_owned(), "stream_records".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn opening_stream_with_unmarked_empty_legacy_idempotency_schema_requires_reset() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("stream.sqlite");
+    let config = StreamConfig::sqlite(&path);
+    let stream = LocalStream::open(config.clone()).await.unwrap();
+    drop(stream);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE stream_idempotency;
+            CREATE TABLE stream_idempotency (
+                idempotency_key TEXT PRIMARY KEY NOT NULL,
+                partition INTEGER NOT NULL,
+                offset INTEGER NOT NULL,
+                FOREIGN KEY (partition, offset)
+                    REFERENCES stream_records(partition, offset) ON DELETE CASCADE
+            );
+            DELETE FROM stream_metadata WHERE key = 'idempotency_key_format';
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match LocalStream::open(config).await {
+        Err(error) => error,
+        Ok(_) => panic!("unmarked legacy idempotency schema must require a stream reset"),
+    };
+    assert!(matches!(
+        error,
+        StreamError::ResetRequiredDurableRecord {
+            record_type: "idempotency"
+        }
+    ));
+
+    let connection = Connection::open(&path).unwrap();
+    let foreign_key_targets = connection
+        .prepare("PRAGMA foreign_key_list(stream_idempotency)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        foreign_key_targets,
+        vec!["stream_records".to_owned(), "stream_records".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn opening_stream_with_incompatible_idempotency_format_requires_reset() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("stream.sqlite");
+    let config = StreamConfig::sqlite(&path);
+    let stream = LocalStream::open(config.clone()).await.unwrap();
+    drop(stream);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE stream_metadata
+             SET value = 'legacy_v0'
+             WHERE key = 'idempotency_key_format'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match LocalStream::open(config).await {
+        Err(error) => error,
+        Ok(_) => panic!("incompatible idempotency format must require a stream reset"),
+    };
+
+    assert!(matches!(
+        error,
+        StreamError::ResetRequiredDurableRecord {
+            record_type: "idempotency"
+        }
+    ));
+}
+
+#[tokio::test]
+async fn opening_stream_with_incompatible_legacy_idempotency_schema_requires_reset() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("stream.sqlite");
+    let config = StreamConfig::sqlite(&path);
+    let stream = LocalStream::open(config.clone()).await.unwrap();
+    drop(stream);
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "
+            PRAGMA foreign_keys = OFF;
+            DROP TABLE stream_idempotency;
+            CREATE TABLE stream_idempotency (
+                idempotency_key TEXT PRIMARY KEY NOT NULL,
+                partition INTEGER NOT NULL,
+                offset INTEGER NOT NULL,
+                FOREIGN KEY (partition, offset)
+                    REFERENCES stream_records(partition, offset) ON DELETE CASCADE
+            );
+            UPDATE stream_metadata
+            SET value = 'legacy_v0'
+            WHERE key = 'idempotency_key_format';
+            ",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = match LocalStream::open(config).await {
+        Err(error) => error,
+        Ok(_) => panic!("incompatible legacy idempotency schema must require a stream reset"),
+    };
+    assert!(matches!(
+        error,
+        StreamError::ResetRequiredDurableRecord {
+            record_type: "idempotency"
+        }
+    ));
+
+    let connection = Connection::open(&path).unwrap();
+    let foreign_key_targets = connection
+        .prepare("PRAGMA foreign_key_list(stream_idempotency)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(2))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        foreign_key_targets,
+        vec!["stream_records".to_owned(), "stream_records".to_owned()]
+    );
 }
 
 #[tokio::test]

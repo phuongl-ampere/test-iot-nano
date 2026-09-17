@@ -341,7 +341,8 @@ SELECT public.add_continuous_aggregate_policy('telemetry_1h', start_offset => IN
     end_offset => INTERVAL '1 hour', schedule_interval => INTERVAL '1 hour', if_not_exists => TRUE);
 
 CREATE TABLE IF NOT EXISTS alert_rules (
-    id UUID PRIMARY KEY, name TEXT NOT NULL CHECK (btrim(name) <> ''), enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    id UUID PRIMARY KEY, tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL CHECK (btrim(name) <> ''), enabled BOOLEAN NOT NULL DEFAULT TRUE,
     device_id TEXT, metric_key TEXT NOT NULL CHECK (metric_key ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
     rule_type TEXT NOT NULL CHECK (rule_type IN ('event_threshold', 'window_average')),
     comparison TEXT NOT NULL CHECK (comparison IN ('gt', 'gte', 'lt', 'lte')),
@@ -356,35 +357,65 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     archived_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK ((rule_type = 'event_threshold' AND window_seconds IS NULL)
-        OR (rule_type = 'window_average' AND window_seconds IS NOT NULL))
+        OR (rule_type = 'window_average' AND window_seconds IS NOT NULL)),
+    UNIQUE (id, tenant_id),
+    CONSTRAINT alert_rules_tenant_device_fkey
+        FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS alert_rules_enabled_kind_device_index ON alert_rules (rule_type, device_id) WHERE enabled;
-CREATE INDEX IF NOT EXISTS alert_rules_active_index ON alert_rules (created_at DESC, id) WHERE archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS alert_rules_enabled_kind_device_index
+    ON alert_rules (tenant_id, rule_type, device_id) WHERE enabled;
+CREATE INDEX IF NOT EXISTS alert_rules_active_index
+    ON alert_rules (tenant_id, created_at DESC, id) WHERE archived_at IS NULL;
 CREATE TABLE IF NOT EXISTS alert_rule_event_evaluations (
-    rule_id UUID NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    rule_id UUID NOT NULL,
     event_at TIMESTAMPTZ NOT NULL, device_id TEXT NOT NULL, boot_id UUID NOT NULL, sequence BIGINT NOT NULL,
-    PRIMARY KEY (rule_id, event_at, device_id, boot_id, sequence)
+    PRIMARY KEY (tenant_id, rule_id, event_at, device_id, boot_id, sequence),
+    CONSTRAINT alert_rule_event_evaluations_tenant_rule_fkey
+        FOREIGN KEY (rule_id, tenant_id)
+        REFERENCES alert_rules(id, tenant_id) ON DELETE CASCADE,
+    CONSTRAINT alert_rule_event_evaluations_tenant_device_fkey
+        FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
 CREATE TABLE IF NOT EXISTS alert_incidents (
-    id UUID PRIMARY KEY, rule_id UUID NOT NULL REFERENCES alert_rules(id) ON DELETE RESTRICT,
+    id UUID PRIMARY KEY, tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    rule_id UUID NOT NULL,
     device_id TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending', 'open', 'resolved')),
     condition_started_at TIMESTAMPTZ NOT NULL, recovery_started_at TIMESTAMPTZ, opened_at TIMESTAMPTZ,
     resolved_at TIMESTAMPTZ, acknowledged_at TIMESTAMPTZ, acknowledged_by TEXT,
     last_value DOUBLE PRECISION, last_notified_at TIMESTAMPTZ, last_reminder_at TIMESTAMPTZ,
     state_version INTEGER NOT NULL DEFAULT 0 CHECK (state_version >= 0),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, tenant_id),
+    CONSTRAINT alert_incidents_tenant_rule_fkey
+        FOREIGN KEY (rule_id, tenant_id)
+        REFERENCES alert_rules(id, tenant_id) ON DELETE RESTRICT,
+    CONSTRAINT alert_incidents_tenant_device_fkey
+        FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS alert_incidents_active_rule_device_index ON alert_incidents (rule_id, device_id) WHERE status IN ('pending', 'open');
-CREATE INDEX IF NOT EXISTS alert_incidents_status_updated_index ON alert_incidents (status, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS alert_incidents_active_rule_device_index
+    ON alert_incidents (tenant_id, rule_id, device_id) WHERE status IN ('pending', 'open');
+CREATE INDEX IF NOT EXISTS alert_incidents_status_updated_index
+    ON alert_incidents (tenant_id, status, updated_at DESC);
 CREATE TABLE IF NOT EXISTS notification_outbox (
-    id UUID PRIMARY KEY, incident_id UUID NOT NULL REFERENCES alert_incidents(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL CHECK (kind IN ('opened', 'resolved', 'reminder')), dedupe_key TEXT NOT NULL UNIQUE,
+    id UUID PRIMARY KEY, tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    incident_id UUID NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('opened', 'resolved', 'reminder')), dedupe_key TEXT NOT NULL,
     subject TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'leased', 'sent')),
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(), lease_until TIMESTAMPTZ,
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0), last_error TEXT, sent_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, tenant_id),
+    UNIQUE (tenant_id, dedupe_key),
+    CONSTRAINT notification_outbox_tenant_incident_fkey
+        FOREIGN KEY (incident_id, tenant_id)
+        REFERENCES alert_incidents(id, tenant_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS notification_outbox_due_index ON notification_outbox (state, next_attempt_at) WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS notification_outbox_due_index
+    ON notification_outbox (tenant_id, state, next_attempt_at) WHERE state = 'pending';
 CREATE TABLE IF NOT EXISTS command_outbox (
     id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,

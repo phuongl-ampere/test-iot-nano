@@ -109,10 +109,16 @@ impl StreamMessage {
     pub(crate) fn idempotency_key(&self) -> String {
         match self {
             Self::Telemetry(message) => format!(
-                "telemetry:{}:{}:{}",
-                message.event.device_id, message.event.boot_id, message.event.sequence
+                "telemetry:{}:{}:{}:{}",
+                message.tenant_id,
+                message.event.device_id,
+                message.event.boot_id,
+                message.event.sequence
             ),
-            Self::Gateway(message) => message.gateway_event.idempotency_key.clone(),
+            Self::Gateway(message) => format!(
+                "gateway:{}:{}",
+                message.tenant_id, message.gateway_event.idempotency_key
+            ),
         }
     }
 

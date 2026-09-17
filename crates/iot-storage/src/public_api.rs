@@ -1545,10 +1545,14 @@ async fn list_public_alerts(
                         incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
                         incidents.acknowledged_by, incidents.last_value, incidents.updated_at
                  FROM alert_incidents AS incidents
-                 JOIN alert_rules AS rules ON rules.id = incidents.rule_id
-                 JOIN devices AS devices ON devices.device_id = incidents.device_id
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id
+                   AND rules.tenant_id = incidents.tenant_id
+                 JOIN devices AS devices
+                    ON devices.device_id = incidents.device_id
+                   AND devices.tenant_id = incidents.tenant_id
                  WHERE devices.deleted_at IS NULL
-                   AND devices.tenant_id = ?
+                   AND incidents.tenant_id = ?
                    AND (? = 1 OR devices.owner_user_id = ?
                     OR EXISTS (
                         SELECT 1 FROM resource_shares
@@ -1587,10 +1591,14 @@ async fn list_public_alerts(
                         incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
                         incidents.acknowledged_by, incidents.last_value, incidents.updated_at
                  FROM alert_incidents AS incidents
-                 JOIN alert_rules AS rules ON rules.id = incidents.rule_id
-                 JOIN devices AS devices ON devices.device_id = incidents.device_id
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id
+                   AND rules.tenant_id = incidents.tenant_id
+                 JOIN devices AS devices
+                    ON devices.device_id = incidents.device_id
+                   AND devices.tenant_id = incidents.tenant_id
                  WHERE devices.deleted_at IS NULL
-                   AND devices.tenant_id = $6
+                   AND incidents.tenant_id = $6
                    AND ($1::boolean OR devices.owner_user_id = $2
                     OR EXISTS (
                         SELECT 1 FROM resource_shares
@@ -1633,9 +1641,13 @@ async fn get_public_alert(
                     incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
                     incidents.acknowledged_by, incidents.last_value, incidents.updated_at
              FROM alert_incidents AS incidents
-             JOIN alert_rules AS rules ON rules.id = incidents.rule_id
-             JOIN devices AS devices ON devices.device_id = incidents.device_id
-             WHERE incidents.id = ? AND devices.tenant_id = ?",
+             JOIN alert_rules AS rules
+                ON rules.id = incidents.rule_id
+               AND rules.tenant_id = incidents.tenant_id
+             JOIN devices AS devices
+                ON devices.device_id = incidents.device_id
+               AND devices.tenant_id = incidents.tenant_id
+             WHERE incidents.id = ? AND incidents.tenant_id = ?",
         )
         .bind(alert_id.to_string())
         .bind(principal.tenant_id.to_string())
@@ -1649,9 +1661,13 @@ async fn get_public_alert(
                     incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
                     incidents.acknowledged_by, incidents.last_value, incidents.updated_at
              FROM alert_incidents AS incidents
-             JOIN alert_rules AS rules ON rules.id = incidents.rule_id
-             JOIN devices AS devices ON devices.device_id = incidents.device_id
-             WHERE incidents.id = $1 AND devices.tenant_id = $2",
+             JOIN alert_rules AS rules
+                ON rules.id = incidents.rule_id
+               AND rules.tenant_id = incidents.tenant_id
+             JOIN devices AS devices
+                ON devices.device_id = incidents.device_id
+               AND devices.tenant_id = incidents.tenant_id
+             WHERE incidents.id = $1 AND incidents.tenant_id = $2",
         )
         .bind(alert_id)
         .bind(principal.tenant_id)
@@ -1693,10 +1709,16 @@ async fn acknowledge_public_alert(
                 "UPDATE alert_incidents
                  SET acknowledged_at = ?, acknowledged_by = ?, updated_at = ?
                  WHERE id = ?
+                   AND tenant_id = ?
+                   AND EXISTS (
+                       SELECT 1 FROM alert_rules
+                       WHERE alert_rules.id = alert_incidents.rule_id
+                         AND alert_rules.tenant_id = alert_incidents.tenant_id
+                   )
                    AND EXISTS (
                        SELECT 1 FROM devices
                        WHERE devices.device_id = alert_incidents.device_id
-                         AND devices.tenant_id = ?
+                         AND devices.tenant_id = alert_incidents.tenant_id
                    )",
             )
             .bind(Utc::now().to_rfc3339())
@@ -1712,10 +1734,16 @@ async fn acknowledge_public_alert(
                 "UPDATE alert_incidents
                  SET acknowledged_at = now(), acknowledged_by = $2, updated_at = now()
                  WHERE id = $1
+                   AND tenant_id = $3
+                   AND EXISTS (
+                       SELECT 1 FROM alert_rules
+                       WHERE alert_rules.id = alert_incidents.rule_id
+                         AND alert_rules.tenant_id = alert_incidents.tenant_id
+                   )
                    AND EXISTS (
                        SELECT 1 FROM devices
                        WHERE devices.device_id = alert_incidents.device_id
-                         AND devices.tenant_id = $3
+                         AND devices.tenant_id = alert_incidents.tenant_id
                    )",
             )
             .bind(alert_id)

@@ -186,8 +186,16 @@ fn at(seconds: i64) -> DateTime<Utc> {
 }
 
 fn telemetry(value: f64, received_at: DateTime<Utc>) -> TelemetryMessage {
+    telemetry_for_tenant(TEST_TENANT_ID, value, received_at)
+}
+
+fn telemetry_for_tenant(
+    tenant_id: Uuid,
+    value: f64,
+    received_at: DateTime<Utc>,
+) -> TelemetryMessage {
     TelemetryMessage {
-        tenant_id: TEST_TENANT_ID,
+        tenant_id,
         topic: TOPIC.to_owned(),
         payload: Vec::new(),
         event: TelemetryEvent {
@@ -297,6 +305,7 @@ async fn event_flush_maps_events_and_acknowledges_after_evaluation() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_at, at(0));
     assert_eq!(events[0].received_at, at(1));
+    assert_eq!(events[0].tenant_id, TEST_TENANT_ID);
     assert_eq!(events[0].device_id, DEVICE_ID);
     assert_eq!(events[0].sequence, 7);
     assert_eq!(events[0].measurements["temperature_c"], json!(41.0));
@@ -304,6 +313,38 @@ async fn event_flush_maps_events_and_acknowledges_after_evaluation() {
     assert_eq!(*event_acknowledgement_counts.lock().unwrap(), vec![0]);
     assert_eq!(*counted_stream.acknowledgements().lock().unwrap(), 1);
     assert!(consumer.claim(10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn event_flush_preserves_each_stream_record_tenant() {
+    let directory = tempfile::tempdir().unwrap();
+    let (stream, _counted_stream, consumer) =
+        counted_stream_and_consumer(&directory, StdDuration::from_secs(1)).await;
+    let tenant_b = Uuid::from_u128(2);
+    stream
+        .append(telemetry_for_tenant(TEST_TENANT_ID, 41.0, at(1)))
+        .await
+        .unwrap();
+    stream
+        .append(telemetry_for_tenant(tenant_b, 42.0, at(2)))
+        .await
+        .unwrap();
+    let repository = FakeRepository::successful(AlertEvaluationResult {
+        evaluated: 2,
+        ..AlertEvaluationResult::default()
+    });
+    let events = Arc::clone(&repository.events);
+
+    let result = PlatformAlertEvaluator::new(repository, 10)
+        .flush_event_rules(&consumer, at(3))
+        .await
+        .unwrap();
+
+    assert_eq!(result.evaluated, 2);
+    let captured = events.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].tenant_id, TEST_TENANT_ID);
+    assert_eq!(captured[1].tenant_id, tenant_b);
 }
 
 #[tokio::test]
@@ -388,19 +429,27 @@ async fn platform_store_event_rule_opens_incident() {
     .await
     .unwrap();
     let pool = store.sqlite_pool().unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES (?)")
-        .bind(DEVICE_ID)
-        .execute(pool)
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'platform-alert-tests', 'active', '{}')",
+    )
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    store
+        .register_device(TEST_TENANT_ID, DEVICE_ID)
         .await
         .unwrap();
     sqlx::query(
         "INSERT INTO alert_rules
-         (id, name, metric_key, rule_type, comparison, threshold, for_seconds,
+         (id, tenant_id, name, metric_key, rule_type, comparison, threshold, for_seconds,
           resolve_after_seconds, reopen_grace_seconds, severity, reminder_interval_seconds)
-         VALUES (?, 'High temperature', 'temperature_c', 'event_threshold', 'gt', 40, 0, 0, 3600,
-                 'warning', 86400)",
+         VALUES (?, ?, 'High temperature', 'temperature_c', 'event_threshold', 'gt', 40, 0, 0,
+                 3600, 'warning', 86400)",
     )
     .bind(Uuid::from_u128(3).to_string())
+    .bind(TEST_TENANT_ID.to_string())
     .execute(pool)
     .await
     .unwrap();
@@ -414,10 +463,14 @@ async fn platform_store_event_rule_opens_incident() {
 
     assert_eq!(result.opened, 1);
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM alert_incidents WHERE status = 'open'")
-            .fetch_one(pool)
-            .await
-            .unwrap(),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM alert_incidents
+             WHERE tenant_id = ? AND status = 'open'",
+        )
+        .bind(TEST_TENANT_ID.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
         1
     );
 }

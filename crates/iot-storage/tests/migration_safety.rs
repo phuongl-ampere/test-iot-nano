@@ -1,6 +1,6 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::PlatformStore;
-use sqlx::{Connection, PgConnection, Row, SqliteConnection};
+use sqlx::{AssertSqlSafe, Connection, PgConnection, Row, SqliteConnection};
 
 mod common;
 
@@ -42,6 +42,123 @@ fn sqlite_configuration(path: std::path::PathBuf) -> StorageConfiguration {
         sqlite_path: Some(path),
         sqlite_busy_timeout_ms: 5_000,
     }
+}
+
+async fn isolated_timescale_connection() -> (String, PgConnection) {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    common::reset_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    (database_url, connection)
+}
+
+async fn assert_timescale_reset_gate(
+    connection: &mut PgConnection,
+    database_url: String,
+    expected_table: &str,
+) {
+    let open_result = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await;
+    let migration_started: bool =
+        sqlx::query_scalar("SELECT to_regclass('iot_nano.system_accounts') IS NOT NULL")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    let error = match open_result {
+        Ok(store) => {
+            drop(store);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    common::reset_timescale_schema(connection).await.unwrap();
+
+    let error = error.expect("partially tenant-scoped schema was accepted");
+    assert!(
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains(expected_table),
+        "unexpected migration error: {error}"
+    );
+    assert!(!migration_started);
+}
+
+async fn create_timescale_command_reset_gate_schema(
+    connection: &mut PgConnection,
+    command_outbox: &str,
+) {
+    let schema = format!(
+        "CREATE SCHEMA iot_nano;
+         SET search_path TO iot_nano, public;
+         CREATE TABLE tenants (id UUID PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         {command_outbox}"
+    );
+    sqlx::raw_sql(AssertSqlSafe(schema))
+        .execute(connection)
+        .await
+        .unwrap();
+}
+
+async fn create_timescale_notification_reset_gate_schema(
+    connection: &mut PgConnection,
+    notification_outbox: &str,
+) {
+    let schema = format!(
+        "CREATE SCHEMA iot_nano;
+         SET search_path TO iot_nano, public;
+         CREATE TABLE tenants (id UUID PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         CREATE TABLE alert_rules (
+             id UUID NOT NULL,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             device_id TEXT,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE alert_incidents (
+             id UUID NOT NULL,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             rule_id UUID NOT NULL,
+             device_id TEXT NOT NULL,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (rule_id, tenant_id)
+                 REFERENCES alert_rules(id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );
+         {notification_outbox}"
+    );
+    sqlx::raw_sql(AssertSqlSafe(schema))
+        .execute(connection)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -167,6 +284,315 @@ async fn sqlite_open_rejects_pre_tenant_platform_schema_without_partial_migratio
 }
 
 #[tokio::test]
+async fn sqlite_open_rejects_partially_tenant_scoped_alert_schema() {
+    let cases = [
+        (
+            "nullable-alert-rule-tenant",
+            "alert_rules",
+            "CREATE TABLE tenants (id TEXT PRIMARY KEY);
+             CREATE TABLE alert_rules (
+                 id TEXT PRIMARY KEY,
+                 tenant_id TEXT,
+                 device_id TEXT
+             );",
+        ),
+        (
+            "unscoped-notification-dedupe",
+            "notification_outbox",
+            "CREATE TABLE tenants (id TEXT PRIMARY KEY);
+             CREATE TABLE notification_outbox (
+                 id TEXT PRIMARY KEY,
+                 tenant_id TEXT NOT NULL,
+                 incident_id TEXT NOT NULL,
+                 dedupe_key TEXT NOT NULL UNIQUE,
+                 state TEXT NOT NULL,
+                 next_attempt_at TEXT NOT NULL
+             );",
+        ),
+    ];
+
+    for (name, table, schema) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("{name}.sqlite"));
+        let mut connection =
+            SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+        sqlx::raw_sql(schema)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+
+        let error = match PlatformStore::open(&sqlite_configuration(path)).await {
+            Ok(_) => panic!("partially tenant-scoped {table} schema was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("reset the development database"),
+            "unexpected migration error for {table}: {error}"
+        );
+        assert!(
+            error.to_string().contains(table),
+            "unexpected migration error for {table}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_alert_rules_without_a_tenant_root_foreign_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-alert-rule-tenant-fk.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         CREATE TABLE alert_rules (
+             id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL,
+             device_id TEXT,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+
+    let error = match PlatformStore::open(&sqlite_configuration(path)).await {
+        Ok(_) => panic!("alert rules without a tenant root foreign key were accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reset the development database"));
+    assert!(error.to_string().contains("alert_rules"));
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_command_outbox_without_a_tenant_root_foreign_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-command-tenant-fk.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         CREATE TABLE command_outbox (
+             id TEXT PRIMARY KEY,
+             tenant_id TEXT NOT NULL,
+             device_id TEXT NOT NULL,
+             mode TEXT NOT NULL,
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+
+    let error = match PlatformStore::open(&sqlite_configuration(path)).await {
+        Ok(_) => panic!("command outbox without a tenant root foreign key was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reset the development database"));
+    assert!(error.to_string().contains("command_outbox"));
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_command_outbox_without_a_tenant_device_foreign_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-command-device-fk.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         CREATE TABLE command_outbox (
+             id TEXT PRIMARY KEY,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             device_id TEXT NOT NULL,
+             mode TEXT NOT NULL
+         );",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+
+    let error = match PlatformStore::open(&sqlite_configuration(path)).await {
+        Ok(_) => panic!("command outbox without a tenant device foreign key was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reset the development database"));
+    assert!(error.to_string().contains("command_outbox"));
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_notification_schema_with_a_global_dedupe_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("global-notification-dedupe.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         CREATE TABLE alert_rules (
+             id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             device_id TEXT,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE alert_incidents (
+             id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             rule_id TEXT NOT NULL,
+             device_id TEXT NOT NULL,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (rule_id, tenant_id)
+                 REFERENCES alert_rules(id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE notification_outbox (
+             id TEXT PRIMARY KEY,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             incident_id TEXT NOT NULL,
+             dedupe_key TEXT NOT NULL,
+             state TEXT NOT NULL,
+             next_attempt_at TEXT NOT NULL,
+             UNIQUE (tenant_id, dedupe_key),
+             UNIQUE (dedupe_key, state),
+             FOREIGN KEY (incident_id, tenant_id)
+                 REFERENCES alert_incidents(id, tenant_id)
+         );",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+
+    let error = match PlatformStore::open(&sqlite_configuration(path)).await {
+        Ok(_) => panic!("notification schema with a global dedupe key was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reset the development database"));
+    assert!(error.to_string().contains("notification_outbox"));
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_notification_schema_with_a_partial_dedupe_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("partial-notification-dedupe.sqlite");
+    let mut connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE tenants (id TEXT PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         CREATE TABLE alert_rules (
+             id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             device_id TEXT,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE alert_incidents (
+             id TEXT NOT NULL,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             rule_id TEXT NOT NULL,
+             device_id TEXT NOT NULL,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (rule_id, tenant_id)
+                 REFERENCES alert_rules(id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE notification_outbox (
+             id TEXT PRIMARY KEY,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id),
+             incident_id TEXT NOT NULL,
+             dedupe_key TEXT NOT NULL,
+             state TEXT NOT NULL,
+             next_attempt_at TEXT NOT NULL,
+             UNIQUE (tenant_id, dedupe_key),
+             FOREIGN KEY (incident_id, tenant_id)
+                 REFERENCES alert_incidents(id, tenant_id)
+         );
+         CREATE UNIQUE INDEX notification_outbox_partial_dedupe_key_index
+             ON notification_outbox (tenant_id, dedupe_key)
+             WHERE state = 'pending';",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+
+    let error = match PlatformStore::open(&sqlite_configuration(path)).await {
+        Ok(_) => panic!("notification schema with a partial dedupe key was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reset the development database"));
+    assert!(error.to_string().contains("notification_outbox"));
+}
+
+#[tokio::test]
+async fn sqlite_open_rejects_notification_schema_with_an_expression_dedupe_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = sqlite_configuration(directory.path().join("expression-dedupe.sqlite"));
+    let store = PlatformStore::open(&configuration).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE UNIQUE INDEX notification_outbox_expression_dedupe_key_index
+         ON notification_outbox (lower(dedupe_key));",
+    )
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    drop(store);
+
+    let error = match PlatformStore::open(&configuration).await {
+        Ok(_) => panic!("notification schema with an expression dedupe key was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reset the development database"));
+    assert!(error.to_string().contains("notification_outbox"));
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_open_rejects_pre_tenant_platform_schema_without_partial_migration() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
@@ -240,6 +666,203 @@ async fn timescale_open_rejects_pre_tenant_platform_schema_without_partial_migra
 }
 
 #[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_notification_schema_with_a_global_dedupe_key() {
+    let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
+        .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
+    let mut connection = PgConnection::connect(&database_url).await.unwrap();
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        database_name.starts_with("iot_nano_test_"),
+        "refusing to reset non-test database {database_name:?}"
+    );
+    common::reset_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE SCHEMA iot_nano;
+         SET search_path TO iot_nano, public;
+         CREATE TABLE tenants (id UUID PRIMARY KEY);
+         CREATE TABLE devices (
+             device_id TEXT NOT NULL,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             PRIMARY KEY (device_id, tenant_id)
+         );
+         CREATE TABLE alert_rules (
+             id UUID NOT NULL,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             device_id TEXT,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE alert_rule_event_evaluations (
+             tenant_id UUID NOT NULL,
+             rule_id UUID NOT NULL,
+             event_at TIMESTAMPTZ NOT NULL,
+             device_id TEXT NOT NULL,
+             boot_id UUID NOT NULL,
+             sequence BIGINT NOT NULL,
+             PRIMARY KEY (tenant_id, rule_id, event_at, device_id, boot_id, sequence),
+             FOREIGN KEY (tenant_id) REFERENCES tenants(id),
+             FOREIGN KEY (rule_id, tenant_id) REFERENCES alert_rules(id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id) REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE alert_incidents (
+             id UUID NOT NULL,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             rule_id UUID NOT NULL,
+             device_id TEXT NOT NULL,
+             PRIMARY KEY (id, tenant_id),
+             FOREIGN KEY (rule_id, tenant_id) REFERENCES alert_rules(id, tenant_id),
+             FOREIGN KEY (device_id, tenant_id) REFERENCES devices(device_id, tenant_id)
+         );
+         CREATE TABLE notification_outbox (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             incident_id UUID NOT NULL,
+             dedupe_key TEXT NOT NULL,
+             state TEXT NOT NULL,
+             UNIQUE (id, tenant_id),
+             UNIQUE (tenant_id, dedupe_key),
+             UNIQUE (dedupe_key, state),
+             FOREIGN KEY (incident_id, tenant_id)
+                 REFERENCES alert_incidents(id, tenant_id)
+         );",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+
+    let open_result = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Timescale,
+        database_url: Some(database_url),
+        sqlite_path: None,
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await;
+
+    let migration_started: bool =
+        sqlx::query_scalar("SELECT to_regclass('iot_nano.system_accounts') IS NOT NULL")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+    let error = match open_result {
+        Ok(store) => {
+            drop(store);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    common::reset_timescale_schema(&mut connection)
+        .await
+        .unwrap();
+
+    let error = error.expect("notification schema with a global dedupe key was accepted");
+    assert!(
+        error.to_string().contains("reset the development database"),
+        "unexpected migration error: {error}"
+    );
+    assert!(
+        error.to_string().contains("notification_outbox"),
+        "unexpected migration error: {error}"
+    );
+    assert!(!migration_started);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_command_outbox_without_a_tenant_root_foreign_key() {
+    let (database_url, mut connection) = isolated_timescale_connection().await;
+    create_timescale_command_reset_gate_schema(
+        &mut connection,
+        "CREATE TABLE command_outbox (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL,
+             device_id TEXT NOT NULL,
+             mode TEXT NOT NULL,
+             FOREIGN KEY (device_id, tenant_id)
+                 REFERENCES devices(device_id, tenant_id)
+         );",
+    )
+    .await;
+
+    assert_timescale_reset_gate(&mut connection, database_url, "command_outbox").await;
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_command_outbox_without_a_tenant_device_foreign_key() {
+    let (database_url, mut connection) = isolated_timescale_connection().await;
+    create_timescale_command_reset_gate_schema(
+        &mut connection,
+        "CREATE TABLE command_outbox (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             device_id TEXT NOT NULL,
+             mode TEXT NOT NULL
+         );",
+    )
+    .await;
+
+    assert_timescale_reset_gate(&mut connection, database_url, "command_outbox").await;
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_notification_schema_with_a_partial_dedupe_key() {
+    let (database_url, mut connection) = isolated_timescale_connection().await;
+    create_timescale_notification_reset_gate_schema(
+        &mut connection,
+        "CREATE TABLE notification_outbox (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             incident_id UUID NOT NULL,
+             dedupe_key TEXT NOT NULL,
+             state TEXT NOT NULL,
+             UNIQUE (id, tenant_id),
+             UNIQUE (tenant_id, dedupe_key),
+             FOREIGN KEY (incident_id, tenant_id)
+                 REFERENCES alert_incidents(id, tenant_id)
+         );
+         CREATE UNIQUE INDEX notification_outbox_partial_dedupe_key_index
+             ON notification_outbox (tenant_id, dedupe_key)
+             WHERE state = 'pending';",
+    )
+    .await;
+
+    assert_timescale_reset_gate(&mut connection, database_url, "notification_outbox").await;
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_open_rejects_notification_schema_with_an_expression_dedupe_key() {
+    let (database_url, mut connection) = isolated_timescale_connection().await;
+    create_timescale_notification_reset_gate_schema(
+        &mut connection,
+        "CREATE TABLE notification_outbox (
+             id UUID PRIMARY KEY,
+             tenant_id UUID NOT NULL REFERENCES tenants(id),
+             incident_id UUID NOT NULL,
+             dedupe_key TEXT NOT NULL,
+             state TEXT NOT NULL,
+             UNIQUE (id, tenant_id),
+             UNIQUE (tenant_id, dedupe_key),
+             FOREIGN KEY (incident_id, tenant_id)
+                 REFERENCES alert_incidents(id, tenant_id)
+         );
+         CREATE UNIQUE INDEX notification_outbox_expression_dedupe_key_index
+             ON notification_outbox (lower(dedupe_key));",
+    )
+    .await;
+
+    assert_timescale_reset_gate(&mut connection, database_url, "notification_outbox").await;
+}
+
+#[tokio::test]
 async fn sqlite_backup_preserves_committed_platform_data() {
     let directory = tempfile::tempdir().unwrap();
     let platform_path = directory.path().join("platform.sqlite");
@@ -297,10 +920,11 @@ async fn sqlite_backup_is_a_coherent_snapshot_during_an_atomic_write() {
         .unwrap();
     sqlx::query(
         "INSERT INTO command_outbox (
-            id, device_id, method, params, mode, expires_at, next_attempt_at
-         ) VALUES (?, ?, 'switch_on', '{}', 'one_way', ?, ?)",
+            id, tenant_id, device_id, method, params, mode, expires_at, next_attempt_at
+         ) VALUES (?, ?, ?, 'switch_on', '{}', 'one_way', ?, ?)",
     )
     .bind(&command_id)
+    .bind(test_tenant_id().to_string())
     .bind(device_id)
     .bind(&now)
     .bind(&now)

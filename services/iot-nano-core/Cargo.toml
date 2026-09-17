@@ -9,14 +9,12 @@ autobins = false
 [dependencies]
 chrono.workspace = true
 iot-core = { path = "../../crates/iot-core" }
-iot-sqldb-common = { path = "../../crates/iot-sqldb-common" }
 iot-storage = { path = "../../crates/iot-storage" }
 iot-stream = { package = "iot-nano-stream", path = "../../services/iot-nano-stream" }
 lettre.workspace = true
 rumqttc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -24,7 +22,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 device-simulator = { path = "../../crates/device-simulator" }
-fs2.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true
 
 [lib]
