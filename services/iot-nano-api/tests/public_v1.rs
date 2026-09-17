@@ -333,20 +333,21 @@ async fn exported_public_router_rejects_application_only_tokens() {
 }
 
 #[tokio::test]
-async fn exported_public_lists_include_effective_permission_and_access_source() {
+async fn exported_public_legacy_admin_lists_only_group_authorized_resources() {
     let (_directory, app, _core, store) = exported_router_with_store().await;
     let pool = store.sqlite_pool().unwrap();
     let member_id = Uuid::now_v7();
     let group_id = Uuid::now_v7();
     let root_asset_id = Uuid::now_v7();
     let child_asset_id = Uuid::now_v7();
+    let unshared_asset_id = Uuid::now_v7();
     let device_id = format!("shared-list-device-{}", Uuid::now_v7());
     let issued_at = Utc::now();
     let expires_at = issued_at + Duration::hours(1);
 
     sqlx::query(
         "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
-         VALUES (?, ?, 'public-list-member', 'unused', 'viewer', 'user')",
+         VALUES (?, ?, 'public-list-member', 'unused', 'admin', 'admin')",
     )
     .bind(member_id.to_string())
     .bind(tenant_id().to_string())
@@ -372,7 +373,9 @@ async fn exported_public_lists_include_effective_permission_and_access_source() 
         .unwrap();
     sqlx::query(
         "INSERT INTO assets (id, tenant_id, name, parent_asset_id, owner_user_id)
-         VALUES (?, ?, 'shared-root', NULL, ?), (?, ?, 'shared-child', ?, ?)",
+         VALUES (?, ?, 'shared-root', NULL, ?),
+                (?, ?, 'shared-child', ?, ?),
+                (?, ?, 'unshared-admin-asset', NULL, ?)",
     )
     .bind(root_asset_id.to_string())
     .bind(tenant_id().to_string())
@@ -380,6 +383,9 @@ async fn exported_public_lists_include_effective_permission_and_access_source() 
     .bind(child_asset_id.to_string())
     .bind(tenant_id().to_string())
     .bind(root_asset_id.to_string())
+    .bind(user_id().to_string())
+    .bind(unshared_asset_id.to_string())
+    .bind(tenant_id().to_string())
     .bind(user_id().to_string())
     .execute(pool)
     .await
@@ -441,6 +447,11 @@ async fn exported_public_lists_include_effective_permission_and_access_source() 
     let assets: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     let assets = assets["items"].as_array().unwrap();
+    assert!(
+        !assets
+            .iter()
+            .any(|asset| asset["id"] == Value::String(unshared_asset_id.to_string()))
+    );
     let root = assets
         .iter()
         .find(|asset| asset["id"] == Value::String(root_asset_id.to_string()))

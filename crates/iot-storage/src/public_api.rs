@@ -828,9 +828,6 @@ async fn sqlite_public_asset_manager_permission(
     let Some(owner) = owner else {
         return Ok(false);
     };
-    if principal.account_class == AccountClass::Admin {
-        return Ok(true);
-    }
     if owner.as_deref() == Some(user_id.as_str()) {
         return Ok(true);
     }
@@ -893,8 +890,7 @@ async fn sqlite_public_device_manager_permission(
     let Some(owner) = owner else {
         return Ok(false);
     };
-    if principal.account_class == AccountClass::Admin || owner.as_deref() == Some(user_id.as_str())
-    {
+    if owner.as_deref() == Some(user_id.as_str()) {
         return Ok(true);
     }
 
@@ -1132,9 +1128,6 @@ async fn timescale_public_asset_manager_permission(
     let Some(owner) = owner else {
         return Ok(false);
     };
-    if principal.account_class == AccountClass::Admin {
-        return Ok(true);
-    }
     if owner == Some(user_id) {
         return Ok(true);
     }
@@ -1209,7 +1202,7 @@ async fn timescale_public_device_manager_permission(
     let Some((owner, asset_id)) = device else {
         return Ok(false);
     };
-    if principal.account_class == AccountClass::Admin || owner == Some(user_id) {
+    if owner == Some(user_id) {
         return Ok(true);
     }
 
@@ -1508,7 +1501,7 @@ async fn list_public_telemetry(
                  ),
                  authorized(device_id) AS (
                      SELECT device_id FROM candidates
-                     WHERE ? = 1 OR owner_user_id = ?
+                     WHERE owner_user_id = ?
                      UNION
                      SELECT candidate.device_id
                      FROM candidates AS candidate
@@ -1554,7 +1547,6 @@ async fn list_public_telemetry(
             )
             .bind(&tenant_id)
             .bind(&tenant_id)
-            .bind(i64::from(subject.account_class == AccountClass::Admin))
             .bind(&user_id)
             .bind(&tenant_id)
             .bind(&user_id)
@@ -1598,7 +1590,7 @@ async fn list_public_telemetry(
                  ),
                  authorized(device_id) AS (
                      SELECT device_id FROM candidates
-                     WHERE $2::boolean OR owner_user_id = $3
+                     WHERE owner_user_id = $2
                      UNION
                      SELECT candidate.device_id
                      FROM candidates AS candidate
@@ -1606,12 +1598,12 @@ async fn list_public_telemetry(
                        ON permission.tenant_id = $1
                       AND permission.device_id = candidate.device_id
                       AND permission.revoked_at IS NULL
-                     WHERE permission.subject_user_id = $3
+                     WHERE permission.subject_user_id = $2
                         OR EXISTS (
                             SELECT 1 FROM user_group_members AS membership
                             WHERE membership.tenant_id = permission.tenant_id
                               AND membership.group_id = permission.subject_group_id
-                              AND membership.user_id = $3
+                              AND membership.user_id = $2
                         )
                      UNION
                      SELECT ancestors.device_id
@@ -1621,12 +1613,12 @@ async fn list_public_telemetry(
                       AND permission.asset_id = ancestors.asset_id
                       AND permission.inherit_children = TRUE
                       AND permission.revoked_at IS NULL
-                     WHERE permission.subject_user_id = $3
+                     WHERE permission.subject_user_id = $2
                         OR EXISTS (
                             SELECT 1 FROM user_group_members AS membership
                             WHERE membership.tenant_id = permission.tenant_id
                               AND membership.group_id = permission.subject_group_id
-                              AND membership.user_id = $3
+                              AND membership.user_id = $2
                         )
                  )
                  SELECT t.event_at, t.received_at, t.device_id, t.boot_id,
@@ -1634,16 +1626,15 @@ async fn list_public_telemetry(
                  FROM telemetry AS t
                  JOIN authorized ON authorized.device_id = t.device_id
                  WHERE t.tenant_id = $1
-                   AND t.event_at >= $4 AND t.event_at <= $5
-                   AND ($6::text IS NULL OR t.device_id = $6)
-                   AND ($7::timestamptz IS NULL OR t.event_at > $7
-                        OR (t.event_at = $7 AND (t.device_id > $8
-                            OR (t.device_id = $8 AND t.sequence > $9))))
+                   AND t.event_at >= $3 AND t.event_at <= $4
+                   AND ($5::text IS NULL OR t.device_id = $5)
+                   AND ($6::timestamptz IS NULL OR t.event_at > $6
+                        OR (t.event_at = $6 AND (t.device_id > $7
+                            OR (t.device_id = $7 AND t.sequence > $8))))
                  ORDER BY t.event_at, t.device_id, t.sequence
-                 LIMIT $10",
+                 LIMIT $9",
             )
             .bind(subject.tenant_id)
-            .bind(subject.account_class == AccountClass::Admin)
             .bind(subject.user_id)
             .bind(from)
             .bind(to)
@@ -1736,7 +1727,7 @@ async fn list_public_alerts(
                  ),
                  authorized(device_id) AS (
                      SELECT device_id FROM candidates
-                     WHERE ? = 1 OR owner_user_id = ?
+                     WHERE owner_user_id = ?
                      UNION
                      SELECT candidate.device_id
                      FROM candidates AS candidate
@@ -1783,7 +1774,6 @@ async fn list_public_alerts(
             )
             .bind(&tenant_id)
             .bind(&tenant_id)
-            .bind(i64::from(subject.account_class == AccountClass::Admin))
             .bind(&user_id)
             .bind(&tenant_id)
             .bind(&user_id)
@@ -1819,7 +1809,7 @@ async fn list_public_alerts(
                  ),
                  authorized(device_id) AS (
                      SELECT device_id FROM candidates
-                     WHERE $2::boolean OR owner_user_id = $3
+                     WHERE owner_user_id = $2
                      UNION
                      SELECT candidate.device_id
                      FROM candidates AS candidate
@@ -1827,12 +1817,12 @@ async fn list_public_alerts(
                        ON permission.tenant_id = $1
                       AND permission.device_id = candidate.device_id
                       AND permission.revoked_at IS NULL
-                     WHERE permission.subject_user_id = $3
+                     WHERE permission.subject_user_id = $2
                         OR EXISTS (
                             SELECT 1 FROM user_group_members AS membership
                             WHERE membership.tenant_id = permission.tenant_id
                               AND membership.group_id = permission.subject_group_id
-                              AND membership.user_id = $3
+                              AND membership.user_id = $2
                         )
                      UNION
                      SELECT ancestors.device_id
@@ -1842,12 +1832,12 @@ async fn list_public_alerts(
                       AND permission.asset_id = ancestors.asset_id
                       AND permission.inherit_children = TRUE
                       AND permission.revoked_at IS NULL
-                     WHERE permission.subject_user_id = $3
+                     WHERE permission.subject_user_id = $2
                         OR EXISTS (
                             SELECT 1 FROM user_group_members AS membership
                             WHERE membership.tenant_id = permission.tenant_id
                               AND membership.group_id = permission.subject_group_id
-                              AND membership.user_id = $3
+                              AND membership.user_id = $2
                         )
                  )
                  SELECT incidents.id, incidents.rule_id, rules.name AS rule_name, rules.severity,
@@ -1860,12 +1850,11 @@ async fn list_public_alerts(
                    AND rules.tenant_id = incidents.tenant_id
                  JOIN authorized ON authorized.device_id = incidents.device_id
                  WHERE incidents.tenant_id = $1
-                   AND ($4::uuid IS NULL OR incidents.id > $4)
+                   AND ($3::uuid IS NULL OR incidents.id > $3)
                  ORDER BY incidents.id
-                 LIMIT $5",
+                 LIMIT $4",
             )
             .bind(subject.tenant_id)
-            .bind(subject.account_class == AccountClass::Admin)
             .bind(subject.user_id)
             .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
             .bind(limit)
@@ -2144,10 +2133,6 @@ async fn list_public_assets(
                      WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
                  ),
                  access_candidates(id, permission_rank, source_rank, access_source) AS (
-                     SELECT id, 3, 0, 'tenant_account'
-                     FROM candidates
-                     WHERE ? = 1
-                     UNION ALL
                      SELECT id, 3, 1, 'owner'
                      FROM candidates
                      WHERE owner_user_id = ?
@@ -2235,7 +2220,6 @@ async fn list_public_assets(
             .bind(after)
             .bind(after)
             .bind(&tenant_id)
-            .bind(i64::from(subject.account_class == AccountClass::Admin))
             .bind(&user_id)
             .bind(&tenant_id)
             .bind(&user_id)
@@ -2272,13 +2256,9 @@ async fn list_public_assets(
                      WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
                  ),
                  access_candidates(id, permission_rank, source_rank, access_source) AS (
-                     SELECT id, 3, 0, 'tenant_account'
-                     FROM candidates
-                     WHERE $3::boolean
-                     UNION ALL
                      SELECT id, 3, 1, 'owner'
                      FROM candidates
-                     WHERE owner_user_id = $4
+                     WHERE owner_user_id = $3
                      UNION ALL
                      SELECT candidate.id,
                             CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -2289,7 +2269,7 @@ async fn list_public_assets(
                        ON permission.tenant_id = $1
                       AND permission.asset_id = candidate.id
                       AND permission.revoked_at IS NULL
-                     WHERE permission.subject_user_id = $4
+                     WHERE permission.subject_user_id = $3
                      UNION ALL
                      SELECT candidate.id,
                             CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -2303,7 +2283,7 @@ async fn list_public_assets(
                      JOIN user_group_members AS membership
                        ON membership.tenant_id = permission.tenant_id
                       AND membership.group_id = permission.subject_group_id
-                      AND membership.user_id = $4
+                      AND membership.user_id = $3
                      UNION ALL
                      SELECT ancestors.candidate_id,
                             CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -2315,7 +2295,7 @@ async fn list_public_assets(
                       AND permission.asset_id = ancestors.asset_id
                       AND permission.inherit_children = TRUE
                       AND permission.revoked_at IS NULL
-                     WHERE ancestors.depth > 0 AND permission.subject_user_id = $4
+                     WHERE ancestors.depth > 0 AND permission.subject_user_id = $3
                      UNION ALL
                      SELECT ancestors.candidate_id,
                             CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -2330,7 +2310,7 @@ async fn list_public_assets(
                      JOIN user_group_members AS membership
                        ON membership.tenant_id = permission.tenant_id
                       AND membership.group_id = permission.subject_group_id
-                      AND membership.user_id = $4
+                      AND membership.user_id = $3
                      WHERE ancestors.depth > 0
                  ),
                  authorized(id, effective_permission, access_source) AS (
@@ -2357,11 +2337,10 @@ async fn list_public_assets(
                  FROM candidates
                  JOIN authorized ON authorized.id = candidates.id
                  ORDER BY candidates.id
-                 LIMIT $5",
+                 LIMIT $4",
             )
             .bind(subject.tenant_id)
             .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
-            .bind(subject.account_class == AccountClass::Admin)
             .bind(subject.user_id)
             .bind(limit)
             .fetch_all(pool)

@@ -127,7 +127,7 @@ async fn sqlite_public_assets_are_invisible_across_tenants() {
 }
 
 #[tokio::test]
-async fn sqlite_public_group_inherited_permission_controls_resource_flows() {
+async fn sqlite_public_legacy_admin_group_inherited_permission_controls_resource_flows() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let owner_id = Uuid::now_v7();
@@ -142,7 +142,7 @@ async fn sqlite_public_group_inherited_permission_controls_resource_flows() {
     sqlx::query(
         "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
          VALUES (?, ?, 'public-owner', 'unused', 'viewer', 'user'),
-                (?, ?, 'public-member', 'unused', 'viewer', 'user')",
+                (?, ?, 'public-member', 'unused', 'admin', 'admin')",
     )
     .bind(owner_id.to_string())
     .bind(test_tenant_id().to_string())
@@ -179,7 +179,7 @@ async fn sqlite_public_group_inherited_permission_controls_resource_flows() {
         tenant_id: test_tenant_id(),
         user_id: Some(member_id),
         app_id: "public-member-app".to_owned(),
-        account_class: AccountClass::User,
+        account_class: AccountClass::Admin,
     };
     let root_asset = PublicApiRepository::create_public_asset(
         &store,
@@ -407,6 +407,295 @@ async fn sqlite_public_group_inherited_permission_controls_resource_flows() {
 }
 
 #[tokio::test]
+async fn sqlite_public_legacy_admin_is_denied_unshared_resources_and_mutations() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let owner_id = Uuid::now_v7();
+    let admin_id = Uuid::now_v7();
+    let unshared_device_id = format!("public-unshared-admin-device-{}", Uuid::now_v7());
+    let owned_device_id = format!("public-owned-admin-device-{}", Uuid::now_v7());
+    let alert_rule_id = Uuid::now_v7();
+    let alert_id = Uuid::now_v7();
+    let event_at = Utc::now();
+
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-unshared-owner', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-legacy-admin', 'unused', 'admin', 'admin')",
+    )
+    .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(admin_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let owner = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(owner_id),
+        app_id: "public-unshared-owner-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let legacy_admin = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(admin_id),
+        app_id: "public-legacy-admin-app".to_owned(),
+        account_class: AccountClass::Admin,
+    };
+    let unshared_asset = PublicApiRepository::create_public_asset(
+        &store,
+        &owner,
+        NewPublicAsset {
+            name: "unshared admin asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let unshared_device = PublicApiRepository::create_public_device(
+        &store,
+        &owner,
+        NewPublicDevice {
+            device_id: unshared_device_id.clone(),
+            display_name: Some("Unshared admin device".to_owned()),
+            metadata: json!({}),
+            asset_id: Some(unshared_asset.id),
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let owned_asset = PublicApiRepository::create_public_asset(
+        &store,
+        &legacy_admin,
+        NewPublicAsset {
+            name: "owned admin asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let owned_device = PublicApiRepository::create_public_device(
+        &store,
+        &legacy_admin,
+        NewPublicDevice {
+            device_id: owned_device_id.clone(),
+            display_name: Some("Owned admin device".to_owned()),
+            metadata: json!({}),
+            asset_id: None,
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, ?, ?, 1, ?, 'public-legacy-admin')",
+    )
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .bind(test_tenant_id().to_string())
+    .bind(&unshared_device_id)
+    .bind(Uuid::now_v7().to_string())
+    .bind(json!({ "temperature_c": 26.0 }).to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold
+         ) VALUES (?, ?, 'Public legacy admin rule', ?, 'temperature_c', 'event_threshold', 'gt', 25)",
+    )
+    .bind(alert_rule_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(&unshared_device_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at, updated_at
+         ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
+    )
+    .bind(alert_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(alert_rule_id.to_string())
+    .bind(&unshared_device_id)
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .bind(event_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let assets = PublicApiRepository::list_public_assets(&store, &legacy_admin, None, 100)
+        .await
+        .unwrap();
+    assert!(!assets.iter().any(|asset| asset.id == unshared_asset.id));
+    assert!(assets.iter().any(|asset| {
+        asset.id == owned_asset.id
+            && asset.access
+                == Some(ResourceAccess {
+                    permission: ResourcePermission::Owner,
+                    source: ResourceAccessSource::Owner,
+                })
+    }));
+    assert!(
+        PublicApiRepository::get_public_asset(&store, &legacy_admin, unshared_asset.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        PublicApiRepository::get_public_asset(&store, &legacy_admin, owned_asset.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let devices = PublicApiRepository::list_public_devices(&store, &legacy_admin, None, 100)
+        .await
+        .unwrap();
+    assert!(
+        !devices
+            .iter()
+            .any(|device| device.device_id == unshared_device.device_id)
+    );
+    assert!(devices.iter().any(|device| {
+        device.device_id == owned_device.device_id
+            && device.access
+                == Some(ResourceAccess {
+                    permission: ResourcePermission::Owner,
+                    source: ResourceAccessSource::Owner,
+                })
+    }));
+    assert!(
+        PublicApiRepository::get_public_device(&store, &legacy_admin, &unshared_device_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        PublicApiRepository::get_public_device(&store, &legacy_admin, &owned_device_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    assert!(
+        PublicApiRepository::list_public_telemetry(
+            &store,
+            &legacy_admin,
+            None,
+            event_at - ChronoDuration::minutes(1),
+            event_at + ChronoDuration::minutes(1),
+            None,
+            100,
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        PublicApiRepository::list_public_alerts(&store, &legacy_admin, None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        PublicApiRepository::get_public_alert(&store, &legacy_admin, alert_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        PublicApiRepository::acknowledge_public_alert(
+            &store,
+            &legacy_admin,
+            alert_id,
+            "legacy-admin",
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+
+    assert!(
+        PublicApiRepository::update_public_device(
+            &store,
+            &legacy_admin,
+            &unshared_device_id,
+            NewPublicDevice {
+                device_id: unshared_device_id.clone(),
+                display_name: Some("attempted unshared update".to_owned()),
+                metadata: json!({}),
+                asset_id: Some(unshared_asset.id),
+                device_profile_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        PublicApiRepository::update_public_asset(
+            &store,
+            &legacy_admin,
+            unshared_asset.id,
+            NewPublicAsset {
+                name: "attempted unshared update".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        PublicApiRepository::update_public_device(
+            &store,
+            &legacy_admin,
+            &owned_device_id,
+            NewPublicDevice {
+                device_id: owned_device_id.clone(),
+                display_name: Some("owned admin device updated".to_owned()),
+                metadata: json!({}),
+                asset_id: None,
+                device_profile_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        PublicApiRepository::update_public_asset(
+            &store,
+            &legacy_admin,
+            owned_asset.id,
+            NewPublicAsset {
+                name: "owned admin asset updated".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_public_asset_mutations_require_destination_access_and_valid_containment() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
@@ -580,6 +869,108 @@ async fn sqlite_public_asset_mutations_require_destination_access_and_valid_cont
         subtree_too_deep,
         iot_storage::PublicAssetError::ParentUnavailable(id) if id == depth_63_parent
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_legacy_admin_is_denied_unshared_assets() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let owner_id = Uuid::now_v7();
+    let admin_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES ($1, 'public-legacy-admin', 'active')",
+    )
+    .bind(test_tenant_id())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'public-timescale-owner', 'unused', 'viewer', 'user'),
+                ($3, $2, 'public-timescale-admin', 'unused', 'admin', 'admin')",
+    )
+    .bind(owner_id)
+    .bind(test_tenant_id())
+    .bind(admin_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let owner = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(owner_id),
+        app_id: "public-timescale-owner-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let legacy_admin = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(admin_id),
+        app_id: "public-timescale-admin-app".to_owned(),
+        account_class: AccountClass::Admin,
+    };
+    let unshared_asset = PublicApiRepository::create_public_asset(
+        &store,
+        &owner,
+        NewPublicAsset {
+            name: "timescale unshared admin asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let owned_asset = PublicApiRepository::create_public_asset(
+        &store,
+        &legacy_admin,
+        NewPublicAsset {
+            name: "timescale owned admin asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    let assets = PublicApiRepository::list_public_assets(&store, &legacy_admin, None, 100)
+        .await
+        .unwrap();
+    assert!(!assets.iter().any(|asset| asset.id == unshared_asset.id));
+    assert!(assets.iter().any(|asset| asset.id == owned_asset.id));
+    assert!(
+        PublicApiRepository::update_public_asset(
+            &store,
+            &legacy_admin,
+            unshared_asset.id,
+            NewPublicAsset {
+                name: "attempted timescale unshared update".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        PublicApiRepository::update_public_asset(
+            &store,
+            &legacy_admin,
+            owned_asset.id,
+            NewPublicAsset {
+                name: "timescale owned admin asset updated".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
 }
 
 #[tokio::test]
