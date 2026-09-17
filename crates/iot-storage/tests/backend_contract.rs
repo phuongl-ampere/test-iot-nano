@@ -52,6 +52,16 @@ fn assert_foreign_key_violation(error: sqlx::Error) {
     );
 }
 
+fn assert_check_constraint_violation(error: sqlx::Error) {
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .as_deref(),
+        Some("23514")
+    );
+}
+
 async fn sqlite_schema_sql(pool: &sqlx::SqlitePool, object_type: &str, name: &str) -> String {
     sqlx::query_scalar(
         "SELECT sql
@@ -1544,6 +1554,137 @@ async fn platform_store_migrates_timescale_into_the_iot_nano_schema() {
             assert!(predicate.contains(expected_fragment));
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn platform_store_timescale_schema_enforces_resource_permission_checks() {
+    let (_test_lock, store) = timescale_test_store().await;
+    ensure_test_tenant(&store).await;
+    let pool = store.timescale_pool().unwrap();
+    let tenant_id = test_tenant_id();
+    let user_id = uuid::Uuid::now_v7();
+    let group_id = uuid::Uuid::now_v7();
+    let asset_id = uuid::Uuid::now_v7();
+    let device_id = "resource-permission-contract-device";
+
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role)
+         VALUES ($1, $2, $3, 'resource-permission-contract-hash', 'member')",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(format!("resource-permission-contract-{user_id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO user_groups (id, tenant_id, owner_user_id, name)
+         VALUES ($1, $2, $3, 'resource-permission-contract-group')",
+    )
+    .bind(group_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name)
+         VALUES ($1, $2, 'resource-permission-contract-asset')",
+    )
+    .bind(asset_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    register_test_device(&store, device_id).await;
+
+    let invalid_permission = sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, device_id, permission, inherit_children, created_by_user_id
+         ) VALUES ($1, $2, $3, $4, 'owner', FALSE, $3)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert_check_constraint_violation(invalid_permission);
+
+    let missing_subject = sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, device_id, permission, inherit_children, created_by_user_id
+         ) VALUES ($1, $2, $3, 'viewer', FALSE, $4)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(device_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert_check_constraint_violation(missing_subject);
+
+    let multiple_subjects = sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, subject_group_id, device_id, permission,
+            inherit_children, created_by_user_id
+         ) VALUES ($1, $2, $3, $4, $5, 'viewer', FALSE, $3)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(group_id)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert_check_constraint_violation(multiple_subjects);
+
+    let missing_scope = sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, permission, inherit_children, created_by_user_id
+         ) VALUES ($1, $2, $3, 'viewer', FALSE, $3)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert_check_constraint_violation(missing_scope);
+
+    let multiple_scopes = sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, asset_id, device_id, permission,
+            inherit_children, created_by_user_id
+         ) VALUES ($1, $2, $3, $4, $5, 'viewer', FALSE, $3)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(asset_id)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert_check_constraint_violation(multiple_scopes);
+
+    let inherited_device_scope = sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, device_id, permission, inherit_children, created_by_user_id
+         ) VALUES ($1, $2, $3, $4, 'viewer', TRUE, $3)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .unwrap_err();
+    assert_check_constraint_violation(inherited_device_scope);
 }
 
 #[tokio::test]
