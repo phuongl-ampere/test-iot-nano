@@ -1528,6 +1528,87 @@ pub struct AuthorizedDeviceSummary {
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewUserGroup {
+    pub tenant_id: uuid::Uuid,
+    pub owner_user_id: uuid::Uuid,
+    pub name: String,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserGroup {
+    pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub owner_user_id: uuid::Uuid,
+    pub name: String,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewResourcePermission {
+    pub tenant_id: uuid::Uuid,
+    pub subject_user_id: Option<uuid::Uuid>,
+    pub subject_group_id: Option<uuid::Uuid>,
+    pub asset_id: Option<uuid::Uuid>,
+    pub device_id: Option<String>,
+    pub permission: ResourcePermission,
+    pub inherit_children: bool,
+    pub created_by_user_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourcePermissionRecord {
+    pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub subject_user_id: Option<uuid::Uuid>,
+    pub subject_group_id: Option<uuid::Uuid>,
+    pub asset_id: Option<uuid::Uuid>,
+    pub device_id: Option<String>,
+    pub permission: ResourcePermission,
+    pub inherit_children: bool,
+    pub created_by_user_id: uuid::Uuid,
+}
+
+#[derive(Debug, Error)]
+pub enum TenantAuthorizationError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("user {user_id} does not belong to tenant {tenant_id}")]
+    UserNotFound {
+        tenant_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    },
+    #[error("group {group_id} does not belong to tenant {tenant_id}")]
+    GroupNotFound {
+        tenant_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+    },
+    #[error("asset {asset_id} does not belong to tenant {tenant_id}")]
+    AssetNotFound {
+        tenant_id: uuid::Uuid,
+        asset_id: uuid::Uuid,
+    },
+    #[error("device {device_id:?} does not belong to tenant {tenant_id}")]
+    DeviceNotFound {
+        tenant_id: uuid::Uuid,
+        device_id: String,
+    },
+    #[error("permission {permission_id} does not belong to tenant {tenant_id}")]
+    PermissionNotFound {
+        tenant_id: uuid::Uuid,
+        permission_id: uuid::Uuid,
+    },
+    #[error("resource permission must select exactly one user or group subject")]
+    InvalidPermissionSubject,
+    #[error("resource permission must select exactly one asset or device scope")]
+    InvalidPermissionResource,
+    #[error("resource permission level must be viewer or manager, got {permission:?}")]
+    InvalidPermissionLevel { permission: ResourcePermission },
+    #[error("device resource permissions cannot inherit children")]
+    DevicePermissionCannotInherit,
+}
+
 pub trait AuthorizationRepository: Send + Sync {
     fn authorization_subject<'a>(
         &'a self,
@@ -1580,6 +1661,40 @@ pub trait AuthorizationRepository: Send + Sync {
             dyn Future<Output = Result<Option<ResourcePermission>, PlatformStoreError>> + Send + 'a,
         >,
     >;
+}
+
+pub trait TenantAuthorizationRepository: Send + Sync {
+    fn create_user_group<'a>(
+        &'a self,
+        group: NewUserGroup,
+    ) -> Pin<Box<dyn Future<Output = Result<UserGroup, TenantAuthorizationError>> + Send + 'a>>;
+    fn add_user_to_group<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
+    fn remove_user_from_group<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
+    fn create_resource_permission<'a>(
+        &'a self,
+        permission: NewResourcePermission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ResourcePermissionRecord, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn revoke_resource_permission<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        permission_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
 }
 
 impl PlatformStore {
@@ -3239,6 +3354,265 @@ impl PlatformStore {
                 .fetch_all(pool)
                 .await?;
                 Ok(strongest_share_permission(rows))
+            }
+        }
+    }
+
+    pub async fn create_user_group(
+        &self,
+        group: NewUserGroup,
+    ) -> Result<UserGroup, TenantAuthorizationError> {
+        let id = uuid::Uuid::now_v7();
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_user(&mut transaction, group.tenant_id, group.owner_user_id)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO user_groups (id, tenant_id, owner_user_id, name, metadata)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(id.to_string())
+                .bind(group.tenant_id.to_string())
+                .bind(group.owner_user_id.to_string())
+                .bind(&group.name)
+                .bind(group.metadata.to_string())
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_tenant_user(
+                    &mut transaction,
+                    group.tenant_id,
+                    group.owner_user_id,
+                )
+                .await?;
+                sqlx::query(
+                    "INSERT INTO user_groups (id, tenant_id, owner_user_id, name, metadata)
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(id)
+                .bind(group.tenant_id)
+                .bind(group.owner_user_id)
+                .bind(&group.name)
+                .bind(Json(group.metadata.clone()))
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(UserGroup {
+            id,
+            tenant_id: group.tenant_id,
+            owner_user_id: group.owner_user_id,
+            name: group.name,
+            metadata: group.metadata,
+        })
+    }
+
+    pub async fn add_user_to_group(
+        &self,
+        tenant_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Result<bool, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
+                sqlite_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
+                let inserted = sqlx::query(
+                    "INSERT INTO user_group_members (tenant_id, group_id, user_id)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT (group_id, user_id) DO NOTHING",
+                )
+                .bind(tenant_id.to_string())
+                .bind(group_id.to_string())
+                .bind(user_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(inserted)
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
+                timescale_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
+                let inserted = sqlx::query(
+                    "INSERT INTO user_group_members (tenant_id, group_id, user_id)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (group_id, user_id) DO NOTHING",
+                )
+                .bind(tenant_id)
+                .bind(group_id)
+                .bind(user_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(inserted)
+            }
+        }
+    }
+
+    pub async fn remove_user_from_group(
+        &self,
+        tenant_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Result<bool, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
+                sqlite_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
+                let removed = sqlx::query(
+                    "DELETE FROM user_group_members
+                     WHERE tenant_id = ? AND group_id = ? AND user_id = ?",
+                )
+                .bind(tenant_id.to_string())
+                .bind(group_id.to_string())
+                .bind(user_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(removed)
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
+                timescale_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
+                let removed = sqlx::query(
+                    "DELETE FROM user_group_members
+                     WHERE tenant_id = $1 AND group_id = $2 AND user_id = $3",
+                )
+                .bind(tenant_id)
+                .bind(group_id)
+                .bind(user_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(removed)
+            }
+        }
+    }
+
+    pub async fn create_resource_permission(
+        &self,
+        permission: NewResourcePermission,
+    ) -> Result<ResourcePermissionRecord, TenantAuthorizationError> {
+        validate_new_resource_permission(&permission)?;
+        let id = uuid::Uuid::now_v7();
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_validate_permission_references(&mut transaction, &permission).await?;
+                sqlx::query(
+                    "INSERT INTO resource_permissions (
+                        id, tenant_id, subject_user_id, subject_group_id, asset_id, device_id,
+                        permission, inherit_children, created_by_user_id
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(id.to_string())
+                .bind(permission.tenant_id.to_string())
+                .bind(permission.subject_user_id.map(|value| value.to_string()))
+                .bind(permission.subject_group_id.map(|value| value.to_string()))
+                .bind(permission.asset_id.map(|value| value.to_string()))
+                .bind(permission.device_id.as_deref())
+                .bind(permission.permission.as_str())
+                .bind(i64::from(permission.inherit_children))
+                .bind(permission.created_by_user_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_validate_permission_references(&mut transaction, &permission).await?;
+                sqlx::query(
+                    "INSERT INTO resource_permissions (
+                        id, tenant_id, subject_user_id, subject_group_id, asset_id, device_id,
+                        permission, inherit_children, created_by_user_id
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                )
+                .bind(id)
+                .bind(permission.tenant_id)
+                .bind(permission.subject_user_id)
+                .bind(permission.subject_group_id)
+                .bind(permission.asset_id)
+                .bind(permission.device_id.as_deref())
+                .bind(permission.permission.as_str())
+                .bind(permission.inherit_children)
+                .bind(permission.created_by_user_id)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+            }
+        }
+        Ok(ResourcePermissionRecord {
+            id,
+            tenant_id: permission.tenant_id,
+            subject_user_id: permission.subject_user_id,
+            subject_group_id: permission.subject_group_id,
+            asset_id: permission.asset_id,
+            device_id: permission.device_id,
+            permission: permission.permission,
+            inherit_children: permission.inherit_children,
+            created_by_user_id: permission.created_by_user_id,
+        })
+    }
+
+    pub async fn revoke_resource_permission(
+        &self,
+        tenant_id: uuid::Uuid,
+        permission_id: uuid::Uuid,
+    ) -> Result<bool, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_permission(&mut transaction, tenant_id, permission_id)
+                    .await?;
+                let revoked = sqlx::query(
+                    "UPDATE resource_permissions
+                     SET revoked_at = ?
+                     WHERE id = ? AND tenant_id = ? AND revoked_at IS NULL",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(permission_id.to_string())
+                .bind(tenant_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(revoked)
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_tenant_permission(&mut transaction, tenant_id, permission_id)
+                    .await?;
+                let revoked = sqlx::query(
+                    "UPDATE resource_permissions
+                     SET revoked_at = now()
+                     WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+                )
+                .bind(permission_id)
+                .bind(tenant_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(revoked)
             }
         }
     }
@@ -7058,6 +7432,61 @@ impl AuthorizationRepository for PlatformStore {
     }
 }
 
+impl TenantAuthorizationRepository for PlatformStore {
+    fn create_user_group<'a>(
+        &'a self,
+        group: NewUserGroup,
+    ) -> Pin<Box<dyn Future<Output = Result<UserGroup, TenantAuthorizationError>> + Send + 'a>>
+    {
+        Box::pin(async move { PlatformStore::create_user_group(self, group).await })
+    }
+
+    fn add_user_to_group<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
+        Box::pin(async move {
+            PlatformStore::add_user_to_group(self, tenant_id, group_id, user_id).await
+        })
+    }
+
+    fn remove_user_from_group<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        group_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
+        Box::pin(async move {
+            PlatformStore::remove_user_from_group(self, tenant_id, group_id, user_id).await
+        })
+    }
+
+    fn create_resource_permission<'a>(
+        &'a self,
+        permission: NewResourcePermission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ResourcePermissionRecord, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { PlatformStore::create_resource_permission(self, permission).await })
+    }
+
+    fn revoke_resource_permission<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        permission_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
+        Box::pin(async move {
+            PlatformStore::revoke_resource_permission(self, tenant_id, permission_id).await
+        })
+    }
+}
+
 impl AlertIncidentRepository for PlatformStore {
     fn create_incident<'a>(
         &'a self,
@@ -7377,6 +7806,322 @@ fn strongest_share_permission(rows: Vec<String>) -> Option<ResourcePermission> {
     rows.into_iter()
         .filter_map(|value| ResourcePermission::parse_share(&value))
         .max()
+}
+
+fn validate_new_resource_permission(
+    permission: &NewResourcePermission,
+) -> Result<(), TenantAuthorizationError> {
+    if permission.subject_user_id.is_some() == permission.subject_group_id.is_some() {
+        return Err(TenantAuthorizationError::InvalidPermissionSubject);
+    }
+    if permission.asset_id.is_some() == permission.device_id.is_some() {
+        return Err(TenantAuthorizationError::InvalidPermissionResource);
+    }
+    if !matches!(
+        permission.permission,
+        ResourcePermission::Viewer | ResourcePermission::Manager
+    ) {
+        return Err(TenantAuthorizationError::InvalidPermissionLevel {
+            permission: permission.permission,
+        });
+    }
+    if permission.device_id.is_some() && permission.inherit_children {
+        return Err(TenantAuthorizationError::DevicePermissionCannotInherit);
+    }
+    Ok(())
+}
+
+async fn sqlite_tenant_uuid_record_exists(
+    transaction: &mut Transaction<'_, Sqlite>,
+    query: &'static str,
+    tenant_id: uuid::Uuid,
+    id: uuid::Uuid,
+) -> Result<bool, TenantAuthorizationError> {
+    Ok(sqlx::query_scalar::<_, i64>(query)
+        .bind(id.to_string())
+        .bind(tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some())
+}
+
+async fn sqlite_require_tenant_user(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if sqlite_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM users WHERE id = ? AND tenant_id = ?",
+        tenant_id,
+        user_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::UserNotFound { tenant_id, user_id })
+    }
+}
+
+async fn sqlite_require_tenant_group(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    group_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if sqlite_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM user_groups WHERE id = ? AND tenant_id = ?",
+        tenant_id,
+        group_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::GroupNotFound {
+            tenant_id,
+            group_id,
+        })
+    }
+}
+
+async fn sqlite_require_tenant_asset(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    asset_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if sqlite_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?",
+        tenant_id,
+        asset_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::AssetNotFound {
+            tenant_id,
+            asset_id,
+        })
+    }
+}
+
+async fn sqlite_require_tenant_permission(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    permission_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if sqlite_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM resource_permissions WHERE id = ? AND tenant_id = ?",
+        tenant_id,
+        permission_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::PermissionNotFound {
+            tenant_id,
+            permission_id,
+        })
+    }
+}
+
+async fn sqlite_require_tenant_device(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<(), TenantAuthorizationError> {
+    let exists =
+        sqlx::query_scalar::<_, i64>("SELECT 1 FROM devices WHERE device_id = ? AND tenant_id = ?")
+            .bind(device_id)
+            .bind(tenant_id.to_string())
+            .fetch_optional(&mut **transaction)
+            .await?
+            .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::DeviceNotFound {
+            tenant_id,
+            device_id: device_id.to_owned(),
+        })
+    }
+}
+
+async fn sqlite_validate_permission_references(
+    transaction: &mut Transaction<'_, Sqlite>,
+    permission: &NewResourcePermission,
+) -> Result<(), TenantAuthorizationError> {
+    sqlite_require_tenant_user(
+        transaction,
+        permission.tenant_id,
+        permission.created_by_user_id,
+    )
+    .await?;
+    if let Some(user_id) = permission.subject_user_id {
+        sqlite_require_tenant_user(transaction, permission.tenant_id, user_id).await?;
+    }
+    if let Some(group_id) = permission.subject_group_id {
+        sqlite_require_tenant_group(transaction, permission.tenant_id, group_id).await?;
+    }
+    if let Some(asset_id) = permission.asset_id {
+        sqlite_require_tenant_asset(transaction, permission.tenant_id, asset_id).await?;
+    }
+    if let Some(device_id) = permission.device_id.as_deref() {
+        sqlite_require_tenant_device(transaction, permission.tenant_id, device_id).await?;
+    }
+    Ok(())
+}
+
+async fn timescale_tenant_uuid_record_exists(
+    transaction: &mut Transaction<'_, Postgres>,
+    query: &'static str,
+    tenant_id: uuid::Uuid,
+    id: uuid::Uuid,
+) -> Result<bool, TenantAuthorizationError> {
+    Ok(sqlx::query_scalar::<_, i64>(query)
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some())
+}
+
+async fn timescale_require_tenant_user(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if timescale_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2",
+        tenant_id,
+        user_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::UserNotFound { tenant_id, user_id })
+    }
+}
+
+async fn timescale_require_tenant_group(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    group_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if timescale_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM user_groups WHERE id = $1 AND tenant_id = $2",
+        tenant_id,
+        group_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::GroupNotFound {
+            tenant_id,
+            group_id,
+        })
+    }
+}
+
+async fn timescale_require_tenant_asset(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    asset_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if timescale_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2",
+        tenant_id,
+        asset_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::AssetNotFound {
+            tenant_id,
+            asset_id,
+        })
+    }
+}
+
+async fn timescale_require_tenant_permission(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    permission_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if timescale_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM resource_permissions WHERE id = $1 AND tenant_id = $2",
+        tenant_id,
+        permission_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::PermissionNotFound {
+            tenant_id,
+            permission_id,
+        })
+    }
+}
+
+async fn timescale_require_tenant_device(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<(), TenantAuthorizationError> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM devices WHERE device_id = $1 AND tenant_id = $2",
+    )
+    .bind(device_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::DeviceNotFound {
+            tenant_id,
+            device_id: device_id.to_owned(),
+        })
+    }
+}
+
+async fn timescale_validate_permission_references(
+    transaction: &mut Transaction<'_, Postgres>,
+    permission: &NewResourcePermission,
+) -> Result<(), TenantAuthorizationError> {
+    timescale_require_tenant_user(
+        transaction,
+        permission.tenant_id,
+        permission.created_by_user_id,
+    )
+    .await?;
+    if let Some(user_id) = permission.subject_user_id {
+        timescale_require_tenant_user(transaction, permission.tenant_id, user_id).await?;
+    }
+    if let Some(group_id) = permission.subject_group_id {
+        timescale_require_tenant_group(transaction, permission.tenant_id, group_id).await?;
+    }
+    if let Some(asset_id) = permission.asset_id {
+        timescale_require_tenant_asset(transaction, permission.tenant_id, asset_id).await?;
+    }
+    if let Some(device_id) = permission.device_id.as_deref() {
+        timescale_require_tenant_device(transaction, permission.tenant_id, device_id).await?;
+    }
+    Ok(())
 }
 
 fn parse_authorized_device_timestamp(value: &str) -> Result<DateTime<Utc>, PlatformStoreError> {
