@@ -7,7 +7,7 @@ use iot_storage::{
     ManagementDeviceRepository, ManagementDeviceTopology, NewDeviceToken, NewOwnedDeviceToken,
     PlatformStore, UpdateManagementDevice,
 };
-use sqlx::{AssertSqlSafe, Connection, PgConnection};
+use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
 mod common;
@@ -332,27 +332,12 @@ async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_m
     .await
     .unwrap();
 
-    // Reassign after the scoped device mutation but before token revocation.
-    let topology_trigger = format!(
-        "CREATE TRIGGER move_topology_race_to_other_tenant
-         AFTER UPDATE OF gateway_device_id ON devices
-         WHEN NEW.device_id = 'topology-race' AND NEW.tenant_id = '{tenant_id}'
-         BEGIN
-             UPDATE devices
-             SET tenant_id = '{other_tenant_id}', gateway_device_id = NULL
-             WHERE device_id = 'topology-race';
-         END",
-    );
-    sqlx::query(AssertSqlSafe(topology_trigger))
-        .execute(pool)
-        .await
-        .unwrap();
     let topology_error = ManagementDeviceRepository::update_management_device(
         &store,
-        tenant_id,
+        other_tenant_id,
         "topology-race",
         UpdateManagementDevice {
-            display_name: "Topology race".to_owned(),
+            display_name: "Cross-tenant topology".to_owned(),
             asset_id: None,
             device_profile_id: None,
             attributes: None,
@@ -368,44 +353,64 @@ async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_m
         topology_error,
         ManagementDeviceError::DeviceNotFound
     ));
+
+    let delete_error = ManagementDeviceRepository::delete_management_device(
+        &store,
+        other_tenant_id,
+        "delete-race",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        delete_error,
+        ManagementDeviceError::DeviceNotFound
+    ));
+
+    let devices = ManagementDeviceRepository::list_management_devices(&store, tenant_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        devices
+            .iter()
+            .find(|device| device.device_id == "topology-race")
+            .unwrap()
+            .topology,
+        ManagementDeviceTopology {
+            is_gateway: false,
+            gateway_device_id: None,
+        }
+    );
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.device_id == "delete-race")
+    );
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
-            "SELECT revoked_at FROM device_tokens WHERE id = ?",
+            "SELECT deleted_at FROM devices WHERE device_id = 'delete-race'",
         )
-        .bind(topology_token.id.to_string())
         .fetch_one(pool)
         .await
         .unwrap()
         .is_none()
     );
 
-    let delete_trigger = format!(
-        "CREATE TRIGGER move_delete_race_to_other_tenant
-         AFTER UPDATE OF deleted_at ON devices
-         WHEN NEW.device_id = 'delete-race' AND NEW.tenant_id = '{tenant_id}'
-         BEGIN
-             UPDATE devices
-             SET tenant_id = '{other_tenant_id}'
-             WHERE device_id = 'delete-race';
-         END",
-    );
-    sqlx::query(AssertSqlSafe(delete_trigger))
-        .execute(pool)
-        .await
-        .unwrap();
-    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "delete-race")
-        .await
-        .unwrap();
-    assert!(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT revoked_at FROM device_tokens WHERE id = ?",
-        )
-        .bind(deleted_token.id.to_string())
-        .fetch_one(pool)
-        .await
-        .unwrap()
-        .is_none()
-    );
+    for (device_id, token_id) in [
+        ("topology-race", topology_token.id),
+        ("delete-race", deleted_token.id),
+    ] {
+        let active = DeviceTokenRepository::active_device_token(&store, tenant_id, token_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, token_id);
+        let history = DeviceTokenRepository::list_device_tokens(&store, tenant_id, device_id)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, token_id);
+        assert!(history[0].revoked_at.is_none());
+    }
 }
 
 #[tokio::test]
