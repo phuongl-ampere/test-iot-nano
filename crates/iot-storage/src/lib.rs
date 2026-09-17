@@ -2932,10 +2932,6 @@ impl PlatformStore {
                          WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
                      ),
                      access_candidates(device_id, permission_rank, source_rank, access_source) AS (
-                         SELECT device_id, 3, 0, 'tenant_account'
-                         FROM candidates
-                         WHERE ? = 1
-                         UNION ALL
                          SELECT device_id, 3, 1, 'owner'
                          FROM candidates
                          WHERE owner_user_id = ?
@@ -3021,7 +3017,6 @@ impl PlatformStore {
                 .bind(after)
                 .bind(after)
                 .bind(&tenant_id)
-                .bind(i64::from(subject.account_class == AccountClass::Admin))
                 .bind(&user_id)
                 .bind(&tenant_id)
                 .bind(&user_id)
@@ -3075,13 +3070,9 @@ impl PlatformStore {
                          WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
                      ),
                      access_candidates(device_id, permission_rank, source_rank, access_source) AS (
-                         SELECT device_id, 3, 0, 'tenant_account'
-                         FROM candidates
-                         WHERE $3::boolean
-                         UNION ALL
                          SELECT device_id, 3, 1, 'owner'
                          FROM candidates
-                         WHERE owner_user_id = $4
+                         WHERE owner_user_id = $3
                          UNION ALL
                          SELECT candidate.device_id,
                                 CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -3092,7 +3083,7 @@ impl PlatformStore {
                            ON permission.tenant_id = $1
                           AND permission.device_id = candidate.device_id
                           AND permission.revoked_at IS NULL
-                         WHERE permission.subject_user_id = $4
+                         WHERE permission.subject_user_id = $3
                          UNION ALL
                          SELECT candidate.device_id,
                                 CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -3106,7 +3097,7 @@ impl PlatformStore {
                          JOIN user_group_members AS membership
                            ON membership.tenant_id = permission.tenant_id
                           AND membership.group_id = permission.subject_group_id
-                          AND membership.user_id = $4
+                          AND membership.user_id = $3
                          UNION ALL
                          SELECT ancestors.device_id,
                                 CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -3118,7 +3109,7 @@ impl PlatformStore {
                           AND permission.asset_id = ancestors.asset_id
                           AND permission.inherit_children = TRUE
                           AND permission.revoked_at IS NULL
-                         WHERE permission.subject_user_id = $4
+                         WHERE permission.subject_user_id = $3
                          UNION ALL
                          SELECT ancestors.device_id,
                                 CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
@@ -3133,7 +3124,7 @@ impl PlatformStore {
                          JOIN user_group_members AS membership
                            ON membership.tenant_id = permission.tenant_id
                           AND membership.group_id = permission.subject_group_id
-                          AND membership.user_id = $4
+                          AND membership.user_id = $3
                      ),
                      authorized(device_id, effective_permission, access_source) AS (
                          SELECT device_id,
@@ -3161,11 +3152,10 @@ impl PlatformStore {
                        ON runtime.tenant_id = $1
                       AND runtime.device_id = candidate.device_id
                      ORDER BY candidate.device_id
-                     LIMIT $5",
+                     LIMIT $4",
                 )
                 .bind(subject.tenant_id)
                 .bind(after)
-                .bind(subject.account_class == AccountClass::Admin)
                 .bind(subject.user_id)
                 .bind(limit)
                 .fetch_all(pool)
@@ -7459,9 +7449,7 @@ async fn sqlite_device_resource_permission(
     let Some(owner) = owner else {
         return Ok(None);
     };
-    if subject.account_class == AccountClass::Admin
-        || owner.as_deref() == Some(&subject.user_id.to_string())
-    {
+    if owner.as_deref() == Some(&subject.user_id.to_string()) {
         return Ok(Some(ResourcePermission::Owner));
     }
 
@@ -7540,9 +7528,7 @@ async fn sqlite_asset_resource_permission(
     let Some(owner) = owner else {
         return Ok(None);
     };
-    if subject.account_class == AccountClass::Admin
-        || owner.as_deref() == Some(&subject.user_id.to_string())
-    {
+    if owner.as_deref() == Some(&subject.user_id.to_string()) {
         return Ok(Some(ResourcePermission::Owner));
     }
 
@@ -7602,7 +7588,7 @@ async fn timescale_device_resource_permission(
     let Some(owner) = owner else {
         return Ok(None);
     };
-    if subject.account_class == AccountClass::Admin || owner == Some(subject.user_id) {
+    if owner == Some(subject.user_id) {
         return Ok(Some(ResourcePermission::Owner));
     }
 
@@ -7672,7 +7658,7 @@ async fn timescale_asset_resource_permission(
     let Some(owner) = owner else {
         return Ok(None);
     };
-    if subject.account_class == AccountClass::Admin || owner == Some(subject.user_id) {
+    if owner == Some(subject.user_id) {
         return Ok(Some(ResourcePermission::Owner));
     }
 
