@@ -115,11 +115,13 @@ async fn flush_once_commits_stream_deduplicated_events_and_advances_group_offset
     let writer = TelemetryWriter::new(pool.clone(), 1_000);
     let result = writer.flush_once(&consumer, now).await.unwrap();
 
-    let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .get::<i64, _>("count");
+    let telemetry_rows =
+        sqlx::query("SELECT COUNT(*) AS count FROM telemetry WHERE tenant_id = $1")
+            .bind(TEST_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get::<i64, _>("count");
 
     assert_eq!(result.read, 1);
     assert_eq!(result.inserted, 1);
@@ -179,9 +181,10 @@ async fn writer_persists_gateway_child_telemetry_and_one_receipt() {
     assert_eq!(result.inserted, 1);
     let receipt_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM gateway_event_receipts
-         WHERE gateway_device_id = 'gateway-001'
+         WHERE tenant_id = $1 AND gateway_device_id = 'gateway-001'
            AND idempotency_key = 'gateway-001:boot-1:1'",
     )
+    .bind(TEST_TENANT_ID)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -214,7 +217,8 @@ async fn sqlite_writer_commits_stream_records_and_rollups() {
 
     let writer = iot_nano_core::SqliteTelemetryWriter::new(store.clone(), 1_000);
     let result = writer.flush_once(&consumer, now).await.unwrap();
-    let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry")
+    let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry WHERE tenant_id = ?")
+        .bind(TEST_TENANT_ID.to_string())
         .fetch_one(store.pool())
         .await
         .unwrap()
@@ -263,7 +267,8 @@ async fn sqlite_writer_acknowledges_gateway_records_without_writing_telemetry() 
 
     let writer = iot_nano_core::SqliteTelemetryWriter::new(store.clone(), 1_000);
     let result = writer.flush_once(&consumer, now).await.unwrap();
-    let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry")
+    let telemetry_rows = sqlx::query("SELECT COUNT(*) AS count FROM telemetry WHERE tenant_id = ?")
+        .bind(TEST_TENANT_ID.to_string())
         .fetch_one(store.pool())
         .await
         .unwrap()
@@ -344,9 +349,10 @@ async fn sqlite_writer_persists_canonical_child_telemetry_and_one_gateway_receip
     );
     let receipt_count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM gateway_event_receipts
-         WHERE gateway_device_id = 'gateway-001'
+         WHERE tenant_id = ? AND gateway_device_id = 'gateway-001'
            AND idempotency_key = 'gateway-001:boot-1:2'",
     )
+    .bind(TEST_TENANT_ID.to_string())
     .fetch_one(store.pool())
     .await
     .unwrap();
