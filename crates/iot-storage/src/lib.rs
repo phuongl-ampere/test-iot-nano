@@ -432,18 +432,6 @@ CREATE INDEX IF NOT EXISTS audit_events_resource_index
 CREATE INDEX IF NOT EXISTS audit_events_actor_index
     ON audit_events (actor_user_id, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS device_claim_codes (
-    device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
-    code_hash TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    issued_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-    issued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    used_at TEXT
-);
-CREATE INDEX IF NOT EXISTS device_claim_codes_expiry_index
-    ON device_claim_codes (expires_at)
-    WHERE used_at IS NULL;
-
 CREATE TABLE IF NOT EXISTS device_tokens (
     id TEXT PRIMARY KEY,
     device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
@@ -8040,7 +8028,6 @@ const SQLITE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
     "resource_shares",
     "resource_grants",
     "audit_events",
-    "device_claim_codes",
     "device_tokens",
     "alert_rules",
     "alert_rule_event_evaluations",
@@ -8094,7 +8081,6 @@ const TIMESCALE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
     "resource_shares",
     "resource_grants",
     "audit_events",
-    "device_claim_codes",
     "device_runtime_state",
     "telemetry",
     "alert_rules",
@@ -9787,18 +9773,7 @@ async fn migrate_resource_authorization_schema(pool: &SqlitePool) -> Result<(), 
          CREATE INDEX IF NOT EXISTS audit_events_resource_index
              ON audit_events (resource_type, resource_id, created_at DESC);
          CREATE INDEX IF NOT EXISTS audit_events_actor_index
-             ON audit_events (actor_user_id, created_at DESC);
-         CREATE TABLE IF NOT EXISTS device_claim_codes (
-             device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
-             code_hash TEXT NOT NULL,
-             expires_at TEXT NOT NULL,
-             issued_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-             issued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-             used_at TEXT
-         );
-         CREATE INDEX IF NOT EXISTS device_claim_codes_expiry_index
-             ON device_claim_codes (expires_at)
-             WHERE used_at IS NULL;",
+             ON audit_events (actor_user_id, created_at DESC);",
     )
     .execute(pool)
     .await

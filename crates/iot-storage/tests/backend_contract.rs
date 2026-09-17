@@ -562,7 +562,6 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "assets",
             "audit_events",
             "command_outbox",
-            "device_claim_codes",
             "device_profiles",
             "device_tokens",
             "devices",

@@ -284,14 +284,6 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS audit_events_resource_index ON audit_events (resource_type, resource_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_actor_index ON audit_events (actor_user_id, created_at DESC);
-CREATE TABLE IF NOT EXISTS device_claim_codes (
-    device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
-    code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
-    issued_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    issued_at TIMESTAMPTZ NOT NULL DEFAULT now(), used_at TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS device_claim_codes_expiry_index ON device_claim_codes (expires_at) WHERE used_at IS NULL;
-
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE TABLE IF NOT EXISTS device_runtime_state (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
