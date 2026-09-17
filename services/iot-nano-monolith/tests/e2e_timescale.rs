@@ -54,8 +54,10 @@ struct ManagedChild {
 }
 
 struct FlowCredentials {
-    admin_username: String,
-    admin_password: String,
+    system_username: String,
+    system_password: String,
+    tenant_slug: String,
+    tenant_account_password: String,
     client_id: String,
     client_secret: String,
 }
@@ -64,15 +66,21 @@ impl FlowCredentials {
     fn generate() -> Self {
         let suffix = Uuid::now_v7();
         Self {
-            admin_username: format!("e2e-admin-{suffix}"),
-            admin_password: format!("E2eTimescaleBootstrapAdmin-{suffix}@2026"),
+            system_username: format!("e2e-system-{suffix}"),
+            system_password: format!("E2eTimescaleBootstrapSystem-{suffix}@2026"),
+            tenant_slug: format!("e2e-tenant-{suffix}"),
+            tenant_account_password: format!("E2eTimescaleTenantAccount-{suffix}@2026"),
             client_id: format!("e2e-client-{suffix}"),
             client_secret: format!("E2eClientSecret-{suffix}@2026"),
         }
     }
 
-    fn child_redactions(&self) -> [&str; 2] {
-        [&self.admin_password, &self.client_secret]
+    fn child_redactions(&self) -> [&str; 3] {
+        [
+            &self.system_password,
+            &self.tenant_account_password,
+            &self.client_secret,
+        ]
     }
 }
 
@@ -224,14 +232,14 @@ async fn run_process_e2e(mut fixture: Fixture) -> E2eResult {
     let mut bootstrap = Command::new(binary);
     fixture.configure(&mut bootstrap);
     bootstrap
-        .arg("--bootstrap-admin")
+        .arg("--bootstrap-system")
         .env(
-            "IOT_NANO_BOOTSTRAP_ADMIN_USERNAME",
-            &credentials.admin_username,
+            "IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME",
+            &credentials.system_username,
         )
         .env(
-            "IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD",
-            &credentials.admin_password,
+            "IOT_NANO_BOOTSTRAP_SYSTEM_PASSWORD",
+            &credentials.system_password,
         );
     let mut bootstrap = spawn_child(
         &mut bootstrap,
@@ -426,27 +434,65 @@ async fn run_e2e_flow(
     client: &Client,
     credentials: &FlowCredentials,
 ) -> E2eResult {
-    let login = client
+    let system_login = client
         .post(format!(
-            "http://{}/api/auth/login",
+            "http://{}/api/system/auth/login",
             fixture.management_address
         ))
         .json(&json!({
-            "username": credentials.admin_username,
-            "password": credentials.admin_password
+            "username": credentials.system_username,
+            "password": credentials.system_password
         }))
         .send()
         .await?;
-    require_status(&login, StatusCode::OK, "management login")?;
-    let cookie = login
+    require_status(&system_login, StatusCode::OK, "system login")?;
+    let system_cookie = system_login
         .headers()
         .get(SET_COOKIE)
-        .ok_or_else(|| test_error("management login did not issue a session cookie"))?
+        .ok_or_else(|| test_error("system login did not issue a session cookie"))?
         .to_str()?
         .split(';')
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| test_error("management session cookie was empty"))?
+        .ok_or_else(|| test_error("system session cookie was empty"))?
+        .to_owned();
+
+    let tenant = client
+        .post(format!(
+            "http://{}/api/system/tenants",
+            fixture.management_address
+        ))
+        .header(COOKIE, &system_cookie)
+        .json(&json!({
+            "slug": credentials.tenant_slug,
+            "metadata": { "source": "timescale-e2e" },
+            "tenant_account_password": credentials.tenant_account_password,
+        }))
+        .send()
+        .await?;
+    require_status(&tenant, StatusCode::CREATED, "tenant creation")?;
+
+    let tenant_login = client
+        .post(format!(
+            "http://{}/api/tenant/auth/login",
+            fixture.management_address
+        ))
+        .json(&json!({
+            "tenant_slug": credentials.tenant_slug,
+            "password": credentials.tenant_account_password,
+        }))
+        .send()
+        .await?;
+    require_status(&tenant_login, StatusCode::OK, "tenant login")?;
+    let tenant_cookie = tenant_login
+        .headers()
+        .get(SET_COOKIE)
+        .ok_or_else(|| test_error("tenant login did not issue a session cookie"))?
+        .to_str()?
+        .split(';')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| test_error("tenant session cookie was empty"))?
         .to_owned();
 
     let suffix = Uuid::now_v7().to_string();
@@ -457,7 +503,7 @@ async fn run_e2e_flow(
             "http://{}/api/management/applications",
             fixture.management_address
         ))
-        .header(COOKIE, &cookie)
+        .header(COOKIE, &tenant_cookie)
         .json(&json!({
             "app_id": app_id,
             "kind": "full_stack",
@@ -534,7 +580,7 @@ async fn run_e2e_flow(
             "http://{}/api/management/devices/{device_id}/tokens",
             fixture.management_address
         ))
-        .header(COOKIE, &cookie)
+        .header(COOKIE, &tenant_cookie)
         .send()
         .await?;
     require_status(
@@ -1513,14 +1559,14 @@ fn monolith_child_redactor_covers_generated_flow_secrets() {
     let credentials = FlowCredentials::generate();
     let stderr = format!(
         "bootstrap password={} client secret={}",
-        credentials.admin_password, credentials.client_secret
+        credentials.system_password, credentials.client_secret
     );
     let redactions = credentials.child_redactions();
 
     let diagnostic = redact_child_diagnostic(stderr.as_bytes(), false, &redactions);
 
     assert!(diagnostic.contains("[REDACTED]"));
-    assert!(!diagnostic.contains(&credentials.admin_password));
+    assert!(!diagnostic.contains(&credentials.system_password));
     assert!(!diagnostic.contains(&credentials.client_secret));
 }
 

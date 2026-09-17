@@ -103,11 +103,11 @@ async fn sqlite_monolith_process_runs_management_oauth_public_api_and_graceful_s
     let mut bootstrap = Command::new(binary);
     fixture.configure(&mut bootstrap);
     let output = bootstrap
-        .arg("--bootstrap-admin")
-        .env("IOT_NANO_BOOTSTRAP_ADMIN_USERNAME", "e2e-admin")
+        .arg("--bootstrap-system")
+        .env("IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME", "e2e-system")
         .env(
-            "IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD",
-            "E2eBootstrapAdmin@2026",
+            "IOT_NANO_BOOTSTRAP_SYSTEM_PASSWORD",
+            "E2eBootstrapSystem@2026",
         )
         .output()
         .await
@@ -183,23 +183,60 @@ async fn run_e2e_flow(
         .build()?;
     wait_ready(&client, fixture.public_address).await?;
 
-    let login = client
+    let system_login = client
         .post(format!(
-            "http://{}/api/auth/login",
+            "http://{}/api/system/auth/login",
             fixture.management_address
         ))
-        .json(&json!({ "username": "e2e-admin", "password": "E2eBootstrapAdmin@2026" }))
+        .json(&json!({ "username": "e2e-system", "password": "E2eBootstrapSystem@2026" }))
         .send()
         .await?;
-    assert_eq!(login.status(), StatusCode::OK);
-    let cookie = login
+    assert_eq!(system_login.status(), StatusCode::OK);
+    let system_cookie = system_login
         .headers()
         .get(SET_COOKIE)
-        .expect("management login did not issue a session cookie")
+        .expect("system login did not issue a session cookie")
         .to_str()?
         .split(';')
         .next()
         .expect("session cookie was empty")
+        .to_owned();
+
+    let tenant = client
+        .post(format!(
+            "http://{}/api/system/tenants",
+            fixture.management_address
+        ))
+        .header(COOKIE, &system_cookie)
+        .json(&json!({
+            "slug": "e2e-tenant",
+            "metadata": { "source": "sqlite-e2e" },
+            "tenant_account_password": "E2eTenantAccount@2026"
+        }))
+        .send()
+        .await?;
+    assert_eq!(tenant.status(), StatusCode::CREATED);
+
+    let tenant_login = client
+        .post(format!(
+            "http://{}/api/tenant/auth/login",
+            fixture.management_address
+        ))
+        .json(&json!({
+            "tenant_slug": "e2e-tenant",
+            "password": "E2eTenantAccount@2026"
+        }))
+        .send()
+        .await?;
+    assert_eq!(tenant_login.status(), StatusCode::OK);
+    let tenant_cookie = tenant_login
+        .headers()
+        .get(SET_COOKIE)
+        .expect("tenant login did not issue a session cookie")
+        .to_str()?
+        .split(';')
+        .next()
+        .expect("tenant session cookie was empty")
         .to_owned();
 
     let registered = client
@@ -207,7 +244,7 @@ async fn run_e2e_flow(
             "http://{}/api/management/applications",
             fixture.management_address
         ))
-        .header(COOKIE, &cookie)
+        .header(COOKIE, &tenant_cookie)
         .json(&json!({
             "app_id": "e2e-app",
             "kind": "full_stack",
@@ -274,7 +311,7 @@ async fn run_e2e_flow(
             "http://{}/api/management/devices/e2e-device/tokens",
             fixture.management_address
         ))
-        .header(COOKIE, &cookie)
+        .header(COOKIE, &tenant_cookie)
         .send()
         .await?
         .json()

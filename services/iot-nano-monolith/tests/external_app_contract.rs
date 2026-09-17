@@ -26,7 +26,12 @@ use tokio::{
     time::sleep,
 };
 
-const ADMIN_PASSWORD: &str = "ExternalContractAdmin@2026";
+const SYSTEM_USERNAME: &str = "external-contract-system";
+const SYSTEM_PASSWORD: &str = "ExternalContractSystem@2026";
+const TENANT_SLUG: &str = "external-contract-tenant";
+const TENANT_ACCOUNT_PASSWORD: &str = "ExternalContractTenantAccount@2026";
+const USERNAME: &str = "external-contract-user";
+const USER_PASSWORD: &str = "ExternalContractUser@2026";
 const CLIENT_SECRET: &str = "ExternalContractClientSecret@2026";
 const INVALID_CLIENT_SECRET: &str = "InvalidExternalContractClientSecret@2026";
 const SESSION_SECRET: &str = "external-contract-session-secret-material-0001";
@@ -257,12 +262,9 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
     let mut bootstrap = Command::new(binary);
     fixture.configure_monolith(&mut bootstrap);
     let bootstrap_output = bootstrap
-        .arg("--bootstrap-admin")
-        .env(
-            "IOT_NANO_BOOTSTRAP_ADMIN_USERNAME",
-            "external-contract-admin",
-        )
-        .env("IOT_NANO_BOOTSTRAP_ADMIN_PASSWORD", ADMIN_PASSWORD)
+        .arg("--bootstrap-system")
+        .env("IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME", SYSTEM_USERNAME)
+        .env("IOT_NANO_BOOTSTRAP_SYSTEM_PASSWORD", SYSTEM_PASSWORD)
         .output()
         .await?;
     assert!(
@@ -275,7 +277,17 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
     let result = async {
         processes
             .register_monolith(start_monolith_with_retry(&mut fixture, binary, &client).await?);
-        let management_cookie = management_login(&client, fixture.management_address).await?;
+        let system_cookie = system_login(&client, fixture.management_address).await?;
+        create_tenant(&client, fixture.management_address, &system_cookie).await?;
+        let tenant_cookie = tenant_login(&client, fixture.management_address).await?;
+        create_user(&client, fixture.management_address, &tenant_cookie).await?;
+        let user_cookie = user_login(&client, fixture.management_address).await?;
+        assert_management_mutation_denied_to_user(
+            &client,
+            fixture.management_address,
+            &user_cookie,
+        )
+        .await?;
         let (child, powermonitor_address) =
             start_powermonitor_with_retry(&fixture, &prepared_powermonitor, &client, CLIENT_SECRET)
                 .await?;
@@ -285,7 +297,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         register_application(
             &client,
             fixture.management_address,
-            &management_cookie,
+            &tenant_cookie,
             "powermonitor-external",
             "powermonitor-external-client",
             &format!("{powermonitor_url}/api/auth/callback"),
@@ -297,7 +309,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         register_application(
             &client,
             fixture.management_address,
-            &management_cookie,
+            &tenant_cookie,
             "disabled-external",
             "disabled-external-client",
             "https://disabled.example.test/callback",
@@ -323,7 +335,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
 
         let authorize = client
             .get(authorize_url)
-            .header(COOKIE, &management_cookie)
+            .header(COOKIE, &user_cookie)
             .send()
             .await?;
         assert_eq!(authorize.status(), StatusCode::FOUND);
@@ -382,7 +394,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         register_application(
             &client,
             fixture.management_address,
-            &management_cookie,
+            &tenant_cookie,
             "powermonitor-external",
             "powermonitor-external-client",
             &format!("{invalid_powermonitor_url}/api/auth/callback"),
@@ -407,7 +419,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
             .to_owned();
         let invalid_authorize = client
             .get(invalid_authorize_url)
-            .header(COOKIE, &management_cookie)
+            .header(COOKIE, &user_cookie)
             .send()
             .await?;
         assert_eq!(invalid_authorize.status(), StatusCode::FOUND);
@@ -481,7 +493,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
                 ),
                 ("code_challenge_method", "S256"),
             ])
-            .header(COOKIE, &management_cookie)
+            .header(COOKIE, &user_cookie)
             .send()
             .await?;
         assert_eq!(disabled_authorize.status(), StatusCode::BAD_REQUEST);
@@ -507,15 +519,15 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
     combine_result_and_cleanup(result, processes.cleanup().await)
 }
 
-async fn management_login(
+async fn system_login(
     client: &Client,
     management_address: SocketAddr,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let response = client
-        .post(format!("http://{management_address}/api/auth/login"))
+        .post(format!("http://{management_address}/api/system/auth/login"))
         .json(&json!({
-            "username": "external-contract-admin",
-            "password": ADMIN_PASSWORD,
+            "username": SYSTEM_USERNAME,
+            "password": SYSTEM_PASSWORD,
         }))
         .send()
         .await?;
@@ -523,10 +535,107 @@ async fn management_login(
     cookie(&response, "iot_nano_session")
 }
 
+async fn create_tenant(
+    client: &Client,
+    management_address: SocketAddr,
+    system_cookie: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{management_address}/api/system/tenants"))
+        .header(COOKIE, system_cookie)
+        .json(&json!({
+            "slug": TENANT_SLUG,
+            "metadata": { "source": "external-app-contract" },
+            "tenant_account_password": TENANT_ACCOUNT_PASSWORD,
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    Ok(())
+}
+
+async fn tenant_login(
+    client: &Client,
+    management_address: SocketAddr,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{management_address}/api/tenant/auth/login"))
+        .json(&json!({
+            "tenant_slug": TENANT_SLUG,
+            "password": TENANT_ACCOUNT_PASSWORD,
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    cookie(&response, "iot_nano_session")
+}
+
+async fn create_user(
+    client: &Client,
+    management_address: SocketAddr,
+    tenant_cookie: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{management_address}/api/management/users"))
+        .header(COOKIE, tenant_cookie)
+        .json(&json!({
+            "username": USERNAME,
+            "password": USER_PASSWORD,
+            "default_app": "/apps/powermonitor",
+            "granted_apps": ["powermonitor-external"],
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    Ok(())
+}
+
+async fn user_login(
+    client: &Client,
+    management_address: SocketAddr,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{management_address}/api/user/auth/login"))
+        .json(&json!({
+            "tenant_slug": TENANT_SLUG,
+            "username": USERNAME,
+            "password": USER_PASSWORD,
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    cookie(&response, "iot_nano_session")
+}
+
+async fn assert_management_mutation_denied_to_user(
+    client: &Client,
+    management_address: SocketAddr,
+    user_cookie: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!(
+            "http://{management_address}/api/management/applications"
+        ))
+        .header(COOKIE, user_cookie)
+        .json(&json!({
+            "app_id": "user-session-denied",
+            "kind": "full_stack",
+            "launch_url": "https://denied.example.test",
+            "client_id": "user-session-denied-client",
+            "redirect_uris": ["https://denied.example.test/callback"],
+            "allowed_scopes": ["devices:read"],
+            "enabled": true,
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
 async fn register_application(
     client: &Client,
     management_address: SocketAddr,
-    management_cookie: &str,
+    tenant_cookie: &str,
     app_id: &str,
     client_id: &str,
     redirect_uri: &str,
@@ -538,7 +647,7 @@ async fn register_application(
         .post(format!(
             "http://{management_address}/api/management/applications"
         ))
-        .header(COOKIE, management_cookie)
+        .header(COOKIE, tenant_cookie)
         .json(&json!({
             "app_id": app_id,
             "kind": "full_stack",
