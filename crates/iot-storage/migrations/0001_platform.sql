@@ -246,35 +246,75 @@ CREATE TABLE IF NOT EXISTS device_tokens (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS device_tokens_one_active_per_device ON device_tokens (device_id) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS device_tokens_active_prefix_index ON device_tokens (token_prefix) WHERE revoked_at IS NULL;
-CREATE TABLE IF NOT EXISTS resource_shares (
-    id UUID PRIMARY KEY, resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
-    resource_id TEXT NOT NULL, target_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    permission TEXT NOT NULL CHECK (permission IN ('viewer', 'controller', 'manager')),
-    inherit_children BOOLEAN NOT NULL DEFAULT FALSE,
-    state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'declined', 'cancelled', 'expired')),
-    created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), responded_at TIMESTAMPTZ, expires_at TIMESTAMPTZ
-);
-CREATE UNIQUE INDEX IF NOT EXISTS resource_shares_one_pending_index
-    ON resource_shares (resource_type, resource_id, target_user_id) WHERE state = 'pending';
-CREATE INDEX IF NOT EXISTS resource_shares_target_state_index ON resource_shares (target_user_id, state, created_at DESC);
-CREATE INDEX IF NOT EXISTS resource_shares_resource_state_index ON resource_shares (resource_type, resource_id, state);
-CREATE TABLE IF NOT EXISTS resource_grants (
+CREATE TABLE IF NOT EXISTS user_groups (
     id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
-    resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
-    resource_id TEXT NOT NULL,
-    grantee_type TEXT NOT NULL CHECK (grantee_type IN ('user', 'application')),
-    grantee_id TEXT NOT NULL,
-    permission TEXT NOT NULL CHECK (permission IN ('viewer', 'controller', 'manager')),
-    created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    owner_user_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (resource_type, resource_id, grantee_type, grantee_id)
+    UNIQUE (id, tenant_id),
+    FOREIGN KEY (owner_user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT
 );
-CREATE INDEX IF NOT EXISTS resource_grants_resource_index ON resource_grants (resource_type, resource_id);
-CREATE INDEX IF NOT EXISTS resource_grants_grantee_index ON resource_grants (grantee_type, grantee_id);
-CREATE INDEX IF NOT EXISTS resource_grants_tenant_id_index ON resource_grants (tenant_id, id);
+CREATE TABLE IF NOT EXISTS user_group_members (
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    group_id UUID NOT NULL,
+    user_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (group_id, user_id),
+    FOREIGN KEY (group_id, tenant_id)
+        REFERENCES user_groups(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS user_group_members_tenant_user_group_index
+    ON user_group_members (tenant_id, user_id, group_id);
+CREATE TABLE IF NOT EXISTS resource_permissions (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    subject_user_id UUID,
+    subject_group_id UUID,
+    asset_id UUID,
+    device_id TEXT,
+    permission TEXT NOT NULL CHECK (permission IN ('viewer', 'manager')),
+    inherit_children BOOLEAN NOT NULL DEFAULT FALSE,
+    created_by_user_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ,
+    CHECK (
+        (subject_user_id IS NOT NULL AND subject_group_id IS NULL)
+        OR (subject_user_id IS NULL AND subject_group_id IS NOT NULL)
+    ),
+    CHECK (
+        (asset_id IS NOT NULL AND device_id IS NULL)
+        OR (asset_id IS NULL AND device_id IS NOT NULL)
+    ),
+    CHECK (device_id IS NULL OR inherit_children = FALSE),
+    FOREIGN KEY (subject_user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (subject_group_id, tenant_id)
+        REFERENCES user_groups(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (asset_id, tenant_id)
+        REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (created_by_user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS resource_permissions_active_device_user_index
+    ON resource_permissions (tenant_id, device_id, subject_user_id)
+    WHERE revoked_at IS NULL AND device_id IS NOT NULL AND subject_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS resource_permissions_active_device_group_index
+    ON resource_permissions (tenant_id, device_id, subject_group_id)
+    WHERE revoked_at IS NULL AND device_id IS NOT NULL AND subject_group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_user_index
+    ON resource_permissions (tenant_id, asset_id, subject_user_id)
+    WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_group_index
+    ON resource_permissions (tenant_id, asset_id, subject_group_id)
+    WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_group_id IS NOT NULL;
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE TABLE IF NOT EXISTS device_runtime_state (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,

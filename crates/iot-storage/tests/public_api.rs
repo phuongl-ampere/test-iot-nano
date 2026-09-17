@@ -2,8 +2,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountClass, ManagementAssetRepository, NewPublicAsset, NewPublicDevice,
-    NewPublicResourceGrant, PlatformStore, PublicApiRepository, PublicDeviceError, PublicPrincipal,
-    ResourcePermission,
+    PlatformStore, PublicApiRepository, PublicDeviceError, PublicPrincipal, ResourcePermission,
 };
 use serde_json::json;
 use sqlx::{Connection, PgConnection, PgPool};
@@ -726,18 +725,14 @@ async fn timescale_relation_lock_is_held(pool: &PgPool, table: &str, mode: &str)
 }
 
 #[tokio::test]
-async fn sqlite_public_repository_filters_assets_and_persists_grants() {
+async fn sqlite_public_repository_filters_assets() {
     let (_directory, store) = sqlite_store().await;
     let user_id = Uuid::now_v7();
-    let other_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
-         VALUES (?, ?, 'public-repository-user', 'unused', 'viewer', 'user'),
-                (?, ?, 'public-repository-other', 'unused', 'viewer', 'user')",
+         VALUES (?, ?, 'public-repository-user', 'unused', 'viewer', 'user')",
     )
     .bind(user_id.to_string())
-    .bind(test_tenant_id().to_string())
-    .bind(other_id.to_string())
     .bind(test_tenant_id().to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
@@ -770,30 +765,6 @@ async fn sqlite_public_repository_filters_assets_and_persists_grants() {
         .await
         .unwrap();
     assert_eq!(assets, [asset.clone()]);
-
-    let grant = PublicApiRepository::create_public_grant(
-        &store,
-        &principal,
-        NewPublicResourceGrant {
-            resource_type: "asset".to_owned(),
-            resource_id: asset.id.to_string(),
-            grantee_type: "user".to_owned(),
-            grantee_id: other_id.to_string(),
-            permission: "viewer".to_owned(),
-        },
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(grant.permission, "viewer");
-    assert_eq!(
-        PublicApiRepository::get_public_grant(&store, &principal, grant.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .id,
-        grant.id
-    );
 }
 
 #[tokio::test]

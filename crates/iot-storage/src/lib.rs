@@ -50,9 +50,8 @@ pub use management::{
     UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 pub use public_api::{
-    NewPublicAsset, NewPublicDevice, NewPublicResourceGrant, PublicAlert, PublicApiRepository,
-    PublicAsset, PublicAssetError, PublicDevice, PublicDeviceError, PublicPrincipal,
-    PublicResourceGrant, PublicTelemetry,
+    NewPublicAsset, NewPublicDevice, PublicAlert, PublicApiRepository, PublicAsset,
+    PublicAssetError, PublicDevice, PublicDeviceError, PublicPrincipal, PublicTelemetry,
 };
 pub use tenant_identity::{
     AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount,
@@ -371,48 +370,75 @@ CREATE INDEX IF NOT EXISTS assets_owner_user_id_index
     ON assets (owner_user_id)
     WHERE owner_user_id IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS resource_shares (
-    id TEXT PRIMARY KEY,
-    resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
-    resource_id TEXT NOT NULL,
-    target_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    permission TEXT NOT NULL CHECK (permission IN ('viewer', 'controller', 'manager')),
-    inherit_children INTEGER NOT NULL DEFAULT 0 CHECK (inherit_children IN (0, 1)),
-    state TEXT NOT NULL CHECK (
-        state IN ('pending', 'active', 'declined', 'cancelled', 'expired')
-    ),
-    created_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    responded_at TEXT,
-    expires_at TEXT
-);
-CREATE UNIQUE INDEX IF NOT EXISTS resource_shares_one_pending_index
-    ON resource_shares (resource_type, resource_id, target_user_id)
-    WHERE state = 'pending';
-CREATE INDEX IF NOT EXISTS resource_shares_target_state_index
-    ON resource_shares (target_user_id, state, created_at DESC);
-CREATE INDEX IF NOT EXISTS resource_shares_resource_state_index
-    ON resource_shares (resource_type, resource_id, state);
-
-CREATE TABLE IF NOT EXISTS resource_grants (
+CREATE TABLE IF NOT EXISTS user_groups (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
-    resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
-    resource_id TEXT NOT NULL,
-    grantee_type TEXT NOT NULL CHECK (grantee_type IN ('user', 'application')),
-    grantee_id TEXT NOT NULL,
-    permission TEXT NOT NULL CHECK (permission IN ('viewer', 'controller', 'manager')),
-    created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    owner_user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (resource_type, resource_id, grantee_type, grantee_id)
+    UNIQUE (id, tenant_id),
+    FOREIGN KEY (owner_user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT
 );
-CREATE INDEX IF NOT EXISTS resource_grants_resource_index
-    ON resource_grants (resource_type, resource_id);
-CREATE INDEX IF NOT EXISTS resource_grants_grantee_index
-    ON resource_grants (grantee_type, grantee_id);
-CREATE INDEX IF NOT EXISTS resource_grants_tenant_id_index
-    ON resource_grants (tenant_id, id);
+CREATE TABLE IF NOT EXISTS user_group_members (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (group_id, user_id),
+    FOREIGN KEY (group_id, tenant_id)
+        REFERENCES user_groups(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS user_group_members_tenant_user_group_index
+    ON user_group_members (tenant_id, user_id, group_id);
+CREATE TABLE IF NOT EXISTS resource_permissions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    subject_user_id TEXT,
+    subject_group_id TEXT,
+    asset_id TEXT,
+    device_id TEXT,
+    permission TEXT NOT NULL CHECK (permission IN ('viewer', 'manager')),
+    inherit_children INTEGER NOT NULL DEFAULT 0 CHECK (inherit_children IN (0, 1)),
+    created_by_user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TEXT,
+    CHECK (
+        (subject_user_id IS NOT NULL AND subject_group_id IS NULL)
+        OR (subject_user_id IS NULL AND subject_group_id IS NOT NULL)
+    ),
+    CHECK (
+        (asset_id IS NOT NULL AND device_id IS NULL)
+        OR (asset_id IS NULL AND device_id IS NOT NULL)
+    ),
+    CHECK (device_id IS NULL OR inherit_children = 0),
+    FOREIGN KEY (subject_user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (subject_group_id, tenant_id)
+        REFERENCES user_groups(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (asset_id, tenant_id)
+        REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (created_by_user_id, tenant_id)
+        REFERENCES users(id, tenant_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS resource_permissions_active_device_user_index
+    ON resource_permissions (tenant_id, device_id, subject_user_id)
+    WHERE revoked_at IS NULL AND device_id IS NOT NULL AND subject_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS resource_permissions_active_device_group_index
+    ON resource_permissions (tenant_id, device_id, subject_group_id)
+    WHERE revoked_at IS NULL AND device_id IS NOT NULL AND subject_group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_user_index
+    ON resource_permissions (tenant_id, asset_id, subject_user_id)
+    WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_group_index
+    ON resource_permissions (tenant_id, asset_id, subject_group_id)
+    WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_group_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS device_tokens (
     id TEXT PRIMARY KEY,
@@ -1518,6 +1544,7 @@ impl ResourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorizationSubject {
     pub user_id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
     pub account_class: AccountClass,
 }
 
@@ -2784,29 +2811,42 @@ impl PlatformStore {
         &self,
         user_id: uuid::Uuid,
     ) -> Result<Option<AuthorizationSubject>, PlatformStoreError> {
-        let account_class = match self {
-            Self::Sqlite(store) => {
-                sqlx::query_scalar::<_, String>("SELECT account_class FROM users WHERE id = ?")
-                    .bind(user_id.to_string())
-                    .fetch_optional(store.pool())
-                    .await?
-            }
+        let identity: Option<(uuid::Uuid, String)> = match self {
+            Self::Sqlite(store) => sqlx::query_as::<_, (String, String)>(
+                "SELECT tenant_id, account_class FROM users WHERE id = ?",
+            )
+            .bind(user_id.to_string())
+            .fetch_optional(store.pool())
+            .await?
+            .map(|(tenant_id, account_class)| {
+                uuid::Uuid::parse_str(&tenant_id)
+                    .map(|tenant_id| (tenant_id, account_class))
+                    .map_err(|_| PlatformStoreError::InvalidAuthorizationAccountClass(tenant_id))
+            })
+            .transpose()?,
             Self::Timescale(pool) => {
-                sqlx::query_scalar::<_, String>("SELECT account_class FROM users WHERE id = $1")
-                    .bind(user_id)
-                    .fetch_optional(pool)
-                    .await?
+                sqlx::query_as::<_, (uuid::Uuid, String)>(
+                    "SELECT tenant_id, account_class FROM users WHERE id = $1",
+                )
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?
             }
         };
-        account_class
-            .map(|account_class| authorization_account_class(&account_class))
-            .transpose()
-            .map(|account_class| {
-                account_class.map(|account_class| AuthorizationSubject {
+        match identity {
+            Some((tenant_id, account_class)) => {
+                let account_class = authorization_account_class(&account_class)?;
+                if account_class == AccountClass::System {
+                    return Ok(None);
+                }
+                Ok(Some(AuthorizationSubject {
                     user_id,
+                    tenant_id,
                     account_class,
-                })
-            })
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn list_authorized_devices(
@@ -2819,46 +2859,77 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => {
                 let user_id = subject.user_id.to_string();
+                let tenant_id = subject.tenant_id.to_string();
                 let rows = sqlx::query(
-                    "SELECT d.device_id, d.display_name, d.last_seen_at
-                     FROM devices AS d
-                     WHERE d.deleted_at IS NULL
-                       AND (? IS NULL OR d.device_id > ?)
-                       AND (
-                           ? = 1
-                           OR d.owner_user_id = ?
-                           OR EXISTS (
-                               SELECT 1 FROM resource_shares AS shares
-                               WHERE shares.resource_type = 'device'
-                                 AND shares.resource_id = d.device_id
-                                 AND shares.target_user_id = ?
-                                 AND shares.state = 'active'
-                           )
-                           OR EXISTS (
-                               WITH RECURSIVE ancestors(id, depth) AS (
-                                   SELECT d.asset_id, 0 WHERE d.asset_id IS NOT NULL
-                                   UNION ALL
-                                   SELECT assets.parent_asset_id, ancestors.depth + 1
-                                   FROM ancestors
-                                   JOIN assets ON assets.id = ancestors.id
-                                   WHERE assets.parent_asset_id IS NOT NULL
-                                     AND ancestors.depth < 64
-                               )
-                               SELECT 1 FROM resource_shares AS shares
-                               JOIN ancestors ON shares.resource_id = ancestors.id
-                               WHERE shares.resource_type = 'asset'
-                                 AND shares.target_user_id = ?
-                                 AND shares.state = 'active'
-                                 AND shares.inherit_children = 1
-                           )
-                       )
-                     ORDER BY d.device_id
+                    "WITH RECURSIVE candidates(
+                         device_id, display_name, last_seen_at, asset_id, owner_user_id
+                     ) AS (
+                         SELECT device_id, display_name, last_seen_at, asset_id, owner_user_id
+                         FROM devices
+                         WHERE tenant_id = ?
+                           AND deleted_at IS NULL
+                           AND (? IS NULL OR device_id > ?)
+                     ),
+                     ancestors(device_id, asset_id, depth) AS (
+                         SELECT device_id, asset_id, 0
+                         FROM candidates
+                         WHERE asset_id IS NOT NULL
+                         UNION ALL
+                         SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                         FROM ancestors
+                         JOIN assets AS asset
+                           ON asset.id = ancestors.asset_id AND asset.tenant_id = ?
+                         WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     ),
+                     authorized(device_id) AS (
+                         SELECT device_id FROM candidates
+                         WHERE ? = 1 OR owner_user_id = ?
+                         UNION
+                         SELECT candidate.device_id
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.device_id = candidate.device_id
+                          AND permission.revoked_at IS NULL
+                         WHERE permission.subject_user_id = ?
+                            OR EXISTS (
+                                SELECT 1 FROM user_group_members AS membership
+                                WHERE membership.tenant_id = permission.tenant_id
+                                  AND membership.group_id = permission.subject_group_id
+                                  AND membership.user_id = ?
+                            )
+                         UNION
+                         SELECT ancestors.device_id
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.asset_id = ancestors.asset_id
+                          AND permission.inherit_children = 1
+                          AND permission.revoked_at IS NULL
+                         WHERE permission.subject_user_id = ?
+                            OR EXISTS (
+                                SELECT 1 FROM user_group_members AS membership
+                                WHERE membership.tenant_id = permission.tenant_id
+                                  AND membership.group_id = permission.subject_group_id
+                                  AND membership.user_id = ?
+                            )
+                     )
+                     SELECT candidate.device_id, candidate.display_name, candidate.last_seen_at
+                     FROM candidates AS candidate
+                     JOIN authorized ON authorized.device_id = candidate.device_id
+                     ORDER BY candidate.device_id
                      LIMIT ?",
                 )
+                .bind(&tenant_id)
                 .bind(after)
                 .bind(after)
+                .bind(&tenant_id)
                 .bind(i64::from(subject.account_class == AccountClass::Admin))
                 .bind(&user_id)
+                .bind(&tenant_id)
+                .bind(&user_id)
+                .bind(&user_id)
+                .bind(&tenant_id)
                 .bind(&user_id)
                 .bind(&user_id)
                 .bind(limit)
@@ -2880,43 +2951,69 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let rows = sqlx::query(
-                    "SELECT d.device_id, d.display_name, runtime.last_seen_at
-                     FROM devices AS d
+                    "WITH RECURSIVE candidates(
+                         device_id, display_name, asset_id, owner_user_id
+                     ) AS (
+                         SELECT d.device_id, d.display_name, d.asset_id, d.owner_user_id
+                         FROM devices AS d
+                         WHERE d.tenant_id = $1
+                           AND d.deleted_at IS NULL
+                           AND ($2::text IS NULL OR d.device_id > $2)
+                     ),
+                     ancestors(device_id, asset_id, depth) AS (
+                         SELECT device_id, asset_id, 0
+                         FROM candidates
+                         WHERE asset_id IS NOT NULL
+                         UNION ALL
+                         SELECT ancestors.device_id, asset.parent_asset_id, ancestors.depth + 1
+                         FROM ancestors
+                         JOIN assets AS asset
+                           ON asset.id = ancestors.asset_id AND asset.tenant_id = $1
+                         WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     ),
+                     authorized(device_id) AS (
+                         SELECT device_id FROM candidates
+                         WHERE $3::boolean OR owner_user_id = $4
+                         UNION
+                         SELECT candidate.device_id
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.device_id = candidate.device_id
+                          AND permission.revoked_at IS NULL
+                         WHERE permission.subject_user_id = $4
+                            OR EXISTS (
+                                SELECT 1 FROM user_group_members AS membership
+                                WHERE membership.tenant_id = permission.tenant_id
+                                  AND membership.group_id = permission.subject_group_id
+                                  AND membership.user_id = $4
+                            )
+                         UNION
+                         SELECT ancestors.device_id
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.asset_id = ancestors.asset_id
+                          AND permission.inherit_children = TRUE
+                          AND permission.revoked_at IS NULL
+                         WHERE permission.subject_user_id = $4
+                            OR EXISTS (
+                                SELECT 1 FROM user_group_members AS membership
+                                WHERE membership.tenant_id = permission.tenant_id
+                                  AND membership.group_id = permission.subject_group_id
+                                  AND membership.user_id = $4
+                            )
+                     )
+                     SELECT candidate.device_id, candidate.display_name, runtime.last_seen_at
+                     FROM candidates AS candidate
+                     JOIN authorized ON authorized.device_id = candidate.device_id
                      LEFT JOIN device_runtime_state AS runtime
-                       ON runtime.device_id = d.device_id
-                     WHERE d.deleted_at IS NULL
-                       AND ($1::text IS NULL OR d.device_id > $1)
-                       AND (
-                           $2::boolean
-                           OR d.owner_user_id = $3
-                           OR EXISTS (
-                               SELECT 1 FROM resource_shares AS shares
-                               WHERE shares.resource_type = 'device'
-                                 AND shares.resource_id = d.device_id
-                                 AND shares.target_user_id = $3
-                                 AND shares.state = 'active'
-                           )
-                           OR EXISTS (
-                               WITH RECURSIVE ancestors(id, depth) AS (
-                                   SELECT d.asset_id, 0 WHERE d.asset_id IS NOT NULL
-                                   UNION ALL
-                                   SELECT assets.parent_asset_id, ancestors.depth + 1
-                                   FROM ancestors
-                                   JOIN assets ON assets.id = ancestors.id
-                                   WHERE assets.parent_asset_id IS NOT NULL
-                                     AND ancestors.depth < 64
-                               )
-                               SELECT 1 FROM resource_shares AS shares
-                               JOIN ancestors ON shares.resource_id = ancestors.id::text
-                               WHERE shares.resource_type = 'asset'
-                                 AND shares.target_user_id = $3
-                                 AND shares.state = 'active'
-                                 AND shares.inherit_children = TRUE
-                           )
-                       )
-                     ORDER BY d.device_id
-                     LIMIT $4",
+                       ON runtime.tenant_id = $1
+                      AND runtime.device_id = candidate.device_id
+                     ORDER BY candidate.device_id
+                     LIMIT $5",
                 )
+                .bind(subject.tenant_id)
                 .bind(after)
                 .bind(subject.account_class == AccountClass::Admin)
                 .bind(subject.user_id)
@@ -2943,46 +3040,19 @@ impl PlatformStore {
     ) -> Result<Option<AuthorizedDeviceSummary>, PlatformStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let user_id = subject.user_id.to_string();
+                if sqlite_device_resource_permission(store.pool(), subject, device_id)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
                 let row = sqlx::query(
-                    "SELECT d.device_id, d.display_name, d.last_seen_at
-                     FROM devices AS d
-                     WHERE d.device_id = ?
-                       AND d.deleted_at IS NULL
-                       AND (
-                           ? = 1
-                           OR d.owner_user_id = ?
-                           OR EXISTS (
-                               SELECT 1 FROM resource_shares AS shares
-                               WHERE shares.resource_type = 'device'
-                                 AND shares.resource_id = d.device_id
-                                 AND shares.target_user_id = ?
-                                 AND shares.state = 'active'
-                           )
-                           OR EXISTS (
-                               WITH RECURSIVE ancestors(id, depth) AS (
-                                   SELECT d.asset_id, 0 WHERE d.asset_id IS NOT NULL
-                                   UNION ALL
-                                   SELECT assets.parent_asset_id, ancestors.depth + 1
-                                   FROM ancestors
-                                   JOIN assets ON assets.id = ancestors.id
-                                   WHERE assets.parent_asset_id IS NOT NULL
-                                     AND ancestors.depth < 64
-                               )
-                               SELECT 1 FROM resource_shares AS shares
-                               JOIN ancestors ON shares.resource_id = ancestors.id
-                               WHERE shares.resource_type = 'asset'
-                                 AND shares.target_user_id = ?
-                                 AND shares.state = 'active'
-                                 AND shares.inherit_children = 1
-                           )
-                       )",
+                    "SELECT device_id, display_name, last_seen_at
+                     FROM devices
+                     WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
                 )
                 .bind(device_id)
-                .bind(i64::from(subject.account_class == AccountClass::Admin))
-                .bind(&user_id)
-                .bind(&user_id)
-                .bind(&user_id)
+                .bind(subject.tenant_id.to_string())
                 .fetch_optional(store.pool())
                 .await?;
                 row.map(|row| {
@@ -2999,45 +3069,24 @@ impl PlatformStore {
                 .transpose()
             }
             Self::Timescale(pool) => {
+                if timescale_device_resource_permission(pool, subject, device_id)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
                 let row = sqlx::query(
                     "SELECT d.device_id, d.display_name, runtime.last_seen_at
                      FROM devices AS d
                      LEFT JOIN device_runtime_state AS runtime
-                       ON runtime.device_id = d.device_id
+                       ON runtime.tenant_id = $2
+                      AND runtime.device_id = d.device_id
                      WHERE d.device_id = $1
-                       AND d.deleted_at IS NULL
-                       AND (
-                           $2::boolean
-                           OR d.owner_user_id = $3
-                           OR EXISTS (
-                               SELECT 1 FROM resource_shares AS shares
-                               WHERE shares.resource_type = 'device'
-                                 AND shares.resource_id = d.device_id
-                                 AND shares.target_user_id = $3
-                                 AND shares.state = 'active'
-                           )
-                           OR EXISTS (
-                               WITH RECURSIVE ancestors(id, depth) AS (
-                                   SELECT d.asset_id, 0 WHERE d.asset_id IS NOT NULL
-                                   UNION ALL
-                                   SELECT assets.parent_asset_id, ancestors.depth + 1
-                                   FROM ancestors
-                                   JOIN assets ON assets.id = ancestors.id
-                                   WHERE assets.parent_asset_id IS NOT NULL
-                                     AND ancestors.depth < 64
-                               )
-                               SELECT 1 FROM resource_shares AS shares
-                               JOIN ancestors ON shares.resource_id = ancestors.id::text
-                               WHERE shares.resource_type = 'asset'
-                                 AND shares.target_user_id = $3
-                                 AND shares.state = 'active'
-                                 AND shares.inherit_children = TRUE
-                           )
-                       )",
+                       AND d.tenant_id = $2
+                       AND d.deleted_at IS NULL",
                 )
                 .bind(device_id)
-                .bind(subject.account_class == AccountClass::Admin)
-                .bind(subject.user_id)
+                .bind(subject.tenant_id)
                 .fetch_optional(pool)
                 .await?;
                 row.map(|row| {
@@ -3057,104 +3106,12 @@ impl PlatformStore {
         subject: &AuthorizationSubject,
         device_id: &str,
     ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
-        if subject.account_class == AccountClass::Admin {
-            return Ok(Some(ResourcePermission::Owner));
-        }
-
         match self {
             Self::Sqlite(store) => {
-                let exists = sqlx::query_scalar::<_, String>(
-                    "SELECT device_id FROM devices
-                     WHERE device_id = ? AND deleted_at IS NULL",
-                )
-                .bind(device_id)
-                .fetch_optional(store.pool())
-                .await?;
-                if exists.is_none() {
-                    return Ok(None);
-                }
-                let owner = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT owner_user_id FROM devices
-                     WHERE device_id = ? AND deleted_at IS NULL",
-                )
-                .bind(device_id)
-                .fetch_optional(store.pool())
-                .await?
-                .flatten();
-                if owner.as_deref() == Some(&subject.user_id.to_string()) {
-                    return Ok(Some(ResourcePermission::Owner));
-                }
-                let rows = sqlx::query_scalar::<_, String>(
-                    "WITH RECURSIVE ancestors(id, depth) AS (
-                        SELECT asset_id, 0 FROM devices
-                        WHERE device_id = ? AND deleted_at IS NULL AND asset_id IS NOT NULL
-                        UNION ALL
-                        SELECT assets.parent_asset_id, ancestors.depth + 1
-                        FROM ancestors JOIN assets ON assets.id = ancestors.id
-                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
-                     )
-                     SELECT permission FROM resource_shares
-                     WHERE resource_type = 'device' AND resource_id = ?
-                       AND target_user_id = ? AND state = 'active'
-                     UNION ALL
-                     SELECT shares.permission FROM resource_shares AS shares
-                     JOIN ancestors ON shares.resource_id = ancestors.id
-                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = ?
-                       AND shares.state = 'active' AND shares.inherit_children = 1",
-                )
-                .bind(device_id)
-                .bind(device_id)
-                .bind(subject.user_id.to_string())
-                .bind(subject.user_id.to_string())
-                .fetch_all(store.pool())
-                .await?;
-                Ok(strongest_share_permission(rows))
+                sqlite_device_resource_permission(store.pool(), subject, device_id).await
             }
             Self::Timescale(pool) => {
-                let exists = sqlx::query_scalar::<_, String>(
-                    "SELECT device_id FROM devices
-                     WHERE device_id = $1 AND deleted_at IS NULL",
-                )
-                .bind(device_id)
-                .fetch_optional(pool)
-                .await?;
-                if exists.is_none() {
-                    return Ok(None);
-                }
-                let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-                    "SELECT owner_user_id FROM devices
-                     WHERE device_id = $1 AND deleted_at IS NULL",
-                )
-                .bind(device_id)
-                .fetch_optional(pool)
-                .await?
-                .flatten();
-                if owner == Some(subject.user_id) {
-                    return Ok(Some(ResourcePermission::Owner));
-                }
-                let rows = sqlx::query_scalar::<_, String>(
-                    "WITH RECURSIVE ancestors(id, depth) AS (
-                        SELECT asset_id, 0 FROM devices
-                        WHERE device_id = $1 AND deleted_at IS NULL AND asset_id IS NOT NULL
-                        UNION ALL
-                        SELECT assets.parent_asset_id, ancestors.depth + 1
-                        FROM ancestors JOIN assets ON assets.id = ancestors.id
-                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
-                     )
-                     SELECT permission FROM resource_shares
-                     WHERE resource_type = 'device' AND resource_id = $1
-                       AND target_user_id = $2 AND state = 'active'
-                     UNION ALL
-                     SELECT shares.permission FROM resource_shares AS shares
-                     JOIN ancestors ON shares.resource_id = ancestors.id::text
-                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = $2
-                       AND shares.state = 'active' AND shares.inherit_children = TRUE",
-                )
-                .bind(device_id)
-                .bind(subject.user_id)
-                .fetch_all(pool)
-                .await?;
-                Ok(strongest_share_permission(rows))
+                timescale_device_resource_permission(pool, subject, device_id).await
             }
         }
     }
@@ -3164,81 +3121,12 @@ impl PlatformStore {
         subject: &AuthorizationSubject,
         asset_id: uuid::Uuid,
     ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
-        if subject.account_class == AccountClass::Admin {
-            return Ok(Some(ResourcePermission::Owner));
-        }
-
         match self {
             Self::Sqlite(store) => {
-                let asset_id = asset_id.to_string();
-                let owner = sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT owner_user_id FROM assets WHERE id = ?",
-                )
-                .bind(&asset_id)
-                .fetch_optional(store.pool())
-                .await?
-                .flatten();
-                if owner.as_deref() == Some(&subject.user_id.to_string()) {
-                    return Ok(Some(ResourcePermission::Owner));
-                }
-                let rows = sqlx::query_scalar::<_, String>(
-                    "WITH RECURSIVE ancestors(id, depth) AS (
-                        SELECT ?, 0
-                        UNION ALL
-                        SELECT assets.parent_asset_id, ancestors.depth + 1
-                        FROM ancestors JOIN assets ON assets.id = ancestors.id
-                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
-                     )
-                     SELECT permission FROM resource_shares
-                     WHERE resource_type = 'asset' AND resource_id = ?
-                       AND target_user_id = ? AND state = 'active'
-                     UNION ALL
-                     SELECT shares.permission FROM resource_shares AS shares
-                     JOIN ancestors ON shares.resource_id = ancestors.id
-                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = ?
-                       AND shares.state = 'active' AND shares.inherit_children = 1",
-                )
-                .bind(&asset_id)
-                .bind(&asset_id)
-                .bind(subject.user_id.to_string())
-                .bind(subject.user_id.to_string())
-                .fetch_all(store.pool())
-                .await?;
-                Ok(strongest_share_permission(rows))
+                sqlite_asset_resource_permission(store.pool(), subject, asset_id).await
             }
             Self::Timescale(pool) => {
-                let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-                    "SELECT owner_user_id FROM assets WHERE id = $1",
-                )
-                .bind(asset_id)
-                .fetch_optional(pool)
-                .await?
-                .flatten();
-                if owner == Some(subject.user_id) {
-                    return Ok(Some(ResourcePermission::Owner));
-                }
-                let rows = sqlx::query_scalar::<_, String>(
-                    "WITH RECURSIVE ancestors(id, depth) AS (
-                        SELECT $1::uuid, 0
-                        UNION ALL
-                        SELECT assets.parent_asset_id, ancestors.depth + 1
-                        FROM ancestors JOIN assets ON assets.id = ancestors.id
-                        WHERE assets.parent_asset_id IS NOT NULL AND ancestors.depth < 64
-                     )
-                     SELECT permission FROM resource_shares
-                     WHERE resource_type = 'asset' AND resource_id = $1::text
-                       AND target_user_id = $2 AND state = 'active'
-                     UNION ALL
-                     SELECT shares.permission FROM resource_shares AS shares
-                     JOIN ancestors ON shares.resource_id = ancestors.id::text
-                     WHERE shares.resource_type = 'asset' AND shares.target_user_id = $2
-                       AND shares.state = 'active' AND shares.inherit_children = TRUE",
-                )
-                .bind(asset_id)
-                .bind(subject.user_id)
-                .fetch_all(pool)
-                .await?;
-                Ok(strongest_share_permission(rows))
+                timescale_asset_resource_permission(pool, subject, asset_id).await
             }
         }
     }
@@ -7379,6 +7267,285 @@ fn strongest_share_permission(rows: Vec<String>) -> Option<ResourcePermission> {
         .max()
 }
 
+fn strongest_resource_permission(rows: Vec<String>) -> Option<ResourcePermission> {
+    rows.into_iter()
+        .filter_map(|value| match value.as_str() {
+            "viewer" => Some(ResourcePermission::Viewer),
+            "manager" => Some(ResourcePermission::Manager),
+            _ => None,
+        })
+        .max()
+}
+
+async fn sqlite_device_resource_permission(
+    pool: &SqlitePool,
+    subject: &AuthorizationSubject,
+    device_id: &str,
+) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+    let owner = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT owner_user_id
+         FROM devices
+         WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+    )
+    .bind(device_id)
+    .bind(subject.tenant_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    if subject.account_class == AccountClass::Admin
+        || owner.as_deref() == Some(&subject.user_id.to_string())
+    {
+        return Ok(Some(ResourcePermission::Owner));
+    }
+
+    let user_id = subject.user_id.to_string();
+    let tenant_id = subject.tenant_id.to_string();
+    let rows = sqlx::query_scalar::<_, String>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT device.asset_id, 0
+            FROM devices AS device
+            WHERE device.device_id = ?
+              AND device.tenant_id = ?
+              AND device.deleted_at IS NULL
+              AND device.asset_id IS NOT NULL
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = ?
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT permission.permission
+         FROM resource_permissions AS permission
+         WHERE permission.tenant_id = ?
+           AND permission.revoked_at IS NULL
+           AND (
+                (permission.device_id = ? AND (
+                    permission.subject_user_id = ?
+                    OR EXISTS (
+                        SELECT 1
+                        FROM user_group_members AS membership
+                        WHERE membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = ?
+                    )
+                ))
+                OR (permission.asset_id IN (SELECT id FROM ancestors)
+                    AND permission.inherit_children = 1 AND (
+                        permission.subject_user_id = ?
+                        OR EXISTS (
+                            SELECT 1
+                            FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = ?
+                        )
+                    ))
+           )",
+    )
+    .bind(device_id)
+    .bind(&tenant_id)
+    .bind(&tenant_id)
+    .bind(&tenant_id)
+    .bind(device_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(strongest_resource_permission(rows))
+}
+
+async fn sqlite_asset_resource_permission(
+    pool: &SqlitePool,
+    subject: &AuthorizationSubject,
+    asset_id: uuid::Uuid,
+) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+    let asset_id = asset_id.to_string();
+    let owner = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT owner_user_id FROM assets WHERE id = ? AND tenant_id = ?",
+    )
+    .bind(&asset_id)
+    .bind(subject.tenant_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    if subject.account_class == AccountClass::Admin
+        || owner.as_deref() == Some(&subject.user_id.to_string())
+    {
+        return Ok(Some(ResourcePermission::Owner));
+    }
+
+    let user_id = subject.user_id.to_string();
+    let tenant_id = subject.tenant_id.to_string();
+    let rows = sqlx::query_scalar::<_, String>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT ?, 0
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = ?
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT permission.permission
+         FROM resource_permissions AS permission
+         JOIN ancestors ON permission.asset_id = ancestors.id
+         WHERE permission.tenant_id = ?
+           AND permission.revoked_at IS NULL
+           AND (ancestors.depth = 0 OR permission.inherit_children = 1)
+           AND (
+                permission.subject_user_id = ?
+                OR EXISTS (
+                    SELECT 1
+                    FROM user_group_members AS membership
+                    WHERE membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = ?
+                )
+           )",
+    )
+    .bind(&asset_id)
+    .bind(&tenant_id)
+    .bind(&tenant_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(strongest_resource_permission(rows))
+}
+
+async fn timescale_device_resource_permission(
+    pool: &PgPool,
+    subject: &AuthorizationSubject,
+    device_id: &str,
+) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+    let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+        "SELECT owner_user_id
+         FROM devices
+         WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(device_id)
+    .bind(subject.tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    if subject.account_class == AccountClass::Admin || owner == Some(subject.user_id) {
+        return Ok(Some(ResourcePermission::Owner));
+    }
+
+    let rows = sqlx::query_scalar::<_, String>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT device.asset_id, 0
+            FROM devices AS device
+            WHERE device.device_id = $1
+              AND device.tenant_id = $2
+              AND device.deleted_at IS NULL
+              AND device.asset_id IS NOT NULL
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = $2
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT permission.permission
+         FROM resource_permissions AS permission
+         WHERE permission.tenant_id = $2
+           AND permission.revoked_at IS NULL
+           AND (
+                (permission.device_id = $1 AND (
+                    permission.subject_user_id = $3
+                    OR EXISTS (
+                        SELECT 1
+                        FROM user_group_members AS membership
+                        WHERE membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = $3
+                    )
+                ))
+                OR (permission.asset_id IN (SELECT id FROM ancestors)
+                    AND permission.inherit_children = TRUE AND (
+                        permission.subject_user_id = $3
+                        OR EXISTS (
+                            SELECT 1
+                            FROM user_group_members AS membership
+                            WHERE membership.tenant_id = permission.tenant_id
+                              AND membership.group_id = permission.subject_group_id
+                              AND membership.user_id = $3
+                        )
+                    ))
+           )",
+    )
+    .bind(device_id)
+    .bind(subject.tenant_id)
+    .bind(subject.user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(strongest_resource_permission(rows))
+}
+
+async fn timescale_asset_resource_permission(
+    pool: &PgPool,
+    subject: &AuthorizationSubject,
+    asset_id: uuid::Uuid,
+) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+    let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+        "SELECT owner_user_id FROM assets WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(asset_id)
+    .bind(subject.tenant_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    if subject.account_class == AccountClass::Admin || owner == Some(subject.user_id) {
+        return Ok(Some(ResourcePermission::Owner));
+    }
+
+    let rows = sqlx::query_scalar::<_, String>(
+        "WITH RECURSIVE ancestors(id, depth) AS (
+            SELECT $1::uuid, 0
+            UNION ALL
+            SELECT asset.parent_asset_id, ancestors.depth + 1
+            FROM ancestors
+            JOIN assets AS asset
+              ON asset.id = ancestors.id AND asset.tenant_id = $2
+            WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+         )
+         SELECT permission.permission
+         FROM resource_permissions AS permission
+         JOIN ancestors
+           ON permission.asset_id = ancestors.id AND permission.tenant_id = $2
+         WHERE permission.revoked_at IS NULL
+           AND (ancestors.depth = 0 OR permission.inherit_children = TRUE)
+           AND (
+                permission.subject_user_id = $3
+                OR EXISTS (
+                    SELECT 1
+                    FROM user_group_members AS membership
+                    WHERE membership.tenant_id = permission.tenant_id
+                      AND membership.group_id = permission.subject_group_id
+                      AND membership.user_id = $3
+                )
+           )",
+    )
+    .bind(asset_id)
+    .bind(subject.tenant_id)
+    .bind(subject.user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(strongest_resource_permission(rows))
+}
+
 fn parse_authorized_device_timestamp(value: &str) -> Result<DateTime<Utc>, PlatformStoreError> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
@@ -8007,8 +8174,9 @@ const SQLITE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
     "asset_profiles",
     "device_profiles",
     "assets",
-    "resource_shares",
-    "resource_grants",
+    "user_groups",
+    "user_group_members",
+    "resource_permissions",
     "device_tokens",
     "alert_rules",
     "alert_rule_event_evaluations",
@@ -8034,7 +8202,9 @@ const SQLITE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "asset_profiles",
     "device_profiles",
     "assets",
-    "resource_grants",
+    "user_groups",
+    "user_group_members",
+    "resource_permissions",
     "alert_rules",
     "alert_rule_event_evaluations",
     "alert_incidents",
@@ -8059,8 +8229,9 @@ const TIMESCALE_PLATFORM_SCHEMA_TABLES: &[&str] = &[
     "assets",
     "devices",
     "device_tokens",
-    "resource_shares",
-    "resource_grants",
+    "user_groups",
+    "user_group_members",
+    "resource_permissions",
     "device_runtime_state",
     "telemetry",
     "alert_rules",
@@ -8084,7 +8255,9 @@ const TIMESCALE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "device_profiles",
     "assets",
     "devices",
-    "resource_grants",
+    "user_groups",
+    "user_group_members",
+    "resource_permissions",
     "device_runtime_state",
     "telemetry",
     "gateway_event_receipts",
@@ -8094,6 +8267,8 @@ const TIMESCALE_PLATFORM_TENANT_TABLES: &[&str] = &[
     "notification_outbox",
     "command_outbox",
 ];
+
+const LEGACY_RESOURCE_AUTHORIZATION_TABLES: &[&str] = &["resource_grants", "resource_shares"];
 
 async fn pre_tenant_platform_sqlite_table(
     pool: &SqlitePool,
@@ -8106,6 +8281,12 @@ async fn pre_tenant_platform_sqlite_table(
     )
     .fetch_all(pool)
     .await?;
+    if let Some(table) = tables
+        .iter()
+        .find(|table| LEGACY_RESOURCE_AUTHORIZATION_TABLES.contains(&table.as_str()))
+    {
+        return Ok(Some(table.clone()));
+    }
     let platform_tables = tables
         .into_iter()
         .filter(|table| SQLITE_PLATFORM_SCHEMA_TABLES.contains(&table.as_str()))
@@ -8329,6 +8510,12 @@ async fn pre_tenant_platform_timescale_table(
     )
     .fetch_all(&mut **transaction)
     .await?;
+    if let Some(table) = tables
+        .iter()
+        .find(|table| LEGACY_RESOURCE_AUTHORIZATION_TABLES.contains(&table.as_str()))
+    {
+        return Ok(Some(table.clone()));
+    }
     let platform_tables = tables
         .into_iter()
         .filter(|table| TIMESCALE_PLATFORM_SCHEMA_TABLES.contains(&table.as_str()))
@@ -9714,29 +9901,7 @@ async fn migrate_resource_authorization_schema(pool: &SqlitePool) -> Result<(), 
              WHERE owner_user_id IS NOT NULL;
          CREATE INDEX IF NOT EXISTS assets_owner_user_id_index
              ON assets (owner_user_id)
-             WHERE owner_user_id IS NOT NULL;
-         CREATE TABLE IF NOT EXISTS resource_shares (
-             id TEXT PRIMARY KEY,
-             resource_type TEXT NOT NULL CHECK (resource_type IN ('asset', 'device')),
-             resource_id TEXT NOT NULL,
-             target_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-             permission TEXT NOT NULL CHECK (permission IN ('viewer', 'controller', 'manager')),
-             inherit_children INTEGER NOT NULL DEFAULT 0 CHECK (inherit_children IN (0, 1)),
-             state TEXT NOT NULL CHECK (
-                 state IN ('pending', 'active', 'declined', 'cancelled', 'expired')
-             ),
-             created_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-             responded_at TEXT,
-             expires_at TEXT
-         );
-         CREATE UNIQUE INDEX IF NOT EXISTS resource_shares_one_pending_index
-             ON resource_shares (resource_type, resource_id, target_user_id)
-             WHERE state = 'pending';
-         CREATE INDEX IF NOT EXISTS resource_shares_target_state_index
-             ON resource_shares (target_user_id, state, created_at DESC);
-         CREATE INDEX IF NOT EXISTS resource_shares_resource_state_index
-             ON resource_shares (resource_type, resource_id, state);",
+             WHERE owner_user_id IS NOT NULL;",
     )
     .execute(pool)
     .await

@@ -11,9 +11,9 @@ use axum::{
 use chrono::Utc;
 use iot_core::RpcMode;
 use iot_storage::{
-    AccountClass, AuthorizationRepository, NewPublicAsset, NewPublicDevice, NewPublicResourceGrant,
+    AccountClass, AuthorizationRepository, NewPublicAsset, NewPublicDevice,
     PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice,
-    PublicDeviceError, PublicPrincipal, PublicResourceGrant, PublicTelemetry, ResourcePermission,
+    PublicDeviceError, PublicPrincipal, PublicTelemetry, ResourcePermission,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,14 +73,6 @@ where
             axum::routing::post(create_command),
         )
         .route("/api/v1/commands/{command_id}", get(get_command))
-        .route(
-            "/api/v1/resource-grants",
-            get(list_grants).post(create_grant),
-        )
-        .route(
-            "/api/v1/resource-grants/{grant_id}",
-            get(get_grant).patch(update_grant).delete(delete_grant),
-        )
         .layer(Extension(context))
 }
 
@@ -715,28 +707,6 @@ struct AlertResponse {
     updated_at: chrono::DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
-struct GrantResponse {
-    id: Uuid,
-    resource_type: String,
-    resource_id: String,
-    grantee_type: String,
-    grantee_id: String,
-    permission: String,
-    created_by_user_id: Option<Uuid>,
-    created_at: chrono::DateTime<Utc>,
-    updated_at: chrono::DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GrantRequest {
-    resource_type: String,
-    resource_id: String,
-    grantee_type: String,
-    grantee_id: String,
-    permission: String,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct PublicCursor {
     version: u8,
@@ -947,127 +917,6 @@ async fn acknowledge_alert(
     Ok(Json(alert_response(alert)))
 }
 
-async fn list_grants(
-    Extension(context): Extension<PublicApiContext>,
-    headers: HeaderMap,
-    Query(query): Query<PublicPageQuery>,
-) -> Result<Json<PublicPage<GrantResponse>>, PublicApiError> {
-    let (store, principal) = authenticate(&context, &headers, "authorization:read").await?;
-    let limit = limit(query.limit)?;
-    let after = decode_cursor(
-        &context.token_vault,
-        &principal,
-        "grants",
-        query.after.as_deref(),
-    )?;
-    let mut rows = PublicApiRepository::list_public_grants(
-        store.as_ref(),
-        &principal,
-        after.as_deref(),
-        u32::try_from(limit.saturating_add(1)).map_err(|_| PublicApiError::BadRequest)?,
-    )
-    .await
-    .map_err(|_| PublicApiError::Unavailable)?;
-    let has_more = rows.len() > limit;
-    rows.truncate(limit);
-    let next_cursor = rows
-        .last()
-        .map(|row| {
-            encode_cursor(
-                &context.token_vault,
-                &principal,
-                "grants",
-                row.id.to_string(),
-            )
-        })
-        .transpose()?;
-    Ok(Json(PublicPage {
-        items: rows.into_iter().map(grant_response).collect(),
-        next_cursor: if has_more { next_cursor } else { None },
-        has_more,
-    }))
-}
-
-async fn get_grant(
-    Extension(context): Extension<PublicApiContext>,
-    headers: HeaderMap,
-    Path(grant_id): Path<String>,
-) -> Result<Json<GrantResponse>, PublicApiError> {
-    let (store, principal) = authenticate(&context, &headers, "authorization:read").await?;
-    let grant_id = grant_id.parse().map_err(|_| PublicApiError::BadRequest)?;
-    let grant = PublicApiRepository::get_public_grant(store.as_ref(), &principal, grant_id)
-        .await
-        .map_err(|_| PublicApiError::Unavailable)?
-        .ok_or(PublicApiError::Forbidden)?;
-    Ok(Json(grant_response(grant)))
-}
-
-async fn create_grant(
-    Extension(context): Extension<PublicApiContext>,
-    headers: HeaderMap,
-    Json(request): Json<GrantRequest>,
-) -> Result<(axum::http::StatusCode, Json<GrantResponse>), PublicApiError> {
-    let (store, principal) = authenticate(&context, &headers, "authorization:write").await?;
-    let grant = PublicApiRepository::create_public_grant(
-        store.as_ref(),
-        &principal,
-        NewPublicResourceGrant {
-            resource_type: request.resource_type,
-            resource_id: request.resource_id,
-            grantee_type: request.grantee_type,
-            grantee_id: request.grantee_id,
-            permission: request.permission,
-        },
-    )
-    .await
-    .map_err(|_| PublicApiError::Unavailable)?
-    .ok_or(PublicApiError::Forbidden)?;
-    Ok((axum::http::StatusCode::CREATED, Json(grant_response(grant))))
-}
-
-async fn update_grant(
-    Extension(context): Extension<PublicApiContext>,
-    headers: HeaderMap,
-    Path(grant_id): Path<String>,
-    Json(request): Json<GrantRequest>,
-) -> Result<Json<GrantResponse>, PublicApiError> {
-    let (store, principal) = authenticate(&context, &headers, "authorization:write").await?;
-    let grant_id = grant_id.parse().map_err(|_| PublicApiError::BadRequest)?;
-    let grant = PublicApiRepository::update_public_grant(
-        store.as_ref(),
-        &principal,
-        grant_id,
-        NewPublicResourceGrant {
-            resource_type: request.resource_type,
-            resource_id: request.resource_id,
-            grantee_type: request.grantee_type,
-            grantee_id: request.grantee_id,
-            permission: request.permission,
-        },
-    )
-    .await
-    .map_err(|_| PublicApiError::Unavailable)?
-    .ok_or(PublicApiError::Forbidden)?;
-    Ok(Json(grant_response(grant)))
-}
-
-async fn delete_grant(
-    Extension(context): Extension<PublicApiContext>,
-    headers: HeaderMap,
-    Path(grant_id): Path<String>,
-) -> Result<axum::http::StatusCode, PublicApiError> {
-    let (store, principal) = authenticate(&context, &headers, "authorization:write").await?;
-    let grant_id = grant_id.parse().map_err(|_| PublicApiError::BadRequest)?;
-    if PublicApiRepository::delete_public_grant(store.as_ref(), &principal, grant_id)
-        .await
-        .map_err(|_| PublicApiError::Unavailable)?
-    {
-        Ok(axum::http::StatusCode::NO_CONTENT)
-    } else {
-        Err(PublicApiError::Forbidden)
-    }
-}
-
 fn telemetry_response(row: PublicTelemetry) -> TelemetryResponse {
     TelemetryResponse {
         event_at: row.event_at,
@@ -1094,20 +943,6 @@ fn alert_response(row: PublicAlert) -> AlertResponse {
         acknowledged_at: row.acknowledged_at,
         acknowledged_by: row.acknowledged_by,
         last_value: row.last_value,
-        updated_at: row.updated_at,
-    }
-}
-
-fn grant_response(row: PublicResourceGrant) -> GrantResponse {
-    GrantResponse {
-        id: row.id,
-        resource_type: row.resource_type,
-        resource_id: row.resource_id,
-        grantee_type: row.grantee_type,
-        grantee_id: row.grantee_id,
-        permission: row.permission,
-        created_by_user_id: row.created_by_user_id,
-        created_at: row.created_at,
         updated_at: row.updated_at,
     }
 }
