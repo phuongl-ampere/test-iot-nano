@@ -396,6 +396,17 @@ async fn sqlite_writer_persists_idempotent_telemetry_and_rollups() {
         sqlite_busy_timeout_ms: 5_000,
     };
     let store = SqliteStore::open(&configuration).await.unwrap();
+    let tenant_id = Uuid::from_u128(20_001);
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'sqlite-writer', 'active')")
+        .bind(tenant_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('device-1', ?)")
+        .bind(tenant_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
     let event = TelemetryEvent {
         schema_version: 1,
         device_id: "device-1".to_owned(),
@@ -411,13 +422,13 @@ async fn sqlite_writer_persists_idempotent_telemetry_and_rollups() {
 
     assert!(
         store
-            .write_telemetry(&event, event.event_at, "topic")
+            .write_telemetry(tenant_id, &event, event.event_at, "topic")
             .await
             .unwrap()
     );
     assert!(
         !store
-            .write_telemetry(&event, event.event_at, "topic")
+            .write_telemetry(tenant_id, &event, event.event_at, "topic")
             .await
             .unwrap()
     );
