@@ -6,7 +6,7 @@ use axum::{
     extract::ConnectInfo,
     http::{
         HeaderMap, HeaderValue, Request, StatusCode,
-        header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
+        header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
     },
 };
 use iot_api::{OAuthBrowserSessionVerifier, TokenVault, hash_password};
@@ -166,6 +166,169 @@ async fn management_user_cookie(router: &axum::Router, username: &str, password:
         .next()
         .unwrap()
         .to_owned()
+}
+
+async fn system_account_cookie(router: &axum::Router) -> String {
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"system","password":"SystemAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+async fn user_account_cookie(router: &axum::Router) -> String {
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/user/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"test","username":"viewer","password":"NanoView@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn platform_get(path: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut request = Request::builder().uri(path);
+    if let Some(cookie) = cookie {
+        request = request.header(COOKIE, cookie);
+    }
+    request.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn platform_root_redirects_each_authenticated_session_kind_to_its_workspace() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for (cookie, destination) in [
+        (&system_cookie, "/system"),
+        (&tenant_cookie, "/tenant"),
+        (&user_cookie, "/app"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(platform_get("/", Some(cookie)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()[LOCATION], destination);
+    }
+}
+
+#[tokio::test]
+async fn platform_routes_deny_unauthenticated_and_cross_kind_sessions() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for path in ["/", "/system", "/tenant", "/app"] {
+        let response = router
+            .clone()
+            .oneshot(platform_get(path, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    for (cookie, path) in [
+        (&system_cookie, "/tenant"),
+        (&system_cookie, "/app"),
+        (&tenant_cookie, "/system"),
+        (&tenant_cookie, "/app"),
+        (&user_cookie, "/system"),
+        (&user_cookie, "/tenant"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(platform_get(path, Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn platform_routes_render_the_matching_server_layout_and_local_css() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for (cookie, path, heading) in [
+        (&system_cookie, "/system", "System Console"),
+        (&tenant_cookie, "/tenant", "Tenant Console"),
+        (&user_cookie, "/app", "My Workspace"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(platform_get(path, Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(
+            response.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "{path}"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains(heading), "{path}");
+        assert!(body.contains("/assets/platform-ui.css"), "{path}");
+    }
+
+    let stylesheet = router
+        .oneshot(platform_get("/assets/platform-ui.css", None))
+        .await
+        .unwrap();
+    assert_eq!(stylesheet.status(), StatusCode::OK);
+    assert!(
+        stylesheet.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    let body = to_bytes(stylesheet.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains(".console-shell"));
 }
 
 #[tokio::test]

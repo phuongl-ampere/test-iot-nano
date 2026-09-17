@@ -2,6 +2,10 @@ use askama::Template;
 
 const PLATFORM_UI_STYLESHEET: &str = include_str!("../assets/platform-ui.css");
 
+pub(crate) fn stylesheet() -> &'static str {
+    PLATFORM_UI_STYLESHEET
+}
+
 /// A display-only identity value for a server-rendered platform page.
 ///
 /// Askama HTML-escapes this value in every layout. Authorization and session
@@ -45,15 +49,11 @@ impl PlatformUiRenderer {
 #[template(path = "platform_ui/system.html")]
 pub struct SystemLayout<'a> {
     identity: &'a PlatformUiIdentity,
-    stylesheet: &'static str,
 }
 
 impl<'a> SystemLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity) -> Self {
-        Self {
-            identity,
-            stylesheet: PLATFORM_UI_STYLESHEET,
-        }
+        Self { identity }
     }
 }
 
@@ -61,15 +61,11 @@ impl<'a> SystemLayout<'a> {
 #[template(path = "platform_ui/tenant.html")]
 pub struct TenantLayout<'a> {
     identity: &'a PlatformUiIdentity,
-    stylesheet: &'static str,
 }
 
 impl<'a> TenantLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity) -> Self {
-        Self {
-            identity,
-            stylesheet: PLATFORM_UI_STYLESHEET,
-        }
+        Self { identity }
     }
 }
 
@@ -77,14 +73,10 @@ impl<'a> TenantLayout<'a> {
 #[template(path = "platform_ui/user.html")]
 pub struct UserLayout<'a> {
     identity: &'a PlatformUiIdentity,
-    stylesheet: &'static str,
 }
 
 impl<'a> UserLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity) -> Self {
-        Self {
-            identity,
-            stylesheet: PLATFORM_UI_STYLESHEET,
-        }
+        Self { identity }
     }
 }

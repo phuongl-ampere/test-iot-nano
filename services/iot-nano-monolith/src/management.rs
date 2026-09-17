@@ -11,9 +11,9 @@ use axum::{
     extract::{ConnectInfo, FromRequest, Path, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{COOKIE, SET_COOKIE},
+        header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post, put},
 };
 use iot_api::{
@@ -116,6 +116,11 @@ impl ManagementSessionRouter {
             authorization_test_hooks: None,
         };
         let router = Router::new()
+            .route("/", get(platform_root))
+            .route("/system", get(platform_system))
+            .route("/tenant", get(platform_tenant))
+            .route("/app", get(platform_app))
+            .route("/assets/platform-ui.css", get(platform_stylesheet))
             .route("/api/auth/login", post(login))
             .route("/api/auth/logout", post(logout))
             .route("/api/auth/me", get(current_session))
@@ -1092,6 +1097,35 @@ impl ManagementSessionVerifier {
         })
     }
 
+    fn platform_session(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<PlatformUiSession, ManagementSessionError> {
+        let session_id = session_id(headers).ok_or(ManagementSessionError::Unauthorized)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired_sessions(&mut sessions);
+        let session = sessions
+            .get(session_id)
+            .ok_or(ManagementSessionError::Unauthorized)?;
+
+        if let Some(system_account_id) = session.system_account_id {
+            return Ok(PlatformUiSession::System { system_account_id });
+        }
+        if session.tenant_account_id.is_some()
+            && let Some(tenant_id) = session.tenant_id
+        {
+            return Ok(PlatformUiSession::Tenant { tenant_id });
+        }
+        if let (Some(user_id), Some(tenant_id)) = (session.user_id, session.tenant_id) {
+            return Ok(PlatformUiSession::User { user_id, tenant_id });
+        }
+
+        Err(ManagementSessionError::Forbidden)
+    }
+
     fn invalidate_tenant(&self, tenant_id: Uuid) {
         let mut sessions = self
             .sessions
@@ -1323,6 +1357,12 @@ struct TenantSession {
 struct UserSession {
     user_id: Uuid,
     tenant_id: Uuid,
+}
+
+enum PlatformUiSession {
+    System { system_account_id: Uuid },
+    Tenant { tenant_id: Uuid },
+    User { user_id: Uuid, tenant_id: Uuid },
 }
 
 enum ManagementAuthorization {
@@ -1878,6 +1918,81 @@ async fn current_user_session(
         user_id: session.user_id,
         tenant_id: session.tenant_id,
     }))
+}
+
+async fn platform_root(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Redirect, ManagementSessionError> {
+    match state.session_verifier.platform_session(&headers)? {
+        PlatformUiSession::System { .. } => Ok(Redirect::to("/system")),
+        PlatformUiSession::Tenant { .. } => Ok(Redirect::to("/tenant")),
+        PlatformUiSession::User { .. } => Ok(Redirect::to("/app")),
+    }
+}
+
+async fn platform_system(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let PlatformUiSession::System { system_account_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    platform_page(PlatformUiSession::System { system_account_id })
+}
+
+async fn platform_tenant(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let PlatformUiSession::Tenant { tenant_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    platform_page(PlatformUiSession::Tenant { tenant_id })
+}
+
+async fn platform_app(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let PlatformUiSession::User { user_id, tenant_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    platform_page(PlatformUiSession::User { user_id, tenant_id })
+}
+
+fn platform_page(session: PlatformUiSession) -> Result<Html<String>, ManagementSessionError> {
+    let rendered = match session {
+        PlatformUiSession::System { system_account_id } => {
+            crate::PlatformUiRenderer::render_system(&crate::PlatformUiIdentity::new(format!(
+                "System Account {system_account_id}"
+            )))
+        }
+        PlatformUiSession::Tenant { tenant_id } => crate::PlatformUiRenderer::render_tenant(
+            &crate::PlatformUiIdentity::new(format!("Tenant {tenant_id}")),
+        ),
+        PlatformUiSession::User { user_id, tenant_id } => crate::PlatformUiRenderer::render_user(
+            &crate::PlatformUiIdentity::new(format!("User {user_id} (tenant {tenant_id})")),
+        ),
+    }
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn platform_stylesheet() -> ([(axum::http::HeaderName, HeaderValue); 1], &'static str) {
+    (
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/css; charset=utf-8"),
+        )],
+        crate::platform_ui::stylesheet(),
+    )
 }
 
 async fn create_system_tenant(
