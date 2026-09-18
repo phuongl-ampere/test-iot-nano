@@ -1,7 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    AccountClass, CreateManagementUser, ManagementUserError, ManagementUserRepository,
-    ManagementUserRole, PlatformStore, UpdateManagementUser,
+    AccountClass, BUILT_IN_USER_WORKSPACE, CreateManagementUser, ManagementUserError,
+    ManagementUserRepository, ManagementUserRole, PlatformStore, UpdateManagementUser,
 };
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
@@ -403,6 +403,71 @@ async fn sqlite_management_user_repository_rejects_duplicate_granted_apps() {
 }
 
 #[tokio::test]
+async fn sqlite_management_user_repository_keeps_builtin_workspace_users_grant_free() {
+    let (_directory, store) = sqlite_store().await;
+
+    let workspace_user = ManagementUserRepository::create_management_user(
+        &store,
+        CreateManagementUser {
+            tenant_id: test_tenant_id(),
+            username: "workspace-user".to_owned(),
+            password_hash: "stored-password-hash".to_owned(),
+            default_app: BUILT_IN_USER_WORKSPACE.to_owned(),
+            granted_apps: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(workspace_user.default_app, BUILT_IN_USER_WORKSPACE);
+    assert!(workspace_user.granted_apps.is_empty());
+
+    let create_with_grant = ManagementUserRepository::create_management_user(
+        &store,
+        CreateManagementUser {
+            tenant_id: test_tenant_id(),
+            username: "workspace-with-grant".to_owned(),
+            password_hash: "stored-password-hash".to_owned(),
+            default_app: BUILT_IN_USER_WORKSPACE.to_owned(),
+            granted_apps: vec!["fleet".to_owned()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        create_with_grant,
+        ManagementUserError::InvalidGrantedApps
+    ));
+
+    let external_user =
+        ManagementUserRepository::create_management_user(&store, user_creation("alice"))
+            .await
+            .unwrap();
+    let update_with_grant = ManagementUserRepository::update_management_user(
+        &store,
+        test_tenant_id(),
+        "alice",
+        UpdateManagementUser {
+            default_app: BUILT_IN_USER_WORKSPACE.to_owned(),
+            granted_apps: vec!["fleet".to_owned()],
+            role: Some(ManagementUserRole::Admin),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        update_with_grant,
+        ManagementUserError::InvalidGrantedApps
+    ));
+    let alice = ManagementUserRepository::list_management_users(&store, test_tenant_id())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|user| user.username == "alice")
+        .unwrap();
+    assert_eq!(alice, external_user);
+}
+
+#[tokio::test]
 async fn sqlite_management_user_repository_returns_typed_input_conflict_and_not_found_errors() {
     let (_directory, store) = sqlite_store().await;
 
@@ -612,6 +677,63 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
         .unwrap();
     assert_eq!(created.role, ManagementUserRole::Viewer);
     assert_eq!(created.granted_apps, ["fleet", "powermonitor"]);
+
+    let workspace_user = ManagementUserRepository::create_management_user(
+        &store,
+        CreateManagementUser {
+            tenant_id: test_tenant_id(),
+            username: "workspace-user".to_owned(),
+            password_hash: "stored-password-hash".to_owned(),
+            default_app: BUILT_IN_USER_WORKSPACE.to_owned(),
+            granted_apps: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(workspace_user.default_app, BUILT_IN_USER_WORKSPACE);
+    assert!(workspace_user.granted_apps.is_empty());
+
+    let create_with_grant = ManagementUserRepository::create_management_user(
+        &store,
+        CreateManagementUser {
+            tenant_id: test_tenant_id(),
+            username: "workspace-with-grant".to_owned(),
+            password_hash: "stored-password-hash".to_owned(),
+            default_app: BUILT_IN_USER_WORKSPACE.to_owned(),
+            granted_apps: vec!["fleet".to_owned()],
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        create_with_grant,
+        ManagementUserError::InvalidGrantedApps
+    ));
+
+    let update_with_grant = ManagementUserRepository::update_management_user(
+        &store,
+        test_tenant_id(),
+        "alice",
+        UpdateManagementUser {
+            default_app: BUILT_IN_USER_WORKSPACE.to_owned(),
+            granted_apps: vec!["fleet".to_owned()],
+            role: Some(ManagementUserRole::Admin),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        update_with_grant,
+        ManagementUserError::InvalidGrantedApps
+    ));
+    let alice_after_invalid_update =
+        ManagementUserRepository::list_management_users(&store, test_tenant_id())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.username == "alice")
+            .unwrap();
+    assert_eq!(alice_after_invalid_update, created);
 
     let updated = ManagementUserRepository::update_management_user(
         &store,

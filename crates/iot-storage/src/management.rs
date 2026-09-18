@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::{AccountClass, PlatformStore, PlatformStoreError};
 
+pub const BUILT_IN_USER_WORKSPACE: &str = "/app";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagementUserRole {
     Admin,
@@ -1149,6 +1151,13 @@ fn validate_management_user_apps(
     default_app: &str,
     granted_apps: &[String],
 ) -> Result<(), ManagementUserError> {
+    if default_app == BUILT_IN_USER_WORKSPACE {
+        return if granted_apps.is_empty() {
+            Ok(())
+        } else {
+            Err(ManagementUserError::InvalidGrantedApps)
+        };
+    }
     let Some(default_app_key) = default_app.strip_prefix("/apps/") else {
         return Err(ManagementUserError::InvalidDefaultApp(
             default_app.to_owned(),

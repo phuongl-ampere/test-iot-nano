@@ -43,16 +43,16 @@ pub use device_relations::{
     RESERVED_GATEWAY_CHILD_RELATION_TYPE,
 };
 pub use management::{
-    CreateManagementAsset, CreateManagementAssetProfile, CreateManagementDeviceProfile,
-    CreateManagementUser, DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError,
-    ManagementAsset, ManagementAssetError, ManagementAssetProfile, ManagementAssetProfileError,
-    ManagementAssetProfileRepository, ManagementAssetRepository, ManagementChildStatus,
-    ManagementDevice, ManagementDeviceError, ManagementDeviceHealth, ManagementDeviceProfile,
-    ManagementDeviceProfileError, ManagementDeviceProfileRepository, ManagementDeviceRepository,
-    ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser, ManagementUserError,
-    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOwnedDeviceToken,
-    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser,
+    BUILT_IN_USER_WORKSPACE, CreateManagementAsset, CreateManagementAssetProfile,
+    CreateManagementDeviceProfile, CreateManagementUser, DeviceTokenRecord, DeviceTokenRepository,
+    DeviceTokenRepositoryError, ManagementAsset, ManagementAssetError, ManagementAssetProfile,
+    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
+    ManagementChildStatus, ManagementDevice, ManagementDeviceError, ManagementDeviceHealth,
+    ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
+    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
+    ManagementUserError, ManagementUserRepository, ManagementUserRole, NewDeviceToken,
+    NewOwnedDeviceToken, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, PublicAlert, PublicApiRepository, PublicAsset,

@@ -3928,6 +3928,113 @@ async fn tenant_user_page_lists_and_creates_normal_users() {
 }
 
 #[tokio::test]
+async fn system_created_tenant_can_create_and_sign_in_a_user_from_the_platform_forms() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+
+    let tenant_created = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants",
+            Some(&system_cookie),
+            "slug=fresh-tenant&tenant_account_password=FreshTenant%402026",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tenant_created.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        tenant_created.headers()[LOCATION],
+        "/system?notice=tenant-created"
+    );
+
+    let tenant_login = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/login/tenant",
+            None,
+            "tenant_slug=fresh-tenant&password=FreshTenant%402026",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tenant_login.status(), StatusCode::SEE_OTHER);
+    assert_eq!(tenant_login.headers()[LOCATION], "/tenant");
+    let tenant_cookie = tenant_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let user_created = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/users",
+            Some(&tenant_cookie),
+            "username=fresh-user&password=FreshUser%402026",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(user_created.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        user_created.headers()[LOCATION],
+        "/tenant/users?notice=user-created"
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT default_app
+             FROM users
+             JOIN tenants ON tenants.id = users.tenant_id
+             WHERE tenants.slug = 'fresh-tenant' AND users.username = 'fresh-user'",
+        )
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        "/app"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)
+             FROM user_app_grants
+             JOIN users ON users.id = user_app_grants.user_id
+             JOIN tenants ON tenants.id = users.tenant_id
+             WHERE tenants.slug = 'fresh-tenant' AND users.username = 'fresh-user'",
+        )
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        0
+    );
+
+    let user_login = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/login/user",
+            None,
+            "tenant_slug=fresh-tenant&username=fresh-user&password=FreshUser%402026",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(user_login.status(), StatusCode::SEE_OTHER);
+    assert_eq!(user_login.headers()[LOCATION], "/app");
+    let user_cookie = user_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let app = router
+        .oneshot(platform_get("/app", Some(&user_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(app.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn tenant_user_page_hides_other_tenant_users_and_rejects_tenant_form_values() {
     let (_directory, store, management) = management_session_router_with_store().await;
     let router = management.router;
