@@ -32,6 +32,7 @@ use tokio::{
 use uuid::Uuid;
 
 const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 struct MonolithMqttFixture {
     _directory: tempfile::TempDir,
@@ -134,6 +135,7 @@ impl DeviceAuthorizationPort for AllowingAuthorization {
             }
             Ok(AuthenticatedDevice {
                 token_id: Uuid::parse_str("018f68d1-cc91-7000-8000-000000000001").unwrap(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "meter-a".to_owned(),
                 is_gateway: false,
             })
@@ -301,6 +303,7 @@ async fn shared_router_waits_for_puback_records_response_and_honors_revocation()
     let publish = tokio::spawn(async move {
         command_transport
             .publish(TransportRpcPublishRequest {
+                tenant_id: TEST_TENANT_ID,
                 device_id: "meter-a".to_owned(),
                 id: command_id,
                 method: "sample_now".to_owned(),
@@ -354,6 +357,7 @@ async fn shared_router_waits_for_puback_records_response_and_honors_revocation()
     let now = Utc::now();
     let revoked_transport = PlatformCommandTransport::new(router, fixture.authorization.clone());
     let revoked = revoked_transport.publish(TransportRpcPublishRequest {
+        tenant_id: TEST_TENANT_ID,
         device_id: "meter-a".to_owned(),
         id: Uuid::now_v7(),
         method: "sample_now".to_owned(),

@@ -13,6 +13,8 @@ use iot_storage::PlatformStore;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 async fn fixture() -> (
     tempfile::TempDir,
     Arc<PlatformStore>,
@@ -33,9 +35,19 @@ async fn fixture() -> (
         .unwrap(),
     );
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway, gateway_device_id)
-         VALUES ('direct', 0, NULL), ('gateway', 1, NULL), ('child', 0, 'gateway')",
+        "INSERT INTO tenants (id, slug, status, metadata)\n         VALUES (?, 'device-authorization', 'active', '{}')",
     )
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
+         VALUES ('direct', ?, 0, NULL), ('gateway', ?, 1, NULL), ('child', ?, 0, 'gateway')",
+    )
+    .bind(TEST_TENANT_ID.to_string())
+    .bind(TEST_TENANT_ID.to_string())
+    .bind(TEST_TENANT_ID.to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -108,6 +120,7 @@ async fn monolith_device_authorization_uses_storage_without_http_and_preserves_g
         .unwrap();
     adapter.authorize_session(gateway.clone()).await.unwrap();
     let request = GatewayAuthorizationRequest {
+        tenant_id: TEST_TENANT_ID,
         gateway_device_id: "gateway".to_owned(),
         token_id: gateway_id,
         child_device_id: Some("child".to_owned()),
@@ -120,6 +133,7 @@ async fn monolith_device_authorization_uses_storage_without_http_and_preserves_g
             .await
             .unwrap(),
         GatewayAuthorization {
+            tenant_id: request.tenant_id,
             gateway_device_id: request.gateway_device_id.clone(),
             token_id: request.token_id,
             child_device_id: request.child_device_id.clone(),
@@ -137,6 +151,7 @@ async fn monolith_device_authorization_uses_storage_without_http_and_preserves_g
             .await
             .unwrap(),
         GatewayAuthorization {
+            tenant_id: no_child_request.tenant_id,
             gateway_device_id: no_child_request.gateway_device_id,
             token_id: no_child_request.token_id,
             child_device_id: None,
@@ -169,6 +184,7 @@ async fn monolith_device_authorization_maps_denials_and_storage_failures() {
         adapter
             .authorize_session(AuthenticatedDevice {
                 token_id: gateway_id,
+                tenant_id: TEST_TENANT_ID,
                 device_id: "child".to_owned(),
                 is_gateway: false,
             })
@@ -178,6 +194,7 @@ async fn monolith_device_authorization_maps_denials_and_storage_failures() {
     assert!(matches!(
         adapter
             .authorize_gateway_uplink(GatewayAuthorizationRequest {
+                tenant_id: TEST_TENANT_ID,
                 gateway_device_id: "wrong".to_owned(),
                 token_id: gateway_id,
                 child_device_id: None,
@@ -196,6 +213,7 @@ async fn monolith_device_authorization_maps_denials_and_storage_failures() {
         unavailable
             .authorize_session(AuthenticatedDevice {
                 token_id: gateway_id,
+                tenant_id: TEST_TENANT_ID,
                 device_id: "direct".to_owned(),
                 is_gateway: false,
             })

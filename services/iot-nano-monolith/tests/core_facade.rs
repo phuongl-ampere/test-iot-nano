@@ -44,6 +44,7 @@ fn command_request(
 ) -> CoreCommandCreateRequest {
     CoreCommandCreateRequest {
         id,
+        tenant_id: TEST_TENANT_ID,
         device_id: device_id.to_owned(),
         method: "device_read".to_owned(),
         params,
@@ -125,11 +126,15 @@ async fn sqlite_core_facade_replays_matching_commands_and_rejects_conflicts() {
     assert_eq!(replay.id, command_id);
     assert_eq!(replay.device_id, "facade-device");
     assert_eq!(
-        facade.get_command(command_id).await.unwrap().mode,
+        facade
+            .get_command(TEST_TENANT_ID, command_id)
+            .await
+            .unwrap()
+            .mode,
         RpcMode::TwoWay
     );
     assert!(matches!(
-        facade.get_command(Uuid::now_v7()).await,
+        facade.get_command(TEST_TENANT_ID, Uuid::now_v7()).await,
         Err(CoreFacadeError::NotFound)
     ));
 
@@ -176,6 +181,7 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
 
     let response = CoreCommandResponseRequest {
         command_id,
+        tenant_id: TEST_TENANT_ID,
         device_id: "facade-device".to_owned(),
         token_id,
         response: json!({"ok": true, "value": 42}),
@@ -187,13 +193,18 @@ async fn sqlite_core_facade_records_idempotent_responses_and_reads_telemetry_buc
         .unwrap();
     facade.record_command_response(response).await.unwrap();
     assert_eq!(
-        facade.get_command(command_id).await.unwrap().response,
+        facade
+            .get_command(TEST_TENANT_ID, command_id)
+            .await
+            .unwrap()
+            .response,
         Some(json!({"ok": true, "value": 42}))
     );
     assert!(matches!(
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id,
+                tenant_id: TEST_TENANT_ID,
                 device_id: "facade-device".to_owned(),
                 token_id,
                 response: json!({"ok": false}),
@@ -294,6 +305,7 @@ async fn sqlite_core_facade_rejects_invalid_queries_and_unpublished_responses() 
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id: Uuid::now_v7(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "facade-device".to_owned(),
                 token_id,
                 response: json!({"ok": true}),
@@ -346,6 +358,7 @@ async fn sqlite_core_facade_rejects_response_for_a_revoked_token() {
         facade
             .record_command_response(CoreCommandResponseRequest {
                 command_id,
+                tenant_id: TEST_TENANT_ID,
                 device_id: "facade-device".to_owned(),
                 token_id: revoked_token_id,
                 response: json!({"ok": true}),
@@ -354,7 +367,10 @@ async fn sqlite_core_facade_rejects_response_for_a_revoked_token() {
             .await,
         Err(CoreFacadeError::Rejected(409))
     ));
-    let command = facade.get_command(command_id).await.unwrap();
+    let command = facade
+        .get_command(TEST_TENANT_ID, command_id)
+        .await
+        .unwrap();
     assert_eq!(command.state, "published_to_broker");
     assert_eq!(command.response, None);
 }

@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 const DEVICE_TOKEN_USERNAME: &str = "iotd_device_token";
 const FIXTURE_CERTIFICATE_VALID_TIME: u64 = 1_790_000_000;
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 #[derive(Debug)]
 struct FixtureCertificateVerifier {
@@ -119,6 +120,7 @@ impl DeviceAuthorizationPort for TestAuthorization {
             }
             Ok(AuthenticatedDevice {
                 token_id: Uuid::parse_str("018f68d1-cc91-7000-8000-000000000001").unwrap(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "meter-a".to_owned(),
                 is_gateway: false,
             })

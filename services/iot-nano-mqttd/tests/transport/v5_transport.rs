@@ -18,6 +18,8 @@ use tokio::{io::duplex, sync::Mutex};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 #[derive(Clone)]
 struct StaticAuthenticator;
 
@@ -33,6 +35,7 @@ impl DeviceAuthenticator for StaticAuthenticator {
             }
             Ok(AuthenticatedDevice {
                 token_id: Uuid::now_v7(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "v5-device".to_owned(),
                 is_gateway: false,
             })
@@ -55,6 +58,7 @@ impl DeviceAuthenticator for StaticGatewayAuthenticator {
             }
             Ok(AuthenticatedDevice {
                 token_id: Uuid::now_v7(),
+                tenant_id: TEST_TENANT_ID,
                 device_id: "v5-gateway".to_owned(),
                 is_gateway: true,
             })
@@ -249,7 +253,11 @@ async fn mqtt5_virtual_rpc_command_waits_for_device_puback() {
         issued_at + Duration::seconds(30),
     )
     .unwrap();
-    let publish = tokio::spawn(async move { router.publish_to_device("v5-device", request).await });
+    let publish = tokio::spawn(async move {
+        router
+            .publish_to_device(TEST_TENANT_ID, "v5-device", request)
+            .await
+    });
     let command = client.next().await.unwrap().unwrap();
     let packet_id = match command {
         Packet::Publish(publish) => {
@@ -321,7 +329,11 @@ async fn mqtt5_two_way_rpc_response_requires_matching_pending_command() {
         RpcMode::TwoWay,
     )
     .unwrap();
-    let publish = tokio::spawn(async move { router.publish_to_device("v5-device", request).await });
+    let publish = tokio::spawn(async move {
+        router
+            .publish_to_device(TEST_TENANT_ID, "v5-device", request)
+            .await
+    });
     let packet_id = match client.next().await.unwrap().unwrap() {
         Packet::Publish(publish) => publish.pkid,
         packet => panic!("expected MQTT5 RPC publish, got {packet:?}"),
@@ -396,8 +408,11 @@ async fn mqtt5_gateway_receives_child_command_on_gateway_topic() {
         issued_at + Duration::seconds(30),
     )
     .unwrap();
-    let publish =
-        tokio::spawn(async move { router.publish_to_device("v5-gateway", request).await });
+    let publish = tokio::spawn(async move {
+        router
+            .publish_to_device(TEST_TENANT_ID, "v5-gateway", request)
+            .await
+    });
     let packet_id = match client.next().await.unwrap().unwrap() {
         Packet::Publish(publish) => {
             assert!(

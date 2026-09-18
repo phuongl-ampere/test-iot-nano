@@ -4,9 +4,12 @@ use iot_nano_mqttd::{RpcSessionRouter, SessionRegistration};
 use serde_json::json;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 fn registration(device_id: &str, connection_id: &str) -> SessionRegistration {
     SessionRegistration {
         token_id: Uuid::now_v7(),
+        tenant_id: TEST_TENANT_ID,
         device_id: device_id.to_owned(),
         client_id: format!("client-{device_id}"),
         connection_id: connection_id.to_owned(),
@@ -40,7 +43,7 @@ async fn routes_a_virtual_rpc_to_only_the_target_session() {
     let router_for_publish = router.clone();
     let publish = tokio::spawn(async move {
         router_for_publish
-            .publish_to_device("device-a", request("sample_now"))
+            .publish_to_device(TEST_TENANT_ID, "device-a", request("sample_now"))
             .await
     });
 
@@ -64,7 +67,7 @@ async fn a_new_session_replaces_the_old_device_connection() {
     let router_for_publish = router.clone();
     let publish = tokio::spawn(async move {
         router_for_publish
-            .publish_to_device("device-a", request("reboot"))
+            .publish_to_device(TEST_TENANT_ID, "device-a", request("reboot"))
             .await
     });
 
@@ -85,7 +88,7 @@ async fn command_publication_waits_for_the_device_puback() {
 
     let publish = tokio::spawn(async move {
         router_for_publish
-            .publish_to_device("device-a", request("sample_now"))
+            .publish_to_device(TEST_TENANT_ID, "device-a", request("sample_now"))
             .await
     });
     let command = device.recv().await.unwrap();
