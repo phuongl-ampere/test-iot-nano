@@ -9,6 +9,7 @@
 # Local tooling
 /.codebase-memory/
 /.worktrees/
+/.cargo-lane/
 
 # Environment files
 .env

@@ -56,6 +56,33 @@ cargo test -p iot-nano-core -- --test-threads=1
 cargo test -p iot-nano-api -- --test-threads=1
 ```
 
+### Cargo lanes
+
+Use the lane wrapper for focused Rust commands. It assigns a persistent target
+directory unique to the current worktree and lane, so concurrent worktrees do
+not share Cargo fingerprints or locks.
+
+```bash
+./scripts/dev/test-cargo-lane.sh
+./scripts/dev/cargo-lane.sh fast-storage -- test -p iot-storage --test identity
+./scripts/dev/cargo-lane.sh sqlite-contract -- test -p iot-storage
+IOT_NANO_USE_SCCACHE=1 ./scripts/dev/cargo-lane.sh fast-monolith -- check -p iot-nano-monolith
+```
+
+The wrapper appends local elapsed-time entries to `.cargo-lane/timing.log`.
+Set `IOT_NANO_LANE_TARGET_ROOT` or `IOT_NANO_LANE_LOG` to override the local
+cache or timing-log locations.
+
+Run broad checks only in the release lane:
+
+```bash
+IOT_NANO_TIMESCALE_TEST_URL=postgres://... ./scripts/dev/release-verify.sh
+```
+
+The release command runs the workspace compile gate, SQLite process check,
+optional Timescale check, and external PowerMonitor contract. Without
+`IOT_NANO_TIMESCALE_TEST_URL`, it reports that the Timescale check was skipped.
+
 ## Repository Layout
 
 ```text
