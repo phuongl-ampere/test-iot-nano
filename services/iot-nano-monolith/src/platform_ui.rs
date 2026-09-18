@@ -483,11 +483,72 @@ impl UserDeviceListPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDeviceDetailPage {
     device: UserDeviceRow,
+    telemetry: Vec<UserDeviceTelemetryRow>,
+    alerts: Vec<UserDeviceAlertRow>,
+    has_telemetry: bool,
+    has_alerts: bool,
 }
 
 impl UserDeviceDetailPage {
     pub fn new(device: UserDeviceRow) -> Self {
-        Self { device }
+        Self {
+            device,
+            telemetry: Vec::new(),
+            alerts: Vec::new(),
+            has_telemetry: false,
+            has_alerts: false,
+        }
+    }
+
+    pub fn with_activity(
+        mut self,
+        telemetry: Vec<UserDeviceTelemetryRow>,
+        alerts: Vec<UserDeviceAlertRow>,
+    ) -> Self {
+        self.has_telemetry = !telemetry.is_empty();
+        self.has_alerts = !alerts.is_empty();
+        self.telemetry = telemetry;
+        self.alerts = alerts;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDeviceTelemetryRow {
+    observed_at: String,
+    measurements: String,
+}
+
+impl UserDeviceTelemetryRow {
+    pub fn new(observed_at: impl Into<String>, measurements: impl Into<String>) -> Self {
+        Self {
+            observed_at: observed_at.into(),
+            measurements: measurements.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDeviceAlertRow {
+    rule_name: String,
+    severity: String,
+    status: String,
+    updated_at: String,
+}
+
+impl UserDeviceAlertRow {
+    pub fn new(
+        rule_name: impl Into<String>,
+        severity: impl Into<String>,
+        status: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            rule_name: rule_name.into(),
+            severity: severity.into(),
+            status: status.into(),
+            updated_at: updated_at.into(),
+        }
     }
 }
 

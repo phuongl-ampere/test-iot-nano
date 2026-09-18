@@ -1844,6 +1844,36 @@ pub trait AuthorizationRepository: Send + Sync {
     >;
 }
 
+/// Recent read-only activity for one already-authorized device.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserDeviceActivity {
+    pub telemetry: Vec<UserDeviceTelemetry>,
+    pub alerts: Vec<UserDeviceAlert>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserDeviceTelemetry {
+    pub event_at: DateTime<Utc>,
+    pub measurements: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserDeviceAlert {
+    pub rule_name: String,
+    pub severity: String,
+    pub status: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub trait UserDeviceActivityRepository: Send + Sync {
+    fn recent_user_device_activity<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        device_id: &'a str,
+        limit: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<UserDeviceActivity, PlatformStoreError>> + Send + 'a>>;
+}
+
 pub trait TenantAuthorizationRepository: Send + Sync {
     fn list_tenant_user_groups<'a>(
         &'a self,
@@ -1992,6 +2022,126 @@ impl PlatformStore {
         match self {
             Self::Sqlite(_) => None,
             Self::Timescale(pool) => Some(pool),
+        }
+    }
+
+    pub async fn recent_user_device_activity(
+        &self,
+        tenant_id: uuid::Uuid,
+        device_id: &str,
+        limit: u32,
+    ) -> Result<UserDeviceActivity, PlatformStoreError> {
+        let limit = i64::from(limit.min(20));
+        match self {
+            Self::Sqlite(store) => {
+                let tenant_id = tenant_id.to_string();
+                let telemetry_rows = sqlx::query(
+                    "SELECT event_at, measurements
+                     FROM telemetry
+                     WHERE tenant_id = ? AND device_id = ?
+                     ORDER BY event_at DESC, sequence DESC
+                     LIMIT ?",
+                )
+                .bind(&tenant_id)
+                .bind(device_id)
+                .bind(limit)
+                .fetch_all(store.pool())
+                .await?;
+                let alert_rows = sqlx::query(
+                    "SELECT rules.name AS rule_name, rules.severity, incidents.status, incidents.updated_at
+                     FROM alert_incidents AS incidents
+                     JOIN alert_rules AS rules
+                       ON rules.id = incidents.rule_id AND rules.tenant_id = incidents.tenant_id
+                     WHERE incidents.tenant_id = ? AND incidents.device_id = ?
+                     ORDER BY incidents.updated_at DESC, incidents.id DESC
+                     LIMIT ?",
+                )
+                .bind(&tenant_id)
+                .bind(device_id)
+                .bind(limit)
+                .fetch_all(store.pool())
+                .await?;
+                Ok(UserDeviceActivity {
+                    telemetry: telemetry_rows
+                        .into_iter()
+                        .map(|row| {
+                            Ok(UserDeviceTelemetry {
+                                event_at: parse_authorized_device_timestamp(
+                                    &row.try_get::<String, _>("event_at")?,
+                                )?,
+                                measurements: row
+                                    .try_get::<Json<serde_json::Value>, _>("measurements")?
+                                    .0,
+                            })
+                        })
+                        .collect::<Result<_, PlatformStoreError>>()?,
+                    alerts: alert_rows
+                        .into_iter()
+                        .map(|row| {
+                            Ok(UserDeviceAlert {
+                                rule_name: row.try_get("rule_name")?,
+                                severity: row.try_get("severity")?,
+                                status: row.try_get("status")?,
+                                updated_at: parse_authorized_device_timestamp(
+                                    &row.try_get::<String, _>("updated_at")?,
+                                )?,
+                            })
+                        })
+                        .collect::<Result<_, PlatformStoreError>>()?,
+                })
+            }
+            Self::Timescale(pool) => {
+                let telemetry_rows = sqlx::query(
+                    "SELECT event_at, measurements
+                     FROM telemetry
+                     WHERE tenant_id = $1 AND device_id = $2
+                     ORDER BY event_at DESC, sequence DESC
+                     LIMIT $3",
+                )
+                .bind(tenant_id)
+                .bind(device_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                let alert_rows = sqlx::query(
+                    "SELECT rules.name AS rule_name, rules.severity, incidents.status, incidents.updated_at
+                     FROM alert_incidents AS incidents
+                     JOIN alert_rules AS rules
+                       ON rules.id = incidents.rule_id AND rules.tenant_id = incidents.tenant_id
+                     WHERE incidents.tenant_id = $1 AND incidents.device_id = $2
+                     ORDER BY incidents.updated_at DESC, incidents.id DESC
+                     LIMIT $3",
+                )
+                .bind(tenant_id)
+                .bind(device_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                Ok(UserDeviceActivity {
+                    telemetry: telemetry_rows
+                        .into_iter()
+                        .map(|row| {
+                            Ok(UserDeviceTelemetry {
+                                event_at: row.try_get("event_at")?,
+                                measurements: row
+                                    .try_get::<Json<serde_json::Value>, _>("measurements")?
+                                    .0,
+                            })
+                        })
+                        .collect::<Result<_, PlatformStoreError>>()?,
+                    alerts: alert_rows
+                        .into_iter()
+                        .map(|row| {
+                            Ok(UserDeviceAlert {
+                                rule_name: row.try_get("rule_name")?,
+                                severity: row.try_get("severity")?,
+                                status: row.try_get("status")?,
+                                updated_at: row.try_get("updated_at")?,
+                            })
+                        })
+                        .collect::<Result<_, PlatformStoreError>>()?,
+                })
+            }
         }
     }
 
@@ -8429,6 +8579,20 @@ impl AuthorizationRepository for PlatformStore {
         >,
     > {
         Box::pin(async move { PlatformStore::asset_permission(self, subject, asset_id).await })
+    }
+}
+
+impl UserDeviceActivityRepository for PlatformStore {
+    fn recent_user_device_activity<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        device_id: &'a str,
+        limit: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<UserDeviceActivity, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            PlatformStore::recent_user_device_activity(self, tenant_id, device_id, limit).await
+        })
     }
 }
 

@@ -26,8 +26,9 @@ pub use platform_ui::{
     TenantRelationRow, TenantRelationsLayout, TenantRelationsPage, TenantSelectOption,
     TenantTopologyLayout, TenantTopologyPage, TenantTopologyRow, TenantUserRow, TenantUsersLayout,
     TenantUsersPage, UserAssetDetailLayout, UserAssetDetailPage, UserAssetLayout,
-    UserAssetListPage, UserAssetRow, UserAssetUnavailableLayout, UserDeviceDetailPage,
-    UserDeviceLayout, UserDeviceListPage, UserDeviceRow, UserDeviceUnavailableLayout, UserLayout,
+    UserAssetListPage, UserAssetRow, UserAssetUnavailableLayout, UserDeviceAlertRow,
+    UserDeviceDetailPage, UserDeviceLayout, UserDeviceListPage, UserDeviceRow,
+    UserDeviceTelemetryRow, UserDeviceUnavailableLayout, UserLayout,
 };
 pub use readiness::Readiness;
 pub use runtime::{MonolithRuntime, ShutdownError, StartupError};

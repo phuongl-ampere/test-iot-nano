@@ -402,6 +402,88 @@ async fn seed_user_workspace_devices(store: &PlatformStore) {
     .execute(pool)
     .await
     .unwrap();
+
+    seed_user_workspace_device_activity(pool, &tenant_id, &other_tenant.id.to_string()).await;
+}
+
+async fn seed_user_workspace_device_activity(
+    pool: &sqlx::SqlitePool,
+    tenant_id: &str,
+    other_tenant_id: &str,
+) {
+    for (event_at, scoped_tenant_id, device_id, marker) in [
+        (
+            "2026-09-18T11:00:00Z",
+            tenant_id,
+            "direct-device",
+            "direct-device-telemetry-<unsafe>",
+        ),
+        (
+            "2026-09-18T11:01:00Z",
+            tenant_id,
+            "unshared-device",
+            "unshared-device-telemetry",
+        ),
+        (
+            "2026-09-18T11:02:00Z",
+            other_tenant_id,
+            "other-tenant-device",
+            "cross-tenant-device-telemetry",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO telemetry (
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+             ) VALUES (?, ?, ?, ?, ?, 1, ?, 'workspace/test')",
+        )
+        .bind(event_at)
+        .bind(event_at)
+        .bind(scoped_tenant_id)
+        .bind(device_id)
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(json!({ "marker": marker }).to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    for (scoped_tenant_id, device_id, rule_name) in [
+        (tenant_id, "direct-device", "Direct alert <unsafe>"),
+        (tenant_id, "unshared-device", "Unshared device alert"),
+        (
+            other_tenant_id,
+            "other-tenant-device",
+            "Cross tenant device alert",
+        ),
+    ] {
+        let rule_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO alert_rules (
+                id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold
+             ) VALUES (?, ?, ?, ?, 'temperature_c', 'event_threshold', 'gt', 80)",
+        )
+        .bind(&rule_id)
+        .bind(scoped_tenant_id)
+        .bind(rule_name)
+        .bind(device_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO alert_incidents (
+                id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at,
+                last_value, state_version, updated_at
+             ) VALUES (?, ?, ?, ?, 'open', '2026-09-18T11:00:00Z',
+                '2026-09-18T11:00:00Z', 81.5, 1, '2026-09-18T11:03:00Z')",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(scoped_tenant_id)
+        .bind(&rule_id)
+        .bind(device_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 struct UserWorkspaceAssets {
@@ -874,6 +956,15 @@ async fn user_workspace_device_detail_masks_unavailable_devices_and_denies_other
     assert!(authorized_body.contains("Direct device"));
     assert!(authorized_body.contains("Viewer"));
     assert!(authorized_body.contains("Direct user permission"));
+    assert!(authorized_body.contains("Recent telemetry"));
+    assert!(authorized_body.contains("direct-device-telemetry-&#60;unsafe&#62;"));
+    assert!(authorized_body.contains("Recent alerts"));
+    assert!(authorized_body.contains("Direct alert &#60;unsafe&#62;"));
+    assert!(authorized_body.contains("Warning"));
+    assert!(!authorized_body.contains("unshared-device-telemetry"));
+    assert!(!authorized_body.contains("cross-tenant-device-telemetry"));
+    assert!(!authorized_body.contains("Unshared device alert"));
+    assert!(!authorized_body.contains("Cross tenant device alert"));
     assert!(!authorized_body.contains("<form"));
     assert!(!authorized_body.contains("/commands"));
 
@@ -891,6 +982,8 @@ async fn user_workspace_device_detail_masks_unavailable_devices_and_denies_other
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("Device unavailable"));
         assert!(!body.contains("Cross tenant device"));
+        assert!(!body.contains("direct-device-telemetry"));
+        assert!(!body.contains("Direct alert"));
     }
 
     for cookie in [&tenant_cookie, &system_cookie] {

@@ -20,4 +20,58 @@
       <div><dt>Access source</dt><dd>{{ page.device.access_source }}</dd></div>
     </dl>
   </section>
+  <section class="workspace-panel">
+    <header><h2>Recent telemetry</h2></header>
+    {% if page.has_telemetry %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Recorded</th>
+              <th scope="col">Measurements</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for telemetry in page.telemetry %}
+              <tr>
+                <td>{{ telemetry.observed_at }}</td>
+                <td>{{ telemetry.measurements }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty-state">No telemetry recorded.</p>
+    {% endif %}
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Recent alerts</h2></header>
+    {% if page.has_alerts %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Rule</th>
+              <th scope="col">Severity</th>
+              <th scope="col">State</th>
+              <th scope="col">Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for alert in page.alerts %}
+              <tr>
+                <td>{{ alert.rule_name }}</td>
+                <td>{{ alert.severity }}</td>
+                <td>{{ alert.status }}</td>
+                <td>{{ alert.updated_at }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty-state">No alerts recorded.</p>
+    {% endif %}
+  </section>
 {% endblock %}

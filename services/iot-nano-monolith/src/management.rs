@@ -39,7 +39,7 @@ use iot_storage::{
     ResourceAccessSource, ResourcePermission, SystemAccount, TenantAuthorizationError,
     TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository, TenantStatus,
     UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser,
+    UpdateManagementDeviceProfile, UpdateManagementUser, UserDeviceActivityRepository,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -60,6 +60,7 @@ const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: u8 = 5;
 const USER_DEVICE_LIST_LIMIT: u32 = 100;
 const USER_ASSET_LIST_LIMIT: u32 = 100;
+const USER_DEVICE_ACTIVITY_LIMIT: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum BootstrapSystemError {
@@ -3156,12 +3157,44 @@ async fn platform_app_device_detail(
 
     match device {
         Some(device) => {
+            let activity = UserDeviceActivityRepository::recent_user_device_activity(
+                state.store.as_ref(),
+                tenant_id,
+                &device.device_id,
+                USER_DEVICE_ACTIVITY_LIMIT,
+            )
+            .await
+            .map_err(|_| ManagementSessionError::Unavailable)?;
             let page = crate::UserDeviceDetailPage::new(user_device_row(
                 device.device_id,
                 device.display_name,
                 device.last_seen_at,
                 device.access,
-            ));
+            ))
+            .with_activity(
+                activity
+                    .telemetry
+                    .into_iter()
+                    .map(|telemetry| {
+                        crate::UserDeviceTelemetryRow::new(
+                            user_workspace_timestamp(telemetry.event_at),
+                            telemetry.measurements.to_string(),
+                        )
+                    })
+                    .collect(),
+                activity
+                    .alerts
+                    .into_iter()
+                    .map(|alert| {
+                        crate::UserDeviceAlertRow::new(
+                            alert.rule_name,
+                            user_alert_label(alert.severity),
+                            user_alert_label(alert.status),
+                            user_workspace_timestamp(alert.updated_at),
+                        )
+                    })
+                    .collect(),
+            );
             let rendered = crate::PlatformUiRenderer::render_user_device(&identity, &page)
                 .map_err(|_| ManagementSessionError::Unavailable)?;
             Ok(Html(rendered).into_response())
@@ -3357,6 +3390,22 @@ fn user_device_row(
         resource_permission_label(access.permission),
         resource_access_source_label(access.source),
     )
+}
+
+fn user_workspace_timestamp(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn user_alert_label(value: String) -> String {
+    match value.as_str() {
+        "info" => "Info".to_owned(),
+        "warning" => "Warning".to_owned(),
+        "critical" => "Critical".to_owned(),
+        "pending" => "Pending".to_owned(),
+        "open" => "Open".to_owned(),
+        "resolved" => "Resolved".to_owned(),
+        _ => value,
+    }
 }
 
 fn user_asset_row(
