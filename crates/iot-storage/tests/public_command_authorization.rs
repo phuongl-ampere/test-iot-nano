@@ -238,21 +238,12 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     };
     let entered = Arc::new(Notify::new());
     let (release_sender, release_receiver) = oneshot::channel();
+    let handoff_token = Uuid::now_v7();
     let _hook = install_public_device_list_handoff_hook(
-        tenant_id,
-        viewer_id,
-        principal.app_id.clone(),
+        handoff_token,
         Arc::clone(&entered),
         release_receiver,
     );
-    let entered_wait = entered.notified();
-    let list_store = Arc::clone(&store);
-    let mut task = tokio::spawn(async move {
-        PublicApiRepository::list_public_devices(list_store.as_ref(), &principal, None, 100).await
-    });
-    timeout(TokioDuration::from_secs(1), entered_wait)
-        .await
-        .expect("selected list request must reach the handoff hook");
 
     let unrelated_store = Arc::clone(&store);
     let unrelated_principal = PublicPrincipal {
@@ -270,7 +261,35 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
         )
         .await
     });
-    let unrelated_before_release = timeout(TokioDuration::from_secs(1), &mut unrelated_task).await;
+    let unrelated = match timeout(TokioDuration::from_secs(1), &mut unrelated_task).await {
+        Ok(result) => result,
+        Err(_) => {
+            unrelated_task.abort();
+            let _ = unrelated_task.await;
+            panic!("same-user request with a different app id was captured by the hook");
+        }
+    };
+    assert_eq!(
+        unrelated.unwrap().unwrap().len(),
+        1,
+        "same-user request with a different app id must not be captured by the hook"
+    );
+
+    let entered_wait = entered.notified();
+    let list_store = Arc::clone(&store);
+    let mut task = tokio::spawn(async move {
+        list_store
+            .list_public_devices_with_handoff_token_for_test(&principal, None, 100, handoff_token)
+            .await
+    });
+    if timeout(TokioDuration::from_secs(1), entered_wait)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+        panic!("selected list request must reach the handoff hook");
+    }
 
     sqlx::query("UPDATE resource_permissions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(permission_id.to_string())
@@ -292,21 +311,4 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
         selected.unwrap().unwrap().is_empty(),
         "the detail query must not use identifiers authorized before revocation"
     );
-
-    match unrelated_before_release {
-        Ok(result) => assert!(
-            result
-                .expect("unrelated list task must not panic")
-                .expect("unrelated list request must succeed")
-                .len()
-                == 1,
-            "same-user request with a different app id must not be captured by the hook"
-        ),
-        Err(_) => {
-            let _ = timeout(TokioDuration::from_secs(1), unrelated_task)
-                .await
-                .expect("unrelated list request must finish after the hook is released");
-            panic!("the handoff hook captured an unrelated public device list request");
-        }
-    }
 }

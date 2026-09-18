@@ -12,9 +12,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "test-support")]
 struct PublicDeviceListHandoffHook {
-    tenant_id: Uuid,
-    target_user_id: Uuid,
-    target_app_id: String,
+    token: Uuid,
     entered: Arc<Notify>,
     release: oneshot::Receiver<()>,
 }
@@ -36,18 +34,14 @@ impl Drop for PublicDeviceListHandoffHookGuard {
 
 #[cfg(feature = "test-support")]
 pub fn install_public_device_list_handoff_hook(
-    tenant_id: Uuid,
-    target_user_id: Uuid,
-    target_app_id: String,
+    token: Uuid,
     entered: Arc<Notify>,
     release: oneshot::Receiver<()>,
 ) -> PublicDeviceListHandoffHookGuard {
     let hook = DEVICE_LIST_HANDOFF_HOOK.get_or_init(|| Mutex::new(None));
     *hook.lock().expect("public device list hook lock poisoned") =
         Some(PublicDeviceListHandoffHook {
-            tenant_id,
-            target_user_id,
-            target_app_id,
+            token,
             entered,
             release,
         });
@@ -55,17 +49,16 @@ pub fn install_public_device_list_handoff_hook(
 }
 
 #[cfg(feature = "test-support")]
-async fn wait_for_public_device_list_handoff_hook(principal: &PublicPrincipal, user_id: Uuid) {
+async fn wait_for_public_device_list_handoff_hook(token: Option<Uuid>) {
     let hook = {
         let mut installed = DEVICE_LIST_HANDOFF_HOOK
             .get_or_init(|| Mutex::new(None))
             .lock()
             .expect("public device list hook lock poisoned");
-        if installed.as_ref().is_some_and(|hook| {
-            hook.tenant_id == principal.tenant_id
-                && hook.target_user_id == user_id
-                && hook.target_app_id == principal.app_id
-        }) {
+        if installed
+            .as_ref()
+            .is_some_and(|hook| Some(hook.token) == token)
+        {
             installed.take()
         } else {
             None
@@ -81,7 +74,7 @@ async fn wait_for_public_device_list_handoff_hook(principal: &PublicPrincipal, u
 }
 
 #[cfg(not(feature = "test-support"))]
-async fn wait_for_public_device_list_handoff_hook(_: &PublicPrincipal, _: Uuid) {}
+async fn wait_for_public_device_list_handoff_hook(_: Option<Uuid>) {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrincipal {
@@ -498,6 +491,20 @@ impl PublicApiRepository for PlatformStore {
     }
 }
 
+#[cfg(feature = "test-support")]
+impl PlatformStore {
+    pub async fn list_public_devices_with_handoff_token_for_test(
+        &self,
+        principal: &PublicPrincipal,
+        after: Option<&str>,
+        limit: u32,
+        handoff_token: Uuid,
+    ) -> Result<Vec<PublicDevice>, PlatformStoreError> {
+        list_public_devices_with_handoff_token(self, principal, after, limit, Some(handoff_token))
+            .await
+    }
+}
+
 async fn public_user_tenant_id(
     store: &PlatformStore,
     user_id: Uuid,
@@ -586,10 +593,20 @@ async fn list_public_devices(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicDevice>, PlatformStoreError> {
+    list_public_devices_with_handoff_token(store, principal, after, limit, None).await
+}
+
+async fn list_public_devices_with_handoff_token(
+    store: &PlatformStore,
+    principal: &PublicPrincipal,
+    after: Option<&str>,
+    limit: u32,
+    handoff_token: Option<Uuid>,
+) -> Result<Vec<PublicDevice>, PlatformStoreError> {
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(Vec::new());
     };
-    wait_for_public_device_list_handoff_hook(principal, subject.user_id).await;
+    wait_for_public_device_list_handoff_hook(handoff_token).await;
     let limit = i64::from(limit);
     match store {
         PlatformStore::Sqlite(store) => {
