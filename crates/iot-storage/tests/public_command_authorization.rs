@@ -193,21 +193,17 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     let pool = store.sqlite_pool().unwrap();
     let owner_id = Uuid::now_v7();
     let viewer_id = Uuid::now_v7();
-    let unrelated_viewer_id = Uuid::now_v7();
     let permission_id = Uuid::now_v7();
     let device_id = format!("public-list-handoff-{}", Uuid::now_v7());
 
     sqlx::query(
         "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
          VALUES (?, ?, 'public-list-owner', 'unused', 'viewer', 'user'),
-                (?, ?, 'public-list-viewer', 'unused', 'viewer', 'user'),
-                (?, ?, 'public-list-unrelated-viewer', 'unused', 'viewer', 'user')",
+                (?, ?, 'public-list-viewer', 'unused', 'viewer', 'user')",
     )
     .bind(owner_id.to_string())
     .bind(tenant_id.to_string())
     .bind(viewer_id.to_string())
-    .bind(tenant_id.to_string())
-    .bind(unrelated_viewer_id.to_string())
     .bind(tenant_id.to_string())
     .execute(pool)
     .await
