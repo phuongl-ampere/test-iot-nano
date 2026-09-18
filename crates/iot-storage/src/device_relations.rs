@@ -4,7 +4,9 @@ use sqlx::{Postgres, Row, Sqlite, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AuditAction, AuditTargetType, PlatformStore, PlatformStoreError, audit};
+use crate::{
+    AuditAction, AuditPrincipal, AuditTargetType, PlatformStore, PlatformStoreError, audit,
+};
 
 pub const RESERVED_GATEWAY_CHILD_RELATION_TYPE: &str = "gateway_child";
 
@@ -69,11 +71,13 @@ pub trait DeviceRelationRepository: Send + Sync {
     fn create_device_relation<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         relation: CreateDeviceRelation,
     ) -> Pin<Box<dyn Future<Output = Result<DeviceRelation, DeviceRelationError>> + Send + 'a>>;
     fn delete_device_relation<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         relation_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, DeviceRelationError>> + Send + 'a>>;
 }
@@ -90,18 +94,20 @@ impl DeviceRelationRepository for PlatformStore {
     fn create_device_relation<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         relation: CreateDeviceRelation,
     ) -> Pin<Box<dyn Future<Output = Result<DeviceRelation, DeviceRelationError>> + Send + 'a>>
     {
-        Box::pin(async move { create_device_relation(self, tenant_id, relation).await })
+        Box::pin(async move { create_device_relation(self, tenant_id, actor, relation).await })
     }
 
     fn delete_device_relation<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         relation_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, DeviceRelationError>> + Send + 'a>> {
-        Box::pin(async move { delete_device_relation(self, tenant_id, relation_id).await })
+        Box::pin(async move { delete_device_relation(self, tenant_id, actor, relation_id).await })
     }
 }
 
@@ -140,6 +146,7 @@ async fn list_device_relations(
 async fn create_device_relation(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     relation: CreateDeviceRelation,
 ) -> Result<DeviceRelation, DeviceRelationError> {
     let relation = validate_new_relation(relation)?;
@@ -147,6 +154,7 @@ async fn create_device_relation(
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             sqlite_require_tenant_device(&mut transaction, tenant_id, &relation.from_device_id)
                 .await?;
             sqlite_require_tenant_device(&mut transaction, tenant_id, &relation.to_device_id)
@@ -164,8 +172,6 @@ async fn create_device_relation(
             .execute(&mut *transaction)
             .await
             .map_err(map_relation_conflict)?;
-            let actor =
-                audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
             let event = audit::NewAuditEvent::new(
                 tenant_id,
                 actor,
@@ -183,6 +189,8 @@ async fn create_device_relation(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             timescale_require_tenant_device(&mut transaction, tenant_id, &relation.from_device_id)
                 .await?;
             timescale_require_tenant_device(&mut transaction, tenant_id, &relation.to_device_id)
@@ -200,8 +208,6 @@ async fn create_device_relation(
             .execute(&mut *transaction)
             .await
             .map_err(map_relation_conflict)?;
-            let actor =
-                audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
             let event = audit::NewAuditEvent::new(
                 tenant_id,
                 actor,
@@ -230,11 +236,13 @@ async fn create_device_relation(
 async fn delete_device_relation(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     relation_id: Uuid,
 ) -> Result<bool, DeviceRelationError> {
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             let relation = sqlx::query(
                 "SELECT from_device_id, to_device_id, relation_type
                  FROM device_relations
@@ -253,8 +261,6 @@ async fn delete_device_relation(
                 .bind(tenant_id.to_string())
                 .execute(&mut *transaction)
                 .await?;
-            let actor =
-                audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
             let event = audit::NewAuditEvent::new(
                 tenant_id,
                 actor,
@@ -272,6 +278,8 @@ async fn delete_device_relation(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             let relation = sqlx::query(
                 "SELECT from_device_id, to_device_id, relation_type
                  FROM device_relations
@@ -291,8 +299,6 @@ async fn delete_device_relation(
                 .bind(tenant_id)
                 .execute(&mut *transaction)
                 .await?;
-            let actor =
-                audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
             let event = audit::NewAuditEvent::new(
                 tenant_id,
                 actor,

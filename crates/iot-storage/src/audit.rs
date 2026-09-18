@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 use sqlx::{
     PgPool, Postgres, Row, Sqlite, SqlitePool, Transaction, postgres::PgRow, sqlite::SqliteRow,
@@ -201,27 +201,70 @@ impl AuditEventRepository for PlatformStore {
     }
 }
 
-pub(crate) async fn sqlite_tenant_account_audit_actor(
+pub(crate) async fn validate_sqlite_tenant_audit_actor(
     transaction: &mut Transaction<'_, Sqlite>,
     tenant_id: Uuid,
-) -> Result<AuditPrincipal, sqlx::Error> {
-    let id: String = sqlx::query_scalar("SELECT id FROM tenant_accounts WHERE tenant_id = ?")
-        .bind(tenant_id.to_string())
-        .fetch_one(&mut **transaction)
-        .await?;
-    let id = Uuid::parse_str(&id).map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-    Ok(AuditPrincipal::TenantAccount(id))
+    actor: AuditPrincipal,
+) -> Result<(), sqlx::Error> {
+    let exists = match actor {
+        AuditPrincipal::SystemAccount(_) => false,
+        AuditPrincipal::TenantAccount(id) => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM tenant_accounts WHERE id = ? AND tenant_id = ?)",
+            )
+            .bind(id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?
+        }
+        AuditPrincipal::User(id) => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = ? AND tenant_id = ?)",
+            )
+            .bind(id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?
+        }
+    };
+    if exists {
+        Ok(())
+    } else {
+        Err(sqlx::Error::RowNotFound)
+    }
 }
 
-pub(crate) async fn timescale_tenant_account_audit_actor(
+pub(crate) async fn validate_timescale_tenant_audit_actor(
     transaction: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
-) -> Result<AuditPrincipal, sqlx::Error> {
-    let id: Uuid = sqlx::query_scalar("SELECT id FROM tenant_accounts WHERE tenant_id = $1")
-        .bind(tenant_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-    Ok(AuditPrincipal::TenantAccount(id))
+    actor: AuditPrincipal,
+) -> Result<(), sqlx::Error> {
+    let exists = match actor {
+        AuditPrincipal::SystemAccount(_) => false,
+        AuditPrincipal::TenantAccount(id) => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM tenant_accounts WHERE id = $1 AND tenant_id = $2)",
+            )
+            .bind(id)
+            .bind(tenant_id)
+            .fetch_one(&mut **transaction)
+            .await?
+        }
+        AuditPrincipal::User(id) => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2)",
+            )
+            .bind(id)
+            .bind(tenant_id)
+            .fetch_one(&mut **transaction)
+            .await?
+        }
+    };
+    if exists {
+        Ok(())
+    } else {
+        Err(sqlx::Error::RowNotFound)
+    }
 }
 
 pub(crate) async fn insert_sqlite_audit_event(
@@ -237,7 +280,11 @@ pub(crate) async fn insert_sqlite_audit_event(
     )
     .bind(Uuid::now_v7().to_string())
     .bind(event.tenant_id.to_string())
-    .bind(event.occurred_at.to_rfc3339())
+    .bind(
+        event
+            .occurred_at
+            .to_rfc3339_opts(SecondsFormat::Nanos, true),
+    )
     .bind(actor_principal_kind)
     .bind(actor_principal_id.to_string())
     .bind(event.action.as_storage())
@@ -312,8 +359,16 @@ async fn sqlite_tenant_audit_events(
              LIMIT ?",
             )
             .bind(tenant_id.to_string())
-            .bind(cursor.occurred_at.to_rfc3339())
-            .bind(cursor.occurred_at.to_rfc3339())
+            .bind(
+                cursor
+                    .occurred_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .bind(
+                cursor
+                    .occurred_at
+                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
             .bind(cursor.id.to_string())
             .bind(limit)
             .fetch_all(pool)

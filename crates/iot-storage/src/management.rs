@@ -8,7 +8,10 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AccountClass, AuditAction, AuditTargetType, PlatformStore, PlatformStoreError, audit};
+use crate::{
+    AccountClass, AuditAction, AuditPrincipal, AuditTargetType, PlatformStore, PlatformStoreError,
+    audit,
+};
 
 pub const BUILT_IN_USER_WORKSPACE: &str = "/app";
 pub const MANAGEMENT_ALERT_LIST_LIMIT: usize = 100;
@@ -698,17 +701,20 @@ pub trait ManagementAssetRepository: Send + Sync {
     fn create_management_asset<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         asset: CreateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>;
     fn update_management_asset<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         asset_id: Uuid,
         asset: UpdateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>;
     fn delete_management_asset<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         asset_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetError>> + Send + 'a>>;
 }
@@ -725,28 +731,33 @@ impl ManagementAssetRepository for PlatformStore {
     fn create_management_asset<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         asset: CreateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>
     {
-        Box::pin(async move { create_management_asset(self, tenant_id, asset).await })
+        Box::pin(async move { create_management_asset(self, tenant_id, actor, asset).await })
     }
 
     fn update_management_asset<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         asset_id: Uuid,
         asset: UpdateManagementAsset,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementAsset, ManagementAssetError>> + Send + 'a>>
     {
-        Box::pin(async move { update_management_asset(self, tenant_id, asset_id, asset).await })
+        Box::pin(
+            async move { update_management_asset(self, tenant_id, actor, asset_id, asset).await },
+        )
     }
 
     fn delete_management_asset<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         asset_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementAssetError>> + Send + 'a>> {
-        Box::pin(async move { delete_management_asset(self, tenant_id, asset_id).await })
+        Box::pin(async move { delete_management_asset(self, tenant_id, actor, asset_id).await })
     }
 }
 
@@ -760,12 +771,14 @@ pub trait ManagementDeviceRepository: Send + Sync {
     fn update_management_device<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         device_id: &'a str,
         update: UpdateManagementDevice,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementDevice, ManagementDeviceError>> + Send + 'a>>;
     fn delete_management_device<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementDeviceError>> + Send + 'a>>;
 }
@@ -783,19 +796,23 @@ impl ManagementDeviceRepository for PlatformStore {
     fn update_management_device<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         device_id: &'a str,
         update: UpdateManagementDevice,
     ) -> Pin<Box<dyn Future<Output = Result<ManagementDevice, ManagementDeviceError>> + Send + 'a>>
     {
-        Box::pin(async move { update_management_device(self, tenant_id, device_id, update).await })
+        Box::pin(async move {
+            update_management_device(self, tenant_id, actor, device_id, update).await
+        })
     }
 
     fn delete_management_device<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         device_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), ManagementDeviceError>> + Send + 'a>> {
-        Box::pin(async move { delete_management_device(self, tenant_id, device_id).await })
+        Box::pin(async move { delete_management_device(self, tenant_id, actor, device_id).await })
     }
 }
 
@@ -1618,6 +1635,7 @@ pub trait DeviceTokenRepository: Send + Sync {
     fn provision_owned_device_token<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         device: NewOwnedDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
@@ -1682,11 +1700,12 @@ impl DeviceTokenRepository for PlatformStore {
     fn provision_owned_device_token<'a>(
         &'a self,
         tenant_id: Uuid,
+        actor: AuditPrincipal,
         device: NewOwnedDeviceToken,
     ) -> Pin<
         Box<dyn Future<Output = Result<DeviceTokenRecord, DeviceTokenRepositoryError>> + Send + 'a>,
     > {
-        Box::pin(async move { provision_owned_device_token(self, tenant_id, device).await })
+        Box::pin(async move { provision_owned_device_token(self, tenant_id, actor, device).await })
     }
 
     fn create_device_token<'a>(
@@ -1795,6 +1814,7 @@ async fn list_management_assets(
 async fn create_management_asset(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     asset: CreateManagementAsset,
 ) -> Result<ManagementAsset, ManagementAssetError> {
     let asset = validate_management_asset(
@@ -1810,6 +1830,7 @@ async fn create_management_asset(
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             validate_sqlite_asset_references(
                 &mut transaction,
                 tenant_id,
@@ -1836,10 +1857,28 @@ async fn create_management_asset(
                     sibling_parent_asset_id,
                 )
             })?;
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Asset,
+                    asset_id.to_string(),
+                    serde_json::json!({
+                        "parent_asset_id": {
+                            "before": null,
+                            "after": parent_asset_id.to_string(),
+                        }
+                    }),
+                );
+                audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+            }
             transaction.commit().await?;
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             validate_timescale_asset_references(
                 &mut transaction,
                 tenant_id,
@@ -1866,6 +1905,22 @@ async fn create_management_asset(
                     sibling_parent_asset_id,
                 )
             })?;
+            if let Some(parent_asset_id) = asset.parent_asset_id {
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Asset,
+                    asset_id.to_string(),
+                    serde_json::json!({
+                        "parent_asset_id": {
+                            "before": null,
+                            "after": parent_asset_id.to_string(),
+                        }
+                    }),
+                );
+                audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+            }
             transaction.commit().await?;
         }
     }
@@ -1875,6 +1930,7 @@ async fn create_management_asset(
 async fn update_management_asset(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     asset_id: Uuid,
     asset: UpdateManagementAsset,
 ) -> Result<ManagementAsset, ManagementAssetError> {
@@ -1893,6 +1949,7 @@ async fn update_management_asset(
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             sqlite_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
             let previous_parent_id: Option<String> = sqlx::query_scalar(
                 "SELECT parent_asset_id FROM assets WHERE id = ? AND tenant_id = ?",
@@ -1944,8 +2001,6 @@ async fn update_management_asset(
                 )
             })?;
             if previous_parent_id != next_parent_id {
-                let actor =
-                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
                 let event = audit::NewAuditEvent::new(
                     tenant_id,
                     actor,
@@ -1965,6 +2020,8 @@ async fn update_management_asset(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             // Match profile deletion before taking hierarchy row locks.
             sqlx::query("LOCK TABLE assets IN SHARE ROW EXCLUSIVE MODE")
                 .execute(&mut *transaction)
@@ -2026,9 +2083,6 @@ async fn update_management_asset(
                 )
             })?;
             if previous_parent_id != next_parent_id {
-                let actor =
-                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
-                        .await?;
                 let event = audit::NewAuditEvent::new(
                     tenant_id,
                     actor,
@@ -2053,11 +2107,13 @@ async fn update_management_asset(
 async fn delete_management_asset(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     asset_id: Uuid,
 ) -> Result<(), ManagementAssetError> {
     let deleted = match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             sqlite_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
             if let Some(name) =
                 sqlite_promoted_asset_root_name_conflict(&mut transaction, tenant_id, asset_id)
@@ -2089,8 +2145,6 @@ async fn delete_management_asset(
             .fetch_all(&mut *transaction)
             .await?;
             if !detached_asset_ids.is_empty() || !detached_device_ids.is_empty() {
-                let actor =
-                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
                 for detached_asset_id in detached_asset_ids {
                     let event = audit::NewAuditEvent::new(
                         tenant_id,
@@ -2135,6 +2189,8 @@ async fn delete_management_asset(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             timescale_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
             if let Some(name) =
                 timescale_promoted_asset_root_name_conflict(&mut transaction, tenant_id, asset_id)
@@ -2166,9 +2222,6 @@ async fn delete_management_asset(
             .fetch_all(&mut *transaction)
             .await?;
             if !detached_asset_ids.is_empty() || !detached_device_ids.is_empty() {
-                let actor =
-                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
-                        .await?;
                 for detached_asset_id in detached_asset_ids {
                     let event = audit::NewAuditEvent::new(
                         tenant_id,
@@ -2859,6 +2912,7 @@ fn sqlite_timestamp(value: Option<String>) -> Result<Option<DateTime<Utc>>, Mana
 async fn update_management_device(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     device_id: &str,
     update: UpdateManagementDevice,
 ) -> Result<ManagementDevice, ManagementDeviceError> {
@@ -2869,6 +2923,7 @@ async fn update_management_device(
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             let current = sqlite_topology(&mut transaction, tenant_id, device_id).await?;
             let previous_asset_id: Option<String> = sqlx::query_scalar(
                 "SELECT asset_id FROM devices
@@ -2909,8 +2964,6 @@ async fn update_management_device(
             .execute(&mut *transaction)
             .await?;
             if previous_asset_id != next_asset_id {
-                let actor =
-                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
                 let event = audit::NewAuditEvent::new(
                     tenant_id,
                     actor,
@@ -2927,8 +2980,6 @@ async fn update_management_device(
                 audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
             }
             if topology_changed {
-                let actor =
-                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
                 let event = audit::NewAuditEvent::new(
                     tenant_id,
                     actor,
@@ -2969,6 +3020,8 @@ async fn update_management_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             // Match profile deletion before taking topology row locks.
             sqlx::query("LOCK TABLE devices IN SHARE ROW EXCLUSIVE MODE")
                 .execute(&mut *transaction)
@@ -3020,9 +3073,6 @@ async fn update_management_device(
             .execute(&mut *transaction)
             .await?;
             if previous_asset_id != next_asset_id {
-                let actor =
-                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
-                        .await?;
                 let event = audit::NewAuditEvent::new(
                     tenant_id,
                     actor,
@@ -3039,9 +3089,6 @@ async fn update_management_device(
                 audit::insert_timescale_audit_event(&mut transaction, &event).await?;
             }
             if topology_changed {
-                let actor =
-                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
-                        .await?;
                 let event = audit::NewAuditEvent::new(
                     tenant_id,
                     actor,
@@ -3098,12 +3145,14 @@ fn gateway_audit_action(
 async fn delete_management_device(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     device_id: &str,
 ) -> Result<(), ManagementDeviceError> {
     validate_device_id(device_id)?;
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             if sqlite_has_children(&mut transaction, tenant_id, device_id).await? {
                 return Err(ManagementDeviceError::GatewayHasChildren);
             }
@@ -3138,6 +3187,8 @@ async fn delete_management_device(
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             if timescale_has_children(&mut transaction, tenant_id, device_id).await? {
                 return Err(ManagementDeviceError::GatewayHasChildren);
             }
@@ -3477,23 +3528,27 @@ async fn provision_device_token(
 async fn provision_owned_device_token(
     store: &PlatformStore,
     tenant_id: Uuid,
+    actor: AuditPrincipal,
     device: NewOwnedDeviceToken,
 ) -> Result<DeviceTokenRecord, DeviceTokenRepositoryError> {
     let device_id = Uuid::now_v7().to_string();
+    let owner_user_id = device.owner_user_id;
+    let asset_id = device.asset_id;
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
+            audit::validate_sqlite_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
             let owner_exists = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE id = ? AND tenant_id = ?)",
             )
-            .bind(device.owner_user_id.to_string())
+            .bind(owner_user_id.to_string())
             .bind(tenant_id.to_string())
             .fetch_one(&mut *transaction)
             .await?;
             if !owner_exists {
                 return Err(DeviceTokenRepositoryError::DeviceNotFound);
             }
-            if let Some(asset_id) = device.asset_id {
+            if let Some(asset_id) = asset_id {
                 let asset_exists = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?)",
                 )
@@ -3513,29 +3568,61 @@ async fn provision_owned_device_token(
             .bind(&device_id)
             .bind(tenant_id.to_string())
             .bind(&device.display_name)
-            .bind(device.owner_user_id.to_string())
-            .bind(device.asset_id.map(|id| id.to_string()))
+            .bind(owner_user_id.to_string())
+            .bind(asset_id.map(|id| id.to_string()))
             .bind(Utc::now().to_rfc3339())
             .execute(&mut *transaction)
             .await?;
             let record =
                 insert_sqlite_device_token(&mut transaction, &device_id, device.token).await?;
+            let ownership_event = audit::NewAuditEvent::new(
+                tenant_id,
+                actor,
+                AuditAction::OwnershipTransferred,
+                AuditTargetType::Device,
+                device_id.clone(),
+                serde_json::json!({
+                    "owner_user_id": {
+                        "before": null,
+                        "after": owner_user_id.to_string(),
+                    }
+                }),
+            );
+            audit::insert_sqlite_audit_event(&mut transaction, &ownership_event).await?;
+            if let Some(asset_id) = asset_id {
+                let containment_event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Device,
+                    device_id.clone(),
+                    serde_json::json!({
+                        "asset_id": {
+                            "before": null,
+                            "after": asset_id.to_string(),
+                        }
+                    }),
+                );
+                audit::insert_sqlite_audit_event(&mut transaction, &containment_event).await?;
+            }
             transaction.commit().await?;
             Ok(record)
         }
         PlatformStore::Timescale(pool) => {
             let mut transaction = pool.begin().await?;
+            audit::validate_timescale_tenant_audit_actor(&mut transaction, tenant_id, actor)
+                .await?;
             let owner_exists = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2)",
             )
-            .bind(device.owner_user_id)
+            .bind(owner_user_id)
             .bind(tenant_id)
             .fetch_one(&mut *transaction)
             .await?;
             if !owner_exists {
                 return Err(DeviceTokenRepositoryError::DeviceNotFound);
             }
-            if let Some(asset_id) = device.asset_id {
+            if let Some(asset_id) = asset_id {
                 let asset_exists = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)",
                 )
@@ -3555,12 +3642,42 @@ async fn provision_owned_device_token(
             .bind(&device_id)
             .bind(tenant_id)
             .bind(&device.display_name)
-            .bind(device.owner_user_id)
-            .bind(device.asset_id)
+            .bind(owner_user_id)
+            .bind(asset_id)
             .execute(&mut *transaction)
             .await?;
             let record =
                 insert_timescale_device_token(&mut transaction, &device_id, device.token).await?;
+            let ownership_event = audit::NewAuditEvent::new(
+                tenant_id,
+                actor,
+                AuditAction::OwnershipTransferred,
+                AuditTargetType::Device,
+                device_id.clone(),
+                serde_json::json!({
+                    "owner_user_id": {
+                        "before": null,
+                        "after": owner_user_id.to_string(),
+                    }
+                }),
+            );
+            audit::insert_timescale_audit_event(&mut transaction, &ownership_event).await?;
+            if let Some(asset_id) = asset_id {
+                let containment_event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Device,
+                    device_id.clone(),
+                    serde_json::json!({
+                        "asset_id": {
+                            "before": null,
+                            "after": asset_id.to_string(),
+                        }
+                    }),
+                );
+                audit::insert_timescale_audit_event(&mut transaction, &containment_event).await?;
+            }
             transaction.commit().await?;
             Ok(record)
         }

@@ -1,7 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    AccountClass, AuthorizationSubject, ManagementDeviceRepository, PlatformStore, ResourceAccess,
-    ResourceAccessSource, ResourcePermission, UpdateManagementDevice,
+    AccountClass, AuditPrincipal, AuthorizationSubject, ManagementDeviceRepository, PlatformStore,
+    ResourceAccess, ResourceAccessSource, ResourcePermission, UpdateManagementDevice,
 };
 use sqlx::{Connection, PgConnection, PgPool, SqlitePool};
 use uuid::Uuid;
@@ -686,6 +686,7 @@ async fn sqlite_authorized_device_list_tracks_effective_access_across_a_move() {
     ManagementDeviceRepository::update_management_device(
         &store,
         TENANT_A,
+        AuditPrincipal::User(USER_A),
         LIST_MOVED_DEVICE_A,
         UpdateManagementDevice {
             display_name: "moved device".to_owned(),
@@ -811,6 +812,7 @@ async fn sqlite_device_detachment_removes_inherited_only_detail_and_list_access(
     ManagementDeviceRepository::update_management_device(
         &store,
         TENANT_A,
+        AuditPrincipal::User(USER_A),
         LIST_INHERITED_ONLY_MOVED_DEVICE_A,
         UpdateManagementDevice {
             display_name: "detached inherited-only device".to_owned(),

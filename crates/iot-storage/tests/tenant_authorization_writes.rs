@@ -110,6 +110,14 @@ fn direct_device_permission() -> NewResourcePermission {
     }
 }
 
+fn tenant_account_actor(tenant_id: Uuid) -> AuditPrincipal {
+    match tenant_id {
+        TENANT_A => AuditPrincipal::TenantAccount(TENANT_ACCOUNT_A),
+        TENANT_B => AuditPrincipal::TenantAccount(TENANT_ACCOUNT_B),
+        _ => unreachable!("test actor requested for an unseeded tenant"),
+    }
+}
+
 #[tokio::test]
 async fn sqlite_permission_grant_emits_immutable_tenant_audit_event() {
     let (_directory, store) = sqlite_store().await;
@@ -314,7 +322,7 @@ async fn sqlite_membership_and_permission_revocation_emit_tenant_audit_events() 
         .unwrap();
     assert!(
         store
-            .add_user_to_group(TENANT_A, group.id, MEMBER_A)
+            .add_user_to_group(TENANT_A, tenant_account_actor(TENANT_A), group.id, MEMBER_A)
             .await
             .unwrap()
     );
@@ -324,13 +332,13 @@ async fn sqlite_membership_and_permission_revocation_emit_tenant_audit_events() 
         .unwrap();
     assert!(
         store
-            .revoke_resource_permission(TENANT_A, permission.id)
+            .revoke_resource_permission(TENANT_A, tenant_account_actor(TENANT_A), permission.id,)
             .await
             .unwrap()
     );
     assert!(
         store
-            .remove_user_from_group(TENANT_A, group.id, MEMBER_A)
+            .remove_user_from_group(TENANT_A, tenant_account_actor(TENANT_A), group.id, MEMBER_A,)
             .await
             .unwrap()
     );
@@ -357,7 +365,10 @@ async fn sqlite_membership_and_permission_revocation_emit_tenant_audit_events() 
         events[0].changes,
         json!({"member_user_id": MEMBER_A.to_string()})
     );
-    assert_eq!(events[1].actor, AuditPrincipal::User(CREATOR_A));
+    assert_eq!(
+        events[1].actor,
+        AuditPrincipal::TenantAccount(TENANT_ACCOUNT_A)
+    );
     assert_eq!(events[1].target_type, AuditTargetType::ResourcePermission);
     assert_eq!(events[1].target_id, permission.id.to_string());
     assert_eq!(events[1].changes, json!({"revoked": true}));
@@ -383,7 +394,7 @@ async fn sqlite_tenant_authorization_writes_create_direct_and_group_permissions(
     assert_eq!(group.name, "operators");
     assert!(
         store
-            .add_user_to_group(TENANT_A, group.id, MEMBER_A)
+            .add_user_to_group(TENANT_A, tenant_account_actor(TENANT_A), group.id, MEMBER_A)
             .await
             .unwrap()
     );
@@ -413,7 +424,7 @@ async fn sqlite_tenant_authorization_writes_create_direct_and_group_permissions(
     assert!(group_permission.inherit_children);
     assert!(
         store
-            .remove_user_from_group(TENANT_A, group.id, MEMBER_A)
+            .remove_user_from_group(TENANT_A, tenant_account_actor(TENANT_A), group.id, MEMBER_A,)
             .await
             .unwrap()
     );
@@ -466,7 +477,9 @@ async fn sqlite_tenant_authorization_writes_reject_cross_tenant_and_invalid_perm
         Err(TenantAuthorizationError::UserNotFound { .. })
     ));
     assert!(matches!(
-        store.add_user_to_group(TENANT_A, group_a.id, USER_B).await,
+        store
+            .add_user_to_group(TENANT_A, tenant_account_actor(TENANT_A), group_a.id, USER_B,)
+            .await,
         Err(TenantAuthorizationError::UserNotFound { .. })
     ));
     assert!(matches!(
@@ -585,7 +598,7 @@ async fn sqlite_tenant_authorization_writes_revoke_only_the_tenant_permission() 
 
     assert!(matches!(
         store
-            .revoke_resource_permission(TENANT_B, permission.id)
+            .revoke_resource_permission(TENANT_B, tenant_account_actor(TENANT_B), permission.id,)
             .await,
         Err(TenantAuthorizationError::PermissionNotFound { .. })
     ));
@@ -601,13 +614,13 @@ async fn sqlite_tenant_authorization_writes_revoke_only_the_tenant_permission() 
     );
     assert!(
         store
-            .revoke_resource_permission(TENANT_A, permission.id)
+            .revoke_resource_permission(TENANT_A, tenant_account_actor(TENANT_A), permission.id,)
             .await
             .unwrap()
     );
     assert!(
         !store
-            .revoke_resource_permission(TENANT_A, permission.id)
+            .revoke_resource_permission(TENANT_A, tenant_account_actor(TENANT_A), permission.id,)
             .await
             .unwrap()
     );
@@ -639,7 +652,12 @@ async fn sqlite_tenant_authorization_lists_tenant_groups_and_active_permissions(
         .await
         .unwrap();
     store
-        .add_user_to_group(TENANT_A, group_a.id, MEMBER_A)
+        .add_user_to_group(
+            TENANT_A,
+            tenant_account_actor(TENANT_A),
+            group_a.id,
+            MEMBER_A,
+        )
         .await
         .unwrap();
     let group_b = store
@@ -652,7 +670,7 @@ async fn sqlite_tenant_authorization_lists_tenant_groups_and_active_permissions(
         .await
         .unwrap();
     store
-        .add_user_to_group(TENANT_B, group_b.id, USER_B)
+        .add_user_to_group(TENANT_B, tenant_account_actor(TENANT_B), group_b.id, USER_B)
         .await
         .unwrap();
 
@@ -674,7 +692,7 @@ async fn sqlite_tenant_authorization_lists_tenant_groups_and_active_permissions(
         .await
         .unwrap();
     store
-        .revoke_resource_permission(TENANT_A, revoked.id)
+        .revoke_resource_permission(TENANT_A, tenant_account_actor(TENANT_A), revoked.id)
         .await
         .unwrap();
 

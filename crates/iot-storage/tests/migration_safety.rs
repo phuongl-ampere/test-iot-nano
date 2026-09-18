@@ -299,6 +299,79 @@ async fn sqlite_current_schema_does_not_create_a_pre_migration_backup() {
 }
 
 #[tokio::test]
+async fn sqlite_open_upgrades_legacy_audit_changes_to_an_object_constraint() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = sqlite_configuration(directory.path().join("audit-events-upgrade.sqlite"));
+    let store = PlatformStore::open(&configuration).await.unwrap();
+    seed_test_tenant(&store).await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::raw_sql(
+        "DROP TABLE audit_events;
+         CREATE TABLE audit_events (
+             id TEXT PRIMARY KEY,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+             occurred_at TEXT NOT NULL,
+             actor_principal_kind TEXT NOT NULL
+                 CHECK (actor_principal_kind IN ('system_account', 'tenant_account', 'user')),
+             actor_principal_id TEXT NOT NULL,
+             action TEXT NOT NULL,
+             target_type TEXT NOT NULL,
+             target_id TEXT NOT NULL,
+             changes TEXT NOT NULL CHECK (json_valid(changes))
+         );
+         INSERT INTO audit_events (
+             id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+             action, target_type, target_id, changes
+         ) VALUES (
+             'legacy-audit-event', '00000000-0000-0000-0000-000000000001',
+             '2026-01-01T00:00:00Z', 'user', '00000000-0000-0000-0000-000000000001',
+             'permission.granted', 'resource_permission', 'legacy-target', '{}'
+         );",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    drop(store);
+
+    let reopened = PlatformStore::open(&configuration).await.unwrap();
+    let pool = reopened.sqlite_pool().unwrap();
+    let schema: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        schema.contains("json_type(changes) = 'object'"),
+        "audit_events schema did not enforce object changes: {schema}"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO audit_events (
+                id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+                action, target_type, target_id, changes
+             ) VALUES (?, ?, '2026-01-01T00:00:01Z', 'user', ?,
+                       'permission.granted', 'resource_permission', 'array-target', '[]')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(test_tenant_id().to_string())
+        .bind(test_tenant_id().to_string())
+        .execute(pool)
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT changes FROM audit_events WHERE id = 'legacy-audit-event'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        "{}"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_open_adds_gateway_topology_version_to_an_existing_devices_table() {
     let directory = tempfile::tempdir().unwrap();
     let configuration =

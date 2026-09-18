@@ -1,7 +1,7 @@
 use chrono::{Duration, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    ManagementChildStatus, ManagementDeviceError, ManagementDeviceRepository,
+    AuditPrincipal, ManagementChildStatus, ManagementDeviceError, ManagementDeviceRepository,
     ManagementDeviceTopology, ManagementGatewayStatus, PlatformStore, UpdateManagementDevice,
 };
 use serde_json::json;
@@ -37,12 +37,16 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, slug: &str) -> Uuid {
             id, tenant_id, password_hash, status, credential_version
          ) VALUES (?, ?, 'unused', 'active', 1)",
     )
-    .bind(Uuid::now_v7().to_string())
+    .bind(tenant_id.to_string())
     .bind(tenant_id.to_string())
     .execute(pool)
     .await
     .unwrap();
     tenant_id
+}
+
+fn tenant_actor(tenant_id: Uuid) -> AuditPrincipal {
+    AuditPrincipal::TenantAccount(tenant_id)
 }
 
 async fn seed_management_devices(store: &PlatformStore, tenant_id: Uuid) -> (Uuid, Uuid) {
@@ -203,6 +207,7 @@ async fn sqlite_management_devices_reject_cross_tenant_lookup_mutation_and_asset
         ManagementDeviceRepository::update_management_device(
             &store,
             tenant_a,
+            tenant_actor(tenant_a),
             "tenant-b-device",
             UpdateManagementDevice {
                 display_name: "Changed".to_owned(),
@@ -216,14 +221,20 @@ async fn sqlite_management_devices_reject_cross_tenant_lookup_mutation_and_asset
         Err(ManagementDeviceError::DeviceNotFound)
     ));
     assert!(matches!(
-        ManagementDeviceRepository::delete_management_device(&store, tenant_a, "tenant-b-device")
-            .await,
+        ManagementDeviceRepository::delete_management_device(
+            &store,
+            tenant_a,
+            tenant_actor(tenant_a),
+            "tenant-b-device",
+        )
+        .await,
         Err(ManagementDeviceError::DeviceNotFound)
     ));
     assert!(matches!(
         ManagementDeviceRepository::update_management_device(
             &store,
             tenant_a,
+            tenant_actor(tenant_a),
             "tenant-a-device",
             UpdateManagementDevice {
                 display_name: "Tenant A".to_owned(),
@@ -240,6 +251,7 @@ async fn sqlite_management_devices_reject_cross_tenant_lookup_mutation_and_asset
         ManagementDeviceRepository::update_management_device(
             &store,
             tenant_a,
+            tenant_actor(tenant_a),
             "tenant-a-device",
             UpdateManagementDevice {
                 display_name: "Tenant A".to_owned(),
@@ -296,6 +308,16 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore, Uuid) {
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES ($1, $2, 'unused', 'active', 1)",
+    )
+    .bind(tenant_id)
+    .bind(tenant_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     (
         TimescaleTestLock {
             _connection: connection,
@@ -344,6 +366,7 @@ async fn sqlite_management_device_repository_updates_lists_and_soft_deletes_devi
     let updated = ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         UpdateManagementDevice {
             display_name: "Renamed direct".to_owned(),
@@ -383,9 +406,14 @@ async fn sqlite_management_device_repository_updates_lists_and_soft_deletes_devi
         .is_some()
     );
 
-    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "management-child")
-        .await
-        .unwrap();
+    ManagementDeviceRepository::delete_management_device(
+        &store,
+        tenant_id,
+        tenant_actor(tenant_id),
+        "management-child",
+    )
+    .await
+    .unwrap();
     assert!(
         ManagementDeviceRepository::list_management_devices(&store, tenant_id)
             .await
@@ -425,6 +453,7 @@ async fn sqlite_gateway_topology_version_increments_on_assignment_reassignment_a
     ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         child_topology_update(Some("management-gateway")),
     )
@@ -438,6 +467,7 @@ async fn sqlite_gateway_topology_version_increments_on_assignment_reassignment_a
     ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         child_topology_update(Some("management-gateway-two")),
     )
@@ -451,6 +481,7 @@ async fn sqlite_gateway_topology_version_increments_on_assignment_reassignment_a
     ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         child_topology_update(None),
     )
@@ -464,6 +495,7 @@ async fn sqlite_gateway_topology_version_increments_on_assignment_reassignment_a
     ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         UpdateManagementDevice {
             display_name: "Renamed direct".to_owned(),
@@ -489,6 +521,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
     let scalar_attributes = ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         UpdateManagementDevice {
             display_name: "Direct".to_owned(),
@@ -508,6 +541,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
     let missing_asset = ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         UpdateManagementDevice {
             display_name: "Direct".to_owned(),
@@ -527,6 +561,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
     let demote_gateway = ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-gateway",
         UpdateManagementDevice {
             display_name: "Gateway".to_owned(),
@@ -549,6 +584,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
     let delete_gateway = ManagementDeviceRepository::delete_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-gateway",
     )
     .await
@@ -561,6 +597,7 @@ async fn sqlite_management_device_repository_returns_typed_validation_errors() {
     let non_gateway_parent = ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         UpdateManagementDevice {
             display_name: "Direct".to_owned(),
@@ -702,6 +739,7 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
     let updated = ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "management-direct",
         UpdateManagementDevice {
             display_name: "Renamed direct".to_owned(),
@@ -724,9 +762,14 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
         Some(ManagementChildStatus::Unavailable)
     );
 
-    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "management-child")
-        .await
-        .unwrap();
+    ManagementDeviceRepository::delete_management_device(
+        &store,
+        tenant_id,
+        tenant_actor(tenant_id),
+        "management-child",
+    )
+    .await
+    .unwrap();
     assert!(
         ManagementDeviceRepository::list_management_devices(&store, tenant_id)
             .await
@@ -756,6 +799,7 @@ async fn timescale_gateway_topology_version_increments_on_assignment_reassignmen
     ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "timescale-version-child",
         child_topology_update(Some("timescale-version-gateway-one")),
     )
@@ -766,6 +810,7 @@ async fn timescale_gateway_topology_version_increments_on_assignment_reassignmen
     ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "timescale-version-child",
         child_topology_update(Some("timescale-version-gateway-two")),
     )
@@ -776,6 +821,7 @@ async fn timescale_gateway_topology_version_increments_on_assignment_reassignmen
     ManagementDeviceRepository::update_management_device(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         "timescale-version-child",
         child_topology_update(None),
     )

@@ -3,9 +3,9 @@ use iot_core::{
     hash_device_token,
 };
 use iot_storage::{
-    DeviceTokenRepository, DeviceTokenRepositoryError, IdentityRepository, ManagementDeviceError,
-    ManagementDeviceRepository, ManagementDeviceTopology, NewDeviceToken, NewOwnedDeviceToken,
-    PlatformStore, UpdateManagementDevice,
+    AuditPrincipal, DeviceTokenRepository, DeviceTokenRepositoryError, IdentityRepository,
+    ManagementDeviceError, ManagementDeviceRepository, ManagementDeviceTopology, NewDeviceToken,
+    NewOwnedDeviceToken, PlatformStore, UpdateManagementDevice,
 };
 use sqlx::{AssertSqlSafe, Connection, PgConnection};
 use uuid::Uuid;
@@ -31,6 +31,16 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
         .execute(store.sqlite_pool().unwrap())
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(provisioning_tenant_id().to_string())
+    .bind(provisioning_tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     (directory, store)
 }
 
@@ -66,6 +76,16 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
         .execute(store.timescale_pool().unwrap())
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES ($1, $2, 'unused', 'active', 1)",
+    )
+    .bind(provisioning_tenant_id())
+    .bind(provisioning_tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     (
         TimescaleTestLock {
             _connection: connection,
@@ -81,6 +101,10 @@ fn token(prefix: &str) -> NewDeviceToken {
         token_hash: format!("{prefix}-hash"),
         token_ciphertext: format!("{prefix}-ciphertext"),
     }
+}
+
+fn tenant_actor(tenant_id: Uuid) -> AuditPrincipal {
+    AuditPrincipal::TenantAccount(tenant_id)
 }
 
 fn generated_token() -> (String, NewDeviceToken) {
@@ -210,6 +234,16 @@ async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(other_tenant_id.to_string())
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
     let issued = DeviceTokenRepository::provision_device_token(
         &store,
         tenant_id,
@@ -304,6 +338,16 @@ async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_m
     .await
     .unwrap();
     sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(other_tenant_id.to_string())
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO devices (device_id, tenant_id, is_gateway) VALUES
              ('topology-gateway', ?, 1),
              ('topology-race', ?, 0),
@@ -335,6 +379,7 @@ async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_m
     let topology_error = ManagementDeviceRepository::update_management_device(
         &store,
         other_tenant_id,
+        tenant_actor(other_tenant_id),
         "topology-race",
         UpdateManagementDevice {
             display_name: "Cross-tenant topology".to_owned(),
@@ -357,6 +402,7 @@ async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_m
     let delete_error = ManagementDeviceRepository::delete_management_device(
         &store,
         other_tenant_id,
+        tenant_actor(other_tenant_id),
         "delete-race",
     )
     .await
@@ -473,6 +519,7 @@ async fn sqlite_management_token_revocations_require_tenant_after_post_mutation_
         ManagementDeviceRepository::update_management_device(
             &store,
             tenant_id,
+            tenant_actor(tenant_id),
             "post-mutation-topology",
             UpdateManagementDevice {
                 display_name: "Post-mutation topology".to_owned(),
@@ -523,9 +570,14 @@ async fn sqlite_management_token_revocations_require_tenant_after_post_mutation_
         .execute(pool)
         .await
         .unwrap();
-    ManagementDeviceRepository::delete_management_device(&store, tenant_id, "post-mutation-delete")
-        .await
-        .unwrap();
+    ManagementDeviceRepository::delete_management_device(
+        &store,
+        tenant_id,
+        tenant_actor(tenant_id),
+        "post-mutation-delete",
+    )
+    .await
+    .unwrap();
     assert!(
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT deleted_at FROM devices WHERE device_id = 'post-mutation-delete'",
@@ -694,6 +746,7 @@ async fn sqlite_device_token_repository_provisions_owned_devices_and_identity_re
     let issued = DeviceTokenRepository::provision_owned_device_token(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         NewOwnedDeviceToken {
             display_name: "Owned device".to_owned(),
             owner_user_id,
@@ -768,6 +821,7 @@ async fn sqlite_owned_token_provision_rejects_cross_tenant_references() {
     let error = DeviceTokenRepository::provision_owned_device_token(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         NewOwnedDeviceToken {
             display_name: "Cross-tenant owned device".to_owned(),
             owner_user_id,
@@ -783,6 +837,7 @@ async fn sqlite_owned_token_provision_rejects_cross_tenant_references() {
     let cross_tenant_owner_error = DeviceTokenRepository::provision_owned_device_token(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         NewOwnedDeviceToken {
             display_name: "Cross-tenant owner device".to_owned(),
             owner_user_id: other_owner_user_id,
@@ -941,6 +996,7 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
     let issued = DeviceTokenRepository::provision_owned_device_token(
         &store,
         tenant_id,
+        tenant_actor(tenant_id),
         NewOwnedDeviceToken {
             display_name: "Owned device".to_owned(),
             owner_user_id,
@@ -998,6 +1054,7 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
         DeviceTokenRepository::provision_owned_device_token(
             &store,
             tenant_id,
+            tenant_actor(tenant_id),
             NewOwnedDeviceToken {
                 display_name: "Cross-tenant asset device".to_owned(),
                 owner_user_id,
@@ -1013,6 +1070,7 @@ async fn timescale_device_token_repository_provisions_owned_devices_and_identity
         DeviceTokenRepository::provision_owned_device_token(
             &store,
             tenant_id,
+            tenant_actor(tenant_id),
             NewOwnedDeviceToken {
                 display_name: "Cross-tenant owner device".to_owned(),
                 owner_user_id: other_owner_user_id,

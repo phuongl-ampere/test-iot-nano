@@ -1,9 +1,9 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    AccountClass, ManagementAssetRepository, NewPublicAsset, NewPublicDevice, PlatformStore,
-    PublicApiRepository, PublicDeviceError, PublicPrincipal, ResourceAccess, ResourceAccessSource,
-    ResourcePermission,
+    AccountClass, AuditPrincipal, ManagementAssetRepository, NewPublicAsset, NewPublicDevice,
+    PlatformStore, PublicApiRepository, PublicDeviceError, PublicPrincipal, ResourceAccess,
+    ResourceAccessSource, ResourcePermission,
 };
 use serde_json::json;
 use sqlx::{Connection, PgConnection, PgPool};
@@ -2425,6 +2425,7 @@ async fn timescale_public_device_assignment_serializes_with_management_asset_del
         ManagementAssetRepository::delete_management_asset(
             &deleting_store,
             test_tenant_id(),
+            AuditPrincipal::User(owner_id),
             asset_id,
         )
         .await

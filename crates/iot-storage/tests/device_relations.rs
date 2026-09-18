@@ -1,6 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    CreateDeviceRelation, DeviceRelationError, DeviceRelationRepository, PlatformStore,
+    AuditPrincipal, CreateDeviceRelation, DeviceRelationError, DeviceRelationRepository,
+    PlatformStore,
 };
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -76,6 +77,14 @@ fn relation(from_device_id: &str, to_device_id: &str, relation_type: &str) -> Cr
     }
 }
 
+fn tenant_actor(tenant_id: Uuid) -> AuditPrincipal {
+    match tenant_id {
+        TENANT_A => AuditPrincipal::TenantAccount(Uuid::from_u128(101)),
+        TENANT_B => AuditPrincipal::TenantAccount(Uuid::from_u128(102)),
+        _ => unreachable!("test actor requested for an unseeded tenant"),
+    }
+}
+
 #[tokio::test]
 async fn sqlite_device_relations_are_tenant_scoped_and_do_not_change_gateway_topology() {
     let (_directory, store) = sqlite_store().await;
@@ -85,6 +94,7 @@ async fn sqlite_device_relations_are_tenant_scoped_and_do_not_change_gateway_top
     let created = DeviceRelationRepository::create_device_relation(
         &store,
         TENANT_A,
+        tenant_actor(TENANT_A),
         relation(DEVICE_A, DEVICE_B, "monitors"),
     )
     .await
@@ -118,9 +128,14 @@ async fn sqlite_device_relations_are_tenant_scoped_and_do_not_change_gateway_top
     );
 
     assert!(
-        DeviceRelationRepository::delete_device_relation(&store, TENANT_A, created.id)
-            .await
-            .unwrap()
+        DeviceRelationRepository::delete_device_relation(
+            &store,
+            TENANT_A,
+            tenant_actor(TENANT_A),
+            created.id,
+        )
+        .await
+        .unwrap()
     );
     assert_eq!(
         sqlx::query_scalar::<_, Option<String>>(
@@ -144,6 +159,7 @@ async fn sqlite_device_relations_reject_invalid_or_cross_tenant_endpoints() {
         DeviceRelationRepository::create_device_relation(
             &store,
             TENANT_A,
+            tenant_actor(TENANT_A),
             relation(DEVICE_A, DEVICE_OTHER_TENANT, "monitors"),
         )
         .await,
@@ -153,6 +169,7 @@ async fn sqlite_device_relations_reject_invalid_or_cross_tenant_endpoints() {
         DeviceRelationRepository::create_device_relation(
             &store,
             TENANT_A,
+            tenant_actor(TENANT_A),
             relation(DEVICE_A, DEVICE_A, "monitors"),
         )
         .await,
@@ -162,6 +179,7 @@ async fn sqlite_device_relations_reject_invalid_or_cross_tenant_endpoints() {
         DeviceRelationRepository::create_device_relation(
             &store,
             TENANT_A,
+            tenant_actor(TENANT_A),
             relation(DEVICE_A, DEVICE_B, "gateway_child"),
         )
         .await,
@@ -171,6 +189,7 @@ async fn sqlite_device_relations_reject_invalid_or_cross_tenant_endpoints() {
         DeviceRelationRepository::create_device_relation(
             &store,
             TENANT_A,
+            tenant_actor(TENANT_A),
             relation(DEVICE_A, DEVICE_B, "invalid relation"),
         )
         .await,
@@ -180,6 +199,7 @@ async fn sqlite_device_relations_reject_invalid_or_cross_tenant_endpoints() {
     let created = DeviceRelationRepository::create_device_relation(
         &store,
         TENANT_A,
+        tenant_actor(TENANT_A),
         relation(DEVICE_A, DEVICE_B, "monitors"),
     )
     .await
@@ -188,13 +208,20 @@ async fn sqlite_device_relations_reject_invalid_or_cross_tenant_endpoints() {
         DeviceRelationRepository::create_device_relation(
             &store,
             TENANT_A,
+            tenant_actor(TENANT_A),
             relation(DEVICE_A, DEVICE_B, "monitors"),
         )
         .await,
         Err(DeviceRelationError::RelationConflict)
     ));
     assert!(matches!(
-        DeviceRelationRepository::delete_device_relation(&store, TENANT_B, created.id).await,
+        DeviceRelationRepository::delete_device_relation(
+            &store,
+            TENANT_B,
+            tenant_actor(TENANT_B),
+            created.id,
+        )
+        .await,
         Err(DeviceRelationError::RelationNotFound)
     ));
     assert_eq!(

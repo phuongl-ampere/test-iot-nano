@@ -1,10 +1,11 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    CreateManagementAssetProfile, CreateManagementDeviceProfile, ManagementAssetError,
-    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
-    ManagementDeviceError, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
-    ManagementDeviceRepository, PlatformStore, UpdateManagementAsset, UpdateManagementAssetProfile,
-    UpdateManagementDevice, UpdateManagementDeviceProfile,
+    AuditPrincipal, CreateManagementAssetProfile, CreateManagementDeviceProfile,
+    ManagementAssetError, ManagementAssetProfileError, ManagementAssetProfileRepository,
+    ManagementAssetRepository, ManagementDeviceError, ManagementDeviceProfileError,
+    ManagementDeviceProfileRepository, ManagementDeviceRepository, PlatformStore,
+    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
+    UpdateManagementDeviceProfile,
 };
 use serde_json::json;
 use sqlx::{Connection, PgConnection, PgPool, types::Json};
@@ -35,7 +36,21 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, slug: &str) -> Uuid {
         .execute(pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(tenant_id.to_string())
+    .bind(tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
     tenant_id
+}
+
+fn tenant_actor(tenant_id: Uuid) -> AuditPrincipal {
+    AuditPrincipal::TenantAccount(tenant_id)
 }
 
 fn device_profile(name: &str) -> CreateManagementDeviceProfile {
@@ -506,6 +521,16 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore, Uuid) {
     sqlx::query(
         "INSERT INTO tenants (id, slug, status) VALUES ($1, 'management-profiles', 'active')",
     )
+    .bind(tenant_id)
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES ($1, $2, 'unused', 'active', 1)",
+    )
+    .bind(tenant_id)
     .bind(tenant_id)
     .execute(store.timescale_pool().unwrap())
     .await
@@ -987,6 +1012,7 @@ async fn timescale_device_profile_deletion_serializes_assignment_and_returns_typ
         ManagementDeviceRepository::update_management_device(
             &update_store,
             update_tenant_id,
+            tenant_actor(update_tenant_id),
             "concurrent-profile-device",
             UpdateManagementDevice {
                 display_name: "Concurrent profile device".to_owned(),
@@ -1083,6 +1109,7 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
         ManagementDeviceRepository::update_management_device(
             &update_store,
             update_tenant_id,
+            tenant_actor(update_tenant_id),
             "concurrent-profile-device",
             UpdateManagementDevice {
                 display_name: "Concurrent profile device".to_owned(),
@@ -1172,6 +1199,7 @@ async fn timescale_profile_deletion_blocks_profile_assignments_before_target_row
         ManagementAssetRepository::update_management_asset(
             &update_store,
             update_tenant_id,
+            tenant_actor(update_tenant_id),
             asset_id,
             UpdateManagementAsset {
                 name: "Concurrent profile asset".to_owned(),

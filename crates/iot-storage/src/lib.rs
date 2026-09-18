@@ -18,7 +18,9 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Duration as ChronoDuration, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
+};
 use iot_core::{
     DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent, device_token_prefix,
     verify_device_token,
@@ -494,7 +496,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     action TEXT NOT NULL,
     target_type TEXT NOT NULL,
     target_id TEXT NOT NULL,
-    changes TEXT NOT NULL CHECK (json_valid(changes))
+    changes TEXT NOT NULL CHECK (json_type(changes) = 'object')
 );
 CREATE INDEX IF NOT EXISTS audit_events_tenant_occurred_at_id_index
     ON audit_events (tenant_id, occurred_at DESC, id DESC);
@@ -1946,12 +1948,14 @@ pub trait TenantAuthorizationRepository: Send + Sync {
     fn add_user_to_group<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         group_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
     fn remove_user_from_group<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         group_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
@@ -1968,6 +1972,7 @@ pub trait TenantAuthorizationRepository: Send + Sync {
     fn revoke_resource_permission<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         permission_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
     fn transfer_resource_ownership<'a>(
@@ -4242,12 +4247,14 @@ impl PlatformStore {
     pub async fn add_user_to_group(
         &self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         group_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Result<bool, TenantAuthorizationError> {
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
                 sqlite_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
                 sqlite_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
                 let inserted = sqlx::query(
@@ -4263,9 +4270,6 @@ impl PlatformStore {
                 .rows_affected()
                     > 0;
                 if inserted {
-                    let actor =
-                        audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id)
-                            .await?;
                     let event = audit::NewAuditEvent::new(
                         tenant_id,
                         actor,
@@ -4281,6 +4285,7 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
+                timescale_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
                 timescale_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
                 timescale_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
                 let inserted = sqlx::query(
@@ -4296,9 +4301,6 @@ impl PlatformStore {
                 .rows_affected()
                     > 0;
                 if inserted {
-                    let actor =
-                        audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
-                            .await?;
                     let event = audit::NewAuditEvent::new(
                         tenant_id,
                         actor,
@@ -4318,12 +4320,14 @@ impl PlatformStore {
     pub async fn remove_user_from_group(
         &self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         group_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Result<bool, TenantAuthorizationError> {
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
                 sqlite_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
                 sqlite_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
                 let removed = sqlx::query(
@@ -4338,9 +4342,6 @@ impl PlatformStore {
                 .rows_affected()
                     > 0;
                 if removed {
-                    let actor =
-                        audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id)
-                            .await?;
                     let event = audit::NewAuditEvent::new(
                         tenant_id,
                         actor,
@@ -4356,6 +4357,7 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
+                timescale_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
                 timescale_require_tenant_group(&mut transaction, tenant_id, group_id).await?;
                 timescale_require_tenant_user(&mut transaction, tenant_id, user_id).await?;
                 let removed = sqlx::query(
@@ -4370,9 +4372,6 @@ impl PlatformStore {
                 .rows_affected()
                     > 0;
                 if removed {
-                    let actor =
-                        audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
-                            .await?;
                     let event = audit::NewAuditEvent::new(
                         tenant_id,
                         actor,
@@ -4490,28 +4489,15 @@ impl PlatformStore {
     pub async fn revoke_resource_permission(
         &self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         permission_id: uuid::Uuid,
     ) -> Result<bool, TenantAuthorizationError> {
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
                 sqlite_require_tenant_permission(&mut transaction, tenant_id, permission_id)
                     .await?;
-                let creator = sqlx::query(
-                    "SELECT created_by_user_id, created_by_tenant_account_id
-                     FROM resource_permissions
-                     WHERE id = ? AND tenant_id = ?",
-                )
-                .bind(permission_id.to_string())
-                .bind(tenant_id.to_string())
-                .fetch_one(&mut *transaction)
-                .await?;
-                let actor = audit_principal_for_permission_creator(permission_creator(
-                    tenant_authorization_optional_uuid(creator.try_get("created_by_user_id")?)?,
-                    tenant_authorization_optional_uuid(
-                        creator.try_get("created_by_tenant_account_id")?,
-                    )?,
-                )?);
                 let revoked = sqlx::query(
                     "UPDATE resource_permissions
                      SET revoked_at = ?
@@ -4540,22 +4526,9 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
+                timescale_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
                 timescale_require_tenant_permission(&mut transaction, tenant_id, permission_id)
                     .await?;
-                let creator = sqlx::query(
-                    "SELECT created_by_user_id, created_by_tenant_account_id
-                     FROM resource_permissions
-                     WHERE id = $1 AND tenant_id = $2
-                     FOR UPDATE",
-                )
-                .bind(permission_id)
-                .bind(tenant_id)
-                .fetch_one(&mut *transaction)
-                .await?;
-                let actor = audit_principal_for_permission_creator(permission_creator(
-                    creator.try_get("created_by_user_id")?,
-                    creator.try_get("created_by_tenant_account_id")?,
-                )?);
                 let revoked = sqlx::query(
                     "UPDATE resource_permissions
                      SET revoked_at = now()
@@ -9066,22 +9039,24 @@ impl TenantAuthorizationRepository for PlatformStore {
     fn add_user_to_group<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         group_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
         Box::pin(async move {
-            PlatformStore::add_user_to_group(self, tenant_id, group_id, user_id).await
+            PlatformStore::add_user_to_group(self, tenant_id, actor, group_id, user_id).await
         })
     }
 
     fn remove_user_from_group<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         group_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
         Box::pin(async move {
-            PlatformStore::remove_user_from_group(self, tenant_id, group_id, user_id).await
+            PlatformStore::remove_user_from_group(self, tenant_id, actor, group_id, user_id).await
         })
     }
 
@@ -9101,10 +9076,11 @@ impl TenantAuthorizationRepository for PlatformStore {
     fn revoke_resource_permission<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
         permission_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
         Box::pin(async move {
-            PlatformStore::revoke_resource_permission(self, tenant_id, permission_id).await
+            PlatformStore::revoke_resource_permission(self, tenant_id, actor, permission_id).await
         })
     }
 
@@ -11918,6 +11894,7 @@ impl SqliteStore {
             .execute(&pool)
             .await?;
         sqlx::raw_sql(SQLITE_SCHEMA).execute(&pool).await?;
+        migrate_audit_events_schema(&pool).await?;
         migrate_root_asset_name_uniqueness(&pool).await?;
         migrate_command_outbox_schema(&pool).await?;
         migrate_resource_authorization_schema(&pool).await?;
@@ -12931,6 +12908,143 @@ async fn migrate_gateway_topology_schema(pool: &SqlitePool) -> Result<(), sqlx::
     Ok(())
 }
 
+async fn migrate_audit_events_schema(pool: &SqlitePool) -> Result<(), SqliteStoreError> {
+    let schema: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let rows = sqlx::query(
+        "SELECT
+             id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+             action, target_type, target_id, changes
+         FROM audit_events",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    let mut timestamps_are_canonical = true;
+    for row in rows {
+        let occurred_at: String = row.try_get("occurred_at")?;
+        let canonical_occurred_at = canonical_sqlite_audit_occurred_at(&occurred_at)?;
+        timestamps_are_canonical &= occurred_at == canonical_occurred_at;
+        events.push((
+            row.try_get::<String, _>("id")?,
+            row.try_get::<String, _>("tenant_id")?,
+            canonical_occurred_at,
+            row.try_get::<String, _>("actor_principal_kind")?,
+            row.try_get::<String, _>("actor_principal_id")?,
+            row.try_get::<String, _>("action")?,
+            row.try_get::<String, _>("target_type")?,
+            row.try_get::<String, _>("target_id")?,
+            row.try_get::<String, _>("changes")?,
+        ));
+    }
+    if sqlite_audit_changes_constraint_is_object(&schema) && timestamps_are_canonical {
+        transaction.commit().await?;
+        return Ok(());
+    }
+
+    let non_object_changes: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM audit_events WHERE json_type(changes) IS NOT 'object'
+         )",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if non_object_changes {
+        return Err(SqliteStoreError::AuditChangesNotObject);
+    }
+    sqlx::raw_sql(
+        "CREATE TABLE audit_events_rebuild (
+             id TEXT PRIMARY KEY,
+             tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+             occurred_at TEXT NOT NULL,
+             actor_principal_kind TEXT NOT NULL
+                 CHECK (actor_principal_kind IN ('system_account', 'tenant_account', 'user')),
+             actor_principal_id TEXT NOT NULL,
+             action TEXT NOT NULL,
+             target_type TEXT NOT NULL,
+             target_id TEXT NOT NULL,
+             changes TEXT NOT NULL CHECK (json_type(changes) = 'object')
+         );",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    for (
+        id,
+        tenant_id,
+        occurred_at,
+        actor_principal_kind,
+        actor_principal_id,
+        action,
+        target_type,
+        target_id,
+        changes,
+    ) in events
+    {
+        sqlx::query(
+            "INSERT INTO audit_events_rebuild (
+                id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+                action, target_type, target_id, changes
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(occurred_at)
+        .bind(actor_principal_kind)
+        .bind(actor_principal_id)
+        .bind(action)
+        .bind(target_type)
+        .bind(target_id)
+        .bind(changes)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    sqlx::raw_sql(
+        "DROP TABLE audit_events;
+         ALTER TABLE audit_events_rebuild RENAME TO audit_events;
+         CREATE INDEX audit_events_tenant_occurred_at_id_index
+             ON audit_events (tenant_id, occurred_at DESC, id DESC);
+         CREATE TRIGGER audit_events_immutable_update
+         BEFORE UPDATE ON audit_events
+         FOR EACH ROW
+         BEGIN
+             SELECT RAISE(ABORT, 'audit_events are immutable');
+         END;
+         CREATE TRIGGER audit_events_immutable_delete
+         BEFORE DELETE ON audit_events
+         FOR EACH ROW
+         BEGIN
+             SELECT RAISE(ABORT, 'audit_events are immutable');
+         END;",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+fn sqlite_audit_changes_constraint_is_object(schema: &str) -> bool {
+    let normalized = schema
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    normalized.contains("check(json_type(changes)='object')")
+}
+
+fn canonical_sqlite_audit_occurred_at(value: &str) -> Result<String, SqliteStoreError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Nanos, true)
+        })
+        .map_err(|_| SqliteStoreError::InvalidAuditTimestamp(value.to_owned()))
+}
+
 async fn sqlite_table_has_column(
     pool: &SqlitePool,
     table: &str,
@@ -13549,6 +13663,10 @@ pub enum SqliteStoreError {
         "platform SQLite schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
     )]
     ResetRequired { table: String },
+    #[error("audit_events contains a non-object changes value and cannot be upgraded")]
+    AuditChangesNotObject,
+    #[error("audit_events contains an invalid occurred_at timestamp: {0}")]
+    InvalidAuditTimestamp(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]

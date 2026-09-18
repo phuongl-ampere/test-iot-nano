@@ -1,8 +1,9 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AuditAction, AuditEventRepository, AuditPrincipal, AuditTargetType, CreateDeviceRelation,
-    DeviceRelationRepository, ManagementAssetRepository, ManagementDeviceRepository,
-    ManagementDeviceTopology, OwnershipTransferTarget, PlatformStore,
+    CreateManagementAsset, DeviceRelationRepository, DeviceTokenRepository,
+    ManagementAssetRepository, ManagementDeviceRepository, ManagementDeviceTopology,
+    NewDeviceToken, NewOwnedDeviceToken, OwnershipTransferTarget, PlatformStore,
     TenantAuthorizationRepository, UpdateManagementAsset, UpdateManagementDevice,
 };
 use serde_json::json;
@@ -24,12 +25,15 @@ const OWNER_A: Uuid = Uuid::from_u128(1_005);
 const OWNER_B: Uuid = Uuid::from_u128(1_006);
 const OTHER_TENANT_ID: Uuid = Uuid::from_u128(1_007);
 const OTHER_TENANT_USER_ID: Uuid = Uuid::from_u128(1_008);
+const OTHER_TENANT_ACCOUNT_ID: Uuid = Uuid::from_u128(1_015);
 const OWNED_ASSET_ID: Uuid = Uuid::from_u128(1_009);
 const DEVICE_CONTAINMENT_ASSET_ID: Uuid = Uuid::from_u128(1_010);
 const DEVICE_CONTAINMENT_DEVICE: &str = "audit-containment-device";
 const DELETE_PARENT_ASSET_ID: Uuid = Uuid::from_u128(1_011);
 const DELETE_CHILD_ASSET_ID: Uuid = Uuid::from_u128(1_012);
 const DELETE_CHILD_DEVICE: &str = "audit-delete-child-device";
+const WHOLE_SECOND_AUDIT_ID: Uuid = Uuid::from_u128(1_013);
+const FRACTIONAL_SECOND_AUDIT_ID: Uuid = Uuid::from_u128(1_014);
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -66,6 +70,307 @@ async fn seed_tenant(store: &PlatformStore) {
     .unwrap();
 }
 
+async fn seed_user(store: &PlatformStore, user_id: Uuid, username: &str) {
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, ?, 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .bind(TENANT_ID.to_string())
+    .bind(username)
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+}
+
+fn tenant_actor() -> AuditPrincipal {
+    AuditPrincipal::TenantAccount(TENANT_ACCOUNT_ID)
+}
+
+#[tokio::test]
+async fn sqlite_audit_keyset_order_is_chronological_for_whole_and_fractional_seconds() {
+    let (directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
+    let pool = store.sqlite_pool().unwrap();
+    for (id, occurred_at) in [
+        (WHOLE_SECOND_AUDIT_ID, "2026-01-01T00:00:00Z"),
+        (FRACTIONAL_SECOND_AUDIT_ID, "2026-01-01T00:00:00.500Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO audit_events (
+                id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+                action, target_type, target_id, changes
+             ) VALUES (?, ?, ?, 'tenant_account', ?,
+                       'permission.granted', 'resource_permission', ?, '{}')",
+        )
+        .bind(id.to_string())
+        .bind(TENANT_ID.to_string())
+        .bind(occurred_at)
+        .bind(TENANT_ACCOUNT_ID.to_string())
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    drop(store);
+
+    let store = PlatformStore::open(&StorageConfiguration {
+        storage: DatabaseStorage::Sqlite,
+        database_url: None,
+        sqlite_path: Some(directory.path().join("platform.sqlite")),
+        sqlite_busy_timeout_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT occurred_at FROM audit_events WHERE id = ?",)
+            .bind(WHOLE_SECOND_AUDIT_ID.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        "2026-01-01T00:00:00.000000000Z"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT occurred_at FROM audit_events WHERE id = ?",)
+            .bind(FRACTIONAL_SECOND_AUDIT_ID.to_string())
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap(),
+        "2026-01-01T00:00:00.500000000Z"
+    );
+    let first_page = AuditEventRepository::list_tenant_audit_events(&store, TENANT_ID, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_page[0].id, FRACTIONAL_SECOND_AUDIT_ID);
+    let second_page = AuditEventRepository::list_tenant_audit_events(
+        &store,
+        TENANT_ID,
+        Some(iot_storage::AuditEventCursor {
+            occurred_at: first_page[0].occurred_at,
+            id: first_page[0].id,
+        }),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_page[0].id, WHOLE_SECOND_AUDIT_ID);
+}
+
+#[tokio::test]
+async fn sqlite_asset_creation_with_containment_records_the_explicit_user_actor() {
+    let (_directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
+    seed_user(&store, OWNER_A, "audit-asset-creator").await;
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Parent')")
+        .bind(PARENT_ASSET_ID.to_string())
+        .bind(TENANT_ID.to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    let asset = ManagementAssetRepository::create_management_asset(
+        &store,
+        TENANT_ID,
+        AuditPrincipal::User(OWNER_A),
+        CreateManagementAsset {
+            name: "Child".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: Some(PARENT_ASSET_ID),
+            metadata: json!({}),
+            attributes: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let events = AuditEventRepository::list_tenant_audit_events(&store, TENANT_ID, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor, AuditPrincipal::User(OWNER_A));
+    assert_eq!(events[0].action, AuditAction::AssetContainmentChanged);
+    assert_eq!(events[0].target_type, AuditTargetType::Asset);
+    assert_eq!(events[0].target_id, asset.id.to_string());
+    assert_eq!(
+        events[0].changes,
+        json!({
+            "parent_asset_id": {
+                "before": null,
+                "after": PARENT_ASSET_ID.to_string(),
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn sqlite_asset_creation_rolls_back_when_containment_audit_insert_fails() {
+    let (_directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
+    seed_user(&store, OWNER_A, "audit-asset-rollback-creator").await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Parent')")
+        .bind(PARENT_ASSET_ID.to_string())
+        .bind(TENANT_ID.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER reject_asset_creation_audit
+         BEFORE INSERT ON audit_events
+         BEGIN
+             SELECT RAISE(ABORT, 'reject asset creation audit');
+         END;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        ManagementAssetRepository::create_management_asset(
+            &store,
+            TENANT_ID,
+            AuditPrincipal::User(OWNER_A),
+            CreateManagementAsset {
+                name: "Failed child".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: Some(PARENT_ASSET_ID),
+                metadata: json!({}),
+                attributes: None,
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM assets WHERE tenant_id = ? AND name = 'Failed child'",
+        )
+        .bind(TENANT_ID.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn sqlite_owned_device_provisioning_records_explicit_actor_ownership_and_containment() {
+    let (_directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
+    seed_user(&store, OWNER_A, "audit-owned-device-owner").await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Owned asset')")
+        .bind(OWNED_ASSET_ID.to_string())
+        .bind(TENANT_ID.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let device = DeviceTokenRepository::provision_owned_device_token(
+        &store,
+        TENANT_ID,
+        tenant_actor(),
+        NewOwnedDeviceToken {
+            display_name: "Owned device".to_owned(),
+            owner_user_id: OWNER_A,
+            asset_id: Some(OWNED_ASSET_ID),
+            token: NewDeviceToken {
+                id: Uuid::now_v7(),
+                token_prefix: "audit-owned-device-token".to_owned(),
+                token_hash: "audit-owned-device-token-hash".to_owned(),
+                token_ciphertext: "audit-owned-device-token-ciphertext".to_owned(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!device.device_id.is_empty());
+
+    let events = AuditEventRepository::list_tenant_audit_events(&store, TENANT_ID, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| {
+        event.actor == tenant_actor()
+            && event.target_type == AuditTargetType::Device
+            && event.target_id == device.device_id
+    }));
+    assert!(events.iter().any(|event| {
+        event.action == AuditAction::OwnershipTransferred
+            && event.changes
+                == json!({
+                    "owner_user_id": {
+                        "before": null,
+                        "after": OWNER_A.to_string(),
+                    }
+                })
+    }));
+    assert!(events.iter().any(|event| {
+        event.action == AuditAction::AssetContainmentChanged
+            && event.changes
+                == json!({
+                    "asset_id": {
+                        "before": null,
+                        "after": OWNED_ASSET_ID.to_string(),
+                    }
+                })
+    }));
+}
+
+#[tokio::test]
+async fn sqlite_owned_device_provisioning_rolls_back_when_audit_insert_fails() {
+    let (_directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
+    seed_user(&store, OWNER_A, "audit-owned-device-rollback-owner").await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER reject_owned_device_audit
+         BEFORE INSERT ON audit_events
+         BEGIN
+             SELECT RAISE(ABORT, 'reject owned device audit');
+         END;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        DeviceTokenRepository::provision_owned_device_token(
+            &store,
+            TENANT_ID,
+            tenant_actor(),
+            NewOwnedDeviceToken {
+                display_name: "Failed owned device".to_owned(),
+                owner_user_id: OWNER_A,
+                asset_id: None,
+                token: NewDeviceToken {
+                    id: Uuid::now_v7(),
+                    token_prefix: "audit-owned-device-failed-token".to_owned(),
+                    token_hash: "audit-owned-device-failed-token-hash".to_owned(),
+                    token_ciphertext: "audit-owned-device-failed-token-ciphertext".to_owned(),
+                },
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM devices WHERE tenant_id = ?")
+            .bind(TENANT_ID.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_tokens")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn sqlite_asset_containment_change_emits_before_and_after_audit_values() {
     let (_directory, store) = sqlite_store().await;
@@ -86,6 +391,7 @@ async fn sqlite_asset_containment_change_emits_before_and_after_audit_values() {
     ManagementAssetRepository::update_management_asset(
         &store,
         TENANT_ID,
+        tenant_actor(),
         CHILD_ASSET_ID,
         UpdateManagementAsset {
             name: "Child".to_owned(),
@@ -157,6 +463,7 @@ async fn sqlite_gateway_assignment_reassignment_and_detach_emit_distinct_audit_a
     ManagementDeviceRepository::update_management_device(
         &store,
         TENANT_ID,
+        tenant_actor(),
         CHILD_DEVICE,
         device_update(Some(GATEWAY_A)),
     )
@@ -165,6 +472,7 @@ async fn sqlite_gateway_assignment_reassignment_and_detach_emit_distinct_audit_a
     ManagementDeviceRepository::update_management_device(
         &store,
         TENANT_ID,
+        tenant_actor(),
         CHILD_DEVICE,
         device_update(Some(GATEWAY_B)),
     )
@@ -173,6 +481,7 @@ async fn sqlite_gateway_assignment_reassignment_and_detach_emit_distinct_audit_a
     ManagementDeviceRepository::update_management_device(
         &store,
         TENANT_ID,
+        tenant_actor(),
         CHILD_DEVICE,
         device_update(None),
     )
@@ -236,6 +545,7 @@ async fn sqlite_device_asset_assignment_emits_containment_audit_values() {
     ManagementDeviceRepository::update_management_device(
         &store,
         TENANT_ID,
+        tenant_actor(),
         DEVICE_CONTAINMENT_DEVICE,
         UpdateManagementDevice {
             display_name: "Containment device".to_owned(),
@@ -298,9 +608,14 @@ async fn sqlite_asset_delete_audits_child_asset_and_device_detachments() {
     .await
     .unwrap();
 
-    ManagementAssetRepository::delete_management_asset(&store, TENANT_ID, DELETE_PARENT_ASSET_ID)
-        .await
-        .unwrap();
+    ManagementAssetRepository::delete_management_asset(
+        &store,
+        TENANT_ID,
+        tenant_actor(),
+        DELETE_PARENT_ASSET_ID,
+    )
+    .await
+    .unwrap();
 
     let events = AuditEventRepository::list_tenant_audit_events(&store, TENANT_ID, None, 10)
         .await
@@ -354,6 +669,7 @@ async fn sqlite_device_relation_create_and_delete_emit_tenant_audit_events() {
     let relation = DeviceRelationRepository::create_device_relation(
         &store,
         TENANT_ID,
+        tenant_actor(),
         CreateDeviceRelation {
             from_device_id: RELATION_FROM_DEVICE.to_owned(),
             to_device_id: RELATION_TO_DEVICE.to_owned(),
@@ -363,9 +679,14 @@ async fn sqlite_device_relation_create_and_delete_emit_tenant_audit_events() {
     .await
     .unwrap();
     assert!(
-        DeviceRelationRepository::delete_device_relation(&store, TENANT_ID, relation.id)
-            .await
-            .unwrap()
+        DeviceRelationRepository::delete_device_relation(
+            &store,
+            TENANT_ID,
+            tenant_actor(),
+            relation.id,
+        )
+        .await
+        .unwrap()
     );
 
     let events = AuditEventRepository::list_tenant_audit_events(&store, TENANT_ID, None, 10)
@@ -392,6 +713,67 @@ async fn sqlite_device_relation_create_and_delete_emit_tenant_audit_events() {
         })
     );
     assert_eq!(events[0].changes, events[1].changes);
+}
+
+#[tokio::test]
+async fn sqlite_audited_mutation_rejects_an_actor_from_another_tenant() {
+    let (_directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'other-audit-actor', 'active')")
+        .bind(OTHER_TENANT_ID.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(OTHER_TENANT_ACCOUNT_ID.to_string())
+    .bind(OTHER_TENANT_ID.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, metadata)
+         VALUES (?, ?, 'Relation source', '{}'), (?, ?, 'Relation target', '{}')",
+    )
+    .bind(RELATION_FROM_DEVICE)
+    .bind(TENANT_ID.to_string())
+    .bind(RELATION_TO_DEVICE)
+    .bind(TENANT_ID.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        DeviceRelationRepository::create_device_relation(
+            &store,
+            TENANT_ID,
+            AuditPrincipal::TenantAccount(OTHER_TENANT_ACCOUNT_ID),
+            CreateDeviceRelation {
+                from_device_id: RELATION_FROM_DEVICE.to_owned(),
+                to_device_id: RELATION_TO_DEVICE.to_owned(),
+                relation_type: "paired_with".to_owned(),
+            },
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_relations")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        AuditEventRepository::list_tenant_audit_events(&store, TENANT_ID, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -479,7 +861,7 @@ async fn sqlite_ownership_transfer_is_audited_and_rejects_cross_tenant_owners() 
 
 #[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
-async fn timescale_permission_audit_events_match_tenant_scoped_immutable_list_contract() {
+async fn timescale_audit_events_cover_permission_relation_and_containment_mutations() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")
         .expect("IOT_NANO_TIMESCALE_TEST_URL must be set when running ignored Timescale tests");
     let mut connection = PgConnection::connect(&database_url).await.unwrap();
@@ -505,6 +887,7 @@ async fn timescale_permission_audit_events_match_tenant_scoped_immutable_list_co
     let pool = store.timescale_pool().unwrap();
     let tenant_id = Uuid::now_v7();
     let user_id = Uuid::now_v7();
+    let tenant_account_id = Uuid::now_v7();
     sqlx::query("INSERT INTO tenants (id, slug, status) VALUES ($1, 'audit-timescale', 'active')")
         .bind(tenant_id)
         .execute(pool)
@@ -519,11 +902,25 @@ async fn timescale_permission_audit_events_match_tenant_scoped_immutable_list_co
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('audit-timescale-device', $1)")
-        .bind(tenant_id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES ($1, $2, 'unused', 'active', 1)",
+    )
+    .bind(tenant_account_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id)
+         VALUES ('audit-timescale-device', $1),
+                ('audit-timescale-relation-device', $1)",
+    )
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
 
     let permission = store
         .create_resource_permission(iot_storage::NewResourcePermission {
@@ -538,14 +935,89 @@ async fn timescale_permission_audit_events_match_tenant_scoped_immutable_list_co
         })
         .await
         .unwrap();
+    let parent = ManagementAssetRepository::create_management_asset(
+        &store,
+        tenant_id,
+        AuditPrincipal::TenantAccount(tenant_account_id),
+        CreateManagementAsset {
+            name: "Timescale audit parent".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+            attributes: None,
+        },
+    )
+    .await
+    .unwrap();
+    let child = ManagementAssetRepository::create_management_asset(
+        &store,
+        tenant_id,
+        AuditPrincipal::User(user_id),
+        CreateManagementAsset {
+            name: "Timescale audit child".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: Some(parent.id),
+            metadata: json!({}),
+            attributes: None,
+        },
+    )
+    .await
+    .unwrap();
+    let relation = DeviceRelationRepository::create_device_relation(
+        &store,
+        tenant_id,
+        AuditPrincipal::TenantAccount(tenant_account_id),
+        CreateDeviceRelation {
+            from_device_id: "audit-timescale-device".to_owned(),
+            to_device_id: "audit-timescale-relation-device".to_owned(),
+            relation_type: "paired_with".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        DeviceRelationRepository::delete_device_relation(
+            &store,
+            tenant_id,
+            AuditPrincipal::TenantAccount(tenant_account_id),
+            relation.id,
+        )
+        .await
+        .unwrap()
+    );
 
     let events = AuditEventRepository::list_tenant_audit_events(&store, tenant_id, None, 100)
         .await
         .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].actor, AuditPrincipal::User(user_id));
-    assert_eq!(events[0].action, AuditAction::PermissionGranted);
-    assert_eq!(events[0].target_id, permission.id.to_string());
+    assert_eq!(events.len(), 4);
+    assert!(events.iter().any(|event| {
+        event.actor == AuditPrincipal::User(user_id)
+            && event.action == AuditAction::PermissionGranted
+            && event.target_id == permission.id.to_string()
+    }));
+    assert!(events.iter().any(|event| {
+        event.actor == AuditPrincipal::User(user_id)
+            && event.action == AuditAction::AssetContainmentChanged
+            && event.target_type == AuditTargetType::Asset
+            && event.target_id == child.id.to_string()
+            && event.changes
+                == json!({
+                    "parent_asset_id": {
+                        "before": null,
+                        "after": parent.id.to_string(),
+                    }
+                })
+    }));
+    assert!(events.iter().any(|event| {
+        event.actor == AuditPrincipal::TenantAccount(tenant_account_id)
+            && event.action == AuditAction::DeviceRelationCreated
+            && event.target_id == relation.id.to_string()
+    }));
+    assert!(events.iter().any(|event| {
+        event.actor == AuditPrincipal::TenantAccount(tenant_account_id)
+            && event.action == AuditAction::DeviceRelationDeleted
+            && event.target_id == relation.id.to_string()
+    }));
     assert!(
         sqlx::query("UPDATE audit_events SET action = 'changed' WHERE id = $1")
             .bind(events[0].id)

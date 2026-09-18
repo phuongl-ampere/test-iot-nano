@@ -1672,6 +1672,25 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         paths["/api/management/alerts"]["get"]["responses"]["403"]["description"],
         "Tenant Account required"
     );
+    assert_eq!(
+        paths["/api/management/audit"]["get"]["parameters"],
+        json!([
+            {
+                "name": "after",
+                "in": "query",
+                "required": false,
+                "description": "Opaque keyset cursor for older audit events.",
+                "schema": {"type": "string"}
+            },
+            {
+                "name": "limit",
+                "in": "query",
+                "required": false,
+                "description": "Maximum number of audit events to return.",
+                "schema": {"type": "integer", "minimum": 1, "maximum": 100}
+            }
+        ])
+    );
 
     for (path, method, status, schema) in [
         (

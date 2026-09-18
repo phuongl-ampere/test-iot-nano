@@ -406,43 +406,49 @@ impl SystemInfrastructureStatus {
         }
     }
 
+    fn component_status<'a>(ready: bool, value: &'a str) -> &'a str {
+        if ready { value } else { "Not ready" }
+    }
+
     fn page(&self) -> crate::SystemInfrastructurePage {
         let ready = self.readiness.is_ready();
         let snapshot = self
             .snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let component_status = |value: &str| if ready { value } else { "Not ready" };
         crate::SystemInfrastructurePage::new(
             if ready { "Ready" } else { "Not ready" },
             vec![
                 crate::SystemInfrastructureStatusRow::new(
                     "Public HTTP listener",
-                    component_status(&snapshot.public_http_listener),
+                    Self::component_status(ready, &snapshot.public_http_listener),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "Management HTTP listener",
-                    component_status(&snapshot.management_http_listener),
+                    Self::component_status(ready, &snapshot.management_http_listener),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "MQTT plaintext listener",
-                    component_status(&snapshot.mqtt_plaintext_listener),
+                    Self::component_status(ready, &snapshot.mqtt_plaintext_listener),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "MQTT TLS listener",
-                    component_status(&snapshot.mqtt_tls_listener),
+                    Self::component_status(ready, &snapshot.mqtt_tls_listener),
                 ),
             ],
             vec![
                 crate::SystemInfrastructureStatusRow::new(
                     "Migrations",
-                    component_status(&snapshot.migration),
+                    Self::component_status(ready, &snapshot.migration),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "Storage",
-                    component_status(&snapshot.storage),
+                    Self::component_status(ready, &snapshot.storage),
                 ),
-                crate::SystemInfrastructureStatusRow::new("TLS", component_status(&snapshot.tls)),
+                crate::SystemInfrastructureStatusRow::new(
+                    "TLS",
+                    Self::component_status(ready, &snapshot.tls),
+                ),
             ],
         )
     }
@@ -549,10 +555,7 @@ fn management_openapi() -> Value {
         "/api/management/audit",
         vec![(
             "get",
-            tenant_management_list_operation(
-                "List tenant audit events",
-                "ManagementAuditEventPage",
-            ),
+            tenant_audit_list_operation("List tenant audit events", "ManagementAuditEventPage"),
         )],
     );
     documented_path(
@@ -844,6 +847,37 @@ fn tenant_management_list_operation(summary: &str, response_schema: &str) -> Val
         ("200", "Request completed", Some(response_schema)),
         &tenant_management_errors(),
     )
+}
+
+fn tenant_audit_list_operation(summary: &str, response_schema: &str) -> Value {
+    let mut operation = tenant_management_list_operation(summary, response_schema);
+    operation
+        .as_object_mut()
+        .expect("documented operation is an object")
+        .insert(
+            "parameters".to_owned(),
+            json!([
+                {
+                    "name": "after",
+                    "in": "query",
+                    "required": false,
+                    "description": "Opaque keyset cursor for older audit events.",
+                    "schema": {"type": "string"}
+                },
+                {
+                    "name": "limit",
+                    "in": "query",
+                    "required": false,
+                    "description": "Maximum number of audit events to return.",
+                    "schema": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TENANT_AUDIT_LIMIT
+                    }
+                }
+            ]),
+        );
+    operation
 }
 
 fn management_no_content_operation(summary: &str) -> Value {
@@ -3334,6 +3368,7 @@ async fn create_tenant_asset_form(
     match ManagementAssetRepository::create_management_asset(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         CreateManagementAsset {
             name: name.to_owned(),
             asset_profile_id: None,
@@ -3667,6 +3702,7 @@ async fn create_tenant_relation_form(
     match DeviceRelationRepository::create_device_relation(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         CreateDeviceRelation {
             from_device_id: request.from_device_id,
             to_device_id: request.to_device_id,
@@ -3695,6 +3731,7 @@ async fn delete_tenant_relation_form(
     match DeviceRelationRepository::delete_device_relation(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         request.relation_id,
     )
     .await
@@ -3848,6 +3885,7 @@ async fn update_tenant_gateway_child(
     ManagementDeviceRepository::update_management_device(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         child_device_id,
         UpdateManagementDevice {
             display_name: child
@@ -5286,6 +5324,7 @@ async fn tenant_group_member_form(
         TenantAuthorizationRepository::add_user_to_group(
             state.store.as_ref(),
             tenant.tenant_id,
+            AuditPrincipal::TenantAccount(tenant.tenant_account_id),
             request.group_id,
             request.user_id,
         )
@@ -5294,6 +5333,7 @@ async fn tenant_group_member_form(
         TenantAuthorizationRepository::remove_user_from_group(
             state.store.as_ref(),
             tenant.tenant_id,
+            AuditPrincipal::TenantAccount(tenant.tenant_account_id),
             request.group_id,
             request.user_id,
         )
@@ -5404,6 +5444,7 @@ async fn revoke_tenant_permission_form(
     match TenantAuthorizationRepository::revoke_resource_permission(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         request.permission_id,
     )
     .await
@@ -5872,6 +5913,7 @@ async fn update_management_device(
     let device = ManagementDeviceRepository::update_management_device(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         &device_id,
         UpdateManagementDevice {
             display_name: request.display_name,
@@ -5899,6 +5941,7 @@ async fn delete_management_device(
     ManagementDeviceRepository::delete_management_device(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         &device_id,
     )
     .await
@@ -5928,6 +5971,7 @@ async fn create_management_asset(
     let asset = ManagementAssetRepository::create_management_asset(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         CreateManagementAsset {
             name: request.name,
             asset_profile_id: request.asset_profile_id,
@@ -5954,6 +5998,7 @@ async fn update_management_asset(
     let asset = ManagementAssetRepository::update_management_asset(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         asset_id,
         UpdateManagementAsset {
             name: request.name,
@@ -5979,6 +6024,7 @@ async fn delete_management_asset(
     ManagementAssetRepository::delete_management_asset(
         state.store.as_ref(),
         tenant.tenant_id,
+        AuditPrincipal::TenantAccount(tenant.tenant_account_id),
         asset_id,
     )
     .await
@@ -6212,6 +6258,9 @@ fn tenant_authorization_error(error: TenantAuthorizationError) -> ManagementSess
         | TenantAuthorizationError::InvalidPermissionLevel { .. }
         | TenantAuthorizationError::DevicePermissionCannotInherit => {
             ManagementSessionError::BadRequest
+        }
+        TenantAuthorizationError::SystemAccountCannotTransferOwnership => {
+            ManagementSessionError::Forbidden
         }
         TenantAuthorizationError::InvalidStoredRecord | TenantAuthorizationError::Database(_) => {
             ManagementSessionError::Unavailable
