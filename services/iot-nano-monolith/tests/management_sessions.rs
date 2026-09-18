@@ -3092,3 +3092,242 @@ async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenan
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     }
 }
+
+#[tokio::test]
+async fn tenant_user_page_lists_and_creates_normal_users() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+    let tenant_home = router
+        .clone()
+        .oneshot(platform_get("/tenant", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(tenant_home.status(), StatusCode::OK);
+    let tenant_home_body = String::from_utf8(
+        to_bytes(tenant_home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(tenant_home_body.contains("href=\"/tenant/users\""));
+
+    let initial_page = router
+        .clone()
+        .oneshot(platform_get("/tenant/users", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(initial_page.status(), StatusCode::OK);
+    let initial_body = String::from_utf8(
+        to_bytes(initial_page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(initial_body.contains("admin"));
+    assert!(initial_body.contains("viewer"));
+    assert!(initial_body.contains("Username"));
+    assert!(initial_body.contains("Status"));
+    assert!(initial_body.contains("Account class"));
+    assert!(!initial_body.contains("Default app"));
+    assert!(!initial_body.contains("Granted apps"));
+    assert!(!initial_body.contains("Role"));
+
+    let created = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/users",
+            Some(&tenant_cookie),
+            "username=site-user&password=SiteUser%402026",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        created.headers()[LOCATION],
+        "/tenant/users?notice=user-created"
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT tenant_id FROM users WHERE username = 'site-user'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        tenant_id
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE username = 'site-user'")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        "viewer"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT account_class FROM users WHERE username = 'site-user'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        "user"
+    );
+
+    let page = router
+        .clone()
+        .oneshot(platform_get(
+            "/tenant/users?notice=user-created",
+            Some(&tenant_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("User created."));
+    assert!(body.contains("site-user"));
+    assert!(body.contains("Active"));
+    assert!(body.contains("User"));
+    assert!(!body.contains("SiteUser@2026"));
+    assert!(!body.contains("value=\"SiteUser@2026\""));
+}
+
+#[tokio::test]
+async fn tenant_user_page_hides_other_tenant_users_and_rejects_tenant_form_values() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+    let primary_tenant_id =
+        sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "tenant-user-other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'other-tenant-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let page = router
+        .clone()
+        .oneshot(platform_get("/tenant/users", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!body.contains("other-tenant-user"));
+
+    let created = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/users",
+            Some(&tenant_cookie),
+            &format!(
+                "username=tenant-scoped-user&password=TenantScoped%402026&tenant_id={}&tenant_slug=tenant-user-other",
+                other_tenant.id
+            ),
+        ))
+    .await
+    .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        created.headers()[LOCATION],
+        "/tenant/users?notice=invalid-request"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM users WHERE tenant_id = ? AND username = 'tenant-scoped-user'",
+        )
+        .bind(&primary_tenant_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM users WHERE tenant_id = ? AND username = 'tenant-scoped-user'",
+        )
+        .bind(other_tenant.id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn tenant_user_routes_reject_non_tenant_sessions_before_form_parsing_or_mutation() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+
+    for (cookie, expected_status) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(system_cookie.as_str()), StatusCode::FORBIDDEN),
+        (Some(user_cookie.as_str()), StatusCode::FORBIDDEN),
+    ] {
+        let get = router
+            .clone()
+            .oneshot(platform_get("/tenant/users", cookie))
+            .await
+            .unwrap();
+        assert_eq!(get.status(), expected_status);
+
+        let post = router
+            .clone()
+            .oneshot(system_lifecycle_form("/tenant/users", cookie, "%"))
+            .await
+            .unwrap();
+        assert_eq!(post.status(), expected_status);
+    }
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM users WHERE username = 'unauthorized-tenant-user'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+}

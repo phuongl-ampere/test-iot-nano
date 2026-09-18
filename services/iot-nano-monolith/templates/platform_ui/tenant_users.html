@@ -1,0 +1,62 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Users | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link active" href="/tenant/users" aria-current="page">Users</a>
+  <a class="nav-link" href="/tenant/groups">Groups</a>
+  <a class="nav-link" href="/tenant/permissions">Permissions</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Users</h1>
+    <p>Create and view Users in this Tenant.</p>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Create User</h2></header>
+    <form class="form-grid" action="/tenant/users" method="post">
+      <label class="field">
+        <span>Username</span>
+        <input name="username" type="text" autocomplete="username" maxlength="64" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input name="password" type="password" autocomplete="new-password" required>
+      </label>
+      <button type="submit">Create User</button>
+    </form>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Users</h2></header>
+    {% if page.users.is_empty() %}
+      <p class="empty-state">No Users have been created.</p>
+    {% else %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Username</th>
+              <th scope="col">Status</th>
+              <th scope="col">Account class</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for user in page.users %}
+              <tr>
+                <td>{{ user.username }}</td>
+                <td>{{ user.status }}</td>
+                <td>{{ user.account_class }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

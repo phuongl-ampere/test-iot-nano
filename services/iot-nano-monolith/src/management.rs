@@ -18,9 +18,9 @@ use axum::{
 };
 use iot_api::{
     AuthError, DeviceTokenResponse, DeviceTokenStoreError, OAuthBrowserSessionVerifier,
-    PrincipalKind, Role, TokenVault, authenticate_credentials, authenticate_credentials_sqlite,
-    authenticate_system_account, authenticate_tenant_account, authenticate_user_account,
-    create_platform_device_token, generate_session_id, hash_password,
+    POWER_MONITOR_APP, PrincipalKind, Role, TokenVault, authenticate_credentials,
+    authenticate_credentials_sqlite, authenticate_system_account, authenticate_tenant_account,
+    authenticate_user_account, create_platform_device_token, generate_session_id, hash_password,
     provision_platform_device_token, validate_password,
 };
 use iot_storage::{
@@ -135,6 +135,10 @@ impl ManagementSessionRouter {
                 post(reset_system_tenant_account_form),
             )
             .route("/tenant", get(platform_tenant))
+            .route(
+                "/tenant/users",
+                get(platform_tenant_users).post(create_tenant_user_form),
+            )
             .route(
                 "/tenant/groups",
                 get(platform_tenant_groups).post(create_tenant_group_form),
@@ -1554,6 +1558,13 @@ struct ResetTenantAccountForm {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTenantUserForm {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
 struct CreateTenantGroupForm {
     name: String,
     owner_user_id: Uuid,
@@ -2041,6 +2052,20 @@ async fn platform_tenant(
     platform_page(&state, PlatformUiSession::Tenant { tenant_id }, None).await
 }
 
+async fn platform_tenant_users(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_users_page(
+        &state,
+        tenant,
+        tenant_management_notice(request.uri().query()),
+    )
+    .await
+}
+
 async fn platform_tenant_groups(
     State(state): State<ManagementState>,
     request: Request,
@@ -2067,6 +2092,45 @@ async fn platform_tenant_permissions(
         tenant_management_notice(request.uri().query()),
     )
     .await
+}
+
+async fn tenant_users_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let users =
+        ManagementUserRepository::list_management_users(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_user_error)?;
+    let page = crate::TenantUsersPage::new(
+        users
+            .into_iter()
+            .map(|user| {
+                crate::TenantUserRow::new(
+                    user.username,
+                    "Active",
+                    tenant_user_account_class_label(user.account_class.as_str()),
+                )
+            })
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_users(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+fn tenant_user_account_class_label(account_class: &str) -> &'static str {
+    match account_class {
+        "system" => "System",
+        "admin" => "Admin",
+        "user" => "User",
+        _ => "Unknown",
+    }
 }
 
 async fn tenant_groups_page(
@@ -2876,12 +2940,14 @@ async fn reset_system_tenant_account_form(
 
 #[derive(Clone, Copy)]
 enum TenantManagementPage {
+    Users,
     Groups,
     Permissions,
 }
 
 #[derive(Clone, Copy)]
 enum TenantManagementNotice {
+    UserCreated,
     GroupCreated,
     MemberAdded,
     MemberRemoved,
@@ -2895,6 +2961,7 @@ enum TenantManagementNotice {
 impl TenantManagementNotice {
     const fn message(self) -> &'static str {
         match self {
+            Self::UserCreated => "User created.",
             Self::GroupCreated => "Group created.",
             Self::MemberAdded => "Member added.",
             Self::MemberRemoved => "Member removed.",
@@ -2912,6 +2979,21 @@ fn tenant_management_redirect(
     notice: TenantManagementNotice,
 ) -> Redirect {
     let path = match page {
+        TenantManagementPage::Users => match notice {
+            TenantManagementNotice::UserCreated => "/tenant/users?notice=user-created",
+            TenantManagementNotice::InvalidRequest => "/tenant/users?notice=invalid-request",
+            TenantManagementNotice::MutationUnavailable => {
+                "/tenant/users?notice=mutation-unavailable"
+            }
+            TenantManagementNotice::ServiceUnavailable => {
+                "/tenant/users?notice=service-unavailable"
+            }
+            TenantManagementNotice::GroupCreated
+            | TenantManagementNotice::MemberAdded
+            | TenantManagementNotice::MemberRemoved
+            | TenantManagementNotice::PermissionCreated
+            | TenantManagementNotice::PermissionRevoked => "/tenant/users?notice=invalid-request",
+        },
         TenantManagementPage::Groups => match notice {
             TenantManagementNotice::GroupCreated => "/tenant/groups?notice=group-created",
             TenantManagementNotice::MemberAdded => "/tenant/groups?notice=member-added",
@@ -2924,7 +3006,8 @@ fn tenant_management_redirect(
                 "/tenant/groups?notice=service-unavailable"
             }
             TenantManagementNotice::PermissionCreated
-            | TenantManagementNotice::PermissionRevoked => "/tenant/groups?notice=invalid-request",
+            | TenantManagementNotice::PermissionRevoked
+            | TenantManagementNotice::UserCreated => "/tenant/groups?notice=invalid-request",
         },
         TenantManagementPage::Permissions => match notice {
             TenantManagementNotice::PermissionCreated => {
@@ -2942,7 +3025,8 @@ fn tenant_management_redirect(
             }
             TenantManagementNotice::GroupCreated
             | TenantManagementNotice::MemberAdded
-            | TenantManagementNotice::MemberRemoved => "/tenant/permissions?notice=invalid-request",
+            | TenantManagementNotice::MemberRemoved
+            | TenantManagementNotice::UserCreated => "/tenant/permissions?notice=invalid-request",
         },
     };
     Redirect::to(path)
@@ -2950,6 +3034,7 @@ fn tenant_management_redirect(
 
 fn tenant_management_notice(query: Option<&str>) -> Option<&'static str> {
     let notice = match query {
+        Some("notice=user-created") => TenantManagementNotice::UserCreated,
         Some("notice=group-created") => TenantManagementNotice::GroupCreated,
         Some("notice=member-added") => TenantManagementNotice::MemberAdded,
         Some("notice=member-removed") => TenantManagementNotice::MemberRemoved,
@@ -2980,6 +3065,54 @@ fn tenant_management_form_error(
         ManagementSessionError::Unavailable => TenantManagementNotice::ServiceUnavailable,
     };
     Ok(tenant_management_redirect(page, notice))
+}
+
+async fn create_tenant_user_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: CreateTenantUserForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return tenant_management_form_error(TenantManagementPage::Users, error),
+    };
+    if validate_password(&request.password).is_err() {
+        return tenant_management_form_error(
+            TenantManagementPage::Users,
+            ManagementSessionError::BadRequest,
+        );
+    }
+    let password_hash = match hash_password(&request.password) {
+        Ok(password_hash) => password_hash,
+        Err(_) => {
+            return tenant_management_form_error(
+                TenantManagementPage::Users,
+                ManagementSessionError::Unavailable,
+            );
+        }
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match ManagementUserRepository::create_management_user(
+        state.store.as_ref(),
+        CreateManagementUser {
+            tenant_id: tenant.tenant_id,
+            username: request.username,
+            password_hash,
+            default_app: format!("/apps/{POWER_MONITOR_APP}"),
+            granted_apps: vec![POWER_MONITOR_APP.to_owned()],
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(tenant_management_redirect(
+            TenantManagementPage::Users,
+            TenantManagementNotice::UserCreated,
+        )),
+        Err(error) => {
+            tenant_management_form_error(TenantManagementPage::Users, management_user_error(error))
+        }
+    }
 }
 
 async fn create_tenant_group_form(

@@ -129,6 +129,44 @@ impl TenantGroupsPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantUserRow {
+    username: String,
+    status: String,
+    account_class: String,
+}
+
+impl TenantUserRow {
+    pub fn new(
+        username: impl Into<String>,
+        status: impl Into<String>,
+        account_class: impl Into<String>,
+    ) -> Self {
+        Self {
+            username: username.into(),
+            status: status.into(),
+            account_class: account_class.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantUsersPage {
+    users: Vec<TenantUserRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantUsersPage {
+    pub fn new(users: Vec<TenantUserRow>, notice: Option<&'static str>) -> Self {
+        Self {
+            users,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantPermissionRow {
     id: String,
     subject: String,
@@ -318,6 +356,13 @@ impl PlatformUiRenderer {
         TenantLayout::new(identity).render()
     }
 
+    pub fn render_tenant_users(
+        identity: &PlatformUiIdentity,
+        page: &TenantUsersPage,
+    ) -> Result<String, askama::Error> {
+        TenantUsersLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_groups(
         identity: &PlatformUiIdentity,
         page: &TenantGroupsPage,
@@ -395,6 +440,19 @@ pub struct TenantLayout<'a> {
 impl<'a> TenantLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity) -> Self {
         Self { identity }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_users.html")]
+pub struct TenantUsersLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantUsersPage,
+}
+
+impl<'a> TenantUsersLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantUsersPage) -> Self {
+        Self { identity, page }
     }
 }
 

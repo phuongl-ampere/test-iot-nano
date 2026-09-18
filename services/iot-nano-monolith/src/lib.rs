@@ -21,9 +21,10 @@ pub use platform_ui::{
     PlatformUiIdentity, PlatformUiRenderer, SystemLayout, SystemPlatformPage, SystemTenantRow,
     TenantGroupMemberRow, TenantGroupRow, TenantGroupsLayout, TenantGroupsPage, TenantLayout,
     TenantPermissionRow, TenantPermissionsLayout, TenantPermissionsPage, TenantSelectOption,
-    UserAssetDetailLayout, UserAssetDetailPage, UserAssetLayout, UserAssetListPage, UserAssetRow,
-    UserAssetUnavailableLayout, UserDeviceDetailPage, UserDeviceLayout, UserDeviceListPage,
-    UserDeviceRow, UserDeviceUnavailableLayout, UserLayout,
+    TenantUserRow, TenantUsersLayout, TenantUsersPage, UserAssetDetailLayout, UserAssetDetailPage,
+    UserAssetLayout, UserAssetListPage, UserAssetRow, UserAssetUnavailableLayout,
+    UserDeviceDetailPage, UserDeviceLayout, UserDeviceListPage, UserDeviceRow,
+    UserDeviceUnavailableLayout, UserLayout,
 };
 pub use readiness::Readiness;
 pub use runtime::{MonolithRuntime, ShutdownError, StartupError};

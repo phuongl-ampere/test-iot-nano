@@ -1,6 +1,6 @@
 use iot_nano_monolith::{
-    PlatformUiIdentity, PlatformUiRenderer, SystemPlatformPage, SystemTenantRow,
-    UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
+    PlatformUiIdentity, PlatformUiRenderer, SystemPlatformPage, SystemTenantRow, TenantUserRow,
+    TenantUsersPage, UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
 };
 
 fn navigation_hrefs(rendered: &str) -> Vec<&str> {
@@ -267,8 +267,36 @@ fn tenant_layout_renders_only_tenant_navigation() {
 
     assert!(rendered.contains("Tenant Console"));
     assert!(rendered.contains("href=\"/tenant\" aria-current=\"page\""));
+    assert!(rendered.contains("href=\"/tenant/users\""));
     assert!(rendered.contains("href=\"/tenant/groups\""));
     assert!(rendered.contains("href=\"/tenant/permissions\""));
+    assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
+}
+
+#[test]
+fn tenant_users_layout_escapes_rows_and_contains_only_tenant_management_fields() {
+    let identity = PlatformUiIdentity::new("Tenant <account>");
+    let page = TenantUsersPage::new(
+        vec![TenantUserRow::new("user-<unsafe>", "Active", "User")],
+        Some("User created."),
+    );
+
+    let rendered = PlatformUiRenderer::render_tenant_users(&identity, &page).unwrap();
+
+    assert!(rendered.contains("href=\"/tenant/users\" aria-current=\"page\""));
+    assert!(rendered.contains("action=\"/tenant/users\""));
+    assert!(rendered.contains("name=\"username\""));
+    assert!(rendered.contains("name=\"password\""));
+    assert!(rendered.contains("type=\"password\""));
+    assert!(rendered.contains("User created."));
+    assert!(rendered.contains("user-&#60;unsafe&#62;"));
+    assert!(!rendered.contains("user-<unsafe>"));
+    assert!(rendered.contains("Username"));
+    assert!(rendered.contains("Status"));
+    assert!(rendered.contains("Account class"));
+    assert!(!rendered.contains("Default app"));
+    assert!(!rendered.contains("Granted apps"));
+    assert!(!rendered.contains("Role"));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
 }
 
