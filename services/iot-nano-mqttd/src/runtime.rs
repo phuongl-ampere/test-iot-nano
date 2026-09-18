@@ -1042,6 +1042,7 @@ mod tests {
                 calls.fetch_add(1, Ordering::Relaxed);
                 Ok(AuthenticatedDevice {
                     token_id: Uuid::nil(),
+                    tenant_id: Uuid::nil(),
                     device_id: "meter-a".to_owned(),
                     is_gateway: false,
                 })
