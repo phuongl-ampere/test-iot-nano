@@ -422,6 +422,59 @@ impl TenantRelationsPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantApplicationRow {
+    app_id: String,
+    client_id: String,
+    kind: String,
+    launch_url: String,
+    redirect_uris: String,
+    scopes: String,
+    status: String,
+}
+
+impl TenantApplicationRow {
+    pub(crate) fn new(
+        app_id: impl Into<String>,
+        client_id: impl Into<String>,
+        kind: impl Into<String>,
+        launch_url: impl Into<String>,
+        redirect_uris: impl Into<String>,
+        scopes: impl Into<String>,
+        status: impl Into<String>,
+    ) -> Self {
+        Self {
+            app_id: app_id.into(),
+            client_id: client_id.into(),
+            kind: kind.into(),
+            launch_url: launch_url.into(),
+            redirect_uris: redirect_uris.into(),
+            scopes: scopes.into(),
+            status: status.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantApplicationsPage {
+    applications: Vec<TenantApplicationRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantApplicationsPage {
+    pub(crate) fn new(
+        applications: Vec<TenantApplicationRow>,
+        notice: Option<&'static str>,
+    ) -> Self {
+        Self {
+            applications,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantDeviceCredentialPage {
     device_id: String,
     display_name: String,
@@ -806,6 +859,13 @@ impl PlatformUiRenderer {
         TenantRelationsLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_applications(
+        identity: &PlatformUiIdentity,
+        page: &TenantApplicationsPage,
+    ) -> Result<String, askama::Error> {
+        TenantApplicationsLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_device_credential(
         identity: &PlatformUiIdentity,
         page: &TenantDeviceCredentialPage,
@@ -996,6 +1056,19 @@ impl<'a> TenantTopologyLayout<'a> {
 pub struct TenantRelationsLayout<'a> {
     identity: &'a PlatformUiIdentity,
     page: &'a TenantRelationsPage,
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_applications.html")]
+pub struct TenantApplicationsLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantApplicationsPage,
+}
+
+impl<'a> TenantApplicationsLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantApplicationsPage) -> Self {
+        Self { identity, page }
+    }
 }
 
 impl<'a> TenantRelationsLayout<'a> {

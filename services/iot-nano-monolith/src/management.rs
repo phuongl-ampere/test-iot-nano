@@ -208,6 +208,10 @@ impl ManagementSessionRouter {
                 "/tenant/relations/delete",
                 post(delete_tenant_relation_form),
             )
+            .route(
+                "/tenant/applications",
+                get(platform_tenant_applications).post(save_tenant_application_form),
+            )
             .route("/app", get(platform_app))
             .route("/app/assets", get(platform_app_assets))
             .route("/app/assets/{asset_id}", get(platform_app_asset_detail))
@@ -1711,6 +1715,19 @@ struct DeleteTenantDeviceRelationForm {
     relation_id: Uuid,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantApplicationForm {
+    app_id: String,
+    kind: String,
+    launch_url: String,
+    client_id: String,
+    redirect_uris: String,
+    allowed_scopes: String,
+    #[serde(default)]
+    enabled: Option<String>,
+}
+
 #[derive(Serialize)]
 struct SystemTenantResponse {
     id: Uuid,
@@ -2340,6 +2357,20 @@ async fn platform_tenant_relations(
     .await
 }
 
+async fn platform_tenant_applications(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_applications_page(
+        &state,
+        tenant,
+        tenant_application_notice(request.uri().query()),
+    )
+    .await
+}
+
 async fn tenant_assets_page(
     state: &ManagementState,
     tenant: TenantSession,
@@ -2726,6 +2757,49 @@ async fn tenant_relations_page(
         notice,
     );
     let rendered = crate::PlatformUiRenderer::render_tenant_relations(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_applications_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let applications =
+        ApplicationRepository::list_applications_for_tenant(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(tenant_application_error)?;
+    let page = crate::TenantApplicationsPage::new(
+        applications
+            .into_iter()
+            .map(|application| {
+                crate::TenantApplicationRow::new(
+                    application.app_id.as_str(),
+                    application.client_id.as_str(),
+                    application.kind.as_str(),
+                    application.launch_url,
+                    application
+                        .redirect_uris
+                        .iter()
+                        .map(|uri| uri.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    application.allowed_scopes.join(" "),
+                    if application.enabled {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    },
+                )
+            })
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_applications(
         &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
         &page,
     )
@@ -3138,6 +3212,126 @@ async fn delete_tenant_relation_form(
     {
         Ok(_) => Ok(Redirect::to("/tenant/relations?notice=relation-deleted")),
         Err(error) => tenant_relation_form_error(device_relation_error(error)),
+    }
+}
+
+async fn save_tenant_application_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: TenantApplicationForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return tenant_application_form_error(error),
+    };
+    let application = match tenant_application_from_form(request, tenant.tenant_id) {
+        Ok(application) => application,
+        Err(error) => return tenant_application_form_error(error),
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match ApplicationRepository::upsert_application(state.store.as_ref(), application).await {
+        Ok(_) => Ok(Redirect::to(
+            "/tenant/applications?notice=application-saved",
+        )),
+        Err(error) => tenant_application_form_error(tenant_application_error(error)),
+    }
+}
+
+fn tenant_application_from_form(
+    request: TenantApplicationForm,
+    tenant_id: Uuid,
+) -> Result<NewApplication, ManagementSessionError> {
+    let app_id = request
+        .app_id
+        .trim()
+        .parse()
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    let kind = ApplicationKind::from_str(request.kind.trim())
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    let client_id = request
+        .client_id
+        .trim()
+        .parse()
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    let launch_url = request.launch_url.trim();
+    if launch_url.is_empty() {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let redirect_uris = request
+        .redirect_uris
+        .lines()
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty())
+        .map(|uri| RedirectUri::from_str(uri).map_err(|_| ManagementSessionError::BadRequest))
+        .collect::<Result<Vec<_>, _>>()?;
+    if redirect_uris.is_empty() {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let allowed_scopes: Vec<_> = request
+        .allowed_scopes
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if allowed_scopes.is_empty() {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    Ok(NewApplication {
+        app_id,
+        tenant_id,
+        kind,
+        launch_url: launch_url.to_owned(),
+        client_id,
+        redirect_uris,
+        allowed_scopes,
+        enabled: request.enabled.is_some(),
+    })
+}
+
+fn tenant_application_notice(query: Option<&str>) -> Option<&'static str> {
+    match query {
+        Some("notice=application-saved") => Some("Application saved."),
+        Some("notice=invalid-request") => Some("Request could not be processed."),
+        Some("notice=mutation-unavailable") => {
+            Some("The requested OAuth application is unavailable.")
+        }
+        Some("notice=service-unavailable") => Some("Tenant management service is unavailable."),
+        _ => None,
+    }
+}
+
+fn tenant_application_form_error(
+    error: ManagementSessionError,
+) -> Result<Redirect, ManagementSessionError> {
+    let path = match error {
+        ManagementSessionError::Unauthorized
+        | ManagementSessionError::TooManyRequests
+        | ManagementSessionError::Forbidden => return Err(error),
+        ManagementSessionError::BadRequest
+        | ManagementSessionError::UnsupportedMediaType
+        | ManagementSessionError::PayloadTooLarge => "/tenant/applications?notice=invalid-request",
+        ManagementSessionError::NotFound | ManagementSessionError::Conflict => {
+            "/tenant/applications?notice=mutation-unavailable"
+        }
+        ManagementSessionError::Unavailable => "/tenant/applications?notice=service-unavailable",
+    };
+    Ok(Redirect::to(path))
+}
+
+fn tenant_application_error(error: PlatformStoreError) -> ManagementSessionError {
+    match error {
+        PlatformStoreError::InvalidApplicationId(_)
+        | PlatformStoreError::InvalidApplicationKind(_)
+        | PlatformStoreError::EmptyApplicationLaunchUrl
+        | PlatformStoreError::EmptyApplicationClientId
+        | PlatformStoreError::EmptyApplicationRedirectUri
+        | PlatformStoreError::InvalidApplicationRedirectUri(_)
+        | PlatformStoreError::DuplicateApplicationRedirectUri(_)
+        | PlatformStoreError::EmptyApplicationScope
+        | PlatformStoreError::InvalidApplicationScopes => ManagementSessionError::BadRequest,
+        PlatformStoreError::ApplicationClientIdConflict(_)
+        | PlatformStoreError::ApplicationTenantConflict(_) => ManagementSessionError::Conflict,
+        _ => ManagementSessionError::Unavailable,
     }
 }
 

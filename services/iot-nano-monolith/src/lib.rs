@@ -19,19 +19,19 @@ pub use config::{
 pub use management::{BootstrapSystemError, ManagementSessionRouter, bootstrap_system};
 pub use platform_ui::{
     LoginLayout, PlatformLoginPage, PlatformUiIdentity, PlatformUiRenderer, SystemLayout,
-    SystemPlatformPage, SystemTenantRow, TenantAssetProfilesLayout, TenantAssetProfilesPage,
-    TenantAssetRow, TenantAssetsLayout, TenantAssetsPage, TenantDeviceCredentialLayout,
-    TenantDeviceCredentialPage, TenantDeviceProfilesLayout, TenantDeviceProfilesPage,
-    TenantDeviceRow, TenantDeviceTokenRow, TenantDeviceTokensLayout, TenantDeviceTokensPage,
-    TenantDevicesLayout, TenantDevicesPage, TenantGroupMemberRow, TenantGroupRow,
-    TenantGroupsLayout, TenantGroupsPage, TenantLayout, TenantPermissionRow,
-    TenantPermissionsLayout, TenantPermissionsPage, TenantProfileRow, TenantRelationRow,
-    TenantRelationsLayout, TenantRelationsPage, TenantSelectOption, TenantTopologyLayout,
-    TenantTopologyPage, TenantTopologyRow, TenantUserRow, TenantUsersLayout, TenantUsersPage,
-    UserAssetDetailLayout, UserAssetDetailPage, UserAssetLayout, UserAssetListPage, UserAssetRow,
-    UserAssetUnavailableLayout, UserDeviceAlertRow, UserDeviceDetailPage, UserDeviceLayout,
-    UserDeviceListPage, UserDeviceRow, UserDeviceTelemetryRow, UserDeviceUnavailableLayout,
-    UserLayout,
+    SystemPlatformPage, SystemTenantRow, TenantApplicationRow, TenantApplicationsLayout,
+    TenantApplicationsPage, TenantAssetProfilesLayout, TenantAssetProfilesPage, TenantAssetRow,
+    TenantAssetsLayout, TenantAssetsPage, TenantDeviceCredentialLayout, TenantDeviceCredentialPage,
+    TenantDeviceProfilesLayout, TenantDeviceProfilesPage, TenantDeviceRow, TenantDeviceTokenRow,
+    TenantDeviceTokensLayout, TenantDeviceTokensPage, TenantDevicesLayout, TenantDevicesPage,
+    TenantGroupMemberRow, TenantGroupRow, TenantGroupsLayout, TenantGroupsPage, TenantLayout,
+    TenantPermissionRow, TenantPermissionsLayout, TenantPermissionsPage, TenantProfileRow,
+    TenantRelationRow, TenantRelationsLayout, TenantRelationsPage, TenantSelectOption,
+    TenantTopologyLayout, TenantTopologyPage, TenantTopologyRow, TenantUserRow, TenantUsersLayout,
+    TenantUsersPage, UserAssetDetailLayout, UserAssetDetailPage, UserAssetLayout,
+    UserAssetListPage, UserAssetRow, UserAssetUnavailableLayout, UserDeviceAlertRow,
+    UserDeviceDetailPage, UserDeviceLayout, UserDeviceListPage, UserDeviceRow,
+    UserDeviceTelemetryRow, UserDeviceUnavailableLayout, UserLayout,
 };
 pub use readiness::Readiness;
 pub use runtime::{MonolithRuntime, ShutdownError, StartupError};

@@ -13,7 +13,8 @@ use iot_api::{OAuthBrowserSessionVerifier, TokenVault, hash_password};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{ManagementSessionRouter, bootstrap_system};
 use iot_storage::{
-    NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository, TenantStatus,
+    ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret, NewTenant,
+    NewTenantAccount, OAuthRepository, PlatformStore, TenantIdentityRepository, TenantStatus,
 };
 use serde_json::json;
 use std::{
@@ -4367,5 +4368,260 @@ async fn tenant_relation_routes_require_a_tenant_session_before_form_parsing() {
                 .unwrap();
             assert_eq!(mutation.status(), expected_status, "{path}");
         }
+    }
+}
+
+#[tokio::test]
+async fn tenant_application_page_scopes_list_upserts_and_hides_client_secrets() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id: uuid::Uuid =
+        sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+    let application = ApplicationRepository::upsert_application(
+        store.as_ref(),
+        NewApplication {
+            app_id: "tenant-console".parse().unwrap(),
+            tenant_id,
+            kind: ApplicationKind::Frontend,
+            launch_url: "https://tenant.example.test/console".to_owned(),
+            client_id: "tenant-console-client".parse().unwrap(),
+            redirect_uris: vec![
+                "https://tenant.example.test/oauth/callback"
+                    .parse()
+                    .unwrap(),
+            ],
+            allowed_scopes: vec!["devices:read".to_owned()],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    OAuthRepository::register_client_secret(
+        store.as_ref(),
+        NewOAuthClientSecret {
+            app_id: application.app_id,
+            tenant_id,
+            client_secret: "tenant-console-secret".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "applications-other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    ApplicationRepository::upsert_application(
+        store.as_ref(),
+        NewApplication {
+            app_id: "other-console".parse().unwrap(),
+            tenant_id: other_tenant.id,
+            kind: ApplicationKind::Frontend,
+            launch_url: "https://other.example.test/console".to_owned(),
+            client_id: "other-console-client".parse().unwrap(),
+            redirect_uris: vec!["https://other.example.test/oauth/callback".parse().unwrap()],
+            allowed_scopes: vec!["assets:read".to_owned()],
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let overview = router
+        .clone()
+        .oneshot(platform_get("/tenant", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(overview.status(), StatusCode::OK);
+    let overview = String::from_utf8(
+        to_bytes(overview.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(overview.contains("href=\"/tenant/applications\""));
+
+    let page = router
+        .clone()
+        .oneshot(platform_get("/tenant/applications", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("tenant-console"));
+    assert!(page.contains("tenant-console-client"));
+    assert!(!page.contains("other-console"));
+    assert!(!page.contains("tenant-console-secret"));
+
+    let saved = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/applications",
+            Some(&tenant_cookie),
+            "app_id=tenant-console&kind=full_stack&launch_url=https%3A%2F%2Ftenant.example.test%2Fupdated&client_id=tenant-console-client-v2&redirect_uris=https%3A%2F%2Ftenant.example.test%2Foauth%2Fcallback%0Ahttp%3A%2F%2Flocalhost%3A3000%2Foauth%2Fcallback&allowed_scopes=assets%3Aread%0Adevices%3Aread&enabled=on",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        saved.headers()[LOCATION],
+        "/tenant/applications?notice=application-saved"
+    );
+
+    let updated =
+        ApplicationRepository::find_application_by_app_id(store.as_ref(), "tenant-console")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(updated.tenant_id, tenant_id);
+    assert_eq!(updated.kind, ApplicationKind::FullStack);
+    assert_eq!(updated.client_id.as_str(), "tenant-console-client-v2");
+    assert_eq!(
+        updated
+            .redirect_uris
+            .iter()
+            .map(|uri| uri.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "http://localhost:3000/oauth/callback",
+            "https://tenant.example.test/oauth/callback",
+        ]
+    );
+    assert_eq!(updated.allowed_scopes, ["assets:read", "devices:read"]);
+}
+
+#[tokio::test]
+async fn tenant_application_form_rejects_invalid_redirects_and_scopes() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+
+    for (app_id, redirect_uris, allowed_scopes) in [
+        (
+            "invalid-redirect",
+            "javascript%3Aalert%281%29",
+            "devices%3Aread",
+        ),
+        (
+            "invalid-scopes",
+            "https%3A%2F%2Ftenant.example.test%2Fcallback",
+            "",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(system_lifecycle_form(
+                "/tenant/applications",
+                Some(&tenant_cookie),
+                &format!(
+                    "app_id={app_id}&kind=frontend&launch_url=https%3A%2F%2Ftenant.example.test%2Fapp&client_id={app_id}-client&redirect_uris={redirect_uris}&allowed_scopes={allowed_scopes}&enabled=on"
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[LOCATION],
+            "/tenant/applications?notice=invalid-request"
+        );
+        assert!(
+            ApplicationRepository::find_application_by_app_id(store.as_ref(), app_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn tenant_application_form_uses_the_authenticated_tenant_and_rejects_injected_tenant() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "applications-injected".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/applications",
+            Some(&tenant_cookie),
+            &format!(
+                "app_id=injected-app&kind=frontend&launch_url=https%3A%2F%2Ftenant.example.test%2Fapp&client_id=injected-app-client&redirect_uris=https%3A%2F%2Ftenant.example.test%2Fcallback&allowed_scopes=devices%3Aread&enabled=on&tenant_id={}",
+                other_tenant.id
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[LOCATION],
+        "/tenant/applications?notice=invalid-request"
+    );
+    assert!(
+        ApplicationRepository::find_application_by_app_id(store.as_ref(), "injected-app")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn tenant_application_routes_require_a_tenant_session_before_form_parsing() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for (cookie, expected_status) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(system_cookie.as_str()), StatusCode::FORBIDDEN),
+        (Some(user_cookie.as_str()), StatusCode::FORBIDDEN),
+    ] {
+        let page = router
+            .clone()
+            .oneshot(platform_get("/tenant/applications", cookie))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), expected_status);
+
+        let mutation = router
+            .clone()
+            .oneshot(system_lifecycle_form("/tenant/applications", cookie, "%"))
+            .await
+            .unwrap();
+        assert_eq!(mutation.status(), expected_status);
     }
 }

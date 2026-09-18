@@ -962,6 +962,10 @@ pub trait ApplicationRepository: Send + Sync {
         &'a self,
         application: NewApplication,
     ) -> Pin<Box<dyn Future<Output = Result<ApplicationRecord, PlatformStoreError>> + Send + 'a>>;
+    fn list_applications_for_tenant<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ApplicationRecord>, PlatformStoreError>> + Send + 'a>>;
     fn find_application_by_app_id<'a>(
         &'a self,
         app_id: &'a str,
@@ -2384,6 +2388,60 @@ impl PlatformStore {
                 .fetch_all(pool)
                 .await?;
                 postgres_application_record(row, redirects).map(Some)
+            }
+        }
+    }
+
+    pub async fn list_applications_for_tenant(
+        &self,
+        tenant_id: uuid::Uuid,
+    ) -> Result<Vec<ApplicationRecord>, PlatformStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let rows = sqlx::query(
+                    "SELECT app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     FROM applications WHERE tenant_id = ? ORDER BY app_id",
+                )
+                .bind(tenant_id.to_string())
+                .fetch_all(store.pool())
+                .await?;
+                let mut applications = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let app_id: String = row.try_get("app_id")?;
+                    let redirects = sqlx::query_scalar(
+                        "SELECT redirect_uri FROM application_redirect_uris
+                         WHERE app_id = ? AND tenant_id = ? ORDER BY redirect_uri",
+                    )
+                    .bind(&app_id)
+                    .bind(tenant_id.to_string())
+                    .fetch_all(store.pool())
+                    .await?;
+                    applications.push(sqlite_application_record(row, redirects)?);
+                }
+                Ok(applications)
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "SELECT app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
+                     FROM applications WHERE tenant_id = $1 ORDER BY app_id",
+                )
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await?;
+                let mut applications = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let app_id: String = row.try_get("app_id")?;
+                    let redirects = sqlx::query_scalar(
+                        "SELECT redirect_uri FROM application_redirect_uris
+                         WHERE app_id = $1 AND tenant_id = $2 ORDER BY redirect_uri",
+                    )
+                    .bind(&app_id)
+                    .bind(tenant_id)
+                    .fetch_all(pool)
+                    .await?;
+                    applications.push(postgres_application_record(row, redirects)?);
+                }
+                Ok(applications)
             }
         }
     }
@@ -8926,6 +8984,14 @@ impl ApplicationRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<ApplicationRecord, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move { PlatformStore::upsert_application(self, application).await })
+    }
+
+    fn list_applications_for_tenant<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ApplicationRecord>, PlatformStoreError>> + Send + 'a>>
+    {
+        Box::pin(async move { PlatformStore::list_applications_for_tenant(self, tenant_id).await })
     }
 
     fn find_application_by_app_id<'a>(
