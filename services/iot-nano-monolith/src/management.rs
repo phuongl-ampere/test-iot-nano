@@ -377,7 +377,7 @@ fn management_openapi() -> Value {
         "/api/management/alerts",
         vec![(
             "get",
-            management_list_operation("List tenant alerts", "ManagementAlertList"),
+            tenant_management_list_operation("List tenant alerts", "ManagementAlertList"),
         )],
     );
     documented_path(
@@ -661,6 +661,16 @@ fn management_list_operation(summary: &str, response_schema: &str) -> Value {
     )
 }
 
+fn tenant_management_list_operation(summary: &str, response_schema: &str) -> Value {
+    documented_operation(
+        summary,
+        Some("managementSession"),
+        None,
+        ("200", "Request completed", Some(response_schema)),
+        &tenant_management_errors(),
+    )
+}
+
 fn management_no_content_operation(summary: &str) -> Value {
     documented_operation(
         summary,
@@ -676,6 +686,17 @@ fn management_errors() -> [(&'static str, &'static str); 6] {
         ("400", "Invalid request"),
         ("401", "No active management session"),
         ("403", "Administrator role required"),
+        ("404", "Resource not found"),
+        ("409", "Conflicting request"),
+        ("503", "Service unavailable"),
+    ]
+}
+
+fn tenant_management_errors() -> [(&'static str, &'static str); 6] {
+    [
+        ("400", "Invalid request"),
+        ("401", "No active management session"),
+        ("403", "Tenant Account required"),
         ("404", "Resource not found"),
         ("409", "Conflicting request"),
         ("503", "Service unavailable"),

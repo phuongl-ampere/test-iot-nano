@@ -175,6 +175,43 @@ async fn sqlite_management_alert_list_is_tenant_scoped_newest_first_and_capped()
 }
 
 #[tokio::test]
+async fn sqlite_management_alert_list_orders_mixed_timestamp_formats_by_instant() {
+    let (_directory, store) = sqlite_store().await;
+    let tenant_id = seed_tenant(&store, "management-alerts-mixed-timestamps").await;
+    let device_id = "management-alerts-mixed-timestamps-device";
+    let older = chrono::DateTime::parse_from_rfc3339("2030-01-01T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    insert_alert(&store, tenant_id, device_id, "older", older).await;
+    insert_alert(
+        &store,
+        tenant_id,
+        device_id,
+        "newer",
+        older + Duration::seconds(1),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE alert_incidents
+         SET updated_at = '2030-01-01 12:00:01'
+         WHERE rule_id = (
+             SELECT id FROM alert_rules
+             WHERE tenant_id = ? AND name = 'newer'
+         )",
+    )
+    .bind(tenant_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    let alerts = ManagementAlertRepository::list_management_alerts(&store, tenant_id)
+        .await
+        .unwrap();
+    assert_eq!(alerts.first().unwrap().rule_name, "newer");
+}
+
+#[tokio::test]
 #[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
 async fn timescale_management_alert_list_is_tenant_scoped_newest_first_and_capped() {
     let database_url = std::env::var("IOT_NANO_TIMESCALE_TEST_URL")

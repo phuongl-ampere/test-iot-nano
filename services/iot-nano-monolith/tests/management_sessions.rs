@@ -1566,6 +1566,10 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
             .collect::<BTreeSet<_>>();
         assert_eq!(actual_methods, expected_methods, "methods for {path}");
     }
+    assert_eq!(
+        paths["/api/management/alerts"]["get"]["responses"]["403"]["description"],
+        "Tenant Account required"
+    );
 
     for (path, method, status, schema) in [
         (

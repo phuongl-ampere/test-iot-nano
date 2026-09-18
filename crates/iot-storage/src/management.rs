@@ -853,7 +853,7 @@ async fn list_management_alerts(
                     ON rules.id = incidents.rule_id
                    AND rules.tenant_id = incidents.tenant_id
                  WHERE incidents.tenant_id = ?
-                 ORDER BY incidents.updated_at DESC, incidents.id DESC
+                 ORDER BY julianday(incidents.updated_at) DESC, incidents.id DESC
                  LIMIT ?",
             )
             .bind(tenant_id.to_string())
