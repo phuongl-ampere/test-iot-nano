@@ -1,7 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    NewSystemAccount, NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository,
-    TenantStatus,
+    AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, PlatformStore,
+    TenantIdentityError, TenantIdentityRepository, TenantStatus,
 };
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
@@ -173,6 +173,24 @@ async fn sqlite_tenant_identity_repository_controls_tenant_and_credential_lifecy
             .password_hash,
         "replacement-hash"
     );
+
+    let disabled = TenantIdentityRepository::disable_tenant_account(&store, "north")
+        .await
+        .unwrap();
+    assert_eq!(disabled.id, tenant_account.id);
+    assert_eq!(disabled.tenant_id, tenant.id);
+    assert_eq!(disabled.status, AccountStatus::Disabled);
+    assert_eq!(disabled.credential_version, 3);
+    assert!(
+        TenantIdentityRepository::tenant_account_credential(&store, "north")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        TenantIdentityRepository::disable_tenant_account(&store, "north").await,
+        Err(TenantIdentityError::TenantLifecycleDenied)
+    ));
 
     TenantIdentityRepository::delete_tenant(&store, "north")
         .await

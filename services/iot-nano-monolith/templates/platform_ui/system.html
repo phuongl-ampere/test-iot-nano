@@ -76,6 +76,10 @@
                     <input name="slug" type="hidden" value="{{ tenant.slug }}">
                     <button type="submit">Delete</button>
                   </form>
+                  <form class="inline-form" action="/system/tenants/tenant-account/disable" method="post">
+                    <input name="slug" type="hidden" value="{{ tenant.slug }}">
+                    <button type="submit">Disable account</button>
+                  </form>
                   <details class="password-reset">
                     <summary>Reset password</summary>
                     <form class="inline-form" action="/system/tenants/tenant-account/reset" method="post">

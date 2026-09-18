@@ -3,7 +3,10 @@ use iot_core::{
     DatabaseStorage, StorageConfiguration, device_token_prefix, generate_device_token,
     hash_device_token,
 };
-use iot_storage::{IdentityRepository, PlatformStore, PlatformStoreError};
+use iot_storage::{
+    AccountStatus, IdentityRepository, NewTenant, NewTenantAccount, PlatformStore,
+    PlatformStoreError, TenantIdentityError, TenantIdentityRepository,
+};
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
@@ -362,4 +365,40 @@ async fn timescale_identity_repository_matches_sqlite_identity_contract() {
             .await
             .unwrap();
     assert_eq!(denied_used_at, None);
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_tenant_account_disable_matches_sqlite_lifecycle() {
+    let (_test_lock, store) = timescale_store().await;
+    let (tenant, account) = TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "tenant-account-disable".to_owned(),
+            metadata: serde_json::json!({}),
+        },
+        NewTenantAccount {
+            password_hash: "tenant-account-hash".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let disabled = TenantIdentityRepository::disable_tenant_account(&store, &tenant.slug)
+        .await
+        .unwrap();
+    assert_eq!(disabled.id, account.id);
+    assert_eq!(disabled.tenant_id, tenant.id);
+    assert_eq!(disabled.status, AccountStatus::Disabled);
+    assert_eq!(disabled.credential_version, 2);
+    assert!(
+        TenantIdentityRepository::tenant_account_credential(&store, &tenant.slug)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        TenantIdentityRepository::disable_tenant_account(&store, &tenant.slug).await,
+        Err(TenantIdentityError::TenantLifecycleDenied)
+    ));
 }

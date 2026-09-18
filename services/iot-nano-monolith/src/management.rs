@@ -141,6 +141,10 @@ impl ManagementSessionRouter {
                 "/system/tenants/tenant-account/reset",
                 post(reset_system_tenant_account_form),
             )
+            .route(
+                "/system/tenants/tenant-account/disable",
+                post(disable_system_tenant_account_form),
+            )
             .route("/tenant", get(platform_tenant))
             .route(
                 "/tenant/users",
@@ -237,6 +241,10 @@ impl ManagementSessionRouter {
             .route(
                 "/api/system/tenants/{tenant_slug}/tenant-account/reset",
                 post(reset_system_tenant_account),
+            )
+            .route(
+                "/api/system/tenants/{tenant_slug}/tenant-account/disable",
+                post(disable_system_tenant_account),
             )
             .route("/api/tenant/auth/login", post(tenant_login))
             .route("/api/tenant/auth/me", get(current_tenant_session))
@@ -4050,6 +4058,7 @@ enum SystemLifecycleNotice {
     TenantReactivated,
     TenantDeleted,
     TenantAccountReset,
+    TenantAccountDisabled,
     InvalidRequest,
     LifecycleUnavailable,
     ServiceUnavailable,
@@ -4063,6 +4072,7 @@ impl SystemLifecycleNotice {
             Self::TenantReactivated => "/system?notice=tenant-reactivated",
             Self::TenantDeleted => "/system?notice=tenant-deleted",
             Self::TenantAccountReset => "/system?notice=tenant-account-reset",
+            Self::TenantAccountDisabled => "/system?notice=tenant-account-disabled",
             Self::InvalidRequest => "/system?notice=invalid-request",
             Self::LifecycleUnavailable => "/system?notice=lifecycle-unavailable",
             Self::ServiceUnavailable => "/system?notice=service-unavailable",
@@ -4076,6 +4086,7 @@ impl SystemLifecycleNotice {
             Self::TenantReactivated => "Tenant reactivated.",
             Self::TenantDeleted => "Tenant deleted.",
             Self::TenantAccountReset => "Tenant Account password reset.",
+            Self::TenantAccountDisabled => "Tenant Account disabled.",
             Self::InvalidRequest => "Request could not be processed.",
             Self::LifecycleUnavailable => "Tenant lifecycle change was not allowed.",
             Self::ServiceUnavailable => "Tenant lifecycle service is unavailable.",
@@ -4090,6 +4101,7 @@ fn system_lifecycle_notice(query: Option<&str>) -> Option<&'static str> {
         Some("notice=tenant-reactivated") => SystemLifecycleNotice::TenantReactivated,
         Some("notice=tenant-deleted") => SystemLifecycleNotice::TenantDeleted,
         Some("notice=tenant-account-reset") => SystemLifecycleNotice::TenantAccountReset,
+        Some("notice=tenant-account-disabled") => SystemLifecycleNotice::TenantAccountDisabled,
         Some("notice=invalid-request") => SystemLifecycleNotice::InvalidRequest,
         Some("notice=lifecycle-unavailable") => SystemLifecycleNotice::LifecycleUnavailable,
         Some("notice=service-unavailable") => SystemLifecycleNotice::ServiceUnavailable,
@@ -4229,6 +4241,22 @@ async fn reset_system_tenant_account(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn disable_system_tenant_account(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(tenant_slug): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    require_system_account(&state.session_verifier, &headers)?;
+    let tenant_account =
+        TenantIdentityRepository::disable_tenant_account(state.store.as_ref(), &tenant_slug)
+            .await
+            .map_err(system_tenant_error)?;
+    state
+        .session_verifier
+        .invalidate_tenant(tenant_account.tenant_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn create_system_tenant_form(
     State(state): State<ManagementState>,
     request: Request,
@@ -4353,6 +4381,31 @@ async fn reset_system_tenant_account_form(
                 .invalidate_tenant(tenant_account.tenant_id);
             Ok(system_lifecycle_redirect(
                 SystemLifecycleNotice::TenantAccountReset,
+            ))
+        }
+        Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
+    }
+}
+
+async fn disable_system_tenant_account_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: SystemTenantLifecycleForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return system_lifecycle_form_error(error),
+    };
+    match TenantIdentityRepository::disable_tenant_account(state.store.as_ref(), &request.slug)
+        .await
+    {
+        Ok(tenant_account) => {
+            state
+                .session_verifier
+                .invalidate_tenant(tenant_account.tenant_id);
+            Ok(system_lifecycle_redirect(
+                SystemLifecycleNotice::TenantAccountDisabled,
             ))
         }
         Err(error) => system_lifecycle_form_error(system_tenant_error(error)),

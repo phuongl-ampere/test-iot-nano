@@ -1257,6 +1257,25 @@ async fn system_html_forms_manage_tenant_lifecycle_with_non_secret_notices() {
         StatusCode::OK
     );
 
+    let disable = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants/tenant-account/disable",
+            Some(&system_cookie),
+            "slug=ui-tenant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disable.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        disable.headers()[LOCATION],
+        "/system?notice=tenant-account-disabled"
+    );
+    assert_eq!(
+        tenant_account_login_status(&router, "ui-tenant", "ReplacementTenant@2026").await,
+        StatusCode::UNAUTHORIZED
+    );
+
     let delete = router
         .clone()
         .oneshot(system_lifecycle_form(
@@ -1314,6 +1333,7 @@ async fn system_html_lifecycle_forms_deny_non_system_sessions_before_form_parsin
             "/system/tenants/reactivate",
             "/system/tenants/delete",
             "/system/tenants/tenant-account/reset",
+            "/system/tenants/tenant-account/disable",
         ] {
             let response = router
                 .clone()

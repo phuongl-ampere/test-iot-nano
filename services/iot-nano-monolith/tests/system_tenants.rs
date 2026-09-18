@@ -537,6 +537,71 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .unwrap();
     assert_eq!(old_password.status(), StatusCode::UNAUTHORIZED);
 
+    let replacement_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"north","password":"NewTenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement_login.status(), StatusCode::OK);
+    let replacement_cookie = replacement_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let disable = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/tenants/north/tenant-account/disable")
+                .header(COOKIE, &system_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disable.status(), StatusCode::NO_CONTENT);
+    let disabled_session = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/tenant/auth/me")
+                .header(COOKIE, replacement_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled_session.status(), StatusCode::UNAUTHORIZED);
+    let disabled_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"tenant_slug":"north","password":"NewTenantAccount@2026"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled_login.status(), StatusCode::UNAUTHORIZED);
+
     let delete = router
         .oneshot(
             Request::builder()

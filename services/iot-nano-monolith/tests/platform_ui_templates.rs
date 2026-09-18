@@ -244,6 +244,7 @@ fn system_layout_renders_lifecycle_forms_without_tenant_secrets() {
         "/system/tenants/reactivate",
         "/system/tenants/delete",
         "/system/tenants/tenant-account/reset",
+        "/system/tenants/tenant-account/disable",
     ] {
         assert!(
             rendered.contains(&format!("action=\"{action}\"")),

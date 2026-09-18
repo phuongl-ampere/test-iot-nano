@@ -492,6 +492,51 @@ impl TenantIdentityRepository {
             }
         }
     }
+
+    pub async fn disable_tenant_account(
+        store: &PlatformStore,
+        tenant_slug: &str,
+    ) -> Result<TenantAccount, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let row = sqlx::query(
+                    "UPDATE tenant_accounts
+                     SET status = 'disabled', credential_version = credential_version + 1,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE tenant_id = (
+                         SELECT id FROM tenants
+                         WHERE slug = ? AND status <> 'deleted'
+                     )
+                       AND status = 'active'
+                     RETURNING id, tenant_id, status, credential_version",
+                )
+                .bind(tenant_slug)
+                .fetch_optional(&store.pool)
+                .await?
+                .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+                tenant_account_from_sqlite(row)
+            }
+            PlatformStore::Timescale(pool) => {
+                let row = sqlx::query(
+                    "UPDATE tenant_accounts
+                     SET status = 'disabled', credential_version = credential_version + 1,
+                         updated_at = now()
+                     FROM tenants
+                     WHERE tenants.id = tenant_accounts.tenant_id
+                       AND tenants.slug = $1
+                       AND tenants.status <> 'deleted'
+                       AND tenant_accounts.status = 'active'
+                     RETURNING tenant_accounts.id, tenant_accounts.tenant_id,
+                               tenant_accounts.status, tenant_accounts.credential_version",
+                )
+                .bind(tenant_slug)
+                .fetch_optional(pool)
+                .await?
+                .ok_or(TenantIdentityError::TenantLifecycleDenied)?;
+                tenant_account_from_postgres(row)
+            }
+        }
+    }
 }
 
 async fn update_tenant_status(
