@@ -14,11 +14,30 @@
     <h1>System Console</h1>
     <p>Platform lifecycle and runtime status.</p>
   </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
   <section class="summary-grid" aria-label="System summary">
     <article class="summary-item">
       <span>Operational health</span>
       <strong>{{ page.operational_health }}</strong>
     </article>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Create tenant</h2></header>
+    <form class="form-grid" action="/system/tenants" method="post">
+      <label class="field">
+        <span>Tenant slug</span>
+        <input name="slug" type="text" autocomplete="off" required>
+      </label>
+      <label class="field">
+        <span>Tenant Account password</span>
+        <input name="tenant_account_password" type="password" autocomplete="new-password" required>
+      </label>
+      <div class="form-actions">
+        <button type="submit">Create tenant</button>
+      </div>
+    </form>
   </section>
   <section class="workspace-panel">
     <header><h2>Tenants</h2></header>
@@ -32,6 +51,7 @@
               <th scope="col">Tenant</th>
               <th scope="col">Status</th>
               <th scope="col">Tenant account</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -40,6 +60,34 @@
                 <td>{{ tenant.slug }}</td>
                 <td>{{ tenant.status }}</td>
                 <td>{{ page.tenant_account_status }}</td>
+                <td class="tenant-actions">
+                  {% if tenant.status == "active" %}
+                    <form class="inline-form" action="/system/tenants/suspend" method="post">
+                      <input name="slug" type="hidden" value="{{ tenant.slug }}">
+                      <button type="submit">Suspend</button>
+                    </form>
+                  {% else if tenant.status == "suspended" %}
+                    <form class="inline-form" action="/system/tenants/reactivate" method="post">
+                      <input name="slug" type="hidden" value="{{ tenant.slug }}">
+                      <button type="submit">Reactivate</button>
+                    </form>
+                  {% endif %}
+                  <form class="inline-form" action="/system/tenants/delete" method="post">
+                    <input name="slug" type="hidden" value="{{ tenant.slug }}">
+                    <button type="submit">Delete</button>
+                  </form>
+                  <details class="password-reset">
+                    <summary>Reset password</summary>
+                    <form class="inline-form" action="/system/tenants/tenant-account/reset" method="post">
+                      <input name="slug" type="hidden" value="{{ tenant.slug }}">
+                      <label class="field">
+                        <span>New password</span>
+                        <input name="password" type="password" autocomplete="new-password" required>
+                      </label>
+                      <button type="submit">Reset</button>
+                    </form>
+                  </details>
+                </td>
               </tr>
             {% endfor %}
           </tbody>

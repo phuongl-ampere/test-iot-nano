@@ -12,7 +12,9 @@ use axum::{
 use iot_api::{OAuthBrowserSessionVerifier, TokenVault, hash_password};
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{ManagementSessionRouter, bootstrap_system};
-use iot_storage::{NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository};
+use iot_storage::{
+    NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository, TenantStatus,
+};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -226,6 +228,39 @@ fn platform_get(path: &str, cookie: Option<&str>) -> Request<Body> {
     request.body(Body::empty()).unwrap()
 }
 
+fn system_lifecycle_form(path: &str, cookie: Option<&str>, body: &str) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(cookie) = cookie {
+        request = request.header(COOKIE, cookie);
+    }
+    request.body(Body::from(body.to_owned())).unwrap()
+}
+
+async fn tenant_account_login_status(
+    router: &axum::Router,
+    tenant_slug: &str,
+    password: &str,
+) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "tenant_slug": tenant_slug, "password": password }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
 #[tokio::test]
 async fn platform_root_redirects_each_authenticated_session_kind_to_its_workspace() {
     let (_directory, management) = management_session_router().await;
@@ -393,6 +428,207 @@ async fn system_page_does_not_read_sensitive_invalid_tenant_metadata() {
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("<td>test</td>"));
     assert!(!body.contains(metadata));
+}
+
+#[tokio::test]
+async fn system_html_forms_manage_tenant_lifecycle_with_non_secret_notices() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+
+    let create = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants",
+            Some(&system_cookie),
+            "slug=ui-tenant&tenant_account_password=ChosenTenant%402026",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::SEE_OTHER);
+    assert_eq!(create.headers()[LOCATION], "/system?notice=tenant-created");
+    assert!(
+        TenantIdentityRepository::list_tenant_summaries(store.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .any(|tenant| tenant.slug == "ui-tenant" && tenant.status == TenantStatus::Active)
+    );
+
+    let suspend = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants/suspend",
+            Some(&system_cookie),
+            "slug=ui-tenant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(suspend.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        suspend.headers()[LOCATION],
+        "/system?notice=tenant-suspended"
+    );
+    assert!(
+        TenantIdentityRepository::list_tenant_summaries(store.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .any(|tenant| tenant.slug == "ui-tenant" && tenant.status == TenantStatus::Suspended)
+    );
+
+    let reactivate = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants/reactivate",
+            Some(&system_cookie),
+            "slug=ui-tenant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reactivate.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        reactivate.headers()[LOCATION],
+        "/system?notice=tenant-reactivated"
+    );
+    assert!(
+        TenantIdentityRepository::list_tenant_summaries(store.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .any(|tenant| tenant.slug == "ui-tenant" && tenant.status == TenantStatus::Active)
+    );
+
+    let reset = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants/tenant-account/reset",
+            Some(&system_cookie),
+            "slug=ui-tenant&password=ReplacementTenant%402026",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        reset.headers()[LOCATION],
+        "/system?notice=tenant-account-reset"
+    );
+    assert_eq!(
+        tenant_account_login_status(&router, "ui-tenant", "ChosenTenant@2026").await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        tenant_account_login_status(&router, "ui-tenant", "ReplacementTenant@2026").await,
+        StatusCode::OK
+    );
+
+    let delete = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants/delete",
+            Some(&system_cookie),
+            "slug=ui-tenant",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::SEE_OTHER);
+    assert_eq!(delete.headers()[LOCATION], "/system?notice=tenant-deleted");
+    assert!(
+        TenantIdentityRepository::list_tenant_summaries(store.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .all(|tenant| tenant.slug != "ui-tenant")
+    );
+
+    let page = router
+        .oneshot(platform_get(
+            "/system?notice=tenant-deleted",
+            Some(&system_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Tenant deleted."));
+    assert!(!page.contains("ChosenTenant@2026"));
+    assert!(!page.contains("ReplacementTenant@2026"));
+}
+
+#[tokio::test]
+async fn system_html_lifecycle_forms_deny_non_system_sessions_before_form_parsing() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for (cookie, expected) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(tenant_cookie.as_str()), StatusCode::FORBIDDEN),
+        (Some(user_cookie.as_str()), StatusCode::FORBIDDEN),
+    ] {
+        for path in [
+            "/system/tenants",
+            "/system/tenants/suspend",
+            "/system/tenants/reactivate",
+            "/system/tenants/delete",
+            "/system/tenants/tenant-account/reset",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(system_lifecycle_form(path, cookie, "%"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn system_html_lifecycle_forms_redirect_invalid_input_without_reflecting_passwords() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+
+    let response = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/system/tenants",
+            Some(&system_cookie),
+            "slug=invalid-tenant&tenant_account_password=too-short",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[LOCATION],
+        "/system?notice=invalid-request"
+    );
+
+    let page = router
+        .oneshot(platform_get(
+            "/system?notice=invalid-request",
+            Some(&system_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Request could not be processed."));
+    assert!(!page.contains("invalid-tenant"));
+    assert!(!page.contains("too-short"));
 }
 
 #[tokio::test]

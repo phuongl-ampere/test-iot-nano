@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Form, Json, Router,
     extract::{ConnectInfo, FromRequest, Path, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -118,6 +118,17 @@ impl ManagementSessionRouter {
         let router = Router::new()
             .route("/", get(platform_root))
             .route("/system", get(platform_system))
+            .route("/system/tenants", post(create_system_tenant_form))
+            .route("/system/tenants/suspend", post(suspend_system_tenant_form))
+            .route(
+                "/system/tenants/reactivate",
+                post(reactivate_system_tenant_form),
+            )
+            .route("/system/tenants/delete", post(delete_system_tenant_form))
+            .route(
+                "/system/tenants/tenant-account/reset",
+                post(reset_system_tenant_account_form),
+            )
             .route("/tenant", get(platform_tenant))
             .route("/app", get(platform_app))
             .route("/assets/platform-ui.css", get(platform_stylesheet))
@@ -1500,6 +1511,23 @@ struct ResetTenantAccountRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct CreateSystemTenantForm {
+    slug: String,
+    tenant_account_password: String,
+}
+
+#[derive(Deserialize)]
+struct SystemTenantLifecycleForm {
+    slug: String,
+}
+
+#[derive(Deserialize)]
+struct ResetTenantAccountForm {
+    slug: String,
+    password: String,
+}
+
 #[derive(Serialize)]
 struct SystemTenantResponse {
     id: Uuid,
@@ -1933,14 +1961,20 @@ async fn platform_root(
 
 async fn platform_system(
     State(state): State<ManagementState>,
-    headers: HeaderMap,
+    request: Request,
 ) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
     let PlatformUiSession::System { system_account_id } =
         state.session_verifier.platform_session(&headers)?
     else {
         return Err(ManagementSessionError::Forbidden);
     };
-    platform_page(&state, PlatformUiSession::System { system_account_id }).await
+    platform_page(
+        &state,
+        PlatformUiSession::System { system_account_id },
+        system_lifecycle_notice(request.uri().query()),
+    )
+    .await
 }
 
 async fn platform_tenant(
@@ -1952,7 +1986,7 @@ async fn platform_tenant(
     else {
         return Err(ManagementSessionError::Forbidden);
     };
-    platform_page(&state, PlatformUiSession::Tenant { tenant_id }).await
+    platform_page(&state, PlatformUiSession::Tenant { tenant_id }, None).await
 }
 
 async fn platform_app(
@@ -1964,12 +1998,13 @@ async fn platform_app(
     else {
         return Err(ManagementSessionError::Forbidden);
     };
-    platform_page(&state, PlatformUiSession::User { user_id, tenant_id }).await
+    platform_page(&state, PlatformUiSession::User { user_id, tenant_id }, None).await
 }
 
 async fn platform_page(
     state: &ManagementState,
     session: PlatformUiSession,
+    system_notice: Option<&'static str>,
 ) -> Result<Html<String>, ManagementSessionError> {
     let rendered = match session {
         PlatformUiSession::System { system_account_id } => {
@@ -1986,7 +2021,8 @@ async fn platform_page(
                         )
                     })
                     .collect(),
-            );
+            )
+            .with_notice(system_notice);
             crate::PlatformUiRenderer::render_system(
                 &crate::PlatformUiIdentity::new(format!("System Account {system_account_id}")),
                 &page,
@@ -2008,6 +2044,86 @@ fn system_tenant_status_label(status: TenantStatus) -> &'static str {
         TenantStatus::Active => "active",
         TenantStatus::Suspended => "suspended",
         TenantStatus::Deleted => "deleted",
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SystemLifecycleNotice {
+    TenantCreated,
+    TenantSuspended,
+    TenantReactivated,
+    TenantDeleted,
+    TenantAccountReset,
+    InvalidRequest,
+    LifecycleUnavailable,
+    ServiceUnavailable,
+}
+
+impl SystemLifecycleNotice {
+    const fn redirect_path(self) -> &'static str {
+        match self {
+            Self::TenantCreated => "/system?notice=tenant-created",
+            Self::TenantSuspended => "/system?notice=tenant-suspended",
+            Self::TenantReactivated => "/system?notice=tenant-reactivated",
+            Self::TenantDeleted => "/system?notice=tenant-deleted",
+            Self::TenantAccountReset => "/system?notice=tenant-account-reset",
+            Self::InvalidRequest => "/system?notice=invalid-request",
+            Self::LifecycleUnavailable => "/system?notice=lifecycle-unavailable",
+            Self::ServiceUnavailable => "/system?notice=service-unavailable",
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::TenantCreated => "Tenant created.",
+            Self::TenantSuspended => "Tenant suspended.",
+            Self::TenantReactivated => "Tenant reactivated.",
+            Self::TenantDeleted => "Tenant deleted.",
+            Self::TenantAccountReset => "Tenant Account password reset.",
+            Self::InvalidRequest => "Request could not be processed.",
+            Self::LifecycleUnavailable => "Tenant lifecycle change was not allowed.",
+            Self::ServiceUnavailable => "Tenant lifecycle service is unavailable.",
+        }
+    }
+}
+
+fn system_lifecycle_notice(query: Option<&str>) -> Option<&'static str> {
+    let notice = match query {
+        Some("notice=tenant-created") => SystemLifecycleNotice::TenantCreated,
+        Some("notice=tenant-suspended") => SystemLifecycleNotice::TenantSuspended,
+        Some("notice=tenant-reactivated") => SystemLifecycleNotice::TenantReactivated,
+        Some("notice=tenant-deleted") => SystemLifecycleNotice::TenantDeleted,
+        Some("notice=tenant-account-reset") => SystemLifecycleNotice::TenantAccountReset,
+        Some("notice=invalid-request") => SystemLifecycleNotice::InvalidRequest,
+        Some("notice=lifecycle-unavailable") => SystemLifecycleNotice::LifecycleUnavailable,
+        Some("notice=service-unavailable") => SystemLifecycleNotice::ServiceUnavailable,
+        _ => return None,
+    };
+    Some(notice.message())
+}
+
+fn system_lifecycle_redirect(notice: SystemLifecycleNotice) -> Redirect {
+    Redirect::to(notice.redirect_path())
+}
+
+fn system_lifecycle_form_error(
+    error: ManagementSessionError,
+) -> Result<Redirect, ManagementSessionError> {
+    match error {
+        ManagementSessionError::Unauthorized
+        | ManagementSessionError::TooManyRequests
+        | ManagementSessionError::Forbidden => Err(error),
+        ManagementSessionError::BadRequest
+        | ManagementSessionError::UnsupportedMediaType
+        | ManagementSessionError::PayloadTooLarge => Ok(system_lifecycle_redirect(
+            SystemLifecycleNotice::InvalidRequest,
+        )),
+        ManagementSessionError::NotFound | ManagementSessionError::Conflict => Ok(
+            system_lifecycle_redirect(SystemLifecycleNotice::LifecycleUnavailable),
+        ),
+        ManagementSessionError::Unavailable => Ok(system_lifecycle_redirect(
+            SystemLifecycleNotice::ServiceUnavailable,
+        )),
     }
 }
 
@@ -2115,6 +2231,136 @@ async fn reset_system_tenant_account(
         .session_verifier
         .invalidate_tenant(tenant_account.tenant_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_system_tenant_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: CreateSystemTenantForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return system_lifecycle_form_error(error),
+    };
+    if validate_password(&request.tenant_account_password).is_err() {
+        return system_lifecycle_form_error(ManagementSessionError::BadRequest);
+    }
+    let password_hash = match hash_password(&request.tenant_account_password) {
+        Ok(password_hash) => password_hash,
+        Err(_) => return system_lifecycle_form_error(ManagementSessionError::Unavailable),
+    };
+    match TenantIdentityRepository::create_tenant_with_account(
+        state.store.as_ref(),
+        NewTenant {
+            slug: request.slug,
+            metadata: json!({}),
+        },
+        NewTenantAccount { password_hash },
+    )
+    .await
+    {
+        Ok(_) => Ok(system_lifecycle_redirect(
+            SystemLifecycleNotice::TenantCreated,
+        )),
+        Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
+    }
+}
+
+async fn suspend_system_tenant_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: SystemTenantLifecycleForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return system_lifecycle_form_error(error),
+    };
+    match TenantIdentityRepository::suspend_tenant(state.store.as_ref(), &request.slug).await {
+        Ok(tenant_id) => {
+            state.session_verifier.invalidate_tenant(tenant_id);
+            Ok(system_lifecycle_redirect(
+                SystemLifecycleNotice::TenantSuspended,
+            ))
+        }
+        Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
+    }
+}
+
+async fn reactivate_system_tenant_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: SystemTenantLifecycleForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return system_lifecycle_form_error(error),
+    };
+    match TenantIdentityRepository::reactivate_tenant(state.store.as_ref(), &request.slug).await {
+        Ok(_) => Ok(system_lifecycle_redirect(
+            SystemLifecycleNotice::TenantReactivated,
+        )),
+        Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
+    }
+}
+
+async fn delete_system_tenant_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: SystemTenantLifecycleForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return system_lifecycle_form_error(error),
+    };
+    match TenantIdentityRepository::delete_tenant(state.store.as_ref(), &request.slug).await {
+        Ok(tenant_id) => {
+            state.session_verifier.invalidate_tenant(tenant_id);
+            Ok(system_lifecycle_redirect(
+                SystemLifecycleNotice::TenantDeleted,
+            ))
+        }
+        Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
+    }
+}
+
+async fn reset_system_tenant_account_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    require_system_account(&state.session_verifier, &headers)?;
+    let request: ResetTenantAccountForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return system_lifecycle_form_error(error),
+    };
+    if validate_password(&request.password).is_err() {
+        return system_lifecycle_form_error(ManagementSessionError::BadRequest);
+    }
+    let password_hash = match hash_password(&request.password) {
+        Ok(password_hash) => password_hash,
+        Err(_) => return system_lifecycle_form_error(ManagementSessionError::Unavailable),
+    };
+    match TenantIdentityRepository::reset_tenant_account_password(
+        state.store.as_ref(),
+        &request.slug,
+        password_hash,
+    )
+    .await
+    {
+        Ok(tenant_account) => {
+            state
+                .session_verifier
+                .invalidate_tenant(tenant_account.tenant_id);
+            Ok(system_lifecycle_redirect(
+                SystemLifecycleNotice::TenantAccountReset,
+            ))
+        }
+        Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
+    }
 }
 
 async fn logout(
@@ -2853,6 +3099,23 @@ where
     Json::<T>::from_request(request, state)
         .await
         .map(|Json(value)| value)
+        .map_err(|rejection| match rejection.into_response().status() {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => ManagementSessionError::UnsupportedMediaType,
+            StatusCode::PAYLOAD_TOO_LARGE => ManagementSessionError::PayloadTooLarge,
+            _ => ManagementSessionError::BadRequest,
+        })
+}
+
+async fn management_request_form<T>(
+    state: &ManagementState,
+    request: Request,
+) -> Result<T, ManagementSessionError>
+where
+    T: DeserializeOwned,
+{
+    Form::<T>::from_request(request, state)
+        .await
+        .map(|Form(value)| value)
         .map_err(|rejection| match rejection.into_response().status() {
             StatusCode::UNSUPPORTED_MEDIA_TYPE => ManagementSessionError::UnsupportedMediaType,
             StatusCode::PAYLOAD_TOO_LARGE => ManagementSessionError::PayloadTooLarge,

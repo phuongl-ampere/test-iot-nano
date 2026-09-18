@@ -47,6 +47,8 @@ pub struct SystemPlatformPage {
     tenants: Vec<SystemTenantRow>,
     tenant_account_status: &'static str,
     operational_health: &'static str,
+    notice: &'static str,
+    has_notice: bool,
 }
 
 impl SystemPlatformPage {
@@ -55,7 +57,17 @@ impl SystemPlatformPage {
             tenants,
             tenant_account_status: "Not reported",
             operational_health: "Not reported",
+            notice: "",
+            has_notice: false,
         }
+    }
+
+    pub(crate) fn with_notice(mut self, notice: Option<&'static str>) -> Self {
+        if let Some(notice) = notice {
+            self.notice = notice;
+            self.has_notice = true;
+        }
+        self
     }
 }
 

@@ -228,6 +228,37 @@ fn system_layout_renders_escaped_tenant_rows_and_neutral_runtime_fields() {
 }
 
 #[test]
+fn system_layout_renders_lifecycle_forms_without_tenant_secrets() {
+    let identity = PlatformUiIdentity::new("System Account");
+    let page = SystemPlatformPage::new(vec![
+        SystemTenantRow::new("tenant-<unsafe>", "active"),
+        SystemTenantRow::new("suspended-tenant", "suspended"),
+    ]);
+
+    let rendered = PlatformUiRenderer::render_system(&identity, &page).unwrap();
+
+    for action in [
+        "/system/tenants",
+        "/system/tenants/suspend",
+        "/system/tenants/reactivate",
+        "/system/tenants/delete",
+        "/system/tenants/tenant-account/reset",
+    ] {
+        assert!(
+            rendered.contains(&format!("action=\"{action}\"")),
+            "missing lifecycle form for {action}"
+        );
+    }
+    assert!(rendered.contains("method=\"post\""));
+    assert!(rendered.contains("name=\"tenant_account_password\""));
+    assert!(rendered.contains("name=\"password\""));
+    assert!(rendered.contains("type=\"password\""));
+    assert!(rendered.contains("value=\"tenant-&#60;unsafe&#62;\""));
+    assert!(!rendered.contains("value=\"TenantPassword@2026\""));
+    assert!(!rendered.contains("TenantPassword@2026"));
+}
+
+#[test]
 fn tenant_layout_renders_only_tenant_navigation() {
     let identity = PlatformUiIdentity::new("Tenant Account");
 
