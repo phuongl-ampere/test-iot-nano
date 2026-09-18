@@ -1,6 +1,6 @@
 #[test]
 fn timescale_command_locks_asset_ancestors_before_the_device() {
-    let source = include_str!("../src/lib.rs");
+    let source = include_str!("../src/domain/commands.rs");
     let function = source
         .split("async fn timescale_user_can_issue_command")
         .nth(1)
