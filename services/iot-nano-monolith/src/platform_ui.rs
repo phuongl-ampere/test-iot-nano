@@ -322,6 +322,47 @@ impl TenantDevicesPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAlertRow {
+    device_id: String,
+    rule_name: String,
+    severity: String,
+    status: String,
+    last_value: String,
+    updated_at: String,
+}
+
+impl TenantAlertRow {
+    pub fn new(
+        device_id: impl Into<String>,
+        rule_name: impl Into<String>,
+        severity: impl Into<String>,
+        status: impl Into<String>,
+        last_value: impl Into<String>,
+        updated_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            rule_name: rule_name.into(),
+            severity: severity.into(),
+            status: status.into(),
+            last_value: last_value.into(),
+            updated_at: updated_at.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAlertsPage {
+    alerts: Vec<TenantAlertRow>,
+}
+
+impl TenantAlertsPage {
+    pub fn new(alerts: Vec<TenantAlertRow>) -> Self {
+        Self { alerts }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantTopologyRow {
     display_name: String,
     device_id: String,
@@ -845,6 +886,13 @@ impl PlatformUiRenderer {
         TenantDevicesLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_alerts(
+        identity: &PlatformUiIdentity,
+        page: &TenantAlertsPage,
+    ) -> Result<String, askama::Error> {
+        TenantAlertsLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_topology(
         identity: &PlatformUiIdentity,
         page: &TenantTopologyPage,
@@ -1034,6 +1082,19 @@ pub struct TenantDevicesLayout<'a> {
 
 impl<'a> TenantDevicesLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDevicesPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_alerts.html")]
+pub struct TenantAlertsLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantAlertsPage,
+}
+
+impl<'a> TenantAlertsLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantAlertsPage) -> Self {
         Self { identity, page }
     }
 }

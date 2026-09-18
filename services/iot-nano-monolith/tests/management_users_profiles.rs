@@ -15,6 +15,7 @@ use iot_nano_monolith::ManagementSessionRouter;
 use iot_storage::{NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 async fn management_router() -> (tempfile::TempDir, Arc<PlatformStore>, axum::Router) {
     let directory = tempfile::tempdir().unwrap();
@@ -65,6 +66,42 @@ async fn management_router() -> (tempfile::TempDir, Arc<PlatformStore>, axum::Ro
             0,
         )))));
     (directory, store, router)
+}
+
+async fn seed_alert(store: &PlatformStore, tenant_id: Uuid, rule_name: &str) {
+    let pool = store.sqlite_pool().unwrap();
+    let device_id = format!("alert-device-{}", Uuid::now_v7());
+    let rule_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
+        .bind(&device_id)
+        .bind(tenant_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_rules (
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold, severity
+         ) VALUES (?, ?, ?, ?, 'temperature_c', 'event_threshold', 'gt', 30, 'critical')",
+    )
+    .bind(rule_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(rule_name)
+    .bind(&device_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+            id, tenant_id, rule_id, device_id, status, condition_started_at, last_value
+         ) VALUES (?, ?, ?, ?, 'open', CURRENT_TIMESTAMP, 42.5)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(tenant_id.to_string())
+    .bind(rule_id.to_string())
+    .bind(&device_id)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn login_cookie(router: &axum::Router, username: &str, password: &str) -> String {
@@ -1050,6 +1087,166 @@ async fn management_users_and_profiles_report_unavailable_storage() {
         StatusCode::SERVICE_UNAVAILABLE,
     )
     .await;
+}
+
+#[tokio::test]
+async fn management_alerts_are_guarded_and_scoped_to_the_authenticated_tenant() {
+    let (_directory, store, router) = management_router().await;
+    let tenant_a_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    let tenant_a_id = Uuid::parse_str(&tenant_a_id).unwrap();
+    seed_alert(&store, tenant_a_id, "Tenant A alert").await;
+
+    let (tenant_b, _) = TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "other-alerts".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_alert(&store, tenant_b.id, "Tenant B alert").await;
+
+    let tenant_a_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
+    let tenant_b_cookie = tenant_account_cookie(&router, "other-alerts", "OtherTenant@2026").await;
+    let viewer_cookie = login_cookie(&router, "viewer", "NanoView@1234").await;
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/alerts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let viewer = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/management/alerts")
+                .header(COOKIE, &viewer_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+
+    let tenant_a_alerts = json_request(
+        &router,
+        "GET",
+        &format!("/api/management/alerts?tenant_id={}", tenant_b.id),
+        &tenant_a_cookie,
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(tenant_a_alerts.as_array().unwrap().len(), 1);
+    assert_eq!(tenant_a_alerts[0]["rule_name"], "Tenant A alert");
+    assert!(tenant_a_alerts[0].get("tenant_id").is_none());
+
+    let tenant_b_alerts = json_request(
+        &router,
+        "GET",
+        "/api/management/alerts",
+        &tenant_b_cookie,
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(tenant_b_alerts.as_array().unwrap().len(), 1);
+    assert_eq!(tenant_b_alerts[0]["rule_name"], "Tenant B alert");
+}
+
+#[tokio::test]
+async fn tenant_alert_page_is_guarded_and_renders_only_the_session_tenant() {
+    let (_directory, store, router) = management_router().await;
+    let tenant_a_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    let tenant_a_id = Uuid::parse_str(&tenant_a_id).unwrap();
+    seed_alert(&store, tenant_a_id, "Tenant A page alert").await;
+
+    let (tenant_b, _) = TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "other-alert-page".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_alert(&store, tenant_b.id, "Tenant B page alert").await;
+
+    let tenant_a_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
+    let viewer_cookie = login_cookie(&router, "viewer", "NanoView@1234").await;
+
+    let anonymous = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/tenant/alerts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let viewer = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/tenant/alerts")
+                .header(COOKIE, &viewer_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
+
+    let page = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/tenant/alerts?tenant_id={}", tenant_b.id))
+                .header(COOKIE, &tenant_a_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Tenant A page alert"));
+    assert!(!page.contains("Tenant B page alert"));
+    assert!(page.contains("href=\"/tenant/alerts\" aria-current=\"page\""));
+    assert!(!page.contains("<form"));
 }
 
 fn test_token_vault() -> TokenVault {

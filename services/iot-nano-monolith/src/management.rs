@@ -28,7 +28,8 @@ use iot_storage::{
     BUILT_IN_USER_WORKSPACE, ClientId, CreateDeviceRelation, CreateManagementAsset,
     CreateManagementAssetProfile, CreateManagementDeviceProfile, CreateManagementUser,
     DeviceRelationError, DeviceRelationRepository, DeviceTokenRepository,
-    DeviceTokenRepositoryError, ManagementAsset as StorageManagementAsset, ManagementAssetError,
+    DeviceTokenRepositoryError, ManagementAlert as StorageManagementAlert, ManagementAlertError,
+    ManagementAlertRepository, ManagementAsset as StorageManagementAsset, ManagementAssetError,
     ManagementAssetProfile, ManagementAssetProfileError, ManagementAssetProfileRepository,
     ManagementAssetRepository, ManagementChildStatus, ManagementDevice as StorageManagementDevice,
     ManagementDeviceError, ManagementDeviceProfile, ManagementDeviceProfileError,
@@ -175,6 +176,7 @@ impl ManagementSessionRouter {
                 "/tenant/devices",
                 get(platform_tenant_devices).post(provision_tenant_device_form),
             )
+            .route("/tenant/alerts", get(platform_tenant_alerts))
             .route(
                 "/tenant/profiles/device",
                 get(platform_tenant_device_profiles).post(create_tenant_device_profile_form),
@@ -251,6 +253,7 @@ impl ManagementSessionRouter {
             .route("/api/user/auth/login", post(user_login))
             .route("/api/user/auth/me", get(current_user_session))
             .route("/api/management/applications", post(create_application))
+            .route("/api/management/alerts", get(list_management_alerts))
             .route(
                 "/api/management/users",
                 get(list_management_users).post(create_management_user),
@@ -367,6 +370,14 @@ fn management_openapi() -> Value {
                 "201",
                 "ApplicationResponse",
             ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/alerts",
+        vec![(
+            "get",
+            management_list_operation("List tenant alerts", "ManagementAlertList"),
         )],
     );
     documented_path(
@@ -823,6 +834,28 @@ fn management_openapi_schemas() -> Value {
         ),
     );
     schemas.insert(
+        "ManagementAlert".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema_non_null(),
+                "rule_name": {"type": "string"},
+                "severity": {"type": "string"},
+                "device_id": {"type": "string"},
+                "status": {"type": "string"},
+                "last_value": {"type": ["number", "null"]},
+                "updated_at": {"type": "string", "format": "date-time"}
+            }),
+            &[
+                "id",
+                "rule_name",
+                "severity",
+                "device_id",
+                "status",
+                "updated_at",
+            ],
+        ),
+    );
+    schemas.insert(
         "DeviceProfileRequest".to_owned(),
         object_schema(
             json!({
@@ -972,6 +1005,7 @@ fn management_openapi_schemas() -> Value {
 
     for (name, item) in [
         ("ManagementUserList", "ManagementUser"),
+        ("ManagementAlertList", "ManagementAlert"),
         ("DeviceProfileList", "DeviceProfile"),
         ("AssetProfileList", "AssetProfile"),
         ("ManagementDeviceList", "ManagementDevice"),
@@ -1787,6 +1821,17 @@ struct ManagementUserResponse {
     granted_apps: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct ManagementAlertResponse {
+    id: Uuid,
+    rule_name: String,
+    severity: String,
+    device_id: String,
+    status: String,
+    last_value: Option<f64>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Deserialize)]
 struct ManagementDeviceProfileRequest {
     name: String,
@@ -2292,6 +2337,14 @@ async fn platform_tenant_devices(
     .await
 }
 
+async fn platform_tenant_alerts(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_alerts_page(&state, tenant).await
+}
+
 async fn platform_tenant_device_profiles(
     State(state): State<ManagementState>,
     request: Request,
@@ -2472,6 +2525,40 @@ async fn tenant_devices_page(
         notice,
     );
     let rendered = crate::PlatformUiRenderer::render_tenant_devices(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_alerts_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+) -> Result<Html<String>, ManagementSessionError> {
+    let alerts =
+        ManagementAlertRepository::list_management_alerts(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_alert_error)?;
+    let page = crate::TenantAlertsPage::new(
+        alerts
+            .into_iter()
+            .map(|alert| {
+                crate::TenantAlertRow::new(
+                    alert.device_id,
+                    alert.rule_name,
+                    alert.severity,
+                    alert.status,
+                    alert
+                        .last_value
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "Not reported".to_owned()),
+                    alert.updated_at.to_rfc3339(),
+                )
+            })
+            .collect(),
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_alerts(
         &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
         &page,
     )
@@ -5065,6 +5152,17 @@ async fn list_management_users(
         .map_err(management_user_error)
 }
 
+async fn list_management_alerts(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementAlertResponse>>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementAlertRepository::list_management_alerts(state.store.as_ref(), tenant.tenant_id)
+        .await
+        .map(|alerts| Json(alerts.into_iter().map(management_alert_response).collect()))
+        .map_err(management_alert_error)
+}
+
 async fn create_management_user(
     State(state): State<ManagementState>,
     request: Request,
@@ -5484,6 +5582,18 @@ fn management_user_response(user: ManagementUser) -> ManagementUserResponse {
     }
 }
 
+fn management_alert_response(alert: StorageManagementAlert) -> ManagementAlertResponse {
+    ManagementAlertResponse {
+        id: alert.id,
+        rule_name: alert.rule_name,
+        severity: alert.severity,
+        device_id: alert.device_id,
+        status: alert.status,
+        last_value: alert.last_value,
+        updated_at: alert.updated_at,
+    }
+}
+
 fn management_device_profile_response(
     profile: ManagementDeviceProfile,
 ) -> ManagementDeviceProfileResponse {
@@ -5521,6 +5631,14 @@ fn management_user_error(error: ManagementUserError) -> ManagementSessionError {
         | ManagementUserError::InvalidStoredRole(_)
         | ManagementUserError::InvalidStoredAccountClass(_)
         | ManagementUserError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_alert_error(error: ManagementAlertError) -> ManagementSessionError {
+    match error {
+        ManagementAlertError::InvalidStoredAlertId
+        | ManagementAlertError::InvalidStoredAlertTimestamp
+        | ManagementAlertError::Storage { .. } => ManagementSessionError::Unavailable,
     }
 }
 

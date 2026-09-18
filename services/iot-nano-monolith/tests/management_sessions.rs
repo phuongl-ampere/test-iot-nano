@@ -1501,6 +1501,7 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "/api/auth/login",
         "/api/auth/logout",
         "/api/auth/me",
+        "/api/management/alerts",
         "/api/management/applications",
         "/api/management/assets",
         "/api/management/assets/{asset_id}",
@@ -1520,6 +1521,7 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         ("/api/auth/login", BTreeSet::from(["post"])),
         ("/api/auth/logout", BTreeSet::from(["post"])),
         ("/api/auth/me", BTreeSet::from(["get"])),
+        ("/api/management/alerts", BTreeSet::from(["get"])),
         ("/api/management/applications", BTreeSet::from(["post"])),
         ("/api/management/assets", BTreeSet::from(["get", "post"])),
         (
@@ -1565,13 +1567,29 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         assert_eq!(actual_methods, expected_methods, "methods for {path}");
     }
 
-    for (path, method) in [
-        ("/api/management/devices", "post"),
-        ("/api/management/devices/{device_id}/tokens", "post"),
+    for (path, method, status, schema) in [
+        (
+            "/api/management/alerts",
+            "get",
+            "200",
+            "#/components/schemas/ManagementAlertList",
+        ),
+        (
+            "/api/management/devices",
+            "post",
+            "201",
+            "#/components/schemas/DeviceToken",
+        ),
+        (
+            "/api/management/devices/{device_id}/tokens",
+            "post",
+            "201",
+            "#/components/schemas/DeviceToken",
+        ),
     ] {
         assert_eq!(
-            paths[path][method]["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/DeviceToken"
+            paths[path][method]["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            schema
         );
     }
 
@@ -1590,6 +1608,8 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "DeviceToken",
         "Error",
         "LoginRequest",
+        "ManagementAlert",
+        "ManagementAlertList",
         "ManagementAsset",
         "ManagementAssetList",
         "ManagementAssetRequest",
@@ -1654,8 +1674,39 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
     }
     assert_eq!(device_token["properties"]["token"]["type"], "string");
 
+    let management_alert = &schemas["ManagementAlert"];
+    assert_eq!(management_alert["type"], "object");
+    assert_eq!(management_alert["additionalProperties"], false);
+    assert_eq!(
+        management_alert["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "device_id",
+            "id",
+            "last_value",
+            "rule_name",
+            "severity",
+            "status",
+            "updated_at",
+        ])
+    );
+    assert_eq!(
+        management_alert["properties"]["id"],
+        json!({"type": "string", "format": "uuid"})
+    );
+    assert_eq!(
+        management_alert["properties"]["updated_at"],
+        json!({"type": "string", "format": "date-time"})
+    );
+    assert!(management_alert["properties"].get("tenant_id").is_none());
+
     for (schema_name, field_name) in [
         ("SessionResponse", "user_id"),
+        ("ManagementAlert", "id"),
         ("ManagementUser", "id"),
         ("DeviceProfile", "id"),
         ("AssetProfile", "id"),

@@ -1,13 +1,70 @@
 use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use chrono::{DateTime, Duration, Utc};
-use sqlx::{Postgres, Row, Sqlite, Transaction, error::DatabaseError, types::Json};
+use sqlx::{
+    Postgres, Row, Sqlite, Transaction, error::DatabaseError, postgres::PgRow, sqlite::SqliteRow,
+    types::Json,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{AccountClass, PlatformStore, PlatformStoreError};
 
 pub const BUILT_IN_USER_WORKSPACE: &str = "/app";
+pub const MANAGEMENT_ALERT_LIST_LIMIT: usize = 100;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagementAlert {
+    pub id: Uuid,
+    pub rule_name: String,
+    pub severity: String,
+    pub device_id: String,
+    pub status: String,
+    pub last_value: Option<f64>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Error)]
+pub enum ManagementAlertError {
+    #[error("stored management alert ID is invalid")]
+    InvalidStoredAlertId,
+    #[error("stored management alert timestamp is invalid")]
+    InvalidStoredAlertTimestamp,
+    #[error("management alert storage operation failed")]
+    Storage {
+        #[source]
+        source: PlatformStoreError,
+    },
+}
+
+impl From<PlatformStoreError> for ManagementAlertError {
+    fn from(source: PlatformStoreError) -> Self {
+        Self::Storage { source }
+    }
+}
+
+impl From<sqlx::Error> for ManagementAlertError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::from(PlatformStoreError::from(source))
+    }
+}
+
+pub trait ManagementAlertRepository: Send + Sync {
+    fn list_management_alerts<'a>(
+        &'a self,
+        tenant_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementAlert>, ManagementAlertError>> + Send + 'a>>;
+}
+
+impl ManagementAlertRepository for PlatformStore {
+    fn list_management_alerts<'a>(
+        &'a self,
+        tenant_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ManagementAlert>, ManagementAlertError>> + Send + 'a>>
+    {
+        Box::pin(async move { list_management_alerts(self, tenant_id).await })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagementUserRole {
@@ -780,6 +837,90 @@ async fn list_management_users(
             Ok(users)
         }
     }
+}
+
+async fn list_management_alerts(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+) -> Result<Vec<ManagementAlert>, ManagementAlertError> {
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let rows = sqlx::query(
+                "SELECT incidents.id, rules.name AS rule_name, rules.severity, incidents.device_id,
+                        incidents.status, incidents.last_value, incidents.updated_at
+                 FROM alert_incidents AS incidents
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id
+                   AND rules.tenant_id = incidents.tenant_id
+                 WHERE incidents.tenant_id = ?
+                 ORDER BY incidents.updated_at DESC, incidents.id DESC
+                 LIMIT ?",
+            )
+            .bind(tenant_id.to_string())
+            .bind(MANAGEMENT_ALERT_LIST_LIMIT as i64)
+            .fetch_all(store.pool())
+            .await?;
+            rows.into_iter()
+                .map(sqlite_management_alert_from_row)
+                .collect()
+        }
+        PlatformStore::Timescale(pool) => {
+            let rows = sqlx::query(
+                "SELECT incidents.id, rules.name AS rule_name, rules.severity, incidents.device_id,
+                        incidents.status, incidents.last_value, incidents.updated_at
+                 FROM alert_incidents AS incidents
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id
+                   AND rules.tenant_id = incidents.tenant_id
+                 WHERE incidents.tenant_id = $1
+                 ORDER BY incidents.updated_at DESC, incidents.id DESC
+                 LIMIT $2",
+            )
+            .bind(tenant_id)
+            .bind(MANAGEMENT_ALERT_LIST_LIMIT as i64)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter()
+                .map(timescale_management_alert_from_row)
+                .collect()
+        }
+    }
+}
+
+fn sqlite_management_alert_from_row(
+    row: SqliteRow,
+) -> Result<ManagementAlert, ManagementAlertError> {
+    let id: String = row.try_get("id")?;
+    let updated_at: String = row.try_get("updated_at")?;
+    Ok(ManagementAlert {
+        id: Uuid::parse_str(&id).map_err(|_| ManagementAlertError::InvalidStoredAlertId)?,
+        rule_name: row.try_get("rule_name")?,
+        severity: row.try_get("severity")?,
+        device_id: row.try_get("device_id")?,
+        status: row.try_get("status")?,
+        last_value: row.try_get("last_value")?,
+        updated_at: DateTime::parse_from_rfc3339(&updated_at)
+            .map(|value| value.with_timezone(&Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(&updated_at, "%Y-%m-%d %H:%M:%S")
+                    .map(|value| value.and_utc())
+            })
+            .map_err(|_| ManagementAlertError::InvalidStoredAlertTimestamp)?,
+    })
+}
+
+fn timescale_management_alert_from_row(
+    row: PgRow,
+) -> Result<ManagementAlert, ManagementAlertError> {
+    Ok(ManagementAlert {
+        id: row.try_get("id")?,
+        rule_name: row.try_get("rule_name")?,
+        severity: row.try_get("severity")?,
+        device_id: row.try_get("device_id")?,
+        status: row.try_get("status")?,
+        last_value: row.try_get("last_value")?,
+        updated_at: row.try_get("updated_at")?,
+    })
 }
 
 async fn create_management_user(

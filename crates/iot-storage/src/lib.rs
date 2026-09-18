@@ -45,7 +45,8 @@ pub use device_relations::{
 pub use management::{
     BUILT_IN_USER_WORKSPACE, CreateManagementAsset, CreateManagementAssetProfile,
     CreateManagementDeviceProfile, CreateManagementUser, DeviceTokenRecord, DeviceTokenRepository,
-    DeviceTokenRepositoryError, ManagementAsset, ManagementAssetError, ManagementAssetProfile,
+    DeviceTokenRepositoryError, MANAGEMENT_ALERT_LIST_LIMIT, ManagementAlert, ManagementAlertError,
+    ManagementAlertRepository, ManagementAsset, ManagementAssetError, ManagementAssetProfile,
     ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
     ManagementChildStatus, ManagementDevice, ManagementDeviceError, ManagementDeviceHealth,
     ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,

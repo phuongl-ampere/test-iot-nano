@@ -1,0 +1,47 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Alerts | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link active" href="/tenant/alerts" aria-current="page">Alerts</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Alerts</h1>
+  </section>
+  <section class="workspace-panel">
+    {% if page.alerts.is_empty() %}
+      <p class="empty-state">No alerts recorded.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Device</th>
+              <th scope="col">Rule</th>
+              <th scope="col">Severity</th>
+              <th scope="col">Status</th>
+              <th scope="col">Last value</th>
+              <th scope="col">Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for alert in page.alerts %}
+              <tr>
+                <td><code>{{ alert.device_id }}</code></td>
+                <td>{{ alert.rule_name }}</td>
+                <td>{{ alert.severity }}</td>
+                <td>{{ alert.status }}</td>
+                <td>{{ alert.last_value }}</td>
+                <td>{{ alert.updated_at }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

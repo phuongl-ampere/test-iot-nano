@@ -1,6 +1,7 @@
 use iot_nano_monolith::{
-    PlatformUiIdentity, PlatformUiRenderer, SystemPlatformPage, SystemTenantRow, TenantUserRow,
-    TenantUsersPage, UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
+    PlatformUiIdentity, PlatformUiRenderer, SystemPlatformPage, SystemTenantRow, TenantAlertRow,
+    TenantAlertsPage, TenantUserRow, TenantUsersPage, UserDeviceDetailPage, UserDeviceListPage,
+    UserDeviceRow,
 };
 
 fn navigation_hrefs(rendered: &str) -> Vec<&str> {
@@ -271,6 +272,7 @@ fn tenant_layout_renders_only_tenant_navigation() {
     assert!(rendered.contains("href=\"/tenant/users\""));
     assert!(rendered.contains("href=\"/tenant/groups\""));
     assert!(rendered.contains("href=\"/tenant/permissions\""));
+    assert!(rendered.contains("href=\"/tenant/alerts\""));
     assert!(rendered.contains("href=\"/tenant/profiles/device\""));
     assert!(rendered.contains("href=\"/tenant/profiles/asset\""));
     assert!(rendered.contains("href=\"/tenant/applications\""));
@@ -301,6 +303,34 @@ fn tenant_users_layout_escapes_rows_and_contains_only_tenant_management_fields()
     assert!(!rendered.contains("Default app"));
     assert!(!rendered.contains("Granted apps"));
     assert!(!rendered.contains("Role"));
+    assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
+}
+
+#[test]
+fn tenant_alerts_layout_is_read_only_and_escapes_server_rows() {
+    let identity = PlatformUiIdentity::new("Tenant <account>");
+    let page = TenantAlertsPage::new(vec![TenantAlertRow::new(
+        "device-<unsafe>",
+        "Rule <unsafe>",
+        "Critical",
+        "Open",
+        "42.5",
+        "2026-09-18T10:20:30Z",
+    )]);
+
+    let rendered = PlatformUiRenderer::render_tenant_alerts(&identity, &page).unwrap();
+
+    assert!(rendered.contains("href=\"/tenant/alerts\" aria-current=\"page\""));
+    assert!(rendered.contains("Alerts"));
+    assert!(rendered.contains("Rule &#60;unsafe&#62;"));
+    assert!(!rendered.contains("Rule <unsafe>"));
+    assert!(rendered.contains("Device"));
+    assert!(rendered.contains("Severity"));
+    assert!(rendered.contains("Status"));
+    assert!(rendered.contains("Last value"));
+    assert!(rendered.contains("Updated"));
+    assert!(!rendered.contains("<form"));
+    assert!(!rendered.contains("name=\"tenant_id\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
 }
 
