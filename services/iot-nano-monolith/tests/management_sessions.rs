@@ -6,7 +6,7 @@ use axum::{
     extract::ConnectInfo,
     http::{
         HeaderMap, HeaderValue, Request, StatusCode,
-        header::{CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE},
     },
 };
 use iot_api::{OAuthBrowserSessionVerifier, TokenVault, hash_password};
@@ -2753,6 +2753,251 @@ fn test_token_vault() -> TokenVault {
 }
 
 #[tokio::test]
+async fn tenant_asset_and_device_pages_only_render_the_authenticated_tenant_resources() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let root_asset_id = uuid::Uuid::now_v7().to_string();
+    let child_asset_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Tenant site')")
+        .bind(&root_asset_id)
+        .bind(&tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, parent_asset_id)
+         VALUES (?, ?, 'Tenant panel', ?)",
+    )
+    .bind(&child_asset_id)
+    .bind(&tenant_id)
+    .bind(&root_asset_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
+         VALUES ('tenant-device', ?, 'Tenant meter', ?)",
+    )
+    .bind(&tenant_id)
+    .bind(&child_asset_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "tenant-setup-other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Other tenant asset')")
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(other_tenant.id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name)
+         VALUES ('other-tenant-device', ?, 'Other tenant device')",
+    )
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let assets = router
+        .clone()
+        .oneshot(platform_get("/tenant/assets", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(assets.status(), StatusCode::OK);
+    let assets = String::from_utf8(
+        to_bytes(assets.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(assets.contains("Tenant site"));
+    assert!(assets.contains("Tenant panel"));
+    assert!(assets.contains(&root_asset_id));
+    assert!(assets.contains(&format!("Tenant site ({root_asset_id})")));
+    assert!(!assets.contains("Other tenant asset"));
+
+    let devices = router
+        .clone()
+        .oneshot(platform_get("/tenant/devices", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(devices.status(), StatusCode::OK);
+    let devices = String::from_utf8(
+        to_bytes(devices.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(devices.contains("tenant-device"));
+    assert!(devices.contains("Tenant meter"));
+    assert!(devices.contains("Offline"));
+    assert!(devices.contains(&format!("Tenant panel ({child_asset_id})")));
+    assert!(!devices.contains("Other tenant device"));
+}
+
+#[tokio::test]
+async fn tenant_asset_and_device_forms_create_current_tenant_resources_without_list_token_leaks() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+
+    let create_asset = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/assets",
+            Some(&tenant_cookie),
+            "name=Created+asset",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_asset.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        create_asset.headers()[LOCATION],
+        "/tenant/assets?notice=asset-created"
+    );
+    let asset_tenant_id = sqlx::query_scalar::<_, String>(
+        "SELECT tenant_id FROM assets WHERE name = 'Created asset'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let expected_tenant_id =
+        sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(asset_tenant_id, expected_tenant_id);
+
+    let provision_device = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/devices",
+            Some(&tenant_cookie),
+            "display_name=Provisioned+meter",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(provision_device.status(), StatusCode::CREATED);
+    assert_eq!(provision_device.headers()[CACHE_CONTROL], "no-store");
+    let provisioned_body = String::from_utf8(
+        to_bytes(provision_device.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let credential = provisioned_body
+        .split("<code id=\"device-credential\" class=\"credential\">")
+        .nth(1)
+        .and_then(|value| value.split("</code>").next())
+        .expect("provision result must contain the one-time credential")
+        .to_owned();
+    assert!(!credential.is_empty());
+    assert!(provisioned_body.contains("Provisioned meter"));
+
+    let device_tenant_id = sqlx::query_scalar::<_, String>(
+        "SELECT tenant_id FROM devices WHERE display_name = 'Provisioned meter'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(device_tenant_id, expected_tenant_id);
+
+    let device_list = router
+        .clone()
+        .oneshot(platform_get("/tenant/devices", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(device_list.status(), StatusCode::OK);
+    let device_list = String::from_utf8(
+        to_bytes(device_list.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(device_list.contains("Provisioned meter"));
+    assert!(!device_list.contains(&credential));
+}
+
+#[tokio::test]
+async fn tenant_asset_and_device_routes_require_a_tenant_session_before_form_parsing() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for path in ["/tenant/assets", "/tenant/devices"] {
+        let unauthenticated = router
+            .clone()
+            .oneshot(platform_get(path, None))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+        for cookie in [&system_cookie, &user_cookie] {
+            let forbidden = router
+                .clone()
+                .oneshot(platform_get(path, Some(cookie)))
+                .await
+                .unwrap();
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+
+        let unauthenticated_form = router
+            .clone()
+            .oneshot(system_lifecycle_form(path, None, "not=a+valid+form"))
+            .await
+            .unwrap();
+        assert_eq!(
+            unauthenticated_form.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} form"
+        );
+
+        for cookie in [&system_cookie, &user_cookie] {
+            let forbidden_form = router
+                .clone()
+                .oneshot(system_lifecycle_form(
+                    path,
+                    Some(cookie),
+                    "not=a+valid+form",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                forbidden_form.status(),
+                StatusCode::FORBIDDEN,
+                "{path} form"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenant_account() {
     let (_directory, store, management) = management_session_router_with_store().await;
     let router = management.router;
@@ -2807,7 +3052,12 @@ async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenan
             .to_vec(),
     )
     .unwrap();
-    for path in ["/tenant/groups", "/tenant/permissions"] {
+    for path in [
+        "/tenant/groups",
+        "/tenant/permissions",
+        "/tenant/assets",
+        "/tenant/devices",
+    ] {
         assert!(
             tenant_home_body.contains(&format!("href=\"{path}\"")),
             "{path}"

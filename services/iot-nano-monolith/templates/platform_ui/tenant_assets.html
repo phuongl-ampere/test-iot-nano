@@ -1,0 +1,69 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Assets | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link active" href="/tenant/assets" aria-current="page">Assets</a>
+  <a class="nav-link" href="/tenant/devices">Devices</a>
+  <a class="nav-link" href="/tenant/groups">Groups</a>
+  <a class="nav-link" href="/tenant/permissions">Permissions</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Assets</h1>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Create asset</h2></header>
+    <form class="form-grid" action="/tenant/assets" method="post">
+      <label class="field">
+        <span>Name</span>
+        <input name="name" type="text" maxlength="128" required>
+      </label>
+      <label class="field">
+        <span>Parent asset</span>
+        <select name="parent_asset_id">
+          <option value="">Root asset</option>
+          {% for asset in page.parent_assets %}
+            <option value="{{ asset.value }}">{{ asset.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="form-actions"><button type="submit">Create</button></div>
+    </form>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Assets</h2></header>
+    {% if page.assets.is_empty() %}
+      <p class="empty-state">No assets created.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Asset</th>
+              <th scope="col">Name</th>
+              <th scope="col">Parent asset</th>
+              <th scope="col">State</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for asset in page.assets %}
+              <tr>
+                <td><code>{{ asset.id }}</code></td>
+                <td>{{ asset.name }}</td>
+                <td>{{ asset.parent }}</td>
+                <td>{{ asset.status }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

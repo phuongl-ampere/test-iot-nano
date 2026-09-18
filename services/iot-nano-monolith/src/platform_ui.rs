@@ -223,6 +223,115 @@ impl TenantPermissionsPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAssetRow {
+    id: String,
+    name: String,
+    parent: String,
+    status: String,
+}
+
+impl TenantAssetRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        parent: impl Into<String>,
+        status: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            parent: parent.into(),
+            status: status.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAssetsPage {
+    assets: Vec<TenantAssetRow>,
+    parent_assets: Vec<TenantSelectOption>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantAssetsPage {
+    pub(crate) fn new(
+        assets: Vec<TenantAssetRow>,
+        parent_assets: Vec<TenantSelectOption>,
+        notice: Option<&'static str>,
+    ) -> Self {
+        Self {
+            assets,
+            parent_assets,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDeviceRow {
+    device_id: String,
+    display_name: String,
+    status: String,
+    asset: String,
+}
+
+impl TenantDeviceRow {
+    pub(crate) fn new(
+        device_id: impl Into<String>,
+        display_name: impl Into<String>,
+        status: impl Into<String>,
+        asset: impl Into<String>,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            display_name: display_name.into(),
+            status: status.into(),
+            asset: asset.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDevicesPage {
+    devices: Vec<TenantDeviceRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantDevicesPage {
+    pub(crate) fn new(devices: Vec<TenantDeviceRow>, notice: Option<&'static str>) -> Self {
+        Self {
+            devices,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDeviceCredentialPage {
+    device_id: String,
+    display_name: String,
+    credential: String,
+}
+
+impl TenantDeviceCredentialPage {
+    pub(crate) fn new(
+        device_id: impl Into<String>,
+        display_name: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            display_name: display_name.into(),
+            credential: credential.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDeviceRow {
     device_id: String,
     display_name: String,
@@ -377,6 +486,27 @@ impl PlatformUiRenderer {
         TenantPermissionsLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_assets(
+        identity: &PlatformUiIdentity,
+        page: &TenantAssetsPage,
+    ) -> Result<String, askama::Error> {
+        TenantAssetsLayout::new(identity, page).render()
+    }
+
+    pub fn render_tenant_devices(
+        identity: &PlatformUiIdentity,
+        page: &TenantDevicesPage,
+    ) -> Result<String, askama::Error> {
+        TenantDevicesLayout::new(identity, page).render()
+    }
+
+    pub fn render_tenant_device_credential(
+        identity: &PlatformUiIdentity,
+        page: &TenantDeviceCredentialPage,
+    ) -> Result<String, askama::Error> {
+        TenantDeviceCredentialLayout::new(identity, page).render()
+    }
+
     pub fn render_user(
         identity: &PlatformUiIdentity,
         page: &UserDeviceListPage,
@@ -478,6 +608,45 @@ pub struct TenantPermissionsLayout<'a> {
 
 impl<'a> TenantPermissionsLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantPermissionsPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_assets.html")]
+pub struct TenantAssetsLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantAssetsPage,
+}
+
+impl<'a> TenantAssetsLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantAssetsPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_devices.html")]
+pub struct TenantDevicesLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantDevicesPage,
+}
+
+impl<'a> TenantDevicesLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDevicesPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_device_credential.html")]
+pub struct TenantDeviceCredentialLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantDeviceCredentialPage,
+}
+
+impl<'a> TenantDeviceCredentialLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDeviceCredentialPage) -> Self {
         Self { identity, page }
     }
 }

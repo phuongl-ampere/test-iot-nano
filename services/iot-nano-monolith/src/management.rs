@@ -11,7 +11,7 @@ use axum::{
     extract::{ConnectInfo, FromRequest, Path, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post, put},
@@ -155,6 +155,14 @@ impl ManagementSessionRouter {
             .route(
                 "/tenant/permissions/revoke",
                 post(revoke_tenant_permission_form),
+            )
+            .route(
+                "/tenant/assets",
+                get(platform_tenant_assets).post(create_tenant_asset_form),
+            )
+            .route(
+                "/tenant/devices",
+                get(platform_tenant_devices).post(provision_tenant_device_form),
             )
             .route("/app", get(platform_app))
             .route("/app/assets", get(platform_app_assets))
@@ -1591,6 +1599,20 @@ struct RevokeTenantPermissionForm {
     permission_id: Uuid,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTenantAssetForm {
+    name: String,
+    #[serde(default)]
+    parent_asset_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionTenantDeviceForm {
+    display_name: String,
+}
+
 #[derive(Serialize)]
 struct SystemTenantResponse {
     id: Uuid,
@@ -2064,6 +2086,247 @@ async fn platform_tenant_users(
         tenant_management_notice(request.uri().query()),
     )
     .await
+}
+
+async fn platform_tenant_assets(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_assets_page(
+        &state,
+        tenant,
+        tenant_management_notice(request.uri().query()),
+    )
+    .await
+}
+
+async fn platform_tenant_devices(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_devices_page(
+        &state,
+        tenant,
+        tenant_management_notice(request.uri().query()),
+    )
+    .await
+}
+
+async fn tenant_assets_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let assets =
+        ManagementAssetRepository::list_management_assets(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_asset_error)?;
+    let asset_names: HashMap<Uuid, String> = assets
+        .iter()
+        .map(|asset| (asset.id, asset.name.clone()))
+        .collect();
+    let parent_assets = assets
+        .iter()
+        .map(|asset| crate::TenantSelectOption::new(asset.id.to_string(), asset.name.clone()))
+        .collect();
+    let page = crate::TenantAssetsPage::new(
+        assets
+            .into_iter()
+            .map(|asset| {
+                let parent = asset.parent_asset_id.map_or_else(
+                    || "Root asset".to_owned(),
+                    |parent_id| {
+                        let parent_name = asset_names
+                            .get(&parent_id)
+                            .cloned()
+                            .unwrap_or_else(|| parent_id.to_string());
+                        format!("{parent_name} ({parent_id})")
+                    },
+                );
+                crate::TenantAssetRow::new(asset.id.to_string(), asset.name, parent, "Configured")
+            })
+            .collect(),
+        parent_assets,
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_assets(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_devices_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let assets =
+        ManagementAssetRepository::list_management_assets(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_asset_error)?;
+    let devices =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_device_error)?;
+    let asset_names: HashMap<Uuid, String> = assets
+        .into_iter()
+        .map(|asset| (asset.id, asset.name))
+        .collect();
+    let page = crate::TenantDevicesPage::new(
+        devices
+            .into_iter()
+            .map(|device| {
+                let device_id = device.device_id;
+                let display_name = device.display_name.unwrap_or_else(|| device_id.clone());
+                let asset = device.asset_id.map_or_else(
+                    || "Unassigned".to_owned(),
+                    |asset_id| {
+                        let asset_name = asset_names
+                            .get(&asset_id)
+                            .cloned()
+                            .unwrap_or_else(|| asset_id.to_string());
+                        format!("{asset_name} ({asset_id})")
+                    },
+                );
+                crate::TenantDeviceRow::new(
+                    device_id,
+                    display_name,
+                    if device.health.online {
+                        "Online"
+                    } else {
+                        "Offline"
+                    },
+                    asset,
+                )
+            })
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_devices(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn create_tenant_asset_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: CreateTenantAssetForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return tenant_management_form_error(TenantManagementPage::Assets, error),
+    };
+    let name = request.name.trim();
+    if name.is_empty() || name.len() > 128 {
+        return tenant_management_form_error(
+            TenantManagementPage::Assets,
+            ManagementSessionError::BadRequest,
+        );
+    }
+    let parent_asset_id = match request
+        .parent_asset_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => match Uuid::parse_str(value) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return tenant_management_form_error(
+                    TenantManagementPage::Assets,
+                    ManagementSessionError::BadRequest,
+                );
+            }
+        },
+        None => None,
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match ManagementAssetRepository::create_management_asset(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        CreateManagementAsset {
+            name: name.to_owned(),
+            asset_profile_id: None,
+            parent_asset_id,
+            metadata: json!({}),
+            attributes: None,
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(tenant_management_redirect(
+            TenantManagementPage::Assets,
+            TenantManagementNotice::AssetCreated,
+        )),
+        Err(error) => tenant_management_form_error(
+            TenantManagementPage::Assets,
+            management_asset_error(error),
+        ),
+    }
+}
+
+async fn provision_tenant_device_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Response, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: ProvisionTenantDeviceForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => {
+            return tenant_management_form_error(TenantManagementPage::Devices, error)
+                .map(|redirect| redirect.into_response());
+        }
+    };
+    let display_name = request.display_name.trim();
+    if display_name.is_empty() || display_name.len() > 128 {
+        return tenant_management_form_error(
+            TenantManagementPage::Devices,
+            ManagementSessionError::BadRequest,
+        )
+        .map(|redirect| redirect.into_response());
+    }
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let token = match provision_platform_device_token(
+        &state.store,
+        &state.token_vault,
+        tenant.tenant_id,
+        display_name,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(error) => {
+            return tenant_management_form_error(
+                TenantManagementPage::Devices,
+                management_device_token_error(error),
+            )
+            .map(|redirect| redirect.into_response());
+        }
+    };
+    let credential = token.token.ok_or(ManagementSessionError::Unavailable)?;
+    let page = crate::TenantDeviceCredentialPage::new(token.device_id, display_name, credential);
+    let rendered = crate::PlatformUiRenderer::render_tenant_device_credential(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok((
+        StatusCode::CREATED,
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Html(rendered),
+    )
+        .into_response())
 }
 
 async fn platform_tenant_groups(
@@ -2943,6 +3206,8 @@ enum TenantManagementPage {
     Users,
     Groups,
     Permissions,
+    Assets,
+    Devices,
 }
 
 #[derive(Clone, Copy)]
@@ -2953,6 +3218,7 @@ enum TenantManagementNotice {
     MemberRemoved,
     PermissionCreated,
     PermissionRevoked,
+    AssetCreated,
     InvalidRequest,
     MutationUnavailable,
     ServiceUnavailable,
@@ -2967,6 +3233,7 @@ impl TenantManagementNotice {
             Self::MemberRemoved => "Member removed.",
             Self::PermissionCreated => "Permission created.",
             Self::PermissionRevoked => "Permission revoked.",
+            Self::AssetCreated => "Asset created.",
             Self::InvalidRequest => "Request could not be processed.",
             Self::MutationUnavailable => "The requested tenant resource is unavailable.",
             Self::ServiceUnavailable => "Tenant management service is unavailable.",
@@ -2992,7 +3259,8 @@ fn tenant_management_redirect(
             | TenantManagementNotice::MemberAdded
             | TenantManagementNotice::MemberRemoved
             | TenantManagementNotice::PermissionCreated
-            | TenantManagementNotice::PermissionRevoked => "/tenant/users?notice=invalid-request",
+            | TenantManagementNotice::PermissionRevoked
+            | TenantManagementNotice::AssetCreated => "/tenant/users?notice=invalid-request",
         },
         TenantManagementPage::Groups => match notice {
             TenantManagementNotice::GroupCreated => "/tenant/groups?notice=group-created",
@@ -3007,7 +3275,8 @@ fn tenant_management_redirect(
             }
             TenantManagementNotice::PermissionCreated
             | TenantManagementNotice::PermissionRevoked
-            | TenantManagementNotice::UserCreated => "/tenant/groups?notice=invalid-request",
+            | TenantManagementNotice::UserCreated
+            | TenantManagementNotice::AssetCreated => "/tenant/groups?notice=invalid-request",
         },
         TenantManagementPage::Permissions => match notice {
             TenantManagementNotice::PermissionCreated => {
@@ -3026,7 +3295,40 @@ fn tenant_management_redirect(
             TenantManagementNotice::GroupCreated
             | TenantManagementNotice::MemberAdded
             | TenantManagementNotice::MemberRemoved
-            | TenantManagementNotice::UserCreated => "/tenant/permissions?notice=invalid-request",
+            | TenantManagementNotice::UserCreated
+            | TenantManagementNotice::AssetCreated => "/tenant/permissions?notice=invalid-request",
+        },
+        TenantManagementPage::Assets => match notice {
+            TenantManagementNotice::AssetCreated => "/tenant/assets?notice=asset-created",
+            TenantManagementNotice::InvalidRequest => "/tenant/assets?notice=invalid-request",
+            TenantManagementNotice::MutationUnavailable => {
+                "/tenant/assets?notice=mutation-unavailable"
+            }
+            TenantManagementNotice::ServiceUnavailable => {
+                "/tenant/assets?notice=service-unavailable"
+            }
+            TenantManagementNotice::GroupCreated
+            | TenantManagementNotice::MemberAdded
+            | TenantManagementNotice::MemberRemoved
+            | TenantManagementNotice::PermissionCreated
+            | TenantManagementNotice::PermissionRevoked
+            | TenantManagementNotice::UserCreated => "/tenant/assets?notice=invalid-request",
+        },
+        TenantManagementPage::Devices => match notice {
+            TenantManagementNotice::InvalidRequest => "/tenant/devices?notice=invalid-request",
+            TenantManagementNotice::MutationUnavailable => {
+                "/tenant/devices?notice=mutation-unavailable"
+            }
+            TenantManagementNotice::ServiceUnavailable => {
+                "/tenant/devices?notice=service-unavailable"
+            }
+            TenantManagementNotice::GroupCreated
+            | TenantManagementNotice::MemberAdded
+            | TenantManagementNotice::MemberRemoved
+            | TenantManagementNotice::PermissionCreated
+            | TenantManagementNotice::PermissionRevoked
+            | TenantManagementNotice::AssetCreated
+            | TenantManagementNotice::UserCreated => "/tenant/devices?notice=invalid-request",
         },
     };
     Redirect::to(path)
@@ -3040,6 +3342,7 @@ fn tenant_management_notice(query: Option<&str>) -> Option<&'static str> {
         Some("notice=member-removed") => TenantManagementNotice::MemberRemoved,
         Some("notice=permission-created") => TenantManagementNotice::PermissionCreated,
         Some("notice=permission-revoked") => TenantManagementNotice::PermissionRevoked,
+        Some("notice=asset-created") => TenantManagementNotice::AssetCreated,
         Some("notice=invalid-request") => TenantManagementNotice::InvalidRequest,
         Some("notice=mutation-unavailable") => TenantManagementNotice::MutationUnavailable,
         Some("notice=service-unavailable") => TenantManagementNotice::ServiceUnavailable,

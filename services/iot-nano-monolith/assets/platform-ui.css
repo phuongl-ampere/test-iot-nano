@@ -393,6 +393,10 @@ button:focus-visible {
   font-size: 13px;
 }
 
+.credential {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 720px) {
   .topbar {
     padding: 10px 14px;

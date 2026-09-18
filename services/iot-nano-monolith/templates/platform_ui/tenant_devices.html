@@ -1,0 +1,60 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Devices | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link" href="/tenant/assets">Assets</a>
+  <a class="nav-link active" href="/tenant/devices" aria-current="page">Devices</a>
+  <a class="nav-link" href="/tenant/groups">Groups</a>
+  <a class="nav-link" href="/tenant/permissions">Permissions</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Devices</h1>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Provision device</h2></header>
+    <form class="form-grid" action="/tenant/devices" method="post">
+      <label class="field">
+        <span>Display name</span>
+        <input name="display_name" type="text" maxlength="128" required>
+      </label>
+      <div class="form-actions"><button type="submit">Provision</button></div>
+    </form>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Devices</h2></header>
+    {% if page.devices.is_empty() %}
+      <p class="empty-state">No devices provisioned.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Device</th>
+              <th scope="col">Name</th>
+              <th scope="col">Status</th>
+              <th scope="col">Assigned asset</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for device in page.devices %}
+              <tr>
+                <td><code>{{ device.device_id }}</code></td>
+                <td>{{ device.display_name }}</td>
+                <td>{{ device.status }}</td>
+                <td>{{ device.asset }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}
