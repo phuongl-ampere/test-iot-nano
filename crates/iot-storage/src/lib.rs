@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS devices (
     deleted_at TEXT,
     is_gateway INTEGER NOT NULL DEFAULT 0,
     gateway_device_id TEXT,
+    gateway_topology_version INTEGER NOT NULL DEFAULT 0,
     gateway_last_read_at TEXT,
     gateway_read_quality TEXT CHECK (gateway_read_quality IN ('good', 'unavailable')),
     owner_user_id TEXT,
@@ -11477,6 +11478,7 @@ impl SqliteStore {
         migrate_root_asset_name_uniqueness(&pool).await?;
         migrate_command_outbox_schema(&pool).await?;
         migrate_resource_authorization_schema(&pool).await?;
+        migrate_gateway_topology_schema(&pool).await?;
         sqlx::query(SET_SQLITE_PLATFORM_SCHEMA_VERSION)
             .execute(&pool)
             .await?;
@@ -12472,6 +12474,18 @@ async fn migrate_resource_authorization_schema(pool: &SqlitePool) -> Result<(), 
     .execute(pool)
     .await
     .map(|_| ())
+}
+
+async fn migrate_gateway_topology_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if !sqlite_table_has_column(pool, "devices", "gateway_topology_version").await? {
+        sqlx::query(
+            "ALTER TABLE devices
+             ADD COLUMN gateway_topology_version INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn sqlite_table_has_column(

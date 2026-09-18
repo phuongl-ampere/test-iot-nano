@@ -45,6 +45,8 @@ fn platform_store_owns_its_postgres_migration_source() {
     assert!(migration.contains("tenant_id UUID NOT NULL"));
     assert!(migration.contains("FOREIGN KEY (device_id, tenant_id)"));
     assert!(migration.contains("FOREIGN KEY (gateway_device_id, tenant_id)"));
+    assert!(migration.contains("gateway_topology_version INTEGER NOT NULL DEFAULT 0"));
+    assert!(migration.contains("ADD COLUMN IF NOT EXISTS gateway_topology_version"));
     assert!(!migration.contains("ADD CONSTRAINT telemetry_device_id_fkey"));
     assert!(!storage_source.contains("services/iot-nano-api/migrations"));
     assert!(!storage_source.contains("services/iot-nano-core/migrations"));
@@ -293,6 +295,39 @@ async fn sqlite_current_schema_does_not_create_a_pre_migration_backup() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_open_adds_gateway_topology_version_to_an_existing_devices_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration =
+        sqlite_configuration(directory.path().join("gateway-topology-version.sqlite"));
+    let store = PlatformStore::open(&configuration).await.unwrap();
+    sqlx::query("ALTER TABLE devices DROP COLUMN gateway_topology_version")
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = PlatformStore::open(&configuration).await.unwrap();
+    seed_test_tenant(&reopened).await;
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('migration-device', ?)")
+        .bind(test_tenant_id().to_string())
+        .execute(reopened.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT gateway_topology_version
+             FROM devices
+             WHERE device_id = 'migration-device' AND tenant_id = ?",
+        )
+        .bind(test_tenant_id().to_string())
+        .fetch_one(reopened.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        0
     );
 }
 

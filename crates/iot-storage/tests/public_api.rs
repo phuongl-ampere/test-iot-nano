@@ -1455,6 +1455,84 @@ async fn sqlite_public_device_repository_creates_updates_and_soft_deletes_owned_
 }
 
 #[tokio::test]
+async fn sqlite_public_gateway_delete_refuses_active_children() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let user_id = Uuid::now_v7();
+    let gateway_id = format!("public-gateway-{user_id}");
+    let child_id = format!("public-gateway-child-{user_id}");
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, ?, 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(format!("public-gateway-owner-{user_id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, owner_user_id, is_gateway)
+         VALUES (?, ?, ?, 1), (?, ?, ?, 0)",
+    )
+    .bind(&gateway_id)
+    .bind(test_tenant_id().to_string())
+    .bind(user_id.to_string())
+    .bind(&child_id)
+    .bind(test_tenant_id().to_string())
+    .bind(user_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE devices
+         SET gateway_device_id = ?
+         WHERE device_id = ? AND tenant_id = ?",
+    )
+    .bind(&gateway_id)
+    .bind(&child_id)
+    .bind(test_tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let principal = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(user_id),
+        app_id: "public-gateway-delete-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+
+    assert!(
+        !PublicApiRepository::delete_public_device(&store, &principal, &gateway_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NULL
+             FROM devices
+             WHERE device_id = ? AND tenant_id = ?",
+        )
+        .bind(&gateway_id)
+        .bind(test_tenant_id().to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    );
+
+    assert!(
+        PublicApiRepository::delete_public_device(&store, &principal, &child_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        PublicApiRepository::delete_public_device(&store, &principal, &gateway_id)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_public_device_asset_assignment_requires_asset_manager_permission() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
@@ -2041,6 +2119,90 @@ async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_public_gateway_delete_refuses_active_children() {
+    let (_lock, store) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    let tenant_id = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
+    let gateway_id = format!("timescale-public-gateway-{user_id}");
+    let child_id = format!("timescale-public-gateway-child-{user_id}");
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES ($1, $2, 'active')")
+        .bind(tenant_id)
+        .bind(format!("timescale-public-gateway-{tenant_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, $3, 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id)
+    .bind(tenant_id)
+    .bind(format!("timescale-public-gateway-owner-{user_id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, owner_user_id, is_gateway)
+         VALUES ($1, $2, $3, TRUE), ($4, $2, $3, FALSE)",
+    )
+    .bind(&gateway_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(&child_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE devices
+         SET gateway_device_id = $1
+         WHERE device_id = $2 AND tenant_id = $3",
+    )
+    .bind(&gateway_id)
+    .bind(&child_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let principal = PublicPrincipal {
+        tenant_id,
+        user_id: Some(user_id),
+        app_id: "timescale-public-gateway-delete-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+
+    assert!(
+        !PublicApiRepository::delete_public_device(&store, &principal, &gateway_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NULL
+             FROM devices
+             WHERE device_id = $1 AND tenant_id = $2",
+        )
+        .bind(&gateway_id)
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    );
+
+    assert!(
+        PublicApiRepository::delete_public_device(&store, &principal, &child_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        PublicApiRepository::delete_public_device(&store, &principal, &gateway_id)
+            .await
+            .unwrap()
     );
 }
 

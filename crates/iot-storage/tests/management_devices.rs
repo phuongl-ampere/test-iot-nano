@@ -109,6 +109,43 @@ async fn seed_management_devices(store: &PlatformStore, tenant_id: Uuid) -> (Uui
     (asset_id, device_profile_id)
 }
 
+fn child_topology_update(gateway_device_id: Option<&str>) -> UpdateManagementDevice {
+    UpdateManagementDevice {
+        display_name: "Direct".to_owned(),
+        asset_id: None,
+        device_profile_id: None,
+        attributes: None,
+        topology: Some(ManagementDeviceTopology {
+            is_gateway: false,
+            gateway_device_id: gateway_device_id.map(str::to_owned),
+        }),
+    }
+}
+
+async fn sqlite_gateway_topology_version(store: &PlatformStore, device_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT gateway_topology_version
+         FROM devices
+         WHERE device_id = ?",
+    )
+    .bind(device_id)
+    .fetch_one(store.sqlite_pool().unwrap())
+    .await
+    .unwrap()
+}
+
+async fn timescale_gateway_topology_version(pool: &sqlx::PgPool, tenant_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT gateway_topology_version
+         FROM devices
+         WHERE device_id = 'timescale-version-child' AND tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn sqlite_management_devices_reject_cross_tenant_lookup_mutation_and_asset_references() {
     let (_directory, store, _default_tenant_id) = sqlite_store().await;
@@ -208,6 +245,10 @@ async fn sqlite_management_devices_reject_cross_tenant_lookup_mutation_and_asset
         .await,
         Err(ManagementDeviceError::GatewayUnavailable)
     ));
+    assert_eq!(
+        sqlite_gateway_topology_version(&store, "tenant-a-device").await,
+        0
+    );
 }
 
 struct TimescaleTestLock {
@@ -350,6 +391,83 @@ async fn sqlite_management_device_repository_updates_lists_and_soft_deletes_devi
         .await
         .unwrap()
         .is_some()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_gateway_topology_version_increments_on_assignment_reassignment_and_detachment() {
+    let (_directory, store, tenant_id) = sqlite_store().await;
+    seed_management_devices(&store, tenant_id).await;
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, metadata, is_gateway)
+         VALUES ('management-gateway-two', ?, 'Gateway two', '{}', 1)",
+    )
+    .bind(tenant_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sqlite_gateway_topology_version(&store, "management-direct").await,
+        0
+    );
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "management-direct",
+        child_topology_update(Some("management-gateway")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlite_gateway_topology_version(&store, "management-direct").await,
+        1
+    );
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "management-direct",
+        child_topology_update(Some("management-gateway-two")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlite_gateway_topology_version(&store, "management-direct").await,
+        2
+    );
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "management-direct",
+        child_topology_update(None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlite_gateway_topology_version(&store, "management-direct").await,
+        3
+    );
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "management-direct",
+        UpdateManagementDevice {
+            display_name: "Renamed direct".to_owned(),
+            asset_id: None,
+            device_profile_id: None,
+            attributes: None,
+            topology: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlite_gateway_topology_version(&store, "management-direct").await,
+        3
     );
 }
 
@@ -606,4 +724,52 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
             .iter()
             .all(|device| device.device_id != "management-child")
     );
+}
+
+#[tokio::test]
+#[ignore = "requires IOT_NANO_TIMESCALE_TEST_URL for an isolated iot_nano_test_* database"]
+async fn timescale_gateway_topology_version_increments_on_assignment_reassignment_and_detachment() {
+    let (_lock, store, tenant_id) = timescale_store().await;
+    let pool = store.timescale_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, is_gateway) VALUES
+             ('timescale-version-gateway-one', $1, 'Gateway one', TRUE),
+             ('timescale-version-gateway-two', $1, 'Gateway two', TRUE),
+             ('timescale-version-child', $1, 'Child', FALSE)",
+    )
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert_eq!(timescale_gateway_topology_version(pool, tenant_id).await, 0);
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "timescale-version-child",
+        child_topology_update(Some("timescale-version-gateway-one")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(timescale_gateway_topology_version(pool, tenant_id).await, 1);
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "timescale-version-child",
+        child_topology_update(Some("timescale-version-gateway-two")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(timescale_gateway_topology_version(pool, tenant_id).await, 2);
+
+    ManagementDeviceRepository::update_management_device(
+        &store,
+        tenant_id,
+        "timescale-version-child",
+        child_topology_update(None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(timescale_gateway_topology_version(pool, tenant_id).await, 3);
 }

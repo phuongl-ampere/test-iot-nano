@@ -215,6 +215,7 @@ CREATE TABLE IF NOT EXISTS devices (
     device_profile_id UUID,
     deleted_at TIMESTAMPTZ, is_gateway BOOLEAN NOT NULL DEFAULT FALSE,
     gateway_device_id TEXT,
+    gateway_topology_version INTEGER NOT NULL DEFAULT 0,
     owner_user_id UUID, claimed_at TIMESTAMPTZ,
     UNIQUE (device_id, tenant_id),
     FOREIGN KEY (asset_id, tenant_id) REFERENCES assets(id, tenant_id) ON DELETE RESTRICT,
@@ -227,6 +228,8 @@ CREATE TABLE IF NOT EXISTS devices (
     CHECK ((is_gateway = TRUE AND gateway_device_id IS NULL)
         OR (is_gateway = FALSE AND gateway_device_id IS DISTINCT FROM device_id))
 );
+ALTER TABLE devices
+    ADD COLUMN IF NOT EXISTS gateway_topology_version INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS devices_asset_id_index ON devices (asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_asset_index ON devices (tenant_id, asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_device_profile_id_index ON devices (device_profile_id) WHERE device_profile_id IS NOT NULL;

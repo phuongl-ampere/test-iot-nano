@@ -1666,6 +1666,15 @@ async fn delete_public_device(
             {
                 return Ok(false);
             }
+            if sqlite_public_gateway_has_active_children(
+                &mut transaction,
+                principal.tenant_id,
+                device_id,
+            )
+            .await?
+            {
+                return Ok(false);
+            }
             let affected = sqlx::query(
                 "UPDATE devices
                  SET deleted_at = CURRENT_TIMESTAMP
@@ -1689,6 +1698,15 @@ async fn delete_public_device(
             {
                 return Ok(false);
             }
+            if timescale_public_gateway_has_active_children(
+                &mut transaction,
+                principal.tenant_id,
+                device_id,
+            )
+            .await?
+            {
+                return Ok(false);
+            }
             let affected = sqlx::query(
                 "UPDATE devices
                  SET deleted_at = now()
@@ -1703,6 +1721,40 @@ async fn delete_public_device(
             Ok(affected == 1)
         }
     }
+}
+
+async fn sqlite_public_gateway_has_active_children(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    Ok(sqlx::query(
+        "SELECT 1 FROM devices
+         WHERE gateway_device_id = ? AND tenant_id = ? AND deleted_at IS NULL
+         LIMIT 1",
+    )
+    .bind(device_id)
+    .bind(tenant_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
+async fn timescale_public_gateway_has_active_children(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    Ok(sqlx::query(
+        "SELECT 1 FROM devices
+         WHERE gateway_device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(device_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
 }
 
 fn public_cursor_parts(

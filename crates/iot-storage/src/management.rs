@@ -2719,6 +2719,7 @@ async fn update_management_device(
             let topology = update.topology.unwrap_or(current.clone());
             validate_sqlite_topology(tenant_id, device_id, &current, &topology, &mut transaction)
                 .await?;
+            let topology_changed = current.gateway_device_id != topology.gateway_device_id;
             validate_sqlite_references(
                 &mut transaction,
                 tenant_id,
@@ -2729,7 +2730,8 @@ async fn update_management_device(
             sqlx::query(
                 "UPDATE devices
                  SET display_name = ?, asset_id = ?, device_profile_id = ?,
-                     metadata = COALESCE(?, metadata), is_gateway = ?, gateway_device_id = ?
+                     metadata = COALESCE(?, metadata), is_gateway = ?, gateway_device_id = ?,
+                     gateway_topology_version = gateway_topology_version + ?
                  WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
             )
             .bind(display_name)
@@ -2738,6 +2740,7 @@ async fn update_management_device(
             .bind(attributes.map(|value| value.to_string()))
             .bind(i64::from(topology.is_gateway))
             .bind(&topology.gateway_device_id)
+            .bind(i32::from(topology_changed))
             .bind(device_id)
             .bind(tenant_id.to_string())
             .execute(&mut *transaction)
@@ -2778,6 +2781,7 @@ async fn update_management_device(
                 &mut transaction,
             )
             .await?;
+            let topology_changed = current.gateway_device_id != topology.gateway_device_id;
             validate_timescale_references(
                 &mut transaction,
                 tenant_id,
@@ -2788,8 +2792,9 @@ async fn update_management_device(
             sqlx::query(
                 "UPDATE devices
                  SET display_name = $2, asset_id = $3, device_profile_id = $4,
-                     metadata = COALESCE($5, metadata), is_gateway = $6, gateway_device_id = $7
-                 WHERE device_id = $1 AND tenant_id = $8 AND deleted_at IS NULL",
+                     metadata = COALESCE($5, metadata), is_gateway = $6, gateway_device_id = $7,
+                     gateway_topology_version = gateway_topology_version + $8
+                 WHERE device_id = $1 AND tenant_id = $9 AND deleted_at IS NULL",
             )
             .bind(device_id)
             .bind(display_name)
@@ -2798,6 +2803,7 @@ async fn update_management_device(
             .bind(attributes.map(Json))
             .bind(topology.is_gateway)
             .bind(&topology.gateway_device_id)
+            .bind(i32::from(topology_changed))
             .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
