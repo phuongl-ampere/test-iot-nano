@@ -367,6 +367,28 @@ async fn platform_routes_render_the_matching_server_layout_and_local_css() {
 }
 
 #[tokio::test]
+async fn system_tenants_navigation_resolves_to_the_system_overview_for_a_system_session() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+
+    let response = router
+        .oneshot(platform_get("/system", Some(&system_cookie)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("href=\"/system\">Tenants</a>"));
+}
+
+#[tokio::test]
 async fn system_page_lists_only_tenant_slug_and_status_with_neutral_runtime_fields() {
     let (_directory, store, management) = management_session_router_with_store().await;
     TenantIdentityRepository::create_tenant_with_account(

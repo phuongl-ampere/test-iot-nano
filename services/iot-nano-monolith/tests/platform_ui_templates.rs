@@ -203,7 +203,7 @@ fn system_layout_renders_only_system_navigation_and_escapes_identity() {
         PlatformUiRenderer::render_system(&identity, &SystemPlatformPage::new(Vec::new())).unwrap();
 
     assert!(rendered.contains("System Console"));
-    assert!(rendered.contains("href=\"/system/tenants\""));
+    assert!(rendered.contains("href=\"/system\">Tenants</a>"));
     assert!(rendered.contains("href=\"/system/infrastructure\""));
     assert!(rendered.contains("href=\"/system\" aria-current=\"page\""));
     assert_excludes_navigation_namespaces(&rendered, &["/tenant", "/app"]);
