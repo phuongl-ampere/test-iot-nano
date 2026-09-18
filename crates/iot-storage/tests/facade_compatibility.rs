@@ -14,7 +14,7 @@ use iot_storage::{
     OAuthAccessTokenRecord, OAuthAuthorizationCodeExchange, OAuthClientCredentialsToken,
     OAuthRepository, OwnershipTransferTarget, PermissionCreator, PlatformStore, PlatformStoreError,
     RedirectUri, ResourceAccess, ResourceAccessSource, ResourceKind, ResourcePermission,
-    ResourcePermissionRecord, SqliteStore, SqliteStoreError, TelemetryAggregate,
+    ResourcePermissionRecord, RetentionResult, SqliteStore, SqliteStoreError, TelemetryAggregate,
     TelemetryAggregateRepository, TelemetryRepository, TenantAuthorizationError,
     TenantAuthorizationRepository, TenantUserGroup, TenantUserGroupMember, TopologyRepository,
     UserDeviceActivity, UserDeviceActivityRepository, UserDeviceAlert, UserDeviceTelemetry,
@@ -92,6 +92,7 @@ fn consumer_can_compile_against_the_root_storage_facade() {
     let _ = std::mem::size_of::<ResourcePermissionRecord>();
     let _ = std::mem::size_of::<SqliteStore>();
     let _ = std::mem::size_of::<SqliteStoreError>();
+    let _ = std::mem::size_of::<RetentionResult>();
     let _ = std::mem::size_of::<AuthorizationSubject>();
     let _ = std::mem::size_of::<NewUserGroup>();
     let _ = std::mem::size_of::<UserGroup>();
@@ -158,4 +159,25 @@ fn consumer_can_call_command_and_notification_store_methods() {
     let _ = PlatformStore::mark_notification_sent;
     let _ = PlatformStore::enqueue_notification;
     let _ = PlatformStore::release_notification_for_retry;
+}
+
+#[test]
+fn consumer_can_call_telemetry_alert_and_retention_store_methods() {
+    let _ = PlatformStore::write_telemetry;
+    let _ = PlatformStore::ingest_gateway;
+    let _ = PlatformStore::average_metric;
+    let _ = PlatformStore::evaluate_alert_events;
+    let _ = PlatformStore::evaluate_alert_windows;
+    let _ = PlatformStore::create_incident;
+    let _ = PlatformStore::update_incident_last_value;
+    let _ = PlatformStore::open_incident;
+    let _ = PlatformStore::open_incident_with_notification;
+    let _ = PlatformStore::recover_incident;
+    let _ = PlatformStore::resolve_incident;
+    let _ = PlatformStore::resolve_incident_with_notification;
+    let _ = PlatformStore::remind_incident;
+    let _ = PlatformStore::remind_incident_with_notification;
+    let _ = SqliteStore::write_telemetry;
+    let _ = SqliteStore::write_telemetry_in_transaction;
+    let _ = SqliteStore::enforce_retention;
 }
