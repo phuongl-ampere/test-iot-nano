@@ -140,3 +140,22 @@ fn consumer_can_call_authorization_and_resource_store_methods() {
     let _ = PlatformStore::revoke_resource_permission;
     let _ = PlatformStore::transfer_resource_ownership;
 }
+
+#[test]
+fn consumer_can_call_command_and_notification_store_methods() {
+    let _ = PlatformStore::enqueue_command;
+    let _ = PlatformStore::enqueue_authorized_command;
+    let _ = PlatformStore::ready_command_tenants;
+    let _ = PlatformStore::claim_commands;
+    let _ = PlatformStore::mark_command_published;
+    let _ = PlatformStore::mark_command_failed;
+    let _ = PlatformStore::release_command_for_retry;
+    let _ = PlatformStore::expire_due_commands;
+    let _ = PlatformStore::expire_command_if_elapsed;
+    let _ = PlatformStore::mark_command_responded;
+    let _ = PlatformStore::claim_notifications;
+    let _ = PlatformStore::ready_notification_tenants;
+    let _ = PlatformStore::mark_notification_sent;
+    let _ = PlatformStore::enqueue_notification;
+    let _ = PlatformStore::release_notification_for_retry;
+}
