@@ -165,6 +165,11 @@ fn assert_excludes_navigation_namespaces(rendered: &str, forbidden_namespaces: &
     }
 }
 
+fn assert_read_only_page_allows_only_logout_form(rendered: &str) {
+    assert_eq!(rendered.matches("<form").count(), 1);
+    assert!(rendered.contains("action=\"/logout\""));
+}
+
 #[test]
 fn navigation_hrefs_extracts_only_anchor_href_attributes() {
     let rendered = r#"
@@ -382,7 +387,7 @@ fn tenant_alerts_layout_is_read_only_and_escapes_server_rows() {
     assert!(rendered.contains("Status"));
     assert!(rendered.contains("Last value"));
     assert!(rendered.contains("Updated"));
-    assert!(!rendered.contains("<form"));
+    assert_read_only_page_allows_only_logout_form(&rendered);
     assert!(!rendered.contains("name=\"tenant_id\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
 }
@@ -417,7 +422,7 @@ fn tenant_audit_layout_escapes_structured_changes_and_uses_tenant_navigation() {
     assert!(rendered.contains("&#60;unsafe&#62;"));
     assert!(!rendered.contains("actor-<unsafe>"));
     assert!(!rendered.contains("device-<unsafe>"));
-    assert!(!rendered.contains("<form"));
+    assert_read_only_page_allows_only_logout_form(&rendered);
     assert!(!rendered.contains("name=\"tenant_id\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
 }
@@ -461,6 +466,6 @@ fn user_device_detail_renders_only_server_supplied_device_context() {
     assert!(rendered.contains("Viewer"));
     assert!(rendered.contains("Group permission"));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/tenant"]);
-    assert!(!rendered.contains("<form"));
+    assert_read_only_page_allows_only_logout_form(&rendered);
     assert!(!rendered.contains("/commands"));
 }
