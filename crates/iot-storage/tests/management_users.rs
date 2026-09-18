@@ -887,7 +887,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
             .iter()
             .map(|user| user.username.as_str())
             .collect::<Vec<_>>(),
-        ["alice", "bob", "system"]
+        ["alice", "bob", "system", "workspace-user"]
     );
     assert_eq!(listed[0], demoted);
     assert_eq!(listed[1], bob);

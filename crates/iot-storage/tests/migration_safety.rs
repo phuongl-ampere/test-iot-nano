@@ -1127,7 +1127,7 @@ async fn timescale_open_rejects_pre_tenant_platform_schema_without_partial_migra
     common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
-    sqlx::query(
+    sqlx::raw_sql(
         "CREATE SCHEMA iot_nano;
          CREATE TABLE iot_nano.devices (
              device_id TEXT PRIMARY KEY,

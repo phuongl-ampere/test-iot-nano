@@ -367,7 +367,7 @@ async fn sqlite_require_tenant_device(
     tenant_id: Uuid,
     device_id: &str,
 ) -> Result<(), DeviceRelationError> {
-    let found = sqlx::query_scalar::<_, i64>(
+    let found = sqlx::query_scalar::<_, i32>(
         "SELECT 1 FROM devices
          WHERE tenant_id = ? AND device_id = ? AND deleted_at IS NULL",
     )
@@ -390,7 +390,7 @@ async fn timescale_require_tenant_device(
     tenant_id: Uuid,
     device_id: &str,
 ) -> Result<(), DeviceRelationError> {
-    let found = sqlx::query_scalar::<_, i64>(
+    let found = sqlx::query_scalar::<_, i32>(
         "SELECT 1 FROM devices
          WHERE tenant_id = $1 AND device_id = $2 AND deleted_at IS NULL
          FOR KEY SHARE",

@@ -1703,8 +1703,8 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
          JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
          WHERE constraint_row.conname IN (
             'command_outbox_tenant_device_fkey',
-            'device_runtime_state_device_id_fkey',
-            'telemetry_device_id_fkey'
+            'device_runtime_state_device_id_tenant_id_fkey',
+            'telemetry_device_id_tenant_id_fkey'
          )
          ORDER BY relation.relname",
     )
@@ -1730,13 +1730,13 @@ async fn platform_store_timescale_schema_enforces_device_ownership() {
             ),
             (
                 "device_runtime_state".to_owned(),
-                "device_runtime_state_device_id_fkey".to_owned(),
+                "device_runtime_state_device_id_tenant_id_fkey".to_owned(),
                 "c".to_owned(),
             ),
             (
                 "telemetry".to_owned(),
-                "telemetry_device_id_fkey".to_owned(),
-                "a".to_owned(),
+                "telemetry_device_id_tenant_id_fkey".to_owned(),
+                "r".to_owned(),
             ),
         ]
     );

@@ -148,8 +148,8 @@ async fn sqlite_gateway_topology_version(store: &PlatformStore, device_id: &str)
     .unwrap()
 }
 
-async fn timescale_gateway_topology_version(pool: &sqlx::PgPool, tenant_id: Uuid) -> i64 {
-    sqlx::query_scalar::<_, i64>(
+async fn timescale_gateway_topology_version(pool: &sqlx::PgPool, tenant_id: Uuid) -> i32 {
+    sqlx::query_scalar::<_, i32>(
         "SELECT gateway_topology_version
          FROM devices
          WHERE device_id = 'timescale-version-child' AND tenant_id = $1",
@@ -700,12 +700,13 @@ async fn timescale_management_device_repository_matches_sqlite_contract() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO device_runtime_state (device_id, last_seen_at, gateway_last_read_at)
-         VALUES ('management-gateway', now(), NULL),
-                ('management-child', now(), now()),
-                ('management-direct', now() - interval '10 minutes', NULL),
-                ('management-recent', now() - interval '3 minutes', NULL)",
+        "INSERT INTO device_runtime_state (tenant_id, device_id, last_seen_at, gateway_last_read_at)
+         VALUES ($1, 'management-gateway', now(), NULL),
+                ($1, 'management-child', now(), now()),
+                ($1, 'management-direct', now() - interval '10 minutes', NULL),
+                ($1, 'management-recent', now() - interval '3 minutes', NULL)",
     )
+    .bind(tenant_id)
     .execute(pool)
     .await
     .unwrap();

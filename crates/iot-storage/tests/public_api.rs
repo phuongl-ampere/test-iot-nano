@@ -62,6 +62,18 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
     (connection, store)
 }
 
+async fn seed_timescale_test_tenant(store: &PlatformStore) {
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status)
+         VALUES ($1, 'timescale-public-api', 'active')
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(test_tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn sqlite_public_assets_are_invisible_across_tenants() {
     let (_directory, store) = sqlite_store().await;
@@ -1992,12 +2004,14 @@ async fn timescale_public_repository_creates_and_reads_an_asset() {
     })
     .await
     .unwrap();
+    seed_timescale_test_tenant(&store).await;
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES ($1, 'timescale-public-user', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'timescale-public-user', 'unused', 'viewer', 'user')",
     )
     .bind(user_id)
+    .bind(test_tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -2062,12 +2076,14 @@ async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
     })
     .await
     .unwrap();
+    seed_timescale_test_tenant(&store).await;
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES ($1, 'timescale-public-device-user', 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'timescale-public-device-user', 'unused', 'viewer', 'user')",
     )
     .bind(user_id)
+    .bind(test_tenant_id())
     .execute(store.timescale_pool().unwrap())
     .await
     .unwrap();
@@ -2231,25 +2247,28 @@ async fn timescale_public_device_asset_assignment_requires_asset_manager_permiss
     })
     .await
     .unwrap();
+    seed_timescale_test_tenant(&store).await;
     let owner_id = Uuid::now_v7();
     let attacker_id = Uuid::now_v7();
     let asset_id = Uuid::now_v7();
     let unique = Uuid::now_v7();
     let pool = store.timescale_pool().unwrap();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES ($1, $2, 'unused', 'viewer', 'user'),
-                ($3, $4, 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, $3, 'unused', 'viewer', 'user'),
+                ($4, $2, $5, 'unused', 'viewer', 'user')",
     )
     .bind(owner_id)
+    .bind(test_tenant_id())
     .bind(format!("timescale-public-asset-owner-{unique}"))
     .bind(attacker_id)
     .bind(format!("timescale-public-asset-attacker-{unique}"))
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO assets (id, name, owner_user_id) VALUES ($1, $2, $3)")
+    sqlx::query("INSERT INTO assets (id, tenant_id, name, owner_user_id) VALUES ($1, $2, $3, $4)")
         .bind(asset_id)
+        .bind(test_tenant_id())
         .bind(format!("timescale-public-protected-asset-{unique}"))
         .bind(owner_id)
         .execute(pool)
@@ -2337,12 +2356,23 @@ async fn timescale_public_device_create_rejects_an_unavailable_profile_atomicall
     })
     .await
     .unwrap();
+    seed_timescale_test_tenant(&store).await;
+    let user_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, 'timescale-unavailable-profile-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id)
+    .bind(test_tenant_id())
+    .execute(store.timescale_pool().unwrap())
+    .await
+    .unwrap();
     let unavailable_profile_id = Uuid::now_v7();
     let result = PublicApiRepository::create_public_device(
         &store,
         &PublicPrincipal {
             tenant_id: test_tenant_id(),
-            user_id: None,
+            user_id: Some(user_id),
             app_id: format!("timescale-unavailable-profile-app-{unavailable_profile_id}"),
             account_class: AccountClass::User,
         },
@@ -2387,21 +2417,24 @@ async fn timescale_public_device_assignment_serializes_with_management_asset_del
     })
     .await
     .unwrap();
+    seed_timescale_test_tenant(&store).await;
     let unique = Uuid::now_v7();
     let owner_id = Uuid::now_v7();
     let asset_id = Uuid::now_v7();
     let pool = store.timescale_pool().unwrap();
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class)
-         VALUES ($1, $2, 'unused', 'viewer', 'user')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, $3, 'unused', 'viewer', 'user')",
     )
     .bind(owner_id)
+    .bind(test_tenant_id())
     .bind(format!("timescale-asset-delete-owner-{unique}"))
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO assets (id, name, owner_user_id) VALUES ($1, $2, $3)")
+    sqlx::query("INSERT INTO assets (id, tenant_id, name, owner_user_id) VALUES ($1, $2, $3, $4)")
         .bind(asset_id)
+        .bind(test_tenant_id())
         .bind(format!("timescale-asset-delete-target-{unique}"))
         .bind(owner_id)
         .execute(pool)
@@ -2473,13 +2506,14 @@ async fn timescale_public_device_assignment_serializes_with_management_asset_del
         deletion_result.is_ok(),
         "management asset deletion failed: {deletion_result:?}"
     );
-    assert!(matches!(
-        timeout(Duration::from_secs(2), &mut assignment)
-            .await
-            .expect("public device assignment deadlocked")
-            .unwrap(),
-        Err(PublicDeviceError::AssetUnavailable(id)) if id == asset_id
-    ));
+    let assignment_result = timeout(Duration::from_secs(2), &mut assignment)
+        .await
+        .expect("public device assignment deadlocked")
+        .unwrap();
+    assert!(
+        matches!(assignment_result, Err(PublicDeviceError::AssetUnavailable(id)) if id == asset_id),
+        "unexpected public device assignment result: {assignment_result:?}"
+    );
 }
 
 #[tokio::test]
@@ -2507,9 +2541,21 @@ async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
     })
     .await
     .unwrap();
+    seed_timescale_test_tenant(&store).await;
     let unique = Uuid::now_v7();
     let device_profile_id = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
     let pool = store.timescale_pool().unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES ($1, $2, $3, 'unused', 'viewer', 'user')",
+    )
+    .bind(user_id)
+    .bind(test_tenant_id())
+    .bind(format!("timescale-device-profile-lock-user-{unique}"))
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO device_profiles (id, tenant_id, name) VALUES ($1, $2, $3)")
         .bind(device_profile_id)
         .bind(test_tenant_id())
@@ -2537,7 +2583,7 @@ async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
             &assigning_store,
             &PublicPrincipal {
                 tenant_id: test_tenant_id(),
-                user_id: None,
+                user_id: Some(user_id),
                 app_id: format!("timescale-device-profile-lock-app-{unique}"),
                 account_class: AccountClass::User,
             },

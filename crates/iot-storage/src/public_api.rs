@@ -923,7 +923,8 @@ async fn create_public_device(
                 device.asset_id,
                 principal.tenant_id,
             )
-            .await?;
+            .await
+            .map_err(|error| map_public_device_assignment_lock_error(error, device.asset_id))?;
             if let Some(asset_id) = device.asset_id {
                 if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
                     .await?
@@ -1042,7 +1043,8 @@ async fn update_public_device(
                 device.asset_id,
                 principal.tenant_id,
             )
-            .await?;
+            .await
+            .map_err(|error| map_public_device_assignment_lock_error(error, device.asset_id))?;
             if let Some(asset_id) = device.asset_id {
                 if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
                     .await?
@@ -1651,6 +1653,19 @@ fn map_public_device_reference_error(
         }
     }
     PublicDeviceError::from(error)
+}
+
+fn map_public_device_assignment_lock_error(
+    error: PlatformStoreError,
+    asset_id: Option<Uuid>,
+) -> PublicDeviceError {
+    if let (PlatformStoreError::Database(sqlx::Error::Database(database)), Some(asset_id)) =
+        (&error, asset_id)
+        && database.code().as_deref() == Some("40001")
+    {
+        return PublicDeviceError::AssetUnavailable(asset_id);
+    }
+    PublicDeviceError::Storage { source: error }
 }
 
 async fn delete_public_device(

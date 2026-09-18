@@ -9880,7 +9880,7 @@ async fn sqlite_tenant_uuid_record_exists(
     tenant_id: uuid::Uuid,
     id: uuid::Uuid,
 ) -> Result<bool, TenantAuthorizationError> {
-    Ok(sqlx::query_scalar::<_, i64>(query)
+    Ok(sqlx::query_scalar::<_, i32>(query)
         .bind(id.to_string())
         .bind(tenant_id.to_string())
         .fetch_optional(&mut **transaction)
@@ -10069,7 +10069,7 @@ async fn timescale_tenant_uuid_record_exists(
     tenant_id: uuid::Uuid,
     id: uuid::Uuid,
 ) -> Result<bool, TenantAuthorizationError> {
-    Ok(sqlx::query_scalar::<_, i64>(query)
+    Ok(sqlx::query_scalar::<_, i32>(query)
         .bind(id)
         .bind(tenant_id)
         .fetch_optional(&mut **transaction)
@@ -10207,7 +10207,7 @@ async fn timescale_require_tenant_device(
     tenant_id: uuid::Uuid,
     device_id: &str,
 ) -> Result<(), TenantAuthorizationError> {
-    let exists = sqlx::query_scalar::<_, i64>(
+    let exists = sqlx::query_scalar::<_, i32>(
         "SELECT 1 FROM devices WHERE device_id = $1 AND tenant_id = $2",
     )
     .bind(device_id)
@@ -10362,7 +10362,7 @@ async fn oauth_user_belongs_to_tenant(
         .fetch_optional(store.pool())
         .await?
         .is_some()),
-        PlatformStore::Timescale(pool) => Ok(sqlx::query_scalar::<_, i64>(
+        PlatformStore::Timescale(pool) => Ok(sqlx::query_scalar::<_, i32>(
             "SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2",
         )
         .bind(user_id)
