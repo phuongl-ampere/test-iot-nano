@@ -443,6 +443,121 @@ impl TenantDeviceCredentialPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantProfileRow {
+    id: String,
+    name: String,
+}
+
+impl TenantProfileRow {
+    pub(crate) fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDeviceProfilesPage {
+    profiles: Vec<TenantProfileRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantDeviceProfilesPage {
+    pub(crate) fn new(profiles: Vec<TenantProfileRow>, notice: Option<&'static str>) -> Self {
+        Self {
+            profiles,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAssetProfilesPage {
+    profiles: Vec<TenantProfileRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantAssetProfilesPage {
+    pub(crate) fn new(profiles: Vec<TenantProfileRow>, notice: Option<&'static str>) -> Self {
+        Self {
+            profiles,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDeviceTokenRow {
+    id: String,
+    prefix: String,
+    created_at: String,
+    last_used_at: String,
+    status: String,
+    revocable: bool,
+}
+
+impl TenantDeviceTokenRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        prefix: impl Into<String>,
+        created_at: impl Into<String>,
+        last_used_at: impl Into<String>,
+        status: impl Into<String>,
+        revocable: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            prefix: prefix.into(),
+            created_at: created_at.into(),
+            last_used_at: last_used_at.into(),
+            status: status.into(),
+            revocable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDeviceTokensPage {
+    device_id: String,
+    display_name: String,
+    tokens: Vec<TenantDeviceTokenRow>,
+    credential: String,
+    has_credential: bool,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantDeviceTokensPage {
+    pub(crate) fn new(
+        device_id: impl Into<String>,
+        display_name: impl Into<String>,
+        tokens: Vec<TenantDeviceTokenRow>,
+        notice: Option<&'static str>,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            display_name: display_name.into(),
+            tokens,
+            credential: String::new(),
+            has_credential: false,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+
+    pub(crate) fn with_credential(mut self, credential: impl Into<String>) -> Self {
+        self.credential = credential.into();
+        self.has_credential = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDeviceRow {
     device_id: String,
     display_name: String,
@@ -698,6 +813,27 @@ impl PlatformUiRenderer {
         TenantDeviceCredentialLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_device_profiles(
+        identity: &PlatformUiIdentity,
+        page: &TenantDeviceProfilesPage,
+    ) -> Result<String, askama::Error> {
+        TenantDeviceProfilesLayout::new(identity, page).render()
+    }
+
+    pub fn render_tenant_asset_profiles(
+        identity: &PlatformUiIdentity,
+        page: &TenantAssetProfilesPage,
+    ) -> Result<String, askama::Error> {
+        TenantAssetProfilesLayout::new(identity, page).render()
+    }
+
+    pub fn render_tenant_device_tokens(
+        identity: &PlatformUiIdentity,
+        page: &TenantDeviceTokensPage,
+    ) -> Result<String, askama::Error> {
+        TenantDeviceTokensLayout::new(identity, page).render()
+    }
+
     pub fn render_user(
         identity: &PlatformUiIdentity,
         page: &UserDeviceListPage,
@@ -877,6 +1013,45 @@ pub struct TenantDeviceCredentialLayout<'a> {
 
 impl<'a> TenantDeviceCredentialLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDeviceCredentialPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_device_profiles.html")]
+pub struct TenantDeviceProfilesLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantDeviceProfilesPage,
+}
+
+impl<'a> TenantDeviceProfilesLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDeviceProfilesPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_asset_profiles.html")]
+pub struct TenantAssetProfilesLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantAssetProfilesPage,
+}
+
+impl<'a> TenantAssetProfilesLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantAssetProfilesPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_device_tokens.html")]
+pub struct TenantDeviceTokensLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantDeviceTokensPage,
+}
+
+impl<'a> TenantDeviceTokensLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDeviceTokensPage) -> Self {
         Self { identity, page }
     }
 }

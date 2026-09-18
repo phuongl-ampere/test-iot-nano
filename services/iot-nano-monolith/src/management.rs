@@ -27,19 +27,20 @@ use iot_storage::{
     ApplicationKind, ApplicationRepository, AuthorizationRepository, AuthorizationSubject,
     ClientId, CreateDeviceRelation, CreateManagementAsset, CreateManagementAssetProfile,
     CreateManagementDeviceProfile, CreateManagementUser, DeviceRelationError,
-    DeviceRelationRepository, ManagementAsset as StorageManagementAsset, ManagementAssetError,
-    ManagementAssetProfile, ManagementAssetProfileError, ManagementAssetProfileRepository,
-    ManagementAssetRepository, ManagementChildStatus, ManagementDevice as StorageManagementDevice,
-    ManagementDeviceError, ManagementDeviceProfile, ManagementDeviceProfileError,
-    ManagementDeviceProfileRepository, ManagementDeviceRepository, ManagementDeviceTopology,
-    ManagementGatewayStatus, ManagementUser, ManagementUserError, ManagementUserRepository,
-    ManagementUserRole, NewApplication, NewOAuthClientSecret, NewResourcePermission,
-    NewSystemAccount, NewTenant, NewTenantAccount, NewUserGroup, OAuthRepository,
-    PermissionCreator, PlatformStore, PlatformStoreError, RedirectUri, ResourceAccess,
-    ResourceAccessSource, ResourcePermission, SystemAccount, TenantAuthorizationError,
-    TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository, TenantStatus,
-    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser, UserDeviceActivityRepository,
+    DeviceRelationRepository, DeviceTokenRepository, DeviceTokenRepositoryError,
+    ManagementAsset as StorageManagementAsset, ManagementAssetError, ManagementAssetProfile,
+    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
+    ManagementChildStatus, ManagementDevice as StorageManagementDevice, ManagementDeviceError,
+    ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
+    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
+    ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
+    NewOAuthClientSecret, NewResourcePermission, NewSystemAccount, NewTenant, NewTenantAccount,
+    NewUserGroup, OAuthRepository, PermissionCreator, PlatformStore, PlatformStoreError,
+    RedirectUri, ResourceAccess, ResourceAccessSource, ResourcePermission, SystemAccount,
+    TenantAuthorizationError, TenantAuthorizationRepository, TenantIdentityError,
+    TenantIdentityRepository, TenantStatus, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
+    UserDeviceActivityRepository,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -169,6 +170,26 @@ impl ManagementSessionRouter {
             .route(
                 "/tenant/devices",
                 get(platform_tenant_devices).post(provision_tenant_device_form),
+            )
+            .route(
+                "/tenant/profiles/device",
+                get(platform_tenant_device_profiles).post(create_tenant_device_profile_form),
+            )
+            .route(
+                "/tenant/profiles/asset",
+                get(platform_tenant_asset_profiles).post(create_tenant_asset_profile_form),
+            )
+            .route(
+                "/tenant/devices/{device_id}/tokens",
+                get(platform_tenant_device_tokens),
+            )
+            .route(
+                "/tenant/devices/{device_id}/tokens/issue",
+                post(issue_tenant_device_token_form),
+            )
+            .route(
+                "/tenant/devices/{device_id}/tokens/revoke",
+                post(revoke_tenant_device_token_form),
             )
             .route("/tenant/topology", get(platform_tenant_topology))
             .route(
@@ -1638,6 +1659,33 @@ struct ProvisionTenantDeviceForm {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CreateTenantDeviceProfileForm {
+    name: String,
+    telemetry_schema: String,
+    metric_mapping: String,
+    reporting_settings: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTenantAssetProfileForm {
+    name: String,
+    fields: String,
+    dashboard_defaults: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueTenantDeviceTokenForm {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeTenantDeviceTokenForm {
+    token_id: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AssignTenantGatewayChildForm {
     child_device_id: String,
     gateway_device_id: String,
@@ -2219,6 +2267,51 @@ async fn platform_tenant_devices(
     .await
 }
 
+async fn platform_tenant_device_profiles(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_device_profiles_page(
+        &state,
+        tenant,
+        tenant_profile_notice(TenantProfileKind::Device, request.uri().query()),
+    )
+    .await
+}
+
+async fn platform_tenant_asset_profiles(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_asset_profiles_page(
+        &state,
+        tenant,
+        tenant_profile_notice(TenantProfileKind::Asset, request.uri().query()),
+    )
+    .await
+}
+
+async fn platform_tenant_device_tokens(
+    State(state): State<ManagementState>,
+    Path(device_id): Path<String>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_device_tokens_page(
+        &state,
+        tenant,
+        &device_id,
+        None,
+        tenant_device_token_notice(request.uri().query()),
+    )
+    .await
+}
+
 async fn platform_tenant_topology(
     State(state): State<ManagementState>,
     request: Request,
@@ -2340,6 +2433,119 @@ async fn tenant_devices_page(
         notice,
     );
     let rendered = crate::PlatformUiRenderer::render_tenant_devices(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_device_profiles_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let profiles = ManagementDeviceProfileRepository::list_management_device_profiles(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(management_device_profile_error)?;
+    let page = crate::TenantDeviceProfilesPage::new(
+        profiles
+            .into_iter()
+            .map(|profile| crate::TenantProfileRow::new(profile.id, profile.name))
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_device_profiles(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_asset_profiles_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let profiles = ManagementAssetProfileRepository::list_management_asset_profiles(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(management_asset_profile_error)?;
+    let page = crate::TenantAssetProfilesPage::new(
+        profiles
+            .into_iter()
+            .map(|profile| crate::TenantProfileRow::new(profile.id, profile.name))
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_asset_profiles(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_device_tokens_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    device_id: &str,
+    credential: Option<String>,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let device =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_device_error)?
+            .into_iter()
+            .find(|device| device.device_id == device_id)
+            .ok_or(ManagementSessionError::NotFound)?;
+    let tokens = DeviceTokenRepository::list_device_tokens(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        device_id,
+    )
+    .await
+    .map_err(management_device_token_repository_error)?;
+    let display_name = device
+        .display_name
+        .unwrap_or_else(|| device.device_id.clone());
+    let page = crate::TenantDeviceTokensPage::new(
+        device_id,
+        display_name,
+        tokens
+            .into_iter()
+            .map(|token| {
+                crate::TenantDeviceTokenRow::new(
+                    token.id,
+                    token.token_prefix,
+                    token.created_at.to_rfc3339(),
+                    token
+                        .last_used_at
+                        .map(|timestamp| timestamp.to_rfc3339())
+                        .unwrap_or_else(|| "Never".to_owned()),
+                    if token.revoked_at.is_some() {
+                        "Revoked"
+                    } else {
+                        "Active"
+                    },
+                    token.revoked_at.is_none(),
+                )
+            })
+            .collect(),
+        notice,
+    );
+    let page = match credential {
+        Some(credential) => page.with_credential(credential),
+        None => page,
+    };
+    let rendered = crate::PlatformUiRenderer::render_tenant_device_tokens(
         &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
         &page,
     )
@@ -2638,6 +2844,194 @@ async fn provision_tenant_device_form(
         Html(rendered),
     )
         .into_response())
+}
+
+fn tenant_profile_object(value: &str) -> Result<Value, ManagementSessionError> {
+    let value: Value =
+        serde_json::from_str(value).map_err(|_| ManagementSessionError::BadRequest)?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(ManagementSessionError::BadRequest)
+    }
+}
+
+async fn create_tenant_device_profile_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: CreateTenantDeviceProfileForm =
+        match management_request_form(&state, request).await {
+            Ok(request) => request,
+            Err(error) => return tenant_profile_form_error(TenantProfileKind::Device, error),
+        };
+    let telemetry_schema = match tenant_profile_object(&request.telemetry_schema) {
+        Ok(value) => value,
+        Err(error) => return tenant_profile_form_error(TenantProfileKind::Device, error),
+    };
+    let metric_mapping = match tenant_profile_object(&request.metric_mapping) {
+        Ok(value) => value,
+        Err(error) => return tenant_profile_form_error(TenantProfileKind::Device, error),
+    };
+    let reporting_settings = match tenant_profile_object(&request.reporting_settings) {
+        Ok(value) => value,
+        Err(error) => return tenant_profile_form_error(TenantProfileKind::Device, error),
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match ManagementDeviceProfileRepository::create_management_device_profile(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        CreateManagementDeviceProfile {
+            name: request.name,
+            telemetry_schema,
+            metric_mapping,
+            reporting_settings,
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(tenant_profile_redirect(
+            TenantProfileKind::Device,
+            TenantProfileKind::Device.created_notice(),
+        )),
+        Err(error) => tenant_profile_form_error(
+            TenantProfileKind::Device,
+            management_device_profile_error(error),
+        ),
+    }
+}
+
+async fn create_tenant_asset_profile_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: CreateTenantAssetProfileForm = match management_request_form(&state, request).await
+    {
+        Ok(request) => request,
+        Err(error) => return tenant_profile_form_error(TenantProfileKind::Asset, error),
+    };
+    let fields = match tenant_profile_object(&request.fields) {
+        Ok(value) => value,
+        Err(error) => return tenant_profile_form_error(TenantProfileKind::Asset, error),
+    };
+    let dashboard_defaults = match tenant_profile_object(&request.dashboard_defaults) {
+        Ok(value) => value,
+        Err(error) => return tenant_profile_form_error(TenantProfileKind::Asset, error),
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match ManagementAssetProfileRepository::create_management_asset_profile(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        CreateManagementAssetProfile {
+            name: request.name,
+            fields,
+            dashboard_defaults,
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(tenant_profile_redirect(
+            TenantProfileKind::Asset,
+            TenantProfileKind::Asset.created_notice(),
+        )),
+        Err(error) => tenant_profile_form_error(
+            TenantProfileKind::Asset,
+            management_asset_profile_error(error),
+        ),
+    }
+}
+
+async fn issue_tenant_device_token_form(
+    State(state): State<ManagementState>,
+    Path(device_id): Path<String>,
+    request: Request,
+) -> Result<Response, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let _: IssueTenantDeviceTokenForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => {
+            return tenant_device_token_form_error(&device_id, error)
+                .map(|redirect| redirect.into_response());
+        }
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let issued = match create_platform_device_token(
+        &state.store,
+        &state.token_vault,
+        tenant.tenant_id,
+        &device_id,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(error) => {
+            return tenant_device_token_form_error(
+                &device_id,
+                management_device_token_error(error),
+            )
+            .map(|redirect| redirect.into_response());
+        }
+    };
+    let credential = issued.token.ok_or(ManagementSessionError::Unavailable)?;
+    let page =
+        tenant_device_tokens_page(&state, tenant, &device_id, Some(credential), None).await?;
+    Ok((
+        StatusCode::CREATED,
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        page,
+    )
+        .into_response())
+}
+
+async fn revoke_tenant_device_token_form(
+    State(state): State<ManagementState>,
+    Path(device_id): Path<String>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: RevokeTenantDeviceTokenForm = match management_request_form(&state, request).await
+    {
+        Ok(request) => request,
+        Err(error) => return tenant_device_token_form_error(&device_id, error),
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let token = match DeviceTokenRepository::active_device_token(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        request.token_id,
+    )
+    .await
+    {
+        Ok(Some(token)) if token.device_id == device_id => token,
+        Ok(_) => {
+            return tenant_device_token_form_error(&device_id, ManagementSessionError::NotFound);
+        }
+        Err(error) => {
+            return tenant_device_token_form_error(
+                &device_id,
+                management_device_token_repository_error(error),
+            );
+        }
+    };
+    match DeviceTokenRepository::revoke_device_token(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        token.id,
+    )
+    .await
+    {
+        Ok(()) => Ok(tenant_device_token_redirect(&device_id, "token-revoked")),
+        Err(error) => tenant_device_token_form_error(
+            &device_id,
+            management_device_token_repository_error(error),
+        ),
+    }
 }
 
 async fn assign_tenant_gateway_child_form(
@@ -3769,6 +4163,101 @@ async fn reset_system_tenant_account_form(
         }
         Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
     }
+}
+
+#[derive(Clone, Copy)]
+enum TenantProfileKind {
+    Device,
+    Asset,
+}
+
+impl TenantProfileKind {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Device => "/tenant/profiles/device",
+            Self::Asset => "/tenant/profiles/asset",
+        }
+    }
+
+    const fn created_notice(self) -> &'static str {
+        match self {
+            Self::Device => "device-profile-created",
+            Self::Asset => "asset-profile-created",
+        }
+    }
+}
+
+fn tenant_profile_notice(kind: TenantProfileKind, query: Option<&str>) -> Option<&'static str> {
+    match (kind, query) {
+        (TenantProfileKind::Device, Some("notice=device-profile-created"))
+        | (TenantProfileKind::Asset, Some("notice=asset-profile-created")) => {
+            Some("Profile created.")
+        }
+        (_, Some("notice=invalid-request")) => Some("Request could not be processed."),
+        (_, Some("notice=mutation-unavailable")) => Some("The requested profile is unavailable."),
+        (_, Some("notice=service-unavailable")) => {
+            Some("Tenant management service is unavailable.")
+        }
+        _ => None,
+    }
+}
+
+fn tenant_profile_redirect(kind: TenantProfileKind, notice: &'static str) -> Redirect {
+    Redirect::to(&format!("{}?notice={notice}", kind.path()))
+}
+
+fn tenant_profile_form_error(
+    kind: TenantProfileKind,
+    error: ManagementSessionError,
+) -> Result<Redirect, ManagementSessionError> {
+    let notice = match error {
+        ManagementSessionError::Unauthorized
+        | ManagementSessionError::TooManyRequests
+        | ManagementSessionError::Forbidden => return Err(error),
+        ManagementSessionError::BadRequest
+        | ManagementSessionError::UnsupportedMediaType
+        | ManagementSessionError::PayloadTooLarge => "invalid-request",
+        ManagementSessionError::NotFound | ManagementSessionError::Conflict => {
+            "mutation-unavailable"
+        }
+        ManagementSessionError::Unavailable => "service-unavailable",
+    };
+    Ok(tenant_profile_redirect(kind, notice))
+}
+
+fn tenant_device_token_notice(query: Option<&str>) -> Option<&'static str> {
+    match query {
+        Some("notice=token-revoked") => Some("Device token revoked."),
+        Some("notice=invalid-request") => Some("Request could not be processed."),
+        Some("notice=mutation-unavailable") => Some("The requested device token is unavailable."),
+        Some("notice=service-unavailable") => Some("Tenant management service is unavailable."),
+        _ => None,
+    }
+}
+
+fn tenant_device_token_redirect(device_id: &str, notice: &'static str) -> Redirect {
+    Redirect::to(&format!(
+        "/tenant/devices/{device_id}/tokens?notice={notice}"
+    ))
+}
+
+fn tenant_device_token_form_error(
+    device_id: &str,
+    error: ManagementSessionError,
+) -> Result<Redirect, ManagementSessionError> {
+    let notice = match error {
+        ManagementSessionError::Unauthorized
+        | ManagementSessionError::TooManyRequests
+        | ManagementSessionError::Forbidden => return Err(error),
+        ManagementSessionError::BadRequest
+        | ManagementSessionError::UnsupportedMediaType
+        | ManagementSessionError::PayloadTooLarge => "invalid-request",
+        ManagementSessionError::NotFound | ManagementSessionError::Conflict => {
+            "mutation-unavailable"
+        }
+        ManagementSessionError::Unavailable => "service-unavailable",
+    };
+    Ok(tenant_device_token_redirect(device_id, notice))
 }
 
 #[derive(Clone, Copy)]
@@ -5014,6 +5503,20 @@ fn management_device_token_error(error: DeviceTokenStoreError) -> ManagementSess
         DeviceTokenStoreError::NotFound => ManagementSessionError::NotFound,
         DeviceTokenStoreError::GatewayChild => ManagementSessionError::Conflict,
         _ => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_device_token_repository_error(
+    error: DeviceTokenRepositoryError,
+) -> ManagementSessionError {
+    match error {
+        DeviceTokenRepositoryError::DeviceNotFound | DeviceTokenRepositoryError::TokenNotFound => {
+            ManagementSessionError::NotFound
+        }
+        DeviceTokenRepositoryError::GatewayChild
+        | DeviceTokenRepositoryError::TokenPrefixConflict => ManagementSessionError::Conflict,
+        DeviceTokenRepositoryError::InvalidStoredTimestamp
+        | DeviceTokenRepositoryError::Storage { .. } => ManagementSessionError::Unavailable,
     }
 }
 

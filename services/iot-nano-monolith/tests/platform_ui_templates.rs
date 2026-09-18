@@ -270,6 +270,8 @@ fn tenant_layout_renders_only_tenant_navigation() {
     assert!(rendered.contains("href=\"/tenant/users\""));
     assert!(rendered.contains("href=\"/tenant/groups\""));
     assert!(rendered.contains("href=\"/tenant/permissions\""));
+    assert!(rendered.contains("href=\"/tenant/profiles/device\""));
+    assert!(rendered.contains("href=\"/tenant/profiles/asset\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
 }
 

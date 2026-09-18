@@ -7,6 +7,8 @@
   <a class="nav-link" href="/tenant">Overview</a>
   <a class="nav-link" href="/tenant/assets">Assets</a>
   <a class="nav-link active" href="/tenant/devices" aria-current="page">Devices</a>
+  <a class="nav-link" href="/tenant/profiles/device">Device profiles</a>
+  <a class="nav-link" href="/tenant/profiles/asset">Asset profiles</a>
   <a class="nav-link" href="/tenant/topology">Topology</a>
   <a class="nav-link" href="/tenant/groups">Groups</a>
   <a class="nav-link" href="/tenant/permissions">Permissions</a>
@@ -47,7 +49,7 @@
           <tbody>
             {% for device in page.devices %}
               <tr>
-                <td><code>{{ device.device_id }}</code></td>
+                <td><a class="resource-link" href="/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens"><code>{{ device.device_id }}</code></a></td>
                 <td>{{ device.display_name }}</td>
                 <td>{{ device.status }}</td>
                 <td>{{ device.asset }}</td>

@@ -1,0 +1,78 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Device Tokens | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link" href="/tenant/users">Users</a>
+  <a class="nav-link" href="/tenant/assets">Assets</a>
+  <a class="nav-link active" href="/tenant/devices" aria-current="page">Devices</a>
+  <a class="nav-link" href="/tenant/profiles/device">Device profiles</a>
+  <a class="nav-link" href="/tenant/profiles/asset">Asset profiles</a>
+  <a class="nav-link" href="/tenant/topology">Topology</a>
+  <a class="nav-link" href="/tenant/relations">Relations</a>
+  <a class="nav-link" href="/tenant/groups">Groups</a>
+  <a class="nav-link" href="/tenant/permissions">Permissions</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Device Tokens</h1>
+    <p><strong>{{ page.display_name }}</strong> <code>{{ page.device_id }}</code></p>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  {% if page.has_credential %}
+    <section class="workspace-panel">
+      <header><h2>New device token</h2></header>
+      <p><code id="device-token-credential" class="credential">{{ page.credential }}</code></p>
+      <p class="notice" role="status">Store this token before leaving this page.</p>
+    </section>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Issue token</h2></header>
+    <form class="form-grid" action="/tenant/devices/{{ page.device_id|urlencode_strict }}/tokens/issue" method="post">
+      <div class="form-actions"><button type="submit">Issue token</button></div>
+    </form>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Device tokens</h2></header>
+    {% if page.tokens.is_empty() %}
+      <p class="empty-state">No device tokens issued.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Prefix</th>
+              <th scope="col">Created</th>
+              <th scope="col">Last used</th>
+              <th scope="col">Status</th>
+              <th scope="col">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for token in page.tokens %}
+              <tr>
+                <td><code>{{ token.prefix }}</code></td>
+                <td>{{ token.created_at }}</td>
+                <td>{{ token.last_used_at }}</td>
+                <td>{{ token.status }}</td>
+                <td>
+                  {% if token.revocable %}
+                    <form action="/tenant/devices/{{ page.device_id|urlencode_strict }}/tokens/revoke" method="post">
+                      <input name="token_id" type="hidden" value="{{ token.id }}">
+                      <button type="submit">Revoke</button>
+                    </form>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

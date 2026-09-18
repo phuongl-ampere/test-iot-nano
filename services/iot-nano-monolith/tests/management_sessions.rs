@@ -3174,6 +3174,246 @@ async fn tenant_asset_and_device_forms_create_current_tenant_resources_without_l
 }
 
 #[tokio::test]
+async fn tenant_profile_forms_and_device_token_pages_are_scoped_and_do_not_list_secrets() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+    let created_device_profile = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/profiles/device",
+            Some(&tenant_cookie),
+            "name=Tenant+device+profile&telemetry_schema=%7B%7D&metric_mapping=%7B%7D&reporting_settings=%7B%7D",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created_device_profile.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        created_device_profile.headers()[LOCATION],
+        "/tenant/profiles/device?notice=device-profile-created"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT tenant_id FROM device_profiles WHERE name = 'Tenant device profile'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        tenant_id
+    );
+
+    let created_asset_profile = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/profiles/asset",
+            Some(&tenant_cookie),
+            "name=Tenant+asset+profile&fields=%7B%7D&dashboard_defaults=%7B%7D",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created_asset_profile.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        created_asset_profile.headers()[LOCATION],
+        "/tenant/profiles/asset?notice=asset-profile-created"
+    );
+
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "tenant-profile-other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO device_profiles (id, tenant_id, name) VALUES (?, ?, 'Other device profile')",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_profiles (id, tenant_id, name) VALUES (?, ?, 'Other asset profile')",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name)
+         VALUES ('other-token-device', ?, 'Other token device')",
+    )
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    for (path, expected, excluded) in [
+        (
+            "/tenant/profiles/device",
+            "Tenant device profile",
+            "Other device profile",
+        ),
+        (
+            "/tenant/profiles/asset",
+            "Tenant asset profile",
+            "Other asset profile",
+        ),
+    ] {
+        let page = router
+            .clone()
+            .oneshot(platform_get(path, Some(&tenant_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK, "{path}");
+        let body = String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains(expected), "{path}");
+        assert!(!body.contains(excluded), "{path}");
+    }
+
+    let provisioned = management_provision_device(&router, &tenant_cookie, "Token device").await;
+    let device_id = provisioned["device_id"].as_str().unwrap();
+    let issued = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            &format!("/tenant/devices/{device_id}/tokens/issue"),
+            Some(&tenant_cookie),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    assert_eq!(issued.headers()[CACHE_CONTROL], "no-store");
+    let issued_body = String::from_utf8(
+        to_bytes(issued.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let credential = issued_body
+        .split("<code id=\"device-token-credential\" class=\"credential\">")
+        .nth(1)
+        .and_then(|value| value.split("</code>").next())
+        .expect("issue response must contain the one-time device token")
+        .to_owned();
+    assert!(!credential.is_empty());
+
+    let token_page = router
+        .clone()
+        .oneshot(platform_get(
+            &format!("/tenant/devices/{device_id}/tokens"),
+            Some(&tenant_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(token_page.status(), StatusCode::OK);
+    let token_page = String::from_utf8(
+        to_bytes(token_page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(token_page.contains("Device tokens"));
+    assert!(!token_page.contains(&credential));
+
+    let active_token_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM device_tokens WHERE device_id = ? AND revoked_at IS NULL",
+    )
+    .bind(device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let revoked = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            &format!("/tenant/devices/{device_id}/tokens/revoke"),
+            Some(&tenant_cookie),
+            &format!("token_id={active_token_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        revoked.headers()[LOCATION],
+        format!("/tenant/devices/{device_id}/tokens?notice=token-revoked")
+    );
+
+    let other_tenant_page = router
+        .oneshot(platform_get(
+            "/tenant/devices/other-token-device/tokens",
+            Some(&tenant_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_tenant_page.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn tenant_profile_and_token_routes_deny_non_tenant_sessions_before_form_parsing() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for (path, form_path) in [
+        ("/tenant/profiles/device", "/tenant/profiles/device"),
+        ("/tenant/profiles/asset", "/tenant/profiles/asset"),
+        (
+            "/tenant/devices/not-a-tenant-device/tokens",
+            "/tenant/devices/not-a-tenant-device/tokens/issue",
+        ),
+        (
+            "/tenant/devices/not-a-tenant-device/tokens",
+            "/tenant/devices/not-a-tenant-device/tokens/revoke",
+        ),
+    ] {
+        for (cookie, expected_status) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(system_cookie.as_str()), StatusCode::FORBIDDEN),
+            (Some(user_cookie.as_str()), StatusCode::FORBIDDEN),
+        ] {
+            let get = router
+                .clone()
+                .oneshot(platform_get(path, cookie))
+                .await
+                .unwrap();
+            assert_eq!(get.status(), expected_status, "GET {path}");
+
+            let post = router
+                .clone()
+                .oneshot(system_lifecycle_form(
+                    form_path,
+                    cookie,
+                    "tenant_id=forbidden&not=a+valid+form",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(post.status(), expected_status, "POST {form_path}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn tenant_asset_and_device_routes_require_a_tenant_session_before_form_parsing() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;

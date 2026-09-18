@@ -1,68 +1,61 @@
 {% extends "platform_ui/base.html" %}
 
-{% block title %}Assets | IoT Nano{% endblock %}
+{% block title %}Device Profiles | IoT Nano{% endblock %}
 {% block account_kind %}Tenant Account{% endblock %}
 {% block navigation_label %}Tenant navigation{% endblock %}
 {% block navigation %}
   <a class="nav-link" href="/tenant">Overview</a>
-  <a class="nav-link active" href="/tenant/assets" aria-current="page">Assets</a>
+  <a class="nav-link" href="/tenant/users">Users</a>
+  <a class="nav-link" href="/tenant/assets">Assets</a>
   <a class="nav-link" href="/tenant/devices">Devices</a>
-  <a class="nav-link" href="/tenant/profiles/device">Device profiles</a>
+  <a class="nav-link active" href="/tenant/profiles/device" aria-current="page">Device profiles</a>
   <a class="nav-link" href="/tenant/profiles/asset">Asset profiles</a>
   <a class="nav-link" href="/tenant/topology">Topology</a>
+  <a class="nav-link" href="/tenant/relations">Relations</a>
   <a class="nav-link" href="/tenant/groups">Groups</a>
   <a class="nav-link" href="/tenant/permissions">Permissions</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
-    <h1>Assets</h1>
+    <h1>Device Profiles</h1>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Create asset</h2></header>
-    <form class="form-grid" action="/tenant/assets" method="post">
+    <header><h2>Create device profile</h2></header>
+    <form class="form-grid" action="/tenant/profiles/device" method="post">
       <label class="field">
         <span>Name</span>
         <input name="name" type="text" maxlength="128" required>
       </label>
       <label class="field">
-        <span>Parent asset</span>
-        <select name="parent_asset_id">
-          <option value="">Root asset</option>
-          {% for asset in page.parent_assets %}
-            <option value="{{ asset.value }}">{{ asset.label }}</option>
-          {% endfor %}
-        </select>
+        <span>Telemetry schema</span>
+        <textarea name="telemetry_schema" rows="4" required>{}</textarea>
+      </label>
+      <label class="field">
+        <span>Metric mapping</span>
+        <textarea name="metric_mapping" rows="4" required>{}</textarea>
+      </label>
+      <label class="field">
+        <span>Reporting settings</span>
+        <textarea name="reporting_settings" rows="4" required>{}</textarea>
       </label>
       <div class="form-actions"><button type="submit">Create</button></div>
     </form>
   </section>
   <section class="workspace-panel">
-    <header><h2>Assets</h2></header>
-    {% if page.assets.is_empty() %}
-      <p class="empty-state">No assets created.</p>
+    <header><h2>Device profiles</h2></header>
+    {% if page.profiles.is_empty() %}
+      <p class="empty-state">No device profiles created.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
-          <thead>
-            <tr>
-              <th scope="col">Asset</th>
-              <th scope="col">Name</th>
-              <th scope="col">Parent asset</th>
-              <th scope="col">State</th>
-            </tr>
-          </thead>
+          <thead><tr><th scope="col">Profile</th><th scope="col">Name</th></tr></thead>
           <tbody>
-            {% for asset in page.assets %}
-              <tr>
-                <td><code>{{ asset.id }}</code></td>
-                <td>{{ asset.name }}</td>
-                <td>{{ asset.parent }}</td>
-                <td>{{ asset.status }}</td>
-              </tr>
+            {% for profile in page.profiles %}
+              <tr><td><code>{{ profile.id }}</code></td><td>{{ profile.name }}</td></tr>
             {% endfor %}
           </tbody>
         </table>
