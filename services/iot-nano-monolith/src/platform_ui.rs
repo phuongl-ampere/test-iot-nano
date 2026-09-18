@@ -1,9 +1,14 @@
 use askama::Template;
 
 const PLATFORM_UI_STYLESHEET: &str = include_str!("../assets/platform-ui.css");
+const HTMX: &str = include_str!("../assets/htmx.min.js");
 
 pub(crate) fn stylesheet() -> &'static str {
     PLATFORM_UI_STYLESHEET
+}
+
+pub(crate) fn htmx() -> &'static str {
+    HTMX
 }
 
 /// A display-only identity value for a server-rendered platform page.
@@ -893,6 +898,12 @@ impl PlatformUiRenderer {
         SystemInfrastructureLayout::new(identity, page).render()
     }
 
+    pub(crate) fn render_system_infrastructure_status(
+        page: &SystemInfrastructurePage,
+    ) -> Result<String, askama::Error> {
+        SystemInfrastructureStatusLayout::new(page).render()
+    }
+
     pub fn render_tenant(identity: &PlatformUiIdentity) -> Result<String, askama::Error> {
         TenantLayout::new(identity).render()
     }
@@ -1065,6 +1076,18 @@ pub struct SystemInfrastructureLayout<'a> {
 impl<'a> SystemInfrastructureLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a SystemInfrastructurePage) -> Self {
         Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/system_infrastructure_status.html")]
+pub(crate) struct SystemInfrastructureStatusLayout<'a> {
+    page: &'a SystemInfrastructurePage,
+}
+
+impl<'a> SystemInfrastructureStatusLayout<'a> {
+    fn new(page: &'a SystemInfrastructurePage) -> Self {
+        Self { page }
     }
 }
 

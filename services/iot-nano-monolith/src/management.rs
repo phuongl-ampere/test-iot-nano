@@ -151,6 +151,10 @@ impl ManagementSessionRouter {
                 "/system/infrastructure",
                 get(platform_system_infrastructure),
             )
+            .route(
+                "/system/infrastructure/status",
+                get(platform_system_infrastructure_status),
+            )
             .route("/system/tenants", post(create_system_tenant_form))
             .route("/system/tenants/suspend", post(suspend_system_tenant_form))
             .route(
@@ -243,6 +247,7 @@ impl ManagementSessionRouter {
             .route("/app/assets/{asset_id}", get(platform_app_asset_detail))
             .route("/app/devices/{device_id}", get(platform_app_device_detail))
             .route("/assets/platform-ui.css", get(platform_stylesheet))
+            .route("/assets/htmx.min.js", get(platform_htmx))
             .route("/api/auth/login", post(login))
             .route("/api/auth/logout", post(logout))
             .route("/api/auth/me", get(current_session))
@@ -396,34 +401,42 @@ impl SystemInfrastructureStatus {
     }
 
     fn page(&self) -> crate::SystemInfrastructurePage {
+        let ready = self.readiness.is_ready();
         let snapshot = self
             .snapshot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let component_status = |value: &str| if ready { value } else { "Not ready" };
         crate::SystemInfrastructurePage::new(
-            self.operational_health(),
+            if ready { "Ready" } else { "Not ready" },
             vec![
                 crate::SystemInfrastructureStatusRow::new(
                     "Public HTTP listener",
-                    &snapshot.public_http_listener,
+                    component_status(&snapshot.public_http_listener),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "Management HTTP listener",
-                    &snapshot.management_http_listener,
+                    component_status(&snapshot.management_http_listener),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "MQTT plaintext listener",
-                    &snapshot.mqtt_plaintext_listener,
+                    component_status(&snapshot.mqtt_plaintext_listener),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "MQTT TLS listener",
-                    &snapshot.mqtt_tls_listener,
+                    component_status(&snapshot.mqtt_tls_listener),
                 ),
             ],
             vec![
-                crate::SystemInfrastructureStatusRow::new("Migrations", &snapshot.migration),
-                crate::SystemInfrastructureStatusRow::new("Storage", &snapshot.storage),
-                crate::SystemInfrastructureStatusRow::new("TLS", &snapshot.tls),
+                crate::SystemInfrastructureStatusRow::new(
+                    "Migrations",
+                    component_status(&snapshot.migration),
+                ),
+                crate::SystemInfrastructureStatusRow::new(
+                    "Storage",
+                    component_status(&snapshot.storage),
+                ),
+                crate::SystemInfrastructureStatusRow::new("TLS", component_status(&snapshot.tls)),
             ],
         )
     }
@@ -2468,6 +2481,20 @@ async fn platform_system_infrastructure(
     Ok(Html(rendered))
 }
 
+async fn platform_system_infrastructure_status(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let PlatformUiSession::System { .. } = state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    let page = state.infrastructure_status.page();
+    let rendered = crate::PlatformUiRenderer::render_system_infrastructure_status(&page)
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
 async fn platform_tenant(
     State(state): State<ManagementState>,
     headers: HeaderMap,
@@ -4415,6 +4442,16 @@ async fn platform_stylesheet() -> ([(axum::http::HeaderName, HeaderValue); 1], &
             HeaderValue::from_static("text/css; charset=utf-8"),
         )],
         crate::platform_ui::stylesheet(),
+    )
+}
+
+async fn platform_htmx() -> ([(axum::http::HeaderName, HeaderValue); 1], &'static str) {
+    (
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/javascript; charset=utf-8"),
+        )],
+        crate::platform_ui::htmx(),
     )
 }
 

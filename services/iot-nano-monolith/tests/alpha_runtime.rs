@@ -162,6 +162,94 @@ async fn alpha_runtime_renders_system_infrastructure_from_started_runtime_withou
 }
 
 #[tokio::test]
+async fn alpha_runtime_infrastructure_page_stops_presenting_components_as_healthy_after_failure() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+    bootstrap_system(runtime.platform().unwrap(), "system", "SystemAccount@2026")
+        .await
+        .unwrap();
+
+    let login_body = r#"{"username":"system","password":"SystemAccount@2026"}"#;
+    let login = send_http(
+        fixture.config.management_http,
+        format!(
+            "POST /api/system/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{login_body}",
+            login_body.len(),
+        ),
+    )
+    .await;
+    assert!(
+        login.starts_with(b"HTTP/1.1 200"),
+        "unexpected system login response: {}",
+        String::from_utf8_lossy(&login)
+    );
+    let cookie = String::from_utf8_lossy(&login)
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: "))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let started = send_http(
+        fixture.config.management_http,
+        format!(
+            "GET /system/infrastructure HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    let started = String::from_utf8(started).unwrap();
+    assert!(started.contains("Listening on"));
+    assert!(started.contains("SQLite connected"));
+
+    runtime.cancellation_token().cancel();
+    timeout(Duration::from_secs(1), async {
+        while runtime.readiness().is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime readiness remained healthy after parent cancellation");
+
+    let failed = send_http(
+        fixture.config.management_http,
+        format!(
+            "GET /system/infrastructure HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        failed.starts_with(b"HTTP/1.1 200"),
+        "unexpected infrastructure response after failure: {}",
+        String::from_utf8_lossy(&failed)
+    );
+    let failed = String::from_utf8(failed).unwrap();
+    assert!(failed.contains("Not ready"));
+    for healthy_status in [
+        "Listening on",
+        "Listening (TLS endpoint bound)",
+        "Completed at startup",
+        "SQLite connected",
+        "Loaded for MQTT TLS",
+    ] {
+        assert!(
+            !failed.contains(healthy_status),
+            "stale healthy status {healthy_status}: {failed}"
+        );
+    }
+
+    let _ = timeout(
+        Duration::from_secs(3),
+        runtime.shutdown(Instant::now() + Duration::from_secs(2)),
+    )
+    .await
+    .expect("runtime shutdown hung after parent cancellation");
+}
+
+#[tokio::test]
 async fn alpha_runtime_marks_not_ready_after_parent_cancellation() {
     let fixture = Fixture::new().await;
     let mut runtime = MonolithRuntime::start(fixture.config.clone())

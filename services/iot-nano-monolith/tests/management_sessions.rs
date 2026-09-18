@@ -1167,7 +1167,7 @@ async fn system_page_does_not_read_sensitive_invalid_tenant_metadata() {
 }
 
 #[tokio::test]
-async fn system_infrastructure_page_requires_a_system_account() {
+async fn system_infrastructure_page_and_fragment_require_a_system_account() {
     let (_directory, _store, management) = management_session_router_with_store().await;
     let router = management.router;
     let system_cookie = system_account_cookie(&router).await;
@@ -1175,32 +1175,34 @@ async fn system_infrastructure_page_requires_a_system_account() {
     let user_cookie = user_account_cookie(&router).await;
     let admin_cookie = management_user_cookie(&router, "admin", "NanoAdmin@1234").await;
 
-    let response = router
-        .clone()
-        .oneshot(platform_get("/system/infrastructure", Some(&system_cookie)))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    for cookie in [
-        None,
-        Some(tenant_cookie.as_str()),
-        Some(user_cookie.as_str()),
-        Some(admin_cookie.as_str()),
-    ] {
+    for path in ["/system/infrastructure", "/system/infrastructure/status"] {
         let response = router
             .clone()
-            .oneshot(platform_get("/system/infrastructure", cookie))
+            .oneshot(platform_get(path, Some(&system_cookie)))
             .await
             .unwrap();
-        assert!(
-            matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ),
-            "unexpected status {}",
-            response.status()
-        );
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+
+        for cookie in [
+            None,
+            Some(tenant_cookie.as_str()),
+            Some(user_cookie.as_str()),
+            Some(admin_cookie.as_str()),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(platform_get(path, cookie))
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ),
+                "{path}: unexpected status {}",
+                response.status()
+            );
+        }
     }
 }
 
@@ -1218,6 +1220,7 @@ async fn system_infrastructure_page_renders_non_secret_runtime_status() {
     let router = management.router;
     let system_cookie = system_account_cookie(&router).await;
     let response = router
+        .clone()
         .oneshot(platform_get("/system/infrastructure", Some(&system_cookie)))
         .await
         .unwrap();
@@ -1243,6 +1246,23 @@ async fn system_infrastructure_page_renders_non_secret_runtime_status() {
     assert!(!body.contains(tenant_metadata));
     assert!(!body.contains("TenantAccount@2026"));
     assert!(!body.contains("SystemAccount@2026"));
+    assert!(body.contains("src=\"/assets/htmx.min.js\""));
+    assert!(body.contains("hx-get=\"/system/infrastructure/status\""));
+    assert!(body.contains("hx-trigger=\"every 5s\""));
+
+    let htmx = router
+        .oneshot(platform_get("/assets/htmx.min.js", None))
+        .await
+        .unwrap();
+    assert_eq!(htmx.status(), StatusCode::OK);
+    assert!(
+        htmx.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/javascript")
+    );
+    let htmx = to_bytes(htmx.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&htmx).contains("htmx"));
 }
 
 #[tokio::test]

@@ -14,52 +14,6 @@
     <h1>System infrastructure</h1>
     <p>Runtime state and configuration status.</p>
   </section>
-  <section class="summary-grid" aria-label="Runtime health">
-    <article class="summary-item">
-      <span>Runtime health</span>
-      <strong>{{ page.health }}</strong>
-    </article>
-  </section>
-  <section class="workspace-panel">
-    <header><h2>Listeners</h2></header>
-    <div class="table-scroll">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th scope="col">Listener</th>
-            <th scope="col">Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for listener in page.listeners %}
-            <tr>
-              <td>{{ listener.label }}</td>
-              <td>{{ listener.value }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </section>
-  <section class="workspace-panel">
-    <header><h2>Runtime configuration</h2></header>
-    <div class="table-scroll">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th scope="col">Component</th>
-            <th scope="col">Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for item in page.configuration %}
-            <tr>
-              <td>{{ item.label }}</td>
-              <td>{{ item.value }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </section>
+  {% include "platform_ui/system_infrastructure_status.html" %}
+  <script src="/assets/htmx.min.js" defer></script>
 {% endblock %}
