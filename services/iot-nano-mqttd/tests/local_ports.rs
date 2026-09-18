@@ -45,6 +45,8 @@ use tokio::{
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
+
 #[derive(Clone, Default)]
 struct RecordingAuthorization {
     authenticated: Arc<Mutex<Vec<TransportAuthRequest>>>,
@@ -365,6 +367,7 @@ async fn local_gateway_uplink_authorizes_and_appends_exactly_once() {
     assert_eq!(
         authorization.requests.lock().await.as_slice(),
         &[GatewayAuthorizationRequest {
+            tenant_id: TEST_TENANT_ID,
             gateway_device_id: "gateway-a".to_owned(),
             token_id: gateway_device().token_id,
             child_device_id: Some("child-a".to_owned()),
@@ -457,6 +460,7 @@ async fn local_rpc_response_forwarder_uses_the_typed_port_without_http() {
     let forwarder = LocalRpcResponseForwarder::new(responses.clone());
     let response = TransportRpcResponse {
         command_id: Uuid::now_v7(),
+        tenant_id: TEST_TENANT_ID,
         device_id: "device-a".to_owned(),
         token_id: Uuid::now_v7(),
         response: json!({"ok": true}),
@@ -487,6 +491,7 @@ async fn injected_router_routes_a_request_to_only_the_connected_transport_sessio
     let mut device = injected_router
         .register(SessionRegistration {
             token_id: device().token_id,
+            tenant_id: TEST_TENANT_ID,
             device_id: "device-a".to_owned(),
             client_id: "local-client".to_owned(),
             connection_id: "connection-a".to_owned(),
@@ -497,6 +502,7 @@ async fn injected_router_routes_a_request_to_only_the_connected_transport_sessio
     let mut other_device = injected_router
         .register(SessionRegistration {
             token_id: Uuid::now_v7(),
+            tenant_id: TEST_TENANT_ID,
             device_id: "device-b".to_owned(),
             client_id: "other-client".to_owned(),
             connection_id: "connection-b".to_owned(),
@@ -519,7 +525,7 @@ async fn injected_router_routes_a_request_to_only_the_connected_transport_sessio
         async move {
             transport
                 .router()
-                .publish_to_device("device-a", request)
+                .publish_to_device(TEST_TENANT_ID, "device-a", request)
                 .await
         }
     });
@@ -543,6 +549,7 @@ async fn legacy_local_ports_wrapper_owns_a_usable_default_router() {
         .router()
         .register(SessionRegistration {
             token_id: device().token_id,
+            tenant_id: TEST_TENANT_ID,
             device_id: "device-a".to_owned(),
             client_id: "local-client".to_owned(),
             connection_id: "connection-a".to_owned(),
@@ -562,7 +569,11 @@ async fn legacy_local_ports_wrapper_owns_a_usable_default_router() {
 
     let publish = tokio::spawn({
         let router = transport.router();
-        async move { router.publish_to_device("device-a", request).await }
+        async move {
+            router
+                .publish_to_device(TEST_TENANT_ID, "device-a", request)
+                .await
+        }
     });
     let command = device.recv().await.unwrap();
 
@@ -579,6 +590,7 @@ async fn revocation_invalidates_a_command_queued_before_device_delivery() {
     let mut device = router
         .register(SessionRegistration {
             token_id,
+            tenant_id: TEST_TENANT_ID,
             device_id: "device-a".to_owned(),
             client_id: "local-client".to_owned(),
             connection_id: "connection-a".to_owned(),
@@ -598,7 +610,11 @@ async fn revocation_invalidates_a_command_queued_before_device_delivery() {
 
     let publish = tokio::spawn({
         let router = router.clone();
-        async move { router.publish_to_device("device-a", request).await }
+        async move {
+            router
+                .publish_to_device(TEST_TENANT_ID, "device-a", request)
+                .await
+        }
     });
     let command = device.recv().await.unwrap();
 
@@ -620,6 +636,7 @@ async fn revoked_token_cannot_register_a_session_after_revocation() {
     let _receiver = router
         .register(SessionRegistration {
             token_id,
+            tenant_id: TEST_TENANT_ID,
             device_id: "device-a".to_owned(),
             client_id: "local-client".to_owned(),
             connection_id: "connection-a".to_owned(),
@@ -852,6 +869,7 @@ fn local_port_implementations_contain_no_http_boundary() {
 fn device() -> AuthenticatedDevice {
     AuthenticatedDevice {
         token_id: Uuid::parse_str("019a5114-0674-7bd7-8486-50b6ebbd7245").unwrap(),
+        tenant_id: TEST_TENANT_ID,
         device_id: "device-a".to_owned(),
         is_gateway: false,
     }
@@ -860,6 +878,7 @@ fn device() -> AuthenticatedDevice {
 fn gateway_device() -> AuthenticatedDevice {
     AuthenticatedDevice {
         token_id: Uuid::parse_str("019a5114-0674-7bd7-8486-50b6ebbd7245").unwrap(),
+        tenant_id: TEST_TENANT_ID,
         device_id: "gateway-a".to_owned(),
         is_gateway: true,
     }
@@ -867,6 +886,7 @@ fn gateway_device() -> AuthenticatedDevice {
 
 fn matching_gateway_authorization() -> GatewayAuthorization {
     GatewayAuthorization {
+        tenant_id: TEST_TENANT_ID,
         gateway_device_id: "gateway-a".to_owned(),
         token_id: gateway_device().token_id,
         child_device_id: Some("child-a".to_owned()),
