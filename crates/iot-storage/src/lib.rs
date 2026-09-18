@@ -58,7 +58,7 @@ pub use public_api::{PublicDeviceListHandoffHookGuard, install_public_device_lis
 pub use tenant_identity::{
     AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount,
     SystemAccountCredential, Tenant, TenantAccount, TenantAccountCredential, TenantIdentityError,
-    TenantIdentityRepository, TenantStatus, TenantUserCredential,
+    TenantIdentityRepository, TenantStatus, TenantSummary, TenantUserCredential,
 };
 
 const SQLITE_SCHEMA: &str = r#"

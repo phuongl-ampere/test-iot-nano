@@ -371,6 +371,31 @@ async fn system_page_lists_only_tenant_slug_and_status_with_neutral_runtime_fiel
 }
 
 #[tokio::test]
+async fn system_page_does_not_read_sensitive_invalid_tenant_metadata() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let metadata = "system-page-secret: do-not-read";
+    sqlx::query("UPDATE tenants SET metadata = ? WHERE slug = ?")
+        .bind(metadata)
+        .bind("test")
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let response = router
+        .oneshot(platform_get("/system", Some(&system_cookie)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("<td>test</td>"));
+    assert!(!body.contains(metadata));
+}
+
+#[tokio::test]
 async fn management_login_issues_a_cookie_used_by_the_oauth_session_verifier_and_logout_revokes_it()
 {
     let (_directory, management) = management_session_router().await;

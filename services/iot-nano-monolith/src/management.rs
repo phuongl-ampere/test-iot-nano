@@ -1973,7 +1973,7 @@ async fn platform_page(
 ) -> Result<Html<String>, ManagementSessionError> {
     let rendered = match session {
         PlatformUiSession::System { system_account_id } => {
-            let tenants = TenantIdentityRepository::list_tenants(state.store.as_ref())
+            let tenants = TenantIdentityRepository::list_tenant_summaries(state.store.as_ref())
                 .await
                 .map_err(|_| ManagementSessionError::Unavailable)?;
             let page = crate::SystemPlatformPage::new(

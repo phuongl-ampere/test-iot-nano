@@ -53,6 +53,12 @@ pub struct Tenant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantSummary {
+    pub slug: String,
+    pub status: TenantStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantAccount {
     pub id: Uuid,
     pub tenant_id: Uuid,
@@ -337,6 +343,35 @@ impl TenantIdentityRepository {
         }
     }
 
+    pub async fn list_tenant_summaries(
+        store: &PlatformStore,
+    ) -> Result<Vec<TenantSummary>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let rows = sqlx::query(
+                    "SELECT slug, status
+                     FROM tenants
+                     WHERE status <> 'deleted'
+                     ORDER BY slug, id",
+                )
+                .fetch_all(&store.pool)
+                .await?;
+                rows.into_iter().map(tenant_summary_from_sqlite).collect()
+            }
+            PlatformStore::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "SELECT slug, status
+                     FROM tenants
+                     WHERE status <> 'deleted'
+                     ORDER BY slug, id",
+                )
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter().map(tenant_summary_from_postgres).collect()
+            }
+        }
+    }
+
     pub async fn suspend_tenant(
         store: &PlatformStore,
         tenant_slug: &str,
@@ -563,12 +598,26 @@ fn tenant_from_sqlite(row: SqliteRow) -> Result<Tenant, TenantIdentityError> {
     })
 }
 
+fn tenant_summary_from_sqlite(row: SqliteRow) -> Result<TenantSummary, TenantIdentityError> {
+    Ok(TenantSummary {
+        slug: row.try_get("slug")?,
+        status: tenant_status_from_str(&row.try_get::<String, _>("status")?)?,
+    })
+}
+
 fn tenant_from_postgres(row: PgRow) -> Result<Tenant, TenantIdentityError> {
     Ok(Tenant {
         id: row.try_get("id")?,
         slug: row.try_get("slug")?,
         status: tenant_status_from_str(&row.try_get::<String, _>("status")?)?,
         metadata: row.try_get::<Json<Value>, _>("metadata")?.0,
+    })
+}
+
+fn tenant_summary_from_postgres(row: PgRow) -> Result<TenantSummary, TenantIdentityError> {
+    Ok(TenantSummary {
+        slug: row.try_get("slug")?,
+        status: tenant_status_from_str(&row.try_get::<String, _>("status")?)?,
     })
 }
 

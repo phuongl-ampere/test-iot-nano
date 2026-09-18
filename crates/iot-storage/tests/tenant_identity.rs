@@ -1,6 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     NewSystemAccount, NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository,
+    TenantStatus,
 };
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
@@ -215,6 +216,37 @@ async fn sqlite_tenant_identity_repository_lists_tenants_without_deleted_rows() 
             .collect::<Vec<_>>(),
         ["north"]
     );
+}
+
+#[tokio::test]
+async fn sqlite_tenant_identity_repository_summarizes_tenants_without_deserializing_metadata() {
+    let (_directory, store) = sqlite_store().await;
+    TenantIdentityRepository::create_tenant_with_account(
+        &store,
+        NewTenant {
+            slug: "north".to_owned(),
+            metadata: serde_json::json!({}),
+        },
+        NewTenantAccount {
+            password_hash: "tenant-account-hash".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE tenants SET metadata = ? WHERE slug = ?")
+        .bind("sensitive metadata that is not JSON")
+        .bind("north")
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    let summaries = TenantIdentityRepository::list_tenant_summaries(&store)
+        .await
+        .unwrap();
+
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].slug, "north");
+    assert_eq!(summaries[0].status, TenantStatus::Active);
 }
 
 #[tokio::test]
