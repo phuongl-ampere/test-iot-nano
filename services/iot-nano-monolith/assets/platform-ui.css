@@ -340,6 +340,59 @@ button:focus-visible {
   gap: 6px;
 }
 
+.resource-link {
+  color: #0b4d96;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.resource-link:hover,
+.resource-link:focus-visible {
+  color: #087d78;
+  text-decoration: underline;
+}
+
+.resource-link:focus-visible {
+  outline: 2px solid #0d5cb5;
+  outline-offset: 2px;
+}
+
+.resource-id {
+  display: block;
+  margin-top: 3px;
+  color: #617188;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+}
+
+.resource-details {
+  margin: 0;
+}
+
+.resource-details > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.35fr) minmax(0, 1fr);
+  gap: 14px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #dfe6ef;
+}
+
+.resource-details > div:last-child {
+  border-bottom: 0;
+}
+
+.resource-details dt {
+  color: #536277;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.resource-details dd {
+  margin: 0;
+  color: #182235;
+  font-size: 13px;
+}
+
 @media (max-width: 720px) {
   .topbar {
     padding: 10px 14px;
@@ -382,5 +435,10 @@ button:focus-visible {
 
   .form-grid {
     grid-template-columns: 1fr;
+  }
+
+  .resource-details > div {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 }

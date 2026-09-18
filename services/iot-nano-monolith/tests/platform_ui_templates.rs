@@ -1,5 +1,6 @@
 use iot_nano_monolith::{
     PlatformUiIdentity, PlatformUiRenderer, SystemPlatformPage, SystemTenantRow,
+    UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
 };
 
 fn navigation_hrefs(rendered: &str) -> Vec<&str> {
@@ -275,12 +276,42 @@ fn tenant_layout_renders_only_tenant_navigation() {
 #[test]
 fn user_layout_renders_only_workspace_navigation() {
     let identity = PlatformUiIdentity::new("Nguyen");
+    let page = UserDeviceListPage::new(vec![UserDeviceRow::new(
+        "device-<unsafe>",
+        "Device <unsafe>",
+        "Last seen 2026-09-18T10:20:30Z",
+        "Viewer",
+        "Direct user permission",
+    )]);
 
-    let rendered = PlatformUiRenderer::render_user(&identity).unwrap();
+    let rendered = PlatformUiRenderer::render_user(&identity, &page).unwrap();
 
-    assert!(rendered.contains("My Workspace"));
-    assert!(rendered.contains("href=\"/app/devices\""));
-    assert!(rendered.contains("href=\"/app/assets\""));
+    assert!(rendered.contains("My Devices"));
+    assert!(rendered.contains("href=\"/app/devices/device-%3Cunsafe%3E\""));
     assert!(rendered.contains("href=\"/app\" aria-current=\"page\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/tenant"]);
+    assert!(rendered.contains("Device &#60;unsafe&#62;"));
+    assert!(!rendered.contains("Device <unsafe>"));
+}
+
+#[test]
+fn user_device_detail_renders_only_server_supplied_device_context() {
+    let identity = PlatformUiIdentity::new("Nguyen");
+    let page = UserDeviceDetailPage::new(UserDeviceRow::new(
+        "device-1",
+        "Device 1",
+        "No activity reported",
+        "Viewer",
+        "Group permission",
+    ));
+
+    let rendered = PlatformUiRenderer::render_user_device(&identity, &page).unwrap();
+
+    assert!(rendered.contains("Device 1"));
+    assert!(rendered.contains("No activity reported"));
+    assert!(rendered.contains("Viewer"));
+    assert!(rendered.contains("Group permission"));
+    assert_excludes_navigation_namespaces(&rendered, &["/system", "/tenant"]);
+    assert!(!rendered.contains("<form"));
+    assert!(!rendered.contains("/commands"));
 }

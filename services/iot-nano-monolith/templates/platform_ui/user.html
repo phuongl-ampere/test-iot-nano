@@ -1,25 +1,47 @@
 {% extends "platform_ui/base.html" %}
 
-{% block title %}My Workspace | IoT Nano{% endblock %}
+{% block title %}My Devices | IoT Nano{% endblock %}
 {% block account_kind %}User Account{% endblock %}
 {% block navigation_label %}Workspace navigation{% endblock %}
 {% block navigation %}
-  <a class="nav-link active" href="/app" aria-current="page">Workspace</a>
-  <a class="nav-link" href="/app/devices">Devices</a>
-  <a class="nav-link" href="/app/assets">Assets</a>
+  <a class="nav-link active" href="/app" aria-current="page">Devices</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
     <p class="eyebrow">User Account</p>
-    <h1>My Workspace</h1>
-    <p>Authorized devices and assets.</p>
-  </section>
-  <section class="summary-grid" aria-label="Workspace summary">
-    <article class="summary-item"><span>Devices</span><strong>--</strong></article>
-    <article class="summary-item"><span>Assets</span><strong>--</strong></article>
+    <h1>My Devices</h1>
+    <p>Devices you own or are permitted to view.</p>
   </section>
   <section class="workspace-panel">
-    <header><h2>Authorized resources</h2></header>
-    <p class="empty-state">Data will appear after the authorization contract is connected.</p>
+    <header><h2>Authorized devices</h2></header>
+    {% if page.devices.is_empty() %}
+      <p class="empty-state">No devices are available to this account.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Device</th>
+              <th scope="col">State</th>
+              <th scope="col">Permission</th>
+              <th scope="col">Access source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for device in page.devices %}
+              <tr>
+                <td>
+                  <a class="resource-link" href="/app/devices/{{ device.device_id|urlencode_strict }}">{{ device.display_name }}</a>
+                  <span class="resource-id">{{ device.device_id }}</span>
+                </td>
+                <td>{{ device.activity }}</td>
+                <td>{{ device.permission }}</td>
+                <td>{{ device.access_source }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
   </section>
 {% endblock %}

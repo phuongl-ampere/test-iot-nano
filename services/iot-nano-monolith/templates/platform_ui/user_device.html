@@ -1,0 +1,23 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Device | IoT Nano{% endblock %}
+{% block account_kind %}User Account{% endblock %}
+{% block navigation_label %}Workspace navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link active" href="/app" aria-current="page">Devices</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Device</p>
+    <h1>{{ page.device.display_name }}</h1>
+    <p class="resource-id">{{ page.device.device_id }}</p>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Access</h2></header>
+    <dl class="resource-details">
+      <div><dt>State</dt><dd>{{ page.device.activity }}</dd></div>
+      <div><dt>Permission</dt><dd>{{ page.device.permission }}</dd></div>
+      <div><dt>Access source</dt><dd>{{ page.device.access_source }}</dd></div>
+    </dl>
+  </section>
+{% endblock %}

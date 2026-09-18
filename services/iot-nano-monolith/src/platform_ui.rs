@@ -51,6 +51,55 @@ pub struct SystemPlatformPage {
     has_notice: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDeviceRow {
+    device_id: String,
+    display_name: String,
+    activity: String,
+    permission: String,
+    access_source: String,
+}
+
+impl UserDeviceRow {
+    pub fn new(
+        device_id: impl Into<String>,
+        display_name: impl Into<String>,
+        activity: impl Into<String>,
+        permission: impl Into<String>,
+        access_source: impl Into<String>,
+    ) -> Self {
+        Self {
+            device_id: device_id.into(),
+            display_name: display_name.into(),
+            activity: activity.into(),
+            permission: permission.into(),
+            access_source: access_source.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDeviceListPage {
+    devices: Vec<UserDeviceRow>,
+}
+
+impl UserDeviceListPage {
+    pub fn new(devices: Vec<UserDeviceRow>) -> Self {
+        Self { devices }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDeviceDetailPage {
+    device: UserDeviceRow,
+}
+
+impl UserDeviceDetailPage {
+    pub fn new(device: UserDeviceRow) -> Self {
+        Self { device }
+    }
+}
+
 impl SystemPlatformPage {
     pub fn new(tenants: Vec<SystemTenantRow>) -> Self {
         Self {
@@ -71,7 +120,7 @@ impl SystemPlatformPage {
     }
 }
 
-/// Renders the static platform layouts that future server handlers will use.
+/// Renders server-side platform layouts.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlatformUiRenderer;
 
@@ -87,8 +136,24 @@ impl PlatformUiRenderer {
         TenantLayout::new(identity).render()
     }
 
-    pub fn render_user(identity: &PlatformUiIdentity) -> Result<String, askama::Error> {
-        UserLayout::new(identity).render()
+    pub fn render_user(
+        identity: &PlatformUiIdentity,
+        page: &UserDeviceListPage,
+    ) -> Result<String, askama::Error> {
+        UserLayout::new(identity, page).render()
+    }
+
+    pub fn render_user_device(
+        identity: &PlatformUiIdentity,
+        page: &UserDeviceDetailPage,
+    ) -> Result<String, askama::Error> {
+        UserDeviceLayout::new(identity, page).render()
+    }
+
+    pub fn render_user_device_unavailable(
+        identity: &PlatformUiIdentity,
+    ) -> Result<String, askama::Error> {
+        UserDeviceUnavailableLayout::new(identity).render()
     }
 }
 
@@ -121,9 +186,35 @@ impl<'a> TenantLayout<'a> {
 #[template(path = "platform_ui/user.html")]
 pub struct UserLayout<'a> {
     identity: &'a PlatformUiIdentity,
+    page: &'a UserDeviceListPage,
 }
 
 impl<'a> UserLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a UserDeviceListPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/user_device.html")]
+pub struct UserDeviceLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a UserDeviceDetailPage,
+}
+
+impl<'a> UserDeviceLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a UserDeviceDetailPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/user_device_unavailable.html")]
+pub struct UserDeviceUnavailableLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+}
+
+impl<'a> UserDeviceUnavailableLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity) -> Self {
         Self { identity }
     }

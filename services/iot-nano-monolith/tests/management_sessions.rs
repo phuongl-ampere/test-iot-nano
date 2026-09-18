@@ -261,6 +261,149 @@ async fn tenant_account_login_status(
         .status()
 }
 
+async fn seed_user_workspace_devices(store: &PlatformStore) {
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let viewer_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let group_id = uuid::Uuid::now_v7().to_string();
+    let inherited_asset_id = uuid::Uuid::now_v7().to_string();
+
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Shared asset')")
+        .bind(&inherited_asset_id)
+        .bind(&tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    for (device_id, display_name, owner_user_id, asset_id) in [
+        (
+            "owned-device",
+            "Owned device",
+            Some(viewer_id.as_str()),
+            None,
+        ),
+        ("direct-device", "Direct device", None, None),
+        ("group-device", "Group device", None, None),
+        (
+            "inherited-device",
+            "Inherited device",
+            None,
+            Some(inherited_asset_id.as_str()),
+        ),
+        ("unshared-device", "Unshared device", None, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO devices (
+                device_id, tenant_id, display_name, owner_user_id, asset_id, last_seen_at
+             ) VALUES (?, ?, ?, ?, ?, '2026-09-18T10:20:30Z')",
+        )
+        .bind(device_id)
+        .bind(&tenant_id)
+        .bind(display_name)
+        .bind(owner_user_id)
+        .bind(asset_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO user_groups (id, tenant_id, owner_user_id, name)
+         VALUES (?, ?, ?, 'Workspace operators')",
+    )
+    .bind(&group_id)
+    .bind(&tenant_id)
+    .bind(&viewer_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO user_group_members (tenant_id, group_id, user_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(&tenant_id)
+    .bind(&group_id)
+    .bind(&viewer_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    for (subject_user_id, subject_group_id, asset_id, device_id, permission, inherit_children) in [
+        (
+            Some(viewer_id.as_str()),
+            None,
+            None,
+            Some("direct-device"),
+            "viewer",
+            0_i64,
+        ),
+        (
+            None,
+            Some(group_id.as_str()),
+            None,
+            Some("group-device"),
+            "manager",
+            0_i64,
+        ),
+        (
+            Some(viewer_id.as_str()),
+            None,
+            Some(inherited_asset_id.as_str()),
+            None,
+            "viewer",
+            1_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_permissions (
+                id, tenant_id, subject_user_id, subject_group_id, asset_id, device_id,
+                permission, inherit_children, created_by_user_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&tenant_id)
+        .bind(subject_user_id)
+        .bind(subject_group_id)
+        .bind(asset_id)
+        .bind(device_id)
+        .bind(permission)
+        .bind(inherit_children)
+        .bind(&viewer_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store,
+        NewTenant {
+            slug: "other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, last_seen_at)
+         VALUES ('other-tenant-device', ?, 'Cross tenant device', '2026-09-18T10:20:30Z')",
+    )
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn platform_root_redirects_each_authenticated_session_kind_to_its_workspace() {
     let (_directory, management) = management_session_router().await;
@@ -330,7 +473,7 @@ async fn platform_routes_render_the_matching_server_layout_and_local_css() {
     for (cookie, path, heading) in [
         (&system_cookie, "/system", "System Console"),
         (&tenant_cookie, "/tenant", "Tenant Console"),
-        (&user_cookie, "/app", "My Workspace"),
+        (&user_cookie, "/app", "My Devices"),
     ] {
         let response = router
             .clone()
@@ -386,6 +529,94 @@ async fn system_tenants_navigation_resolves_to_the_system_overview_for_a_system_
     )
     .unwrap();
     assert!(body.contains("href=\"/system\">Tenants</a>"));
+}
+
+#[tokio::test]
+async fn user_workspace_lists_only_authorized_devices_with_server_resolved_access() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    seed_user_workspace_devices(store.as_ref()).await;
+
+    let router = management.router;
+    let user_cookie = user_account_cookie(&router).await;
+    let response = router
+        .oneshot(platform_get("/app", Some(&user_cookie)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    for (device_name, permission, access_source) in [
+        ("Owned device", "Owner", "Owner"),
+        ("Direct device", "Viewer", "Direct user permission"),
+        ("Group device", "Manager", "Group permission"),
+        ("Inherited device", "Viewer", "Inherited user permission"),
+    ] {
+        assert!(body.contains(device_name), "missing {device_name}");
+        assert!(body.contains(permission), "missing {permission}");
+        assert!(body.contains(access_source), "missing {access_source}");
+    }
+    assert!(body.contains("2026-09-18T10:20:30Z"));
+    assert!(!body.contains("Unshared device"));
+    assert!(!body.contains("Cross tenant device"));
+    assert!(!body.contains("href=\"/system"));
+    assert!(!body.contains("href=\"/tenant"));
+    assert!(!body.contains("/commands"));
+    assert!(!body.contains("<form"));
+}
+
+#[tokio::test]
+async fn user_workspace_device_detail_masks_unavailable_devices_and_denies_other_sessions() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    seed_user_workspace_devices(store.as_ref()).await;
+
+    let router = management.router;
+    let user_cookie = user_account_cookie(&router).await;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let system_cookie = system_account_cookie(&router).await;
+
+    let authorized = router
+        .clone()
+        .oneshot(platform_get(
+            "/app/devices/direct-device",
+            Some(&user_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let authorized_body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
+    let authorized_body = String::from_utf8(authorized_body.to_vec()).unwrap();
+    assert!(authorized_body.contains("Direct device"));
+    assert!(authorized_body.contains("Viewer"));
+    assert!(authorized_body.contains("Direct user permission"));
+    assert!(!authorized_body.contains("<form"));
+    assert!(!authorized_body.contains("/commands"));
+
+    for device_id in ["other-tenant-device", "guessed-device"] {
+        let response = router
+            .clone()
+            .oneshot(platform_get(
+                &format!("/app/devices/{device_id}"),
+                Some(&user_cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{device_id}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Device unavailable"));
+        assert!(!body.contains("Cross tenant device"));
+    }
+
+    for cookie in [&tenant_cookie, &system_cookie] {
+        let response = router
+            .clone()
+            .oneshot(platform_get("/app/devices/direct-device", Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[tokio::test]

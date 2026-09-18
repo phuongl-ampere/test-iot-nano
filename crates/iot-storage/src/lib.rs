@@ -1605,6 +1605,7 @@ pub struct AuthorizedDeviceSummary {
     pub device_id: String,
     pub display_name: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
+    pub access: ResourceAccess,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3041,6 +3042,17 @@ impl PlatformStore {
         after: Option<&str>,
         limit: u32,
     ) -> Result<Vec<AuthorizedDeviceListEntry>, PlatformStoreError> {
+        self.list_authorized_devices_matching(subject, after, limit, None)
+            .await
+    }
+
+    async fn list_authorized_devices_matching(
+        &self,
+        subject: &AuthorizationSubject,
+        after: Option<&str>,
+        limit: u32,
+        device_id: Option<&str>,
+    ) -> Result<Vec<AuthorizedDeviceListEntry>, PlatformStoreError> {
         let limit = i64::from(limit);
         match self {
             Self::Sqlite(store) => {
@@ -3055,6 +3067,7 @@ impl PlatformStore {
                          WHERE tenant_id = ?
                            AND deleted_at IS NULL
                            AND (? IS NULL OR device_id > ?)
+                           AND (? IS NULL OR device_id = ?)
                      ),
                      ancestors(device_id, asset_id, depth) AS (
                          SELECT device_id, asset_id, 0
@@ -3152,6 +3165,8 @@ impl PlatformStore {
                 .bind(&tenant_id)
                 .bind(after)
                 .bind(after)
+                .bind(device_id)
+                .bind(device_id)
                 .bind(&tenant_id)
                 .bind(&user_id)
                 .bind(&tenant_id)
@@ -3193,6 +3208,7 @@ impl PlatformStore {
                          WHERE d.tenant_id = $1
                            AND d.deleted_at IS NULL
                            AND ($2::text IS NULL OR d.device_id > $2)
+                           AND ($4::text IS NULL OR d.device_id = $4)
                      ),
                      ancestors(device_id, asset_id, depth) AS (
                          SELECT device_id, asset_id, 0
@@ -3288,11 +3304,12 @@ impl PlatformStore {
                        ON runtime.tenant_id = $1
                       AND runtime.device_id = candidate.device_id
                      ORDER BY candidate.device_id
-                     LIMIT $4",
+                     LIMIT $5",
                 )
                 .bind(subject.tenant_id)
                 .bind(after)
                 .bind(subject.user_id)
+                .bind(device_id)
                 .bind(limit)
                 .fetch_all(pool)
                 .await?;
@@ -3318,67 +3335,15 @@ impl PlatformStore {
         subject: &AuthorizationSubject,
         device_id: &str,
     ) -> Result<Option<AuthorizedDeviceSummary>, PlatformStoreError> {
-        match self {
-            Self::Sqlite(store) => {
-                if sqlite_device_resource_permission(store.pool(), subject, device_id)
-                    .await?
-                    .is_none()
-                {
-                    return Ok(None);
-                }
-                let row = sqlx::query(
-                    "SELECT device_id, display_name, last_seen_at
-                     FROM devices
-                     WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
-                )
-                .bind(device_id)
-                .bind(subject.tenant_id.to_string())
-                .fetch_optional(store.pool())
-                .await?;
-                row.map(|row| {
-                    let last_seen_at = row
-                        .try_get::<Option<String>, _>("last_seen_at")?
-                        .map(|value| parse_authorized_device_timestamp(&value))
-                        .transpose()?;
-                    Ok(AuthorizedDeviceSummary {
-                        device_id: row.try_get("device_id")?,
-                        display_name: row.try_get("display_name")?,
-                        last_seen_at,
-                    })
-                })
-                .transpose()
-            }
-            Self::Timescale(pool) => {
-                if timescale_device_resource_permission(pool, subject, device_id)
-                    .await?
-                    .is_none()
-                {
-                    return Ok(None);
-                }
-                let row = sqlx::query(
-                    "SELECT d.device_id, d.display_name, runtime.last_seen_at
-                     FROM devices AS d
-                     LEFT JOIN device_runtime_state AS runtime
-                       ON runtime.tenant_id = $2
-                      AND runtime.device_id = d.device_id
-                     WHERE d.device_id = $1
-                       AND d.tenant_id = $2
-                       AND d.deleted_at IS NULL",
-                )
-                .bind(device_id)
-                .bind(subject.tenant_id)
-                .fetch_optional(pool)
-                .await?;
-                row.map(|row| {
-                    Ok(AuthorizedDeviceSummary {
-                        device_id: row.try_get("device_id")?,
-                        display_name: row.try_get("display_name")?,
-                        last_seen_at: row.try_get("last_seen_at")?,
-                    })
-                })
-                .transpose()
-            }
-        }
+        let mut devices = self
+            .list_authorized_devices_matching(subject, None, 1, Some(device_id))
+            .await?;
+        Ok(devices.pop().map(|device| AuthorizedDeviceSummary {
+            device_id: device.device_id,
+            display_name: device.display_name,
+            last_seen_at: device.last_seen_at,
+            access: device.access,
+        }))
     }
 
     pub async fn device_permission(

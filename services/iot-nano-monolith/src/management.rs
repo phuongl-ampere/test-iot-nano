@@ -24,16 +24,17 @@ use iot_api::{
     provision_platform_device_token, validate_password,
 };
 use iot_storage::{
-    ApplicationKind, ApplicationRepository, ClientId, CreateManagementAsset,
-    CreateManagementAssetProfile, CreateManagementDeviceProfile, CreateManagementUser,
-    ManagementAsset as StorageManagementAsset, ManagementAssetError, ManagementAssetProfile,
-    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
-    ManagementChildStatus, ManagementDevice as StorageManagementDevice, ManagementDeviceError,
-    ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
-    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
-    ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
-    NewOAuthClientSecret, NewSystemAccount, NewTenant, NewTenantAccount, OAuthRepository,
-    PlatformStore, PlatformStoreError, RedirectUri, SystemAccount, TenantIdentityError,
+    ApplicationKind, ApplicationRepository, AuthorizationRepository, AuthorizationSubject,
+    ClientId, CreateManagementAsset, CreateManagementAssetProfile, CreateManagementDeviceProfile,
+    CreateManagementUser, ManagementAsset as StorageManagementAsset, ManagementAssetError,
+    ManagementAssetProfile, ManagementAssetProfileError, ManagementAssetProfileRepository,
+    ManagementAssetRepository, ManagementChildStatus, ManagementDevice as StorageManagementDevice,
+    ManagementDeviceError, ManagementDeviceProfile, ManagementDeviceProfileError,
+    ManagementDeviceProfileRepository, ManagementDeviceRepository, ManagementDeviceTopology,
+    ManagementGatewayStatus, ManagementUser, ManagementUserError, ManagementUserRepository,
+    ManagementUserRole, NewApplication, NewOAuthClientSecret, NewSystemAccount, NewTenant,
+    NewTenantAccount, OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri,
+    ResourceAccess, ResourceAccessSource, ResourcePermission, SystemAccount, TenantIdentityError,
     TenantIdentityRepository, TenantStatus, UpdateManagementAsset, UpdateManagementAssetProfile,
     UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
 };
@@ -54,6 +55,7 @@ const SESSION_COOKIE: &str = "iot_nano_session";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: u8 = 5;
+const USER_DEVICE_LIST_LIMIT: u32 = 100;
 
 #[derive(Debug, Error)]
 pub enum BootstrapSystemError {
@@ -131,6 +133,7 @@ impl ManagementSessionRouter {
             )
             .route("/tenant", get(platform_tenant))
             .route("/app", get(platform_app))
+            .route("/app/devices/{device_id}", get(platform_app_device_detail))
             .route("/assets/platform-ui.css", get(platform_stylesheet))
             .route("/api/auth/login", post(login))
             .route("/api/auth/logout", post(logout))
@@ -2001,6 +2004,43 @@ async fn platform_app(
     platform_page(&state, PlatformUiSession::User { user_id, tenant_id }, None).await
 }
 
+async fn platform_app_device_detail(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Result<Response, ManagementSessionError> {
+    let PlatformUiSession::User { user_id, tenant_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    let subject = user_authorization_subject(&state, user_id, tenant_id).await?;
+    let identity = crate::PlatformUiIdentity::new(format!("User {user_id}"));
+    let device =
+        AuthorizationRepository::authorized_device(state.store.as_ref(), &subject, &device_id)
+            .await
+            .map_err(|_| ManagementSessionError::Unavailable)?;
+
+    match device {
+        Some(device) => {
+            let page = crate::UserDeviceDetailPage::new(user_device_row(
+                device.device_id,
+                device.display_name,
+                device.last_seen_at,
+                device.access,
+            ));
+            let rendered = crate::PlatformUiRenderer::render_user_device(&identity, &page)
+                .map_err(|_| ManagementSessionError::Unavailable)?;
+            Ok(Html(rendered).into_response())
+        }
+        None => {
+            let rendered = crate::PlatformUiRenderer::render_user_device_unavailable(&identity)
+                .map_err(|_| ManagementSessionError::Unavailable)?;
+            Ok((StatusCode::NOT_FOUND, Html(rendered)).into_response())
+        }
+    }
+}
+
 async fn platform_page(
     state: &ManagementState,
     session: PlatformUiSession,
@@ -2027,16 +2067,101 @@ async fn platform_page(
                 &crate::PlatformUiIdentity::new(format!("System Account {system_account_id}")),
                 &page,
             )
+            .map_err(|_| ManagementSessionError::Unavailable)
         }
         PlatformUiSession::Tenant { tenant_id } => crate::PlatformUiRenderer::render_tenant(
             &crate::PlatformUiIdentity::new(format!("Tenant {tenant_id}")),
-        ),
-        PlatformUiSession::User { user_id, tenant_id } => crate::PlatformUiRenderer::render_user(
-            &crate::PlatformUiIdentity::new(format!("User {user_id} (tenant {tenant_id})")),
-        ),
-    }
-    .map_err(|_| ManagementSessionError::Unavailable)?;
+        )
+        .map_err(|_| ManagementSessionError::Unavailable),
+        PlatformUiSession::User { user_id, tenant_id } => {
+            let subject = user_authorization_subject(state, user_id, tenant_id).await?;
+            let devices = AuthorizationRepository::list_authorized_devices(
+                state.store.as_ref(),
+                &subject,
+                None,
+                USER_DEVICE_LIST_LIMIT,
+            )
+            .await
+            .map_err(|_| ManagementSessionError::Unavailable)?;
+            let page = crate::UserDeviceListPage::new(
+                devices
+                    .into_iter()
+                    .map(|device| {
+                        user_device_row(
+                            device.device_id,
+                            device.display_name,
+                            device.last_seen_at,
+                            device.access,
+                        )
+                    })
+                    .collect(),
+            );
+            crate::PlatformUiRenderer::render_user(
+                &crate::PlatformUiIdentity::new(format!("User {user_id}")),
+                &page,
+            )
+            .map_err(|_| ManagementSessionError::Unavailable)
+        }
+    }?;
     Ok(Html(rendered))
+}
+
+async fn user_authorization_subject(
+    state: &ManagementState,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<AuthorizationSubject, ManagementSessionError> {
+    let subject = AuthorizationRepository::authorization_subject(state.store.as_ref(), user_id)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?
+        .ok_or(ManagementSessionError::Unauthorized)?;
+    if subject.tenant_id != tenant_id {
+        return Err(ManagementSessionError::Forbidden);
+    }
+    Ok(subject)
+}
+
+fn user_device_row(
+    device_id: String,
+    display_name: Option<String>,
+    last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    access: ResourceAccess,
+) -> crate::UserDeviceRow {
+    let display_name = display_name.unwrap_or_else(|| device_id.clone());
+    let activity = match last_seen_at {
+        Some(timestamp) => format!(
+            "Last seen {}",
+            timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        None => "No activity reported".to_owned(),
+    };
+    crate::UserDeviceRow::new(
+        device_id,
+        display_name,
+        activity,
+        resource_permission_label(access.permission),
+        resource_access_source_label(access.source),
+    )
+}
+
+fn resource_permission_label(permission: ResourcePermission) -> &'static str {
+    match permission {
+        ResourcePermission::Viewer => "Viewer",
+        ResourcePermission::Controller => "Controller",
+        ResourcePermission::Manager => "Manager",
+        ResourcePermission::Owner => "Owner",
+    }
+}
+
+fn resource_access_source_label(source: ResourceAccessSource) -> &'static str {
+    match source {
+        ResourceAccessSource::TenantAccount => "Tenant account",
+        ResourceAccessSource::Owner => "Owner",
+        ResourceAccessSource::DirectUser => "Direct user permission",
+        ResourceAccessSource::Group => "Group permission",
+        ResourceAccessSource::InheritedUser => "Inherited user permission",
+        ResourceAccessSource::InheritedGroup => "Inherited group permission",
+    }
 }
 
 fn system_tenant_status_label(status: TenantStatus) -> &'static str {
