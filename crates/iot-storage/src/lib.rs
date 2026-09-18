@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod device_relations;
 mod management;
 mod public_api;
 mod tenant_identity;
@@ -37,6 +38,10 @@ const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform
 const SQLITE_PLATFORM_SCHEMA_VERSION: i64 = 1;
 const SET_SQLITE_PLATFORM_SCHEMA_VERSION: &str = "PRAGMA user_version = 1";
 
+pub use device_relations::{
+    CreateDeviceRelation, DeviceRelation, DeviceRelationError, DeviceRelationRepository,
+    RESERVED_GATEWAY_CHILD_RELATION_TYPE,
+};
 pub use management::{
     CreateManagementAsset, CreateManagementAssetProfile, CreateManagementDeviceProfile,
     CreateManagementUser, DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError,
@@ -372,6 +377,28 @@ CREATE INDEX IF NOT EXISTS devices_owner_user_id_index
 CREATE INDEX IF NOT EXISTS assets_owner_user_id_index
     ON assets (owner_user_id)
     WHERE owner_user_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS device_relations (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    from_device_id TEXT NOT NULL,
+    to_device_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (tenant_id, from_device_id, to_device_id, relation_type),
+    FOREIGN KEY (from_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (to_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    CHECK (from_device_id <> to_device_id),
+    CHECK (
+        length(relation_type) BETWEEN 1 AND 64
+        AND relation_type NOT GLOB '*[^A-Za-z0-9_-]*'
+        AND relation_type <> 'gateway_child'
+    )
+);
+CREATE INDEX IF NOT EXISTS device_relations_tenant_list_index
+    ON device_relations (tenant_id, relation_type, from_device_id, to_device_id, id);
 
 CREATE TABLE IF NOT EXISTS user_groups (
     id TEXT PRIMARY KEY,

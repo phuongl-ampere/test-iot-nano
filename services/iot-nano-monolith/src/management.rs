@@ -25,8 +25,9 @@ use iot_api::{
 };
 use iot_storage::{
     ApplicationKind, ApplicationRepository, AuthorizationRepository, AuthorizationSubject,
-    ClientId, CreateManagementAsset, CreateManagementAssetProfile, CreateManagementDeviceProfile,
-    CreateManagementUser, ManagementAsset as StorageManagementAsset, ManagementAssetError,
+    ClientId, CreateDeviceRelation, CreateManagementAsset, CreateManagementAssetProfile,
+    CreateManagementDeviceProfile, CreateManagementUser, DeviceRelationError,
+    DeviceRelationRepository, ManagementAsset as StorageManagementAsset, ManagementAssetError,
     ManagementAssetProfile, ManagementAssetProfileError, ManagementAssetProfileRepository,
     ManagementAssetRepository, ManagementChildStatus, ManagementDevice as StorageManagementDevice,
     ManagementDeviceError, ManagementDeviceProfile, ManagementDeviceProfileError,
@@ -176,6 +177,14 @@ impl ManagementSessionRouter {
             .route(
                 "/tenant/topology/detach",
                 post(detach_tenant_gateway_child_form),
+            )
+            .route(
+                "/tenant/relations",
+                get(platform_tenant_relations).post(create_tenant_relation_form),
+            )
+            .route(
+                "/tenant/relations/delete",
+                post(delete_tenant_relation_form),
             )
             .route("/app", get(platform_app))
             .route("/app/assets", get(platform_app_assets))
@@ -1639,6 +1648,20 @@ struct DetachTenantGatewayChildForm {
     child_device_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateTenantDeviceRelationForm {
+    from_device_id: String,
+    to_device_id: String,
+    relation_type: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteTenantDeviceRelationForm {
+    relation_id: Uuid,
+}
+
 #[derive(Serialize)]
 struct SystemTenantResponse {
     id: Uuid,
@@ -2209,6 +2232,20 @@ async fn platform_tenant_topology(
     .await
 }
 
+async fn platform_tenant_relations(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_relations_page(
+        &state,
+        tenant,
+        tenant_relation_notice(request.uri().query()),
+    )
+    .await
+}
+
 async fn tenant_assets_page(
     state: &ManagementState,
     tenant: TenantSession,
@@ -2424,6 +2461,71 @@ async fn tenant_topology_page(
     Ok(Html(rendered))
 }
 
+async fn tenant_relations_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let devices =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_device_error)?;
+    let relations =
+        DeviceRelationRepository::list_device_relations(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(device_relation_error)?;
+    let device_names: HashMap<String, String> = devices
+        .iter()
+        .map(|device| {
+            (
+                device.device_id.clone(),
+                device
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| device.device_id.clone()),
+            )
+        })
+        .collect();
+    let options = devices
+        .into_iter()
+        .map(|device| {
+            let label = device
+                .display_name
+                .unwrap_or_else(|| device.device_id.clone());
+            crate::TenantSelectOption::new(device.device_id, label)
+        })
+        .collect();
+    let page = crate::TenantRelationsPage::new(
+        options,
+        relations
+            .into_iter()
+            .map(|relation| {
+                let from_device = device_names
+                    .get(&relation.from_device_id)
+                    .cloned()
+                    .unwrap_or(relation.from_device_id);
+                let to_device = device_names
+                    .get(&relation.to_device_id)
+                    .cloned()
+                    .unwrap_or(relation.to_device_id);
+                crate::TenantRelationRow::new(
+                    relation.id.to_string(),
+                    from_device,
+                    relation.relation_type,
+                    to_device,
+                )
+            })
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_relations(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
 async fn create_tenant_asset_form(
     State(state): State<ManagementState>,
     request: Request,
@@ -2592,6 +2694,58 @@ async fn detach_tenant_gateway_child_form(
     }
 }
 
+async fn create_tenant_relation_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: CreateTenantDeviceRelationForm =
+        match management_request_form(&state, request).await {
+            Ok(request) => request,
+            Err(error) => return tenant_relation_form_error(error),
+        };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match DeviceRelationRepository::create_device_relation(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        CreateDeviceRelation {
+            from_device_id: request.from_device_id,
+            to_device_id: request.to_device_id,
+            relation_type: request.relation_type,
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(Redirect::to("/tenant/relations?notice=relation-created")),
+        Err(error) => tenant_relation_form_error(device_relation_error(error)),
+    }
+}
+
+async fn delete_tenant_relation_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: DeleteTenantDeviceRelationForm =
+        match management_request_form(&state, request).await {
+            Ok(request) => request,
+            Err(error) => return tenant_relation_form_error(error),
+        };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match DeviceRelationRepository::delete_device_relation(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        request.relation_id,
+    )
+    .await
+    {
+        Ok(_) => Ok(Redirect::to("/tenant/relations?notice=relation-deleted")),
+        Err(error) => tenant_relation_form_error(device_relation_error(error)),
+    }
+}
+
 fn tenant_topology_device_id(value: &str) -> Result<&str, ManagementSessionError> {
     let value = value.trim();
     if value.is_empty() {
@@ -2661,6 +2815,37 @@ fn tenant_topology_form_error(
             "/tenant/topology?notice=mutation-unavailable"
         }
         ManagementSessionError::Unavailable => "/tenant/topology?notice=service-unavailable",
+    };
+    Ok(Redirect::to(path))
+}
+
+fn tenant_relation_notice(query: Option<&str>) -> Option<&'static str> {
+    match query {
+        Some("notice=relation-created") => Some("Device relation created."),
+        Some("notice=relation-deleted") => Some("Device relation deleted."),
+        Some("notice=invalid-request") => Some("Request could not be processed."),
+        Some("notice=mutation-unavailable") => {
+            Some("The requested device relation is unavailable.")
+        }
+        Some("notice=service-unavailable") => Some("Tenant management service is unavailable."),
+        _ => None,
+    }
+}
+
+fn tenant_relation_form_error(
+    error: ManagementSessionError,
+) -> Result<Redirect, ManagementSessionError> {
+    let path = match error {
+        ManagementSessionError::Unauthorized
+        | ManagementSessionError::TooManyRequests
+        | ManagementSessionError::Forbidden => return Err(error),
+        ManagementSessionError::BadRequest
+        | ManagementSessionError::UnsupportedMediaType
+        | ManagementSessionError::PayloadTooLarge => "/tenant/relations?notice=invalid-request",
+        ManagementSessionError::NotFound | ManagementSessionError::Conflict => {
+            "/tenant/relations?notice=mutation-unavailable"
+        }
+        ManagementSessionError::Unavailable => "/tenant/relations?notice=service-unavailable",
     };
     Ok(Redirect::to(path))
 }
@@ -4655,6 +4840,22 @@ fn management_device_error(error: ManagementDeviceError) -> ManagementSessionErr
         ManagementDeviceError::InvalidStoredAttributes
         | ManagementDeviceError::InvalidStoredTimestamp
         | ManagementDeviceError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn device_relation_error(error: DeviceRelationError) -> ManagementSessionError {
+    match error {
+        DeviceRelationError::InvalidDeviceId(_)
+        | DeviceRelationError::InvalidRelationType(_)
+        | DeviceRelationError::ReservedRelationType
+        | DeviceRelationError::SelfRelation => ManagementSessionError::BadRequest,
+        DeviceRelationError::DeviceNotFound { .. } | DeviceRelationError::RelationNotFound => {
+            ManagementSessionError::NotFound
+        }
+        DeviceRelationError::RelationConflict => ManagementSessionError::Conflict,
+        DeviceRelationError::InvalidStoredRelation | DeviceRelationError::Storage { .. } => {
+            ManagementSessionError::Unavailable
+        }
     }
 }
 

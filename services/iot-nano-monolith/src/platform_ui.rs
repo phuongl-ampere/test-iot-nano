@@ -375,6 +375,53 @@ impl TenantTopologyPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRelationRow {
+    id: String,
+    from_device: String,
+    relation_type: String,
+    to_device: String,
+}
+
+impl TenantRelationRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        from_device: impl Into<String>,
+        relation_type: impl Into<String>,
+        to_device: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            from_device: from_device.into(),
+            relation_type: relation_type.into(),
+            to_device: to_device.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRelationsPage {
+    devices: Vec<TenantSelectOption>,
+    relations: Vec<TenantRelationRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantRelationsPage {
+    pub(crate) fn new(
+        devices: Vec<TenantSelectOption>,
+        relations: Vec<TenantRelationRow>,
+        notice: Option<&'static str>,
+    ) -> Self {
+        Self {
+            devices,
+            relations,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantDeviceCredentialPage {
     device_id: String,
     display_name: String,
@@ -576,6 +623,13 @@ impl PlatformUiRenderer {
         TenantTopologyLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_relations(
+        identity: &PlatformUiIdentity,
+        page: &TenantRelationsPage,
+    ) -> Result<String, askama::Error> {
+        TenantRelationsLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_device_credential(
         identity: &PlatformUiIdentity,
         page: &TenantDeviceCredentialPage,
@@ -736,6 +790,19 @@ pub struct TenantTopologyLayout<'a> {
 
 impl<'a> TenantTopologyLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantTopologyPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_relations.html")]
+pub struct TenantRelationsLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantRelationsPage,
+}
+
+impl<'a> TenantRelationsLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantRelationsPage) -> Self {
         Self { identity, page }
     }
 }

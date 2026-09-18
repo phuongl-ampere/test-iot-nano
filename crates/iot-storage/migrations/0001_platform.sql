@@ -240,6 +240,27 @@ CREATE INDEX IF NOT EXISTS devices_tenant_gateway_device_id_index
 CREATE INDEX IF NOT EXISTS devices_owner_user_id_index ON devices (owner_user_id) WHERE owner_user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS assets_owner_user_id_index ON assets (owner_user_id) WHERE owner_user_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS device_relations (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    from_device_id TEXT NOT NULL,
+    to_device_id TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, from_device_id, to_device_id, relation_type),
+    FOREIGN KEY (from_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    FOREIGN KEY (to_device_id, tenant_id)
+        REFERENCES devices(device_id, tenant_id) ON DELETE RESTRICT,
+    CHECK (from_device_id <> to_device_id),
+    CHECK (
+        relation_type ~ '^[A-Za-z0-9_-]{1,64}$'
+        AND relation_type <> 'gateway_child'
+    )
+);
+CREATE INDEX IF NOT EXISTS device_relations_tenant_list_index
+    ON device_relations (tenant_id, relation_type, from_device_id, to_device_id, id);
+
 CREATE TABLE IF NOT EXISTS device_tokens (
     id UUID PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
     token_prefix TEXT NOT NULL UNIQUE, token_hash TEXT NOT NULL, token_ciphertext TEXT,

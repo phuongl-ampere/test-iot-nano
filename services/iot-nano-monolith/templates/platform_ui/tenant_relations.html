@@ -1,0 +1,85 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Device Relations | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link" href="/tenant/assets">Assets</a>
+  <a class="nav-link" href="/tenant/devices">Devices</a>
+  <a class="nav-link" href="/tenant/topology">Topology</a>
+  <a class="nav-link active" href="/tenant/relations" aria-current="page">Relations</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Device Relations</h1>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Create relation</h2></header>
+    {% if page.devices.is_empty() %}
+      <p class="empty-state">Devices are required before creating relations.</p>
+    {% else %}
+      <form class="form-grid" action="/tenant/relations" method="post">
+        <label class="field">
+          <span>From device</span>
+          <select name="from_device_id" required>
+            {% for device in page.devices %}
+              <option value="{{ device.value }}">{{ device.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="field">
+          <span>Relation type</span>
+          <input name="relation_type" required maxlength="64" pattern="[A-Za-z0-9_-]+">
+        </label>
+        <label class="field">
+          <span>To device</span>
+          <select name="to_device_id" required>
+            {% for device in page.devices %}
+              <option value="{{ device.value }}">{{ device.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="form-actions"><button type="submit">Create relation</button></div>
+      </form>
+    {% endif %}
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Relations</h2></header>
+    {% if page.relations.is_empty() %}
+      <p class="empty-state">No device relations configured.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">From</th>
+              <th scope="col">Type</th>
+              <th scope="col">To</th>
+              <th scope="col"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for relation in page.relations %}
+              <tr>
+                <td>{{ relation.from_device }}</td>
+                <td><code>{{ relation.relation_type }}</code></td>
+                <td>{{ relation.to_device }}</td>
+                <td>
+                  <form action="/tenant/relations/delete" method="post">
+                    <input type="hidden" name="relation_id" value="{{ relation.id }}">
+                    <button type="submit">Delete</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

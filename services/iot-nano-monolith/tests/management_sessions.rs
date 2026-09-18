@@ -3901,3 +3901,138 @@ async fn tenant_topology_routes_require_a_tenant_session_before_form_parsing() {
         }
     }
 }
+
+#[tokio::test]
+async fn tenant_relations_page_and_forms_use_the_authenticated_tenant() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+    let first = management_provision_device(&router, &tenant_cookie, "Relation first").await;
+    let first_id = first["device_id"].as_str().unwrap().to_owned();
+    let second = management_provision_device(&router, &tenant_cookie, "Relation second").await;
+    let second_id = second["device_id"].as_str().unwrap().to_owned();
+
+    let overview = router
+        .clone()
+        .oneshot(platform_get("/tenant", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(overview.status(), StatusCode::OK);
+    let overview = String::from_utf8(
+        to_bytes(overview.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(overview.contains("href=\"/tenant/relations\""));
+
+    let page = router
+        .clone()
+        .oneshot(platform_get("/tenant/relations", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+
+    let injected_tenant = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/relations",
+            Some(&tenant_cookie),
+            &format!(
+                "from_device_id={first_id}&to_device_id={second_id}&relation_type=located_near&tenant_id=injected"
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(injected_tenant.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        injected_tenant.headers()[LOCATION],
+        "/tenant/relations?notice=invalid-request"
+    );
+
+    let created = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/relations",
+            Some(&tenant_cookie),
+            &format!(
+                "from_device_id={first_id}&to_device_id={second_id}&relation_type=located_near"
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        created.headers()[LOCATION],
+        "/tenant/relations?notice=relation-created"
+    );
+    let tenant_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let relation_id: String = sqlx::query_scalar(
+        "SELECT id FROM device_relations
+         WHERE tenant_id = ? AND from_device_id = ? AND to_device_id = ?",
+    )
+    .bind(&tenant_id)
+    .bind(&first_id)
+    .bind(&second_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    let deleted = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/relations/delete",
+            Some(&tenant_cookie),
+            &format!("relation_id={relation_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        deleted.headers()[LOCATION],
+        "/tenant/relations?notice=relation-deleted"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_relations WHERE tenant_id = ?",)
+            .bind(tenant_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn tenant_relation_routes_require_a_tenant_session_before_form_parsing() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for (cookie, expected_status) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(system_cookie.as_str()), StatusCode::FORBIDDEN),
+        (Some(user_cookie.as_str()), StatusCode::FORBIDDEN),
+    ] {
+        let page = router
+            .clone()
+            .oneshot(platform_get("/tenant/relations", cookie))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), expected_status);
+
+        for path in ["/tenant/relations", "/tenant/relations/delete"] {
+            let mutation = router
+                .clone()
+                .oneshot(system_lifecycle_form(path, cookie, "%"))
+                .await
+                .unwrap();
+            assert_eq!(mutation.status(), expected_status, "{path}");
+        }
+    }
+}
