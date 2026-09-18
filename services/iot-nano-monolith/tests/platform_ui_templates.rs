@@ -266,10 +266,9 @@ fn tenant_layout_renders_only_tenant_navigation() {
     let rendered = PlatformUiRenderer::render_tenant(&identity).unwrap();
 
     assert!(rendered.contains("Tenant Console"));
-    assert!(rendered.contains("href=\"/tenant/users\""));
-    assert!(rendered.contains("href=\"/tenant/assets\""));
-    assert!(rendered.contains("href=\"/tenant/devices\""));
     assert!(rendered.contains("href=\"/tenant\" aria-current=\"page\""));
+    assert!(rendered.contains("href=\"/tenant/groups\""));
+    assert!(rendered.contains("href=\"/tenant/permissions\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
 }
 
