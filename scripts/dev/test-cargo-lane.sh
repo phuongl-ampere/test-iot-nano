@@ -117,6 +117,7 @@ set -euo pipefail
   printf 'args:\n'
   printf '%s\n' "$@"
 } >"$CAPTURE_FILE"
+exit "${CARGO_EXIT_CODE:-0}"
 EOF
 chmod +x "$fixture/bin/cargo"
 
@@ -151,6 +152,20 @@ assert_equal "$target_a_first" "$target_a_second" \
 expected_args="$(printf '%s\n' "${command[@]}")"
 assert_equal "$expected_args" "$(captured_args "$fixture/a-first.capture")" \
   'the cargo command after the delimiter must be preserved exactly'
+
+log_failure_status=0
+if CAPTURE_FILE="$fixture/log-failure.capture" \
+  CARGO_EXIT_CODE=73 \
+  IOT_NANO_LANE_TARGET_ROOT="$fixture/targets" \
+  IOT_NANO_LANE_LOG=/dev/full \
+  PATH="$fixture/bin:$PATH" \
+  "$repository_a/scripts/dev/cargo-lane.sh" fast-storage -- check -p iot-storage; then
+  log_failure_status=0
+else
+  log_failure_status=$?
+fi
+assert_equal '73' "$log_failure_status" \
+  'an unwritable timing log must not change Cargo failure status'
 
 run_wrapper_case "$repository_a" "$fixture/rustc-wrapper.capture" \
   RUSTC_WRAPPER='caller-rustc-wrapper'

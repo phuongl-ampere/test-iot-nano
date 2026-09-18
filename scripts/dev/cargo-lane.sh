@@ -25,7 +25,7 @@ target_root="${IOT_NANO_LANE_TARGET_ROOT:-$cache_root/rush-iot-nano/cargo-lanes}
 target_dir="$target_root/$worktree_key/$lane"
 log_path="${IOT_NANO_LANE_LOG:-$root/.cargo-lane/timing.log}"
 
-mkdir -p "$target_dir" "$(dirname "$log_path")"
+mkdir -p "$target_dir"
 
 SECONDS=0
 if CARGO_TARGET_DIR="$target_dir" cargo "$@"; then
@@ -35,8 +35,12 @@ else
 fi
 elapsed_seconds="$SECONDS"
 
-printf '%s lane=%q worktree=%q target=%q elapsed_seconds=%s exit=%s\n' \
+if ! mkdir -p "$(dirname "$log_path")"; then
+  :
+elif ! printf '%s lane=%q worktree=%q target=%q elapsed_seconds=%s exit=%s\n' \
   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$lane" "$worktree_key" "$target_dir" \
-  "$elapsed_seconds" "$status" >>"$log_path"
+  "$elapsed_seconds" "$status" >>"$log_path"; then
+  :
+fi
 
 exit "$status"
