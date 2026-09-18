@@ -1,0 +1,65 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}System Infrastructure | IoT Nano{% endblock %}
+{% block account_kind %}System Account{% endblock %}
+{% block navigation_label %}System navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/system">Overview</a>
+  <a class="nav-link" href="/system">Tenants</a>
+  <a class="nav-link active" href="/system/infrastructure" aria-current="page">Infrastructure</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">System Account</p>
+    <h1>System infrastructure</h1>
+    <p>Runtime state and configuration status.</p>
+  </section>
+  <section class="summary-grid" aria-label="Runtime health">
+    <article class="summary-item">
+      <span>Runtime health</span>
+      <strong>{{ page.health }}</strong>
+    </article>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Listeners</h2></header>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Listener</th>
+            <th scope="col">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for listener in page.listeners %}
+            <tr>
+              <td>{{ listener.label }}</td>
+              <td>{{ listener.value }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Runtime configuration</h2></header>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Component</th>
+            <th scope="col">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in page.configuration %}
+            <tr>
+              <td>{{ item.label }}</td>
+              <td>{{ item.value }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

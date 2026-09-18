@@ -6,7 +6,7 @@ use std::{
 
 use iot_api::{hash_password, seed_tenant_test_users_sqlite};
 use iot_core::{DatabaseStorage, StorageConfiguration};
-use iot_nano_monolith::{MonolithConfig, MonolithRuntime};
+use iot_nano_monolith::{MonolithConfig, MonolithRuntime, bootstrap_system};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, NewTenant, NewTenantAccount,
     TenantIdentityRepository,
@@ -80,6 +80,85 @@ async fn alpha_runtime_binds_health_and_mqtt_after_recovery() {
         let listener = TcpListener::bind(address).await.unwrap();
         drop(listener);
     }
+}
+
+#[tokio::test]
+async fn alpha_runtime_renders_system_infrastructure_from_started_runtime_without_secrets() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+    bootstrap_system(runtime.platform().unwrap(), "system", "SystemAccount@2026")
+        .await
+        .unwrap();
+
+    let login_body = r#"{"username":"system","password":"SystemAccount@2026"}"#;
+    let login = send_http(
+        fixture.config.management_http,
+        format!(
+            "POST /api/system/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{login_body}",
+            login_body.len(),
+        ),
+    )
+    .await;
+    assert!(
+        login.starts_with(b"HTTP/1.1 200"),
+        "unexpected system login response: {}",
+        String::from_utf8_lossy(&login)
+    );
+    let cookie = String::from_utf8_lossy(&login)
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: "))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let infrastructure = send_http(
+        fixture.config.management_http,
+        format!(
+            "GET /system/infrastructure HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        infrastructure.starts_with(b"HTTP/1.1 200"),
+        "unexpected infrastructure response: {}",
+        String::from_utf8_lossy(&infrastructure)
+    );
+    let infrastructure = String::from_utf8(infrastructure).unwrap();
+    assert!(infrastructure.contains("Runtime health"));
+    assert!(infrastructure.contains("Ready"));
+    assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.public_http)));
+    assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.management_http)));
+    assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.mqtt_tcp)));
+    assert!(infrastructure.contains("Listening (TLS endpoint bound)"));
+    assert!(infrastructure.contains("Completed at startup"));
+    assert!(infrastructure.contains("SQLite connected"));
+    assert!(infrastructure.contains("Loaded for MQTT TLS"));
+    assert!(!infrastructure.contains("Not reported"));
+    assert!(
+        !infrastructure.contains(
+            &fixture
+                .config
+                .storage
+                .sqlite_path
+                .as_ref()
+                .unwrap()
+                .display()
+                .to_string(),
+        )
+    );
+    assert!(!infrastructure.contains(&fixture.config.tls_cert_path.display().to_string()));
+    assert!(!infrastructure.contains(&fixture.config.tls_key_path.display().to_string()));
+    assert!(!infrastructure.contains(&fixture.config.device_token_vault_key));
+    assert!(!infrastructure.contains("SystemAccount@2026"));
+
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

@@ -26,6 +26,7 @@ use thiserror::Error;
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::management::SystemInfrastructureStatus;
 use crate::{
     BootstrapSystemError, CacheError, ManagementSessionRouter, MonolithConfig, PersistentCache,
     PlatformCommandResponse, PlatformCommandTransport, PlatformCoreFacade,
@@ -158,8 +159,12 @@ impl MonolithRuntime {
         );
         let readiness = Readiness::default();
         let token_vault = TokenVault::from_key_material(&config.device_token_vault_key);
-        let management_sessions =
-            ManagementSessionRouter::new(Arc::clone(&platform), token_vault.clone());
+        let infrastructure_status = SystemInfrastructureStatus::starting(readiness.clone());
+        let management_sessions = ManagementSessionRouter::new_with_infrastructure_status(
+            Arc::clone(&platform),
+            token_vault.clone(),
+            infrastructure_status.clone(),
+        );
         let browser_session_verifier: Arc<dyn iot_api::OAuthBrowserSessionVerifier> =
             management_sessions.session_verifier.clone();
         let public_router = health_router(readiness.clone())
@@ -215,6 +220,14 @@ impl MonolithRuntime {
                 return Err(StartupError::ManagementHttpBind(error));
             }
         };
+        infrastructure_status.mark_started(
+            &config.storage,
+            public_listener.local_addr().unwrap_or(config.public_http),
+            management_listener
+                .local_addr()
+                .unwrap_or(config.management_http),
+            mqtt.plaintext_address(),
+        );
         let http_tasks = vec![
             spawn_http_server(public_listener, public_router, http_cancellation.clone()),
             spawn_http_server(

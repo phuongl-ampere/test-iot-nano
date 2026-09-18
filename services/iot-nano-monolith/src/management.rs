@@ -23,6 +23,7 @@ use iot_api::{
     create_platform_device_token, generate_session_id, hash_password,
     provision_platform_device_token, validate_password,
 };
+use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, AuthorizationRepository, AuthorizationSubject,
     BUILT_IN_USER_WORKSPACE, ClientId, CreateDeviceRelation, CreateManagementAsset,
@@ -50,6 +51,8 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use tokio::sync::Notify;
+
+use crate::Readiness;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +117,18 @@ pub struct ManagementSessionRouter {
 
 impl ManagementSessionRouter {
     pub fn new(store: Arc<PlatformStore>, token_vault: TokenVault) -> Self {
+        Self::new_with_infrastructure_status(
+            store,
+            token_vault,
+            SystemInfrastructureStatus::not_running(),
+        )
+    }
+
+    pub(crate) fn new_with_infrastructure_status(
+        store: Arc<PlatformStore>,
+        token_vault: TokenVault,
+        infrastructure_status: SystemInfrastructureStatus,
+    ) -> Self {
         let session_verifier = Arc::new(ManagementSessionVerifier::default());
         let state = ManagementState {
             store,
@@ -121,6 +136,7 @@ impl ManagementSessionRouter {
             token_vault,
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
             authorization_gate: Arc::new(ManagementAuthorizationGate::default()),
+            infrastructure_status,
             #[cfg(test)]
             authorization_test_hooks: None,
         };
@@ -131,6 +147,10 @@ impl ManagementSessionRouter {
             .route("/login/tenant", post(platform_tenant_login))
             .route("/login/user", post(platform_user_login))
             .route("/system", get(platform_system))
+            .route(
+                "/system/infrastructure",
+                get(platform_system_infrastructure),
+            )
             .route("/system/tenants", post(create_system_tenant_form))
             .route("/system/tenants/suspend", post(suspend_system_tenant_form))
             .route(
@@ -306,6 +326,131 @@ impl ManagementSessionRouter {
         Self {
             router,
             session_verifier,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SystemInfrastructureStatus {
+    readiness: Readiness,
+    snapshot: Arc<Mutex<SystemInfrastructureSnapshot>>,
+}
+
+struct SystemInfrastructureSnapshot {
+    public_http_listener: String,
+    management_http_listener: String,
+    mqtt_plaintext_listener: String,
+    mqtt_tls_listener: String,
+    migration: String,
+    storage: String,
+    tls: String,
+}
+
+impl SystemInfrastructureStatus {
+    fn not_running() -> Self {
+        Self {
+            readiness: Readiness::default(),
+            snapshot: Arc::new(Mutex::new(SystemInfrastructureSnapshot::not_running())),
+        }
+    }
+
+    pub(crate) fn starting(readiness: Readiness) -> Self {
+        Self {
+            readiness,
+            snapshot: Arc::new(Mutex::new(SystemInfrastructureSnapshot::starting())),
+        }
+    }
+
+    pub(crate) fn mark_started(
+        &self,
+        storage: &StorageConfiguration,
+        public_http_listener: SocketAddr,
+        management_http_listener: SocketAddr,
+        mqtt_plaintext_listener: SocketAddr,
+    ) {
+        let storage = match &storage.storage {
+            DatabaseStorage::Sqlite => "SQLite connected",
+            DatabaseStorage::Timescale => "Timescale connected",
+        };
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *snapshot = SystemInfrastructureSnapshot {
+            public_http_listener: format!("Listening on {public_http_listener}"),
+            management_http_listener: format!("Listening on {management_http_listener}"),
+            mqtt_plaintext_listener: format!("Listening on {mqtt_plaintext_listener}"),
+            mqtt_tls_listener: "Listening (TLS endpoint bound)".to_owned(),
+            migration: "Completed at startup".to_owned(),
+            storage: storage.to_owned(),
+            tls: "Loaded for MQTT TLS".to_owned(),
+        };
+    }
+
+    fn operational_health(&self) -> &'static str {
+        if self.readiness.is_ready() {
+            "Ready"
+        } else {
+            "Not ready"
+        }
+    }
+
+    fn page(&self) -> crate::SystemInfrastructurePage {
+        let snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::SystemInfrastructurePage::new(
+            self.operational_health(),
+            vec![
+                crate::SystemInfrastructureStatusRow::new(
+                    "Public HTTP listener",
+                    &snapshot.public_http_listener,
+                ),
+                crate::SystemInfrastructureStatusRow::new(
+                    "Management HTTP listener",
+                    &snapshot.management_http_listener,
+                ),
+                crate::SystemInfrastructureStatusRow::new(
+                    "MQTT plaintext listener",
+                    &snapshot.mqtt_plaintext_listener,
+                ),
+                crate::SystemInfrastructureStatusRow::new(
+                    "MQTT TLS listener",
+                    &snapshot.mqtt_tls_listener,
+                ),
+            ],
+            vec![
+                crate::SystemInfrastructureStatusRow::new("Migrations", &snapshot.migration),
+                crate::SystemInfrastructureStatusRow::new("Storage", &snapshot.storage),
+                crate::SystemInfrastructureStatusRow::new("TLS", &snapshot.tls),
+            ],
+        )
+    }
+}
+
+impl SystemInfrastructureSnapshot {
+    fn not_running() -> Self {
+        Self {
+            public_http_listener: "Not running".to_owned(),
+            management_http_listener: "Not running".to_owned(),
+            mqtt_plaintext_listener: "Not running".to_owned(),
+            mqtt_tls_listener: "Not running".to_owned(),
+            migration: "Not run by this router".to_owned(),
+            storage: "Not connected by this router".to_owned(),
+            tls: "Not loaded by this router".to_owned(),
+        }
+    }
+
+    fn starting() -> Self {
+        Self {
+            public_http_listener: "Starting".to_owned(),
+            management_http_listener: "Starting".to_owned(),
+            mqtt_plaintext_listener: "Starting".to_owned(),
+            mqtt_tls_listener: "Starting".to_owned(),
+            migration: "Completed before listener startup".to_owned(),
+            storage: "Connected before listener startup".to_owned(),
+            tls: "Loading for MQTT TLS".to_owned(),
         }
     }
 }
@@ -1314,6 +1459,7 @@ struct ManagementState {
     token_vault: TokenVault,
     login_limiter: Arc<Mutex<LoginRateLimiter>>,
     authorization_gate: Arc<ManagementAuthorizationGate>,
+    infrastructure_status: SystemInfrastructureStatus,
     #[cfg(test)]
     authorization_test_hooks: Option<Arc<ManagementAuthorizationTestHooks>>,
 }
@@ -2302,6 +2448,24 @@ async fn platform_system(
         system_lifecycle_notice(request.uri().query()),
     )
     .await
+}
+
+async fn platform_system_infrastructure(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let PlatformUiSession::System { system_account_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    let page = state.infrastructure_status.page();
+    let rendered = crate::PlatformUiRenderer::render_system_infrastructure(
+        &crate::PlatformUiIdentity::new(format!("System Account {system_account_id}")),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
 }
 
 async fn platform_tenant(
@@ -4014,6 +4178,7 @@ async fn platform_page(
                     })
                     .collect(),
             )
+            .with_operational_health(state.infrastructure_status.operational_health())
             .with_notice(system_notice);
             crate::PlatformUiRenderer::render_system(
                 &crate::PlatformUiIdentity::new(format!("System Account {system_account_id}")),

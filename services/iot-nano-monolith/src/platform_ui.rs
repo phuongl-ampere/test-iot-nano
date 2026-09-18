@@ -56,10 +56,45 @@ impl SystemTenantRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemPlatformPage {
     tenants: Vec<SystemTenantRow>,
-    tenant_account_status: &'static str,
-    operational_health: &'static str,
+    operational_health: String,
     notice: &'static str,
     has_notice: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemInfrastructureStatusRow {
+    label: String,
+    value: String,
+}
+
+impl SystemInfrastructureStatusRow {
+    pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemInfrastructurePage {
+    health: String,
+    listeners: Vec<SystemInfrastructureStatusRow>,
+    configuration: Vec<SystemInfrastructureStatusRow>,
+}
+
+impl SystemInfrastructurePage {
+    pub fn new(
+        health: impl Into<String>,
+        listeners: Vec<SystemInfrastructureStatusRow>,
+        configuration: Vec<SystemInfrastructureStatusRow>,
+    ) -> Self {
+        Self {
+            health: health.into(),
+            listeners,
+            configuration,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -814,11 +849,15 @@ impl SystemPlatformPage {
     pub fn new(tenants: Vec<SystemTenantRow>) -> Self {
         Self {
             tenants,
-            tenant_account_status: "Not reported",
-            operational_health: "Not reported",
+            operational_health: "Not ready".to_owned(),
             notice: "",
             has_notice: false,
         }
+    }
+
+    pub(crate) fn with_operational_health(mut self, operational_health: impl Into<String>) -> Self {
+        self.operational_health = operational_health.into();
+        self
     }
 
     pub(crate) fn with_notice(mut self, notice: Option<&'static str>) -> Self {
@@ -845,6 +884,13 @@ impl PlatformUiRenderer {
         page: &SystemPlatformPage,
     ) -> Result<String, askama::Error> {
         SystemLayout::new(identity, page).render()
+    }
+
+    pub fn render_system_infrastructure(
+        identity: &PlatformUiIdentity,
+        page: &SystemInfrastructurePage,
+    ) -> Result<String, askama::Error> {
+        SystemInfrastructureLayout::new(identity, page).render()
     }
 
     pub fn render_tenant(identity: &PlatformUiIdentity) -> Result<String, askama::Error> {
@@ -1005,6 +1051,19 @@ pub struct SystemLayout<'a> {
 
 impl<'a> SystemLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a SystemPlatformPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/system_infrastructure.html")]
+pub struct SystemInfrastructureLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a SystemInfrastructurePage,
+}
+
+impl<'a> SystemInfrastructureLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a SystemInfrastructurePage) -> Self {
         Self { identity, page }
     }
 }

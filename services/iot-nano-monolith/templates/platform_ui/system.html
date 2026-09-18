@@ -50,7 +50,6 @@
             <tr>
               <th scope="col">Tenant</th>
               <th scope="col">Status</th>
-              <th scope="col">Tenant account</th>
               <th scope="col">Actions</th>
             </tr>
           </thead>
@@ -59,7 +58,6 @@
               <tr>
                 <td>{{ tenant.slug }}</td>
                 <td>{{ tenant.status }}</td>
-                <td>{{ page.tenant_account_status }}</td>
                 <td class="tenant-actions">
                   {% if tenant.status == "active" %}
                     <form class="inline-form" action="/system/tenants/suspend" method="post">

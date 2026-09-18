@@ -1102,7 +1102,7 @@ async fn user_workspace_asset_detail_masks_unavailable_assets_and_requires_user_
 }
 
 #[tokio::test]
-async fn system_page_lists_only_tenant_slug_and_status_with_neutral_runtime_fields() {
+async fn system_page_lists_only_tenant_slug_and_status_without_runtime_placeholders() {
     let (_directory, store, management) = management_session_router_with_store().await;
     TenantIdentityRepository::create_tenant_with_account(
         store.as_ref(),
@@ -1135,7 +1135,8 @@ async fn system_page_lists_only_tenant_slug_and_status_with_neutral_runtime_fiel
     assert!(body.contains("<td>test</td>"));
     assert!(body.contains("<td>active</td>"));
     assert!(body.contains("<td>suspended</td>"));
-    assert_eq!(body.matches("Not reported").count(), 3);
+    assert!(body.contains("Not ready"));
+    assert!(!body.contains("Not reported"));
     assert!(!body.contains("system-page-private-metadata"));
     assert!(!body.contains("SeparateTenant@2026"));
 }
@@ -1163,6 +1164,85 @@ async fn system_page_does_not_read_sensitive_invalid_tenant_metadata() {
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("<td>test</td>"));
     assert!(!body.contains(metadata));
+}
+
+#[tokio::test]
+async fn system_infrastructure_page_requires_a_system_account() {
+    let (_directory, _store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+    let admin_cookie = management_user_cookie(&router, "admin", "NanoAdmin@1234").await;
+
+    let response = router
+        .clone()
+        .oneshot(platform_get("/system/infrastructure", Some(&system_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for cookie in [
+        None,
+        Some(tenant_cookie.as_str()),
+        Some(user_cookie.as_str()),
+        Some(admin_cookie.as_str()),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(platform_get("/system/infrastructure", cookie))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "unexpected status {}",
+            response.status()
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_infrastructure_page_renders_non_secret_runtime_status() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let tenant_metadata = "infrastructure-page-tenant-metadata";
+    sqlx::query("UPDATE tenants SET metadata = ? WHERE slug = ?")
+        .bind(tenant_metadata)
+        .bind("test")
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let response = router
+        .oneshot(platform_get("/system/infrastructure", Some(&system_cookie)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Infrastructure"));
+    for status in [
+        "Runtime health",
+        "Not ready",
+        "Public HTTP listener",
+        "Management HTTP listener",
+        "MQTT plaintext listener",
+        "MQTT TLS listener",
+        "Migrations",
+        "Storage",
+        "TLS",
+    ] {
+        assert!(body.contains(status), "missing {status}: {body}");
+    }
+    assert!(!body.contains("Not reported"));
+    assert!(!body.contains(tenant_metadata));
+    assert!(!body.contains("TenantAccount@2026"));
+    assert!(!body.contains("SystemAccount@2026"));
 }
 
 #[tokio::test]

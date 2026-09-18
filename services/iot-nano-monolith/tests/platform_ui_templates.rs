@@ -1,5 +1,6 @@
 use iot_nano_monolith::{
-    PlatformUiIdentity, PlatformUiRenderer, SystemPlatformPage, SystemTenantRow, TenantAlertRow,
+    PlatformUiIdentity, PlatformUiRenderer, SystemInfrastructurePage,
+    SystemInfrastructureStatusRow, SystemPlatformPage, SystemTenantRow, TenantAlertRow,
     TenantAlertsPage, TenantUserRow, TenantUsersPage, UserDeviceDetailPage, UserDeviceListPage,
     UserDeviceRow,
 };
@@ -214,7 +215,7 @@ fn system_layout_renders_only_system_navigation_and_escapes_identity() {
 }
 
 #[test]
-fn system_layout_renders_escaped_tenant_rows_and_neutral_runtime_fields() {
+fn system_layout_renders_escaped_tenant_rows_without_runtime_placeholders() {
     let identity = PlatformUiIdentity::new("System Account");
     let page = SystemPlatformPage::new(vec![SystemTenantRow::new("tenant-<unsafe>", "suspended")]);
 
@@ -222,11 +223,50 @@ fn system_layout_renders_escaped_tenant_rows_and_neutral_runtime_fields() {
 
     assert!(rendered.contains("<th scope=\"col\">Tenant</th>"));
     assert!(rendered.contains("<th scope=\"col\">Status</th>"));
-    assert!(rendered.contains("<th scope=\"col\">Tenant account</th>"));
     assert!(rendered.contains("tenant-&#60;unsafe&#62;"));
     assert!(!rendered.contains("tenant-<unsafe>"));
     assert!(rendered.contains("suspended"));
-    assert_eq!(rendered.matches("Not reported").count(), 2);
+    assert!(rendered.contains("Not ready"));
+    assert!(!rendered.contains("Tenant account"));
+    assert!(!rendered.contains("Not reported"));
+}
+
+#[test]
+fn infrastructure_layout_renders_escaped_status_and_system_navigation_only() {
+    let identity = PlatformUiIdentity::new("System <operator>");
+    let page = SystemInfrastructurePage::new(
+        "Ready",
+        vec![
+            SystemInfrastructureStatusRow::new(
+                "Public HTTP listener",
+                "Listening on 127.0.0.1:8080",
+            ),
+            SystemInfrastructureStatusRow::new(
+                "MQTT TLS listener",
+                "Listening (TLS endpoint bound)",
+            ),
+        ],
+        vec![
+            SystemInfrastructureStatusRow::new("Migrations", "Completed at startup"),
+            SystemInfrastructureStatusRow::new("Storage", "SQLite connected"),
+            SystemInfrastructureStatusRow::new("TLS", "Loaded for MQTT TLS"),
+            SystemInfrastructureStatusRow::new("Unsafe", "<secret-value>"),
+        ],
+    );
+
+    let rendered = PlatformUiRenderer::render_system_infrastructure(&identity, &page).unwrap();
+
+    assert!(rendered.contains("System infrastructure"));
+    assert!(rendered.contains("href=\"/system/infrastructure\" aria-current=\"page\""));
+    assert!(rendered.contains("Runtime health"));
+    assert!(rendered.contains("Ready"));
+    assert!(rendered.contains("Public HTTP listener"));
+    assert!(rendered.contains("Listening on 127.0.0.1:8080"));
+    assert!(rendered.contains("Migrations"));
+    assert!(rendered.contains("SQLite connected"));
+    assert!(rendered.contains("&#60;secret-value&#62;"));
+    assert!(!rendered.contains("<secret-value>"));
+    assert_excludes_navigation_namespaces(&rendered, &["/tenant", "/app"]);
 }
 
 #[test]
