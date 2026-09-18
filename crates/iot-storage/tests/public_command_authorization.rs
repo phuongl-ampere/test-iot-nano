@@ -304,6 +304,7 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
         Ok(result) => result,
         Err(_) => {
             task.abort();
+            let _ = task.await;
             panic!("selected list request did not finish after the hook release");
         }
     };
