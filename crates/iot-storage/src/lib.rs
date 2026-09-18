@@ -5764,30 +5764,8 @@ async fn ingest_sqlite_gateway(
     store: &SqliteStore,
     request: GatewayIngestRequest,
 ) -> Result<GatewayIngestResult, PlatformStoreError> {
+    validate_gateway_ingest_request(&request)?;
     let mut transaction = store.pool().begin().await?;
-    let receipt = sqlx::query(
-        "INSERT OR IGNORE INTO gateway_event_receipts (
-            tenant_id, gateway_device_id, idempotency_key, event_at, received_at
-         ) VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(request.tenant_id.to_string())
-    .bind(&request.gateway_device_id)
-    .bind(&request.idempotency_key)
-    .bind(request.event_at.to_rfc3339())
-    .bind(request.received_at.to_rfc3339())
-    .execute(transaction.as_mut())
-    .await?;
-    if receipt.rows_affected() == 0 {
-        transaction.commit().await?;
-        return Ok(GatewayIngestResult {
-            receipt_inserted: false,
-            telemetry_inserted: false,
-        });
-    }
-    if let Err(error) = validate_gateway_ingest_request(&request) {
-        transaction.rollback().await?;
-        return Err(error);
-    }
     if !sqlite_active_gateway_exists(
         &mut transaction,
         request.tenant_id,
@@ -5811,6 +5789,26 @@ async fn ingest_sqlite_gateway(
         return Err(PlatformStoreError::UnknownDevice(
             child_device_id.to_owned(),
         ));
+    }
+
+    let receipt = sqlx::query(
+        "INSERT OR IGNORE INTO gateway_event_receipts (
+            tenant_id, gateway_device_id, idempotency_key, event_at, received_at
+         ) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(request.tenant_id.to_string())
+    .bind(&request.gateway_device_id)
+    .bind(&request.idempotency_key)
+    .bind(request.event_at.to_rfc3339())
+    .bind(request.received_at.to_rfc3339())
+    .execute(transaction.as_mut())
+    .await?;
+    if receipt.rows_affected() == 0 {
+        transaction.commit().await?;
+        return Ok(GatewayIngestResult {
+            receipt_inserted: false,
+            telemetry_inserted: false,
+        });
     }
 
     let event_at = request.event_at.to_rfc3339();
@@ -5888,31 +5886,8 @@ async fn ingest_timescale_gateway(
     pool: &PgPool,
     request: GatewayIngestRequest,
 ) -> Result<GatewayIngestResult, PlatformStoreError> {
+    validate_gateway_ingest_request(&request)?;
     let mut transaction = pool.begin().await?;
-    let receipt = sqlx::query(
-        "INSERT INTO gateway_event_receipts (
-            tenant_id, gateway_device_id, idempotency_key, event_at, received_at
-         ) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (tenant_id, gateway_device_id, idempotency_key) DO NOTHING",
-    )
-    .bind(request.tenant_id)
-    .bind(&request.gateway_device_id)
-    .bind(&request.idempotency_key)
-    .bind(request.event_at)
-    .bind(request.received_at)
-    .execute(&mut *transaction)
-    .await?;
-    if receipt.rows_affected() == 0 {
-        transaction.commit().await?;
-        return Ok(GatewayIngestResult {
-            receipt_inserted: false,
-            telemetry_inserted: false,
-        });
-    }
-    if let Err(error) = validate_gateway_ingest_request(&request) {
-        transaction.rollback().await?;
-        return Err(error);
-    }
     if !timescale_active_gateway_is_locked(
         &mut transaction,
         request.tenant_id,
@@ -5936,6 +5911,27 @@ async fn ingest_timescale_gateway(
         return Err(PlatformStoreError::UnknownDevice(
             child_device_id.to_owned(),
         ));
+    }
+
+    let receipt = sqlx::query(
+        "INSERT INTO gateway_event_receipts (
+            tenant_id, gateway_device_id, idempotency_key, event_at, received_at
+         ) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (tenant_id, gateway_device_id, idempotency_key) DO NOTHING",
+    )
+    .bind(request.tenant_id)
+    .bind(&request.gateway_device_id)
+    .bind(&request.idempotency_key)
+    .bind(request.event_at)
+    .bind(request.received_at)
+    .execute(&mut *transaction)
+    .await?;
+    if receipt.rows_affected() == 0 {
+        transaction.commit().await?;
+        return Ok(GatewayIngestResult {
+            receipt_inserted: false,
+            telemetry_inserted: false,
+        });
     }
 
     sqlx::query(

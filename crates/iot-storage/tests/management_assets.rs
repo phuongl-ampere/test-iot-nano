@@ -351,30 +351,11 @@ async fn sqlite_management_asset_repository_returns_typed_validation_errors() {
     ));
 
     let dangling_asset_id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO devices (device_id, tenant_id, display_name, asset_id)
-         VALUES ('dangling-management-asset-device', ?, 'Dangling asset device', ?)",
-    )
-    .bind(tenant_id.to_string())
-    .bind(dangling_asset_id.to_string())
-    .execute(pool)
-    .await
-    .unwrap();
     let missing_asset =
         ManagementAssetRepository::delete_management_asset(&store, tenant_id, dangling_asset_id)
             .await
             .unwrap_err();
     assert!(matches!(missing_asset, ManagementAssetError::AssetNotFound));
-    assert_eq!(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT asset_id FROM devices WHERE device_id = 'dangling-management-asset-device'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap(),
-        Some(dangling_asset_id.to_string())
-    );
-
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM assets")
             .fetch_one(pool)

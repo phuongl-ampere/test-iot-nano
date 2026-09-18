@@ -585,6 +585,7 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "assets",
             "command_outbox",
             "device_profiles",
+            "device_relations",
             "device_tokens",
             "devices",
             "gateway_event_receipts",

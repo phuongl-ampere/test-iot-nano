@@ -225,7 +225,7 @@ async fn timescale_management_alert_list_is_tenant_scoped_newest_first_and_cappe
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {

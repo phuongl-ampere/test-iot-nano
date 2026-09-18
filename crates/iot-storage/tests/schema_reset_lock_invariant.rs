@@ -23,6 +23,7 @@ const SHARED_SCHEMA_TEST_FILES: &[&str] = &[
     "device_tokens.rs",
     "gateway_ingest.rs",
     "identity.rs",
+    "management_alerts.rs",
     "management_assets.rs",
     "management_devices.rs",
     "management_profiles.rs",
@@ -48,6 +49,10 @@ const RESETTERS: &[(&str, &str)] = &[
     ("device_tokens.rs", "timescale_store"),
     ("gateway_ingest.rs", "timescale_test_store"),
     ("identity.rs", "timescale_store"),
+    (
+        "management_alerts.rs",
+        "timescale_management_alert_list_is_tenant_scoped_newest_first_and_capped",
+    ),
     ("management_assets.rs", "timescale_store"),
     ("management_devices.rs", "timescale_store"),
     ("management_profiles.rs", "timescale_store"),
@@ -55,10 +60,6 @@ const RESETTERS: &[(&str, &str)] = &[
     (
         "migration_safety.rs",
         "timescale_open_rejects_pre_tenant_platform_schema_without_partial_migration",
-    ),
-    (
-        "migration_safety.rs",
-        "timescale_open_rejects_partially_tenant_scoped_alert_schema",
     ),
     (
         "migration_safety.rs",

@@ -2015,6 +2015,15 @@ async fn delete_management_asset(
                     parent_asset_id: None,
                 });
             }
+            sqlx::query(
+                "UPDATE assets
+                 SET parent_asset_id = NULL
+                 WHERE parent_asset_id = ? AND tenant_id = ?",
+            )
+            .bind(asset_id.to_string())
+            .bind(tenant_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
             sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = ? AND tenant_id = ?")
                 .bind(asset_id.to_string())
                 .bind(tenant_id.to_string())
@@ -2041,6 +2050,15 @@ async fn delete_management_asset(
                     parent_asset_id: None,
                 });
             }
+            sqlx::query(
+                "UPDATE assets
+                 SET parent_asset_id = NULL
+                 WHERE parent_asset_id = $1 AND tenant_id = $2",
+            )
+            .bind(asset_id)
+            .bind(tenant_id)
+            .execute(&mut *transaction)
+            .await?;
             sqlx::query(
                 "UPDATE devices SET asset_id = NULL WHERE asset_id = $1 AND tenant_id = $2",
             )

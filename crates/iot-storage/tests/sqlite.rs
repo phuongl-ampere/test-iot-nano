@@ -73,26 +73,37 @@ async fn sqlite_maintenance_prunes_raw_and_rollup_rows_in_batches() {
         sqlite_busy_timeout_ms: 5_000,
     };
     let store = SqliteStore::open(&configuration).await.unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('device-1')")
+    let tenant_id = Uuid::from_u128(10_001);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'sqlite-retention-raw', 'active')",
+    )
+    .bind(tenant_id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('device-1', ?)")
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
     for event_at in ["2025-01-01T00:00:00Z", "2026-09-07T00:00:00Z"] {
         sqlx::query(
             "INSERT INTO telemetry (
-                event_at, received_at, device_id, boot_id, sequence, measurements, topic
-             ) VALUES (?, ?, 'device-1', 'boot', 1, '{}', 'topic')",
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+             ) VALUES (?, ?, ?, 'device-1', 'boot', 1, '{}', 'topic')",
         )
         .bind(event_at)
         .bind(event_at)
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
     }
     sqlx::query(
-        "INSERT INTO telemetry_rollups_5m (bucket_at, device_id, event_count)
-         VALUES ('2025-01-01T00:00:00Z', 'device-1', 1)",
+        "INSERT INTO telemetry_rollups_5m (bucket_at, tenant_id, device_id, event_count)
+         VALUES ('2025-01-01T00:00:00Z', ?, 'device-1', 1)",
     )
+    .bind(tenant_id.to_string())
     .execute(store.pool())
     .await
     .unwrap();
@@ -128,34 +139,46 @@ async fn sqlite_maintenance_limits_each_table_to_one_batch() {
         sqlite_busy_timeout_ms: 5_000,
     };
     let store = SqliteStore::open(&configuration).await.unwrap();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('device-1')")
+    let tenant_id = Uuid::from_u128(10_002);
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'sqlite-retention-batch', 'active')",
+    )
+    .bind(tenant_id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('device-1', ?)")
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
     for sequence in 1..=2 {
         sqlx::query(
             "INSERT INTO telemetry (
-                event_at, received_at, device_id, boot_id, sequence, measurements, topic
-             ) VALUES ('2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z',
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+             ) VALUES ('2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z', ?,
                        'device-1', 'boot', ?, '{}', 'topic')",
         )
+        .bind(tenant_id.to_string())
         .bind(sequence)
         .execute(store.pool())
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO telemetry_rollups_5m (bucket_at, device_id, event_count)
-             VALUES (?, 'device-1', 1)",
+            "INSERT INTO telemetry_rollups_5m (bucket_at, tenant_id, device_id, event_count)
+             VALUES (?, ?, 'device-1', 1)",
         )
         .bind(format!("2025-01-01T00:0{sequence}:00Z"))
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO telemetry_rollups_1h (bucket_at, device_id, event_count)
-             VALUES (?, 'device-1', 1)",
+            "INSERT INTO telemetry_rollups_1h (bucket_at, tenant_id, device_id, event_count)
+             VALUES (?, ?, 'device-1', 1)",
         )
         .bind(format!("2025-01-01T0{sequence}:00:00Z"))
+        .bind(tenant_id.to_string())
         .execute(store.pool())
         .await
         .unwrap();
@@ -203,12 +226,27 @@ async fn sqlite_maintenance_bounds_alert_history_without_pruning_active_work() {
     let store = SqliteStore::open(&configuration).await.unwrap();
     let raw_before = "2026-01-01T00:00:00Z";
     let rollup_before = "2026-01-01T00:00:00Z";
+    let tenant_id = Uuid::from_u128(10_003);
+
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'sqlite-retention-alerts', 'active')",
+    )
+    .bind(tenant_id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('device-1', ?)")
+        .bind(tenant_id.to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
 
     sqlx::query(
         "INSERT INTO alert_rules (
-            id, name, metric_key, rule_type, comparison, threshold
-         ) VALUES ('rule-1', 'High temperature', 'temperature_c', 'event', 'gt', 40)",
+            id, tenant_id, name, device_id, metric_key, rule_type, comparison, threshold
+         ) VALUES ('rule-1', ?, 'High temperature', 'device-1', 'temperature_c', 'event', 'gt', 40)",
     )
+    .bind(tenant_id.to_string())
     .execute(store.pool())
     .await
     .unwrap();
@@ -220,9 +258,10 @@ async fn sqlite_maintenance_bounds_alert_history_without_pruning_active_work() {
     ] {
         sqlx::query(
             "INSERT INTO alert_rule_event_evaluations (
-                rule_id, event_at, device_id, boot_id, sequence
-             ) VALUES ('rule-1', ?, 'device-1', ?, ?)",
+                tenant_id, rule_id, event_at, device_id, boot_id, sequence
+             ) VALUES (?, 'rule-1', ?, 'device-1', ?, ?)",
         )
+        .bind(tenant_id.to_string())
         .bind(event_at)
         .bind(boot_id)
         .bind(sequence)
@@ -256,10 +295,11 @@ async fn sqlite_maintenance_bounds_alert_history_without_pruning_active_work() {
     ] {
         sqlx::query(
             "INSERT INTO alert_incidents (
-                id, rule_id, device_id, status, condition_started_at, resolved_at
-             ) VALUES (?, 'rule-1', 'device-1', ?, '2025-01-01T00:00:00Z', ?)",
+                id, tenant_id, rule_id, device_id, status, condition_started_at, resolved_at
+             ) VALUES (?, ?, 'rule-1', 'device-1', ?, '2025-01-01T00:00:00Z', ?)",
         )
         .bind(id)
+        .bind(tenant_id.to_string())
         .bind(status)
         .bind(resolved_at)
         .execute(store.pool())
@@ -301,11 +341,12 @@ async fn sqlite_maintenance_bounds_alert_history_without_pruning_active_work() {
     ] {
         sqlx::query(
             "INSERT INTO notification_outbox (
-                id, incident_id, kind, dedupe_key, subject, body, state, sent_at, created_at
-             ) VALUES (?, ?, 'email', ?, 'subject', 'body', ?, ?,
+                id, tenant_id, incident_id, kind, dedupe_key, subject, body, state, sent_at, created_at
+             ) VALUES (?, ?, ?, 'email', ?, 'subject', 'body', ?, ?,
                        '2025-01-01T00:00:00Z')",
         )
         .bind(id)
+        .bind(tenant_id.to_string())
         .bind(incident_id)
         .bind(format!("dedupe-{id}"))
         .bind(state)
