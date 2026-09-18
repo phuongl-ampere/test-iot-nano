@@ -168,6 +168,15 @@ impl ManagementSessionRouter {
                 "/tenant/devices",
                 get(platform_tenant_devices).post(provision_tenant_device_form),
             )
+            .route("/tenant/topology", get(platform_tenant_topology))
+            .route(
+                "/tenant/topology/assign",
+                post(assign_tenant_gateway_child_form),
+            )
+            .route(
+                "/tenant/topology/detach",
+                post(detach_tenant_gateway_child_form),
+            )
             .route("/app", get(platform_app))
             .route("/app/assets", get(platform_app_assets))
             .route("/app/assets/{asset_id}", get(platform_app_asset_detail))
@@ -1617,6 +1626,19 @@ struct ProvisionTenantDeviceForm {
     display_name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignTenantGatewayChildForm {
+    child_device_id: String,
+    gateway_device_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetachTenantGatewayChildForm {
+    child_device_id: String,
+}
+
 #[derive(Serialize)]
 struct SystemTenantResponse {
     id: Uuid,
@@ -2173,6 +2195,20 @@ async fn platform_tenant_devices(
     .await
 }
 
+async fn platform_tenant_topology(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_topology_page(
+        &state,
+        tenant,
+        tenant_topology_notice(request.uri().query()),
+    )
+    .await
+}
+
 async fn tenant_assets_page(
     state: &ManagementState,
     tenant: TenantSession,
@@ -2266,6 +2302,121 @@ async fn tenant_devices_page(
         notice,
     );
     let rendered = crate::PlatformUiRenderer::render_tenant_devices(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_topology_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let devices =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_device_error)?;
+    let gateway_names: HashMap<String, String> = devices
+        .iter()
+        .filter(|device| device.topology.is_gateway)
+        .map(|device| {
+            (
+                device.device_id.clone(),
+                device
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| device.device_id.clone()),
+            )
+        })
+        .collect();
+    let gateways = devices
+        .iter()
+        .filter(|device| device.topology.is_gateway)
+        .map(|device| {
+            crate::TenantSelectOption::new(
+                device.device_id.clone(),
+                format!(
+                    "{} ({})",
+                    device
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(device.device_id.as_str()),
+                    device.device_id
+                ),
+            )
+        })
+        .collect();
+    let children = devices
+        .iter()
+        .filter(|device| !device.topology.is_gateway)
+        .map(|device| {
+            crate::TenantSelectOption::new(
+                device.device_id.clone(),
+                format!(
+                    "{} ({})",
+                    device
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(device.device_id.as_str()),
+                    device.device_id
+                ),
+            )
+        })
+        .collect();
+    let assigned_children = devices
+        .iter()
+        .filter(|device| !device.topology.is_gateway && device.topology.gateway_device_id.is_some())
+        .map(|device| {
+            crate::TenantSelectOption::new(
+                device.device_id.clone(),
+                format!(
+                    "{} ({})",
+                    device
+                        .display_name
+                        .as_deref()
+                        .unwrap_or(device.device_id.as_str()),
+                    device.device_id
+                ),
+            )
+        })
+        .collect();
+    let page = crate::TenantTopologyPage::new(
+        devices
+            .into_iter()
+            .map(|device| {
+                let device_id = device.device_id;
+                let gateway = device
+                    .topology
+                    .gateway_device_id
+                    .as_deref()
+                    .map(|gateway_id| {
+                        let gateway_name = gateway_names
+                            .get(gateway_id)
+                            .cloned()
+                            .unwrap_or_else(|| gateway_id.to_owned());
+                        format!("{gateway_name} ({gateway_id})")
+                    })
+                    .unwrap_or_else(|| "Direct".to_owned());
+                crate::TenantTopologyRow::new(
+                    device.display_name.unwrap_or_else(|| device_id.clone()),
+                    device_id,
+                    if device.topology.is_gateway {
+                        "Gateway"
+                    } else {
+                        "Device"
+                    },
+                    gateway,
+                )
+            })
+            .collect(),
+        gateways,
+        children,
+        assigned_children,
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_topology(
         &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
         &page,
     )
@@ -2384,6 +2535,134 @@ async fn provision_tenant_device_form(
         Html(rendered),
     )
         .into_response())
+}
+
+async fn assign_tenant_gateway_child_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: AssignTenantGatewayChildForm = match management_request_form(&state, request).await
+    {
+        Ok(request) => request,
+        Err(error) => return tenant_topology_form_error(error),
+    };
+    let child_device_id = match tenant_topology_device_id(&request.child_device_id) {
+        Ok(device_id) => device_id,
+        Err(error) => return tenant_topology_form_error(error),
+    };
+    let gateway_device_id = match tenant_topology_device_id(&request.gateway_device_id) {
+        Ok(device_id) => device_id,
+        Err(error) => return tenant_topology_form_error(error),
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match update_tenant_gateway_child(
+        &state,
+        tenant,
+        child_device_id,
+        Some(gateway_device_id.to_owned()),
+    )
+    .await
+    {
+        Ok(_) => Ok(Redirect::to("/tenant/topology?notice=gateway-assigned")),
+        Err(error) => tenant_topology_form_error(management_device_error(error)),
+    }
+}
+
+async fn detach_tenant_gateway_child_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: DetachTenantGatewayChildForm = match management_request_form(&state, request).await
+    {
+        Ok(request) => request,
+        Err(error) => return tenant_topology_form_error(error),
+    };
+    let child_device_id = match tenant_topology_device_id(&request.child_device_id) {
+        Ok(device_id) => device_id,
+        Err(error) => return tenant_topology_form_error(error),
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match update_tenant_gateway_child(&state, tenant, child_device_id, None).await {
+        Ok(_) => Ok(Redirect::to("/tenant/topology?notice=gateway-detached")),
+        Err(error) => tenant_topology_form_error(management_device_error(error)),
+    }
+}
+
+fn tenant_topology_device_id(value: &str) -> Result<&str, ManagementSessionError> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(ManagementSessionError::BadRequest)
+    } else {
+        Ok(value)
+    }
+}
+
+async fn update_tenant_gateway_child(
+    state: &ManagementState,
+    tenant: TenantSession,
+    child_device_id: &str,
+    gateway_device_id: Option<String>,
+) -> Result<(), ManagementDeviceError> {
+    let child =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await?
+            .into_iter()
+            .find(|device| device.device_id == child_device_id)
+            .ok_or(ManagementDeviceError::DeviceNotFound)?;
+    ManagementDeviceRepository::update_management_device(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        child_device_id,
+        UpdateManagementDevice {
+            display_name: child
+                .display_name
+                .unwrap_or_else(|| child.device_id.clone()),
+            asset_id: child.asset_id,
+            device_profile_id: child.device_profile_id,
+            attributes: None,
+            topology: Some(ManagementDeviceTopology {
+                is_gateway: child.topology.is_gateway,
+                gateway_device_id,
+            }),
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+fn tenant_topology_notice(query: Option<&str>) -> Option<&'static str> {
+    match query {
+        Some("notice=gateway-assigned") => Some("Gateway child assigned."),
+        Some("notice=gateway-detached") => Some("Gateway child detached."),
+        Some("notice=invalid-request") => Some("Request could not be processed."),
+        Some("notice=mutation-unavailable") => {
+            Some("The requested gateway assignment is unavailable.")
+        }
+        Some("notice=service-unavailable") => Some("Tenant management service is unavailable."),
+        _ => None,
+    }
+}
+
+fn tenant_topology_form_error(
+    error: ManagementSessionError,
+) -> Result<Redirect, ManagementSessionError> {
+    let path = match error {
+        ManagementSessionError::Unauthorized
+        | ManagementSessionError::TooManyRequests
+        | ManagementSessionError::Forbidden => return Err(error),
+        ManagementSessionError::BadRequest
+        | ManagementSessionError::UnsupportedMediaType
+        | ManagementSessionError::PayloadTooLarge => "/tenant/topology?notice=invalid-request",
+        ManagementSessionError::NotFound | ManagementSessionError::Conflict => {
+            "/tenant/topology?notice=mutation-unavailable"
+        }
+        ManagementSessionError::Unavailable => "/tenant/topology?notice=service-unavailable",
+    };
+    Ok(Redirect::to(path))
 }
 
 async fn platform_tenant_groups(

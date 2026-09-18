@@ -322,6 +322,59 @@ impl TenantDevicesPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantTopologyRow {
+    display_name: String,
+    device_id: String,
+    role: String,
+    gateway: String,
+}
+
+impl TenantTopologyRow {
+    pub(crate) fn new(
+        display_name: impl Into<String>,
+        device_id: impl Into<String>,
+        role: impl Into<String>,
+        gateway: impl Into<String>,
+    ) -> Self {
+        Self {
+            display_name: display_name.into(),
+            device_id: device_id.into(),
+            role: role.into(),
+            gateway: gateway.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantTopologyPage {
+    devices: Vec<TenantTopologyRow>,
+    gateways: Vec<TenantSelectOption>,
+    children: Vec<TenantSelectOption>,
+    assigned_children: Vec<TenantSelectOption>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantTopologyPage {
+    pub(crate) fn new(
+        devices: Vec<TenantTopologyRow>,
+        gateways: Vec<TenantSelectOption>,
+        children: Vec<TenantSelectOption>,
+        assigned_children: Vec<TenantSelectOption>,
+        notice: Option<&'static str>,
+    ) -> Self {
+        Self {
+            devices,
+            gateways,
+            children,
+            assigned_children,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantDeviceCredentialPage {
     device_id: String,
     display_name: String,
@@ -516,6 +569,13 @@ impl PlatformUiRenderer {
         TenantDevicesLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_topology(
+        identity: &PlatformUiIdentity,
+        page: &TenantTopologyPage,
+    ) -> Result<String, askama::Error> {
+        TenantTopologyLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_device_credential(
         identity: &PlatformUiIdentity,
         page: &TenantDeviceCredentialPage,
@@ -663,6 +723,19 @@ pub struct TenantDevicesLayout<'a> {
 
 impl<'a> TenantDevicesLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDevicesPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_topology.html")]
+pub struct TenantTopologyLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantTopologyPage,
+}
+
+impl<'a> TenantTopologyLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantTopologyPage) -> Self {
         Self { identity, page }
     }
 }

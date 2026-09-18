@@ -3718,3 +3718,186 @@ async fn tenant_user_routes_reject_non_tenant_sessions_before_form_parsing_or_mu
         0
     );
 }
+
+#[tokio::test]
+async fn tenant_topology_forms_scope_gateway_children_and_reject_invalid_assignments() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+
+    let gateway = management_provision_device(&router, &tenant_cookie, "Tenant gateway").await;
+    let gateway_id = gateway["device_id"].as_str().unwrap().to_owned();
+    let child = management_provision_device(&router, &tenant_cookie, "Tenant child").await;
+    let child_id = child["device_id"].as_str().unwrap().to_owned();
+    let direct = management_provision_device(&router, &tenant_cookie, "Direct device").await;
+    let direct_id = direct["device_id"].as_str().unwrap().to_owned();
+
+    let gateway_update = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/devices/{gateway_id}"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Tenant gateway",
+                        "topology": { "is_gateway": true },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gateway_update.status(), StatusCode::OK);
+
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "topology-other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, is_gateway)
+         VALUES ('other-tenant-gateway', ?, 'Other tenant gateway', 1)",
+    )
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let page = router
+        .clone()
+        .oneshot(platform_get("/tenant/topology", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Gateway Topology"));
+    assert!(page.contains(&gateway_id));
+    assert!(page.contains(&child_id));
+    assert!(!page.contains("Other tenant gateway"));
+    assert!(!page.contains("gateway_child"));
+
+    let assigned = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/topology/assign",
+            Some(&tenant_cookie),
+            &format!("child_device_id={child_id}&gateway_device_id={gateway_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(assigned.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        assigned.headers()[LOCATION],
+        "/tenant/topology?notice=gateway-assigned"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT gateway_device_id FROM devices WHERE device_id = ?",
+        )
+        .bind(&child_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        Some(gateway_id.clone())
+    );
+
+    let detached = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/topology/detach",
+            Some(&tenant_cookie),
+            &format!("child_device_id={child_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(detached.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        detached.headers()[LOCATION],
+        "/tenant/topology?notice=gateway-detached"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT gateway_device_id FROM devices WHERE device_id = ?",
+        )
+        .bind(&child_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        None
+    );
+
+    for gateway_device_id in [&child_id, &direct_id, "other-tenant-gateway"] {
+        let rejected = router
+            .clone()
+            .oneshot(system_lifecycle_form(
+                "/tenant/topology/assign",
+                Some(&tenant_cookie),
+                &format!("child_device_id={child_id}&gateway_device_id={gateway_device_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            rejected.headers()[LOCATION],
+            "/tenant/topology?notice=mutation-unavailable"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT gateway_device_id FROM devices WHERE device_id = ?",
+        )
+        .bind(&child_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn tenant_topology_routes_require_a_tenant_session_before_form_parsing() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+
+    for (cookie, expected_status) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some(system_cookie.as_str()), StatusCode::FORBIDDEN),
+        (Some(user_cookie.as_str()), StatusCode::FORBIDDEN),
+    ] {
+        let page = router
+            .clone()
+            .oneshot(platform_get("/tenant/topology", cookie))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), expected_status);
+
+        for path in ["/tenant/topology/assign", "/tenant/topology/detach"] {
+            let mutation = router
+                .clone()
+                .oneshot(system_lifecycle_form(path, cookie, "%"))
+                .await
+                .unwrap();
+            assert_eq!(mutation.status(), expected_status, "{path}");
+        }
+    }
+}

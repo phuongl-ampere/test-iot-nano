@@ -1,0 +1,96 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Gateway Topology | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link" href="/tenant/users">Users</a>
+  <a class="nav-link" href="/tenant/assets">Assets</a>
+  <a class="nav-link" href="/tenant/devices">Devices</a>
+  <a class="nav-link active" href="/tenant/topology" aria-current="page">Topology</a>
+  <a class="nav-link" href="/tenant/groups">Groups</a>
+  <a class="nav-link" href="/tenant/permissions">Permissions</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Gateway Topology</h1>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Assign gateway child</h2></header>
+    {% if page.children.is_empty() || page.gateways.is_empty() %}
+      <p class="empty-state">A direct device and a gateway are required.</p>
+    {% else %}
+      <form class="form-grid" action="/tenant/topology/assign" method="post">
+        <label class="field">
+          <span>Child device</span>
+          <select name="child_device_id" required>
+            {% for child in page.children %}
+              <option value="{{ child.value }}">{{ child.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="field">
+          <span>Gateway</span>
+          <select name="gateway_device_id" required>
+            {% for gateway in page.gateways %}
+              <option value="{{ gateway.value }}">{{ gateway.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="form-actions"><button type="submit">Assign</button></div>
+      </form>
+    {% endif %}
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Detach gateway child</h2></header>
+    {% if page.assigned_children.is_empty() %}
+      <p class="empty-state">No gateway children assigned.</p>
+    {% else %}
+      <form class="form-grid" action="/tenant/topology/detach" method="post">
+        <label class="field">
+          <span>Child device</span>
+          <select name="child_device_id" required>
+            {% for child in page.assigned_children %}
+              <option value="{{ child.value }}">{{ child.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="form-actions"><button type="submit">Detach</button></div>
+      </form>
+    {% endif %}
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Devices</h2></header>
+    {% if page.devices.is_empty() %}
+      <p class="empty-state">No devices provisioned.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Device</th>
+              <th scope="col">Name</th>
+              <th scope="col">Topology role</th>
+              <th scope="col">Gateway assignment</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for device in page.devices %}
+              <tr>
+                <td><code>{{ device.device_id }}</code></td>
+                <td>{{ device.display_name }}</td>
+                <td>{{ device.role }}</td>
+                <td>{{ device.gateway }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}
