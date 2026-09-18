@@ -64,7 +64,6 @@ crates/     storage and core platform crates
 contracts/  versioned public and device data contracts
 infra/      Compose, systemd, and monolith environment templates
 docs/       architecture, plans, and operations guidance
-web/        Next.js application
 firmware/   ESP32 firmware
 ```
 

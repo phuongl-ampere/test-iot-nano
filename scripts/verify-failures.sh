@@ -10,4 +10,3 @@ DATABASE_URL="$database_url" cargo test -p iot-nano-core --test writer -- --test
 DATABASE_URL="$database_url" cargo test -p iot-nano-core --test alert --test notification -- --test-threads=1
 DATABASE_URL="$database_url" cargo test -p iot-nano-core --test e2e -- --test-threads=1
 DATABASE_URL="$database_url" cargo test -p iot-nano-api --test api -- --test-threads=1
-npm --prefix web test

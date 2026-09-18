@@ -2,12 +2,6 @@
 /target/
 **/*.rs.bk
 
-# Node.js / Next.js
-/web/node_modules/
-/web/.next/
-/web/out/
-/web/coverage/
-
 # PlatformIO
 /firmware/esp32/.pio/
 /firmware/esp32/.vscode/
@@ -40,10 +34,6 @@ debug/.demo_lighting_switcher.env
 # Local TLS material
 /infra/tls/*
 !/infra/tls/.gitkeep
-
-# Browser test artifacts
-/web/playwright-report/
-/web/test-results/
 
 # Editor and OS files
 .DS_Store
