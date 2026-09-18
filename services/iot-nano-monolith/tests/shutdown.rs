@@ -183,6 +183,7 @@ async fn enqueue_command(store: &PlatformStore, command_id: Uuid, device_id: &st
     store
         .enqueue_command(NewCommandOutboxEntry {
             id: command_id.to_string(),
+            tenant_id: provisioning_tenant_id(),
             device_id: device_id.to_owned(),
             method: "sample_now".to_owned(),
             params: r#"{"source":"shutdown"}"#.to_owned(),

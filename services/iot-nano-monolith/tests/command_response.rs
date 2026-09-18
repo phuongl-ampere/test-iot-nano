@@ -8,6 +8,7 @@ use iot_storage::{NewCommandOutboxEntry, PlatformStore};
 use uuid::Uuid;
 
 const STORAGE_UNAVAILABLE: &str = "platform storage unavailable";
+const TENANT_ID: Uuid = Uuid::from_u128(1);
 
 async fn fixture() -> (tempfile::TempDir, Arc<PlatformStore>, Uuid, Uuid) {
     let directory = tempfile::tempdir().unwrap();
@@ -21,8 +22,17 @@ async fn fixture() -> (tempfile::TempDir, Arc<PlatformStore>, Uuid, Uuid) {
         .await
         .unwrap(),
     );
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'command-response', 'active', '{}')",
+    )
+    .bind(TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     let token_id = Uuid::now_v7();
-    sqlx::query("INSERT INTO devices (device_id) VALUES ('device-1')")
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('device-1', ?)")
+        .bind(TENANT_ID.to_string())
         .execute(store.sqlite_pool().unwrap())
         .await
         .unwrap();
@@ -41,6 +51,7 @@ async fn published_command(store: &PlatformStore, command_id: Uuid, now: chrono:
     store
         .enqueue_command(NewCommandOutboxEntry {
             id: command_id.to_string(),
+            tenant_id: TENANT_ID,
             device_id: "device-1".to_owned(),
             method: "device.read".to_owned(),
             params: r#"{"channel":"temperature"}"#.to_owned(),
@@ -51,11 +62,11 @@ async fn published_command(store: &PlatformStore, command_id: Uuid, now: chrono:
         .await
         .unwrap();
     store
-        .claim_commands(now, now + Duration::seconds(30), 1)
+        .claim_commands(TENANT_ID, now, now + Duration::seconds(30), 1)
         .await
         .unwrap();
     store
-        .mark_command_published(command_id, now + Duration::seconds(1))
+        .mark_command_published(TENANT_ID, command_id, now + Duration::seconds(1))
         .await
         .unwrap()
         .unwrap();
@@ -64,6 +75,7 @@ async fn published_command(store: &PlatformStore, command_id: Uuid, now: chrono:
 fn response(command_id: Uuid, device_id: &str, token_id: Uuid) -> TransportRpcResponse {
     TransportRpcResponse {
         command_id,
+        tenant_id: TENANT_ID,
         device_id: device_id.to_owned(),
         token_id,
         response: serde_json::json!({"ok": true, "value": 42}),

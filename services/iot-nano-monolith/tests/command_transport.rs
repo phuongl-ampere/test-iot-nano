@@ -15,6 +15,8 @@ use iot_storage::PlatformStore;
 use serde_json::json;
 use uuid::Uuid;
 
+const TENANT_ID: Uuid = Uuid::from_u128(1);
+
 #[derive(Default)]
 struct AllowingAuthorization;
 
@@ -27,6 +29,7 @@ impl DeviceAuthorizationPort for AllowingAuthorization {
         Box::pin(async {
             Ok(AuthenticatedDevice {
                 token_id: Uuid::now_v7(),
+                tenant_id: TENANT_ID,
                 device_id: "device-a".to_owned(),
                 is_gateway: false,
             })
@@ -56,6 +59,7 @@ fn allowing_authorization() -> Arc<dyn DeviceAuthorizationPort> {
 fn registration(device_id: &str, connection_id: &str) -> SessionRegistration {
     SessionRegistration {
         token_id: Uuid::now_v7(),
+        tenant_id: TENANT_ID,
         device_id: device_id.to_owned(),
         client_id: format!("client-{device_id}"),
         connection_id: connection_id.to_owned(),
@@ -67,6 +71,7 @@ fn registration(device_id: &str, connection_id: &str) -> SessionRegistration {
 fn request(device_id: &str) -> TransportRpcPublishRequest {
     let issued_at = Utc::now();
     TransportRpcPublishRequest {
+        tenant_id: TENANT_ID,
         device_id: device_id.to_owned(),
         id: Uuid::now_v7(),
         method: "device_read".to_owned(),
@@ -158,9 +163,18 @@ async fn storage_revocation_blocks_an_active_session_before_command_publication(
         .unwrap(),
     );
     sqlx::query(
-        "INSERT INTO devices (device_id, is_gateway, gateway_device_id)
-         VALUES ('device-a', 0, NULL)",
+        "INSERT INTO tenants (id, slug, status, metadata)
+         VALUES (?, 'command-transport', 'active', '{}')",
     )
+    .bind(TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, is_gateway, gateway_device_id)
+         VALUES ('device-a', ?, 0, NULL)",
+    )
+    .bind(TENANT_ID.to_string())
     .execute(store.sqlite_pool().unwrap())
     .await
     .unwrap();
@@ -191,6 +205,7 @@ async fn storage_revocation_blocks_an_active_session_before_command_publication(
     let mut active_session = router
         .register(SessionRegistration {
             token_id: device.token_id,
+            tenant_id: device.tenant_id,
             device_id: device.device_id.clone(),
             client_id: "device-client".to_owned(),
             connection_id: "active-connection".to_owned(),
