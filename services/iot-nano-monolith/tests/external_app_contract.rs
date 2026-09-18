@@ -280,14 +280,6 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         let system_cookie = system_login(&client, fixture.management_address).await?;
         create_tenant(&client, fixture.management_address, &system_cookie).await?;
         let tenant_cookie = tenant_login(&client, fixture.management_address).await?;
-        create_user(&client, fixture.management_address, &tenant_cookie).await?;
-        let user_cookie = user_login(&client, fixture.management_address).await?;
-        assert_management_mutation_denied_to_user(
-            &client,
-            fixture.management_address,
-            &user_cookie,
-        )
-        .await?;
         let (child, powermonitor_address) =
             start_powermonitor_with_retry(&fixture, &prepared_powermonitor, &client, CLIENT_SECRET)
                 .await?;
@@ -316,6 +308,15 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
             false,
             &["devices:read"],
             None,
+        )
+        .await?;
+
+        create_user(&client, fixture.management_address, &tenant_cookie).await?;
+        let user_cookie = user_login(&client, fixture.management_address).await?;
+        assert_management_mutation_denied_to_user(
+            &client,
+            fixture.management_address,
+            &user_cookie,
         )
         .await?;
 
@@ -476,7 +477,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
                 .send()
                 .await?
                 .status(),
-            StatusCode::OK
+            StatusCode::FORBIDDEN
         );
 
         let disabled_authorize = client
