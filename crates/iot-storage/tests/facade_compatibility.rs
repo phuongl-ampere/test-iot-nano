@@ -121,3 +121,22 @@ fn consumer_can_call_application_oauth_and_identity_store_methods() {
     let _ = PlatformStore::register_device;
     let _ = PlatformStore::resolve_active_device_token;
 }
+
+#[test]
+fn consumer_can_call_authorization_and_resource_store_methods() {
+    let _ = PlatformStore::authorization_subject;
+    let _ = PlatformStore::list_authorized_devices;
+    let _ = PlatformStore::list_authorized_assets;
+    let _ = PlatformStore::authorized_device;
+    let _ = PlatformStore::authorized_asset;
+    let _ = PlatformStore::device_permission;
+    let _ = PlatformStore::asset_permission;
+    let _ = PlatformStore::list_tenant_user_groups;
+    let _ = PlatformStore::list_active_resource_permissions;
+    let _ = PlatformStore::create_user_group;
+    let _ = PlatformStore::add_user_to_group;
+    let _ = PlatformStore::remove_user_from_group;
+    let _ = PlatformStore::create_resource_permission;
+    let _ = PlatformStore::revoke_resource_permission;
+    let _ = PlatformStore::transfer_resource_ownership;
+}

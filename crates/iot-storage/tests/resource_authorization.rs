@@ -904,6 +904,64 @@ async fn sqlite_owner_permission_precedes_direct_permission() {
 }
 
 #[tokio::test]
+async fn sqlite_authorized_device_detail_and_list_preserve_owner_precedence() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_identities(pool).await;
+    insert_device(pool, OWNED_DEVICE_A, TENANT_A, None, Some(USER_A)).await;
+    insert_group_member(pool, TENANT_A, GROUP_A, OTHER_USER_A, USER_A).await;
+    insert_permission(
+        pool,
+        "owner-direct-viewer",
+        TENANT_A,
+        Some(USER_A),
+        None,
+        None,
+        Some(OWNED_DEVICE_A),
+        ResourcePermission::Viewer,
+        false,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+    insert_permission(
+        pool,
+        "owner-group-manager",
+        TENANT_A,
+        None,
+        Some(GROUP_A),
+        None,
+        Some(OWNED_DEVICE_A),
+        ResourcePermission::Manager,
+        false,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+
+    let user = subject(USER_A, TENANT_A, AccountClass::User);
+    let expected = access(ResourcePermission::Owner, ResourceAccessSource::Owner);
+    assert_eq!(
+        store
+            .authorized_device(&user, OWNED_DEVICE_A)
+            .await
+            .unwrap()
+            .map(|device| device.access),
+        Some(expected),
+    );
+    assert_eq!(
+        store
+            .list_authorized_devices(&user, None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|device| device.access)
+            .collect::<Vec<_>>(),
+        vec![expected],
+    );
+}
+
+#[tokio::test]
 async fn sqlite_denies_cross_tenant_user_and_unshared_legacy_admin() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
