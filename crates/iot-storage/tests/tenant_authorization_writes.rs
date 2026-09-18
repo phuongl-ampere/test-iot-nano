@@ -1,10 +1,11 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    NewResourcePermission, NewUserGroup, PermissionCreator, PlatformStore, ResourcePermission,
-    TenantAuthorizationError, TenantAuthorizationRepository,
+    AuditAction, AuditEventCursor, AuditEventError, AuditEventRepository, AuditPrincipal,
+    AuditTargetType, NewResourcePermission, NewUserGroup, PermissionCreator, PlatformStore,
+    ResourcePermission, TenantAuthorizationError, TenantAuthorizationRepository,
 };
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 const TENANT_A: Uuid = Uuid::from_u128(1);
@@ -13,6 +14,8 @@ const OWNER_A: Uuid = Uuid::from_u128(10);
 const MEMBER_A: Uuid = Uuid::from_u128(11);
 const CREATOR_A: Uuid = Uuid::from_u128(12);
 const USER_B: Uuid = Uuid::from_u128(20);
+const TENANT_ACCOUNT_A: Uuid = Uuid::from_u128(21);
+const TENANT_ACCOUNT_B: Uuid = Uuid::from_u128(22);
 const ASSET_A: Uuid = Uuid::from_u128(30);
 const ASSET_B: Uuid = Uuid::from_u128(31);
 const DEVICE_A: &str = "device-a";
@@ -59,6 +62,18 @@ async fn seed_tenants(pool: &SqlitePool) {
     insert_user(pool, CREATOR_A, TENANT_A, "creator-a").await;
     insert_user(pool, USER_B, TENANT_B, "user-b").await;
     sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1), (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(TENANT_ACCOUNT_A.to_string())
+    .bind(TENANT_A.to_string())
+    .bind(TENANT_ACCOUNT_B.to_string())
+    .bind(TENANT_B.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO assets (id, tenant_id, name)
          VALUES (?, ?, 'asset-a'), (?, ?, 'asset-b')",
     )
@@ -93,6 +108,259 @@ fn direct_device_permission() -> NewResourcePermission {
         inherit_children: false,
         created_by: PermissionCreator::User(CREATOR_A),
     }
+}
+
+#[tokio::test]
+async fn sqlite_permission_grant_emits_immutable_tenant_audit_event() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_tenants(pool).await;
+
+    let permission = store
+        .create_resource_permission(direct_device_permission())
+        .await
+        .unwrap();
+
+    let event = sqlx::query(
+        "SELECT id, tenant_id, actor_principal_kind, actor_principal_id, action,
+                target_type, target_id, changes
+         FROM audit_events",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let event_id: String = event.try_get("id").unwrap();
+    let changes: serde_json::Value =
+        serde_json::from_str(&event.try_get::<String, _>("changes").unwrap()).unwrap();
+
+    assert_eq!(
+        event.try_get::<String, _>("tenant_id").unwrap(),
+        TENANT_A.to_string()
+    );
+    assert_eq!(
+        event.try_get::<String, _>("actor_principal_kind").unwrap(),
+        "user"
+    );
+    assert_eq!(
+        event.try_get::<String, _>("actor_principal_id").unwrap(),
+        CREATOR_A.to_string()
+    );
+    assert_eq!(
+        event.try_get::<String, _>("action").unwrap(),
+        "permission.granted"
+    );
+    assert_eq!(
+        event.try_get::<String, _>("target_type").unwrap(),
+        "resource_permission"
+    );
+    assert_eq!(
+        event.try_get::<String, _>("target_id").unwrap(),
+        permission.id.to_string()
+    );
+    assert_eq!(
+        changes,
+        json!({
+            "subject": {"kind": "user", "id": MEMBER_A.to_string()},
+            "resource": {"kind": "device", "id": DEVICE_A},
+            "permission": "viewer",
+            "inherit_children": false,
+        })
+    );
+    assert!(
+        sqlx::query("UPDATE audit_events SET action = 'changed' WHERE id = ?")
+            .bind(&event_id)
+            .execute(pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM audit_events WHERE id = ?")
+            .bind(&event_id)
+            .execute(pool)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_tenant_audit_events_use_tenant_scoped_deterministic_keyset_pagination() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_tenants(pool).await;
+
+    let first_permission = store
+        .create_resource_permission(direct_device_permission())
+        .await
+        .unwrap();
+    let group = store
+        .create_user_group(NewUserGroup {
+            tenant_id: TENANT_A,
+            owner_user_id: OWNER_A,
+            name: "audit-readers".to_owned(),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    let second_permission = store
+        .create_resource_permission(NewResourcePermission {
+            tenant_id: TENANT_A,
+            subject_user_id: None,
+            subject_group_id: Some(group.id),
+            asset_id: Some(ASSET_A),
+            device_id: None,
+            permission: ResourcePermission::Manager,
+            inherit_children: true,
+            created_by: PermissionCreator::User(CREATOR_A),
+        })
+        .await
+        .unwrap();
+
+    let first_page = AuditEventRepository::list_tenant_audit_events(&store, TENANT_A, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].tenant_id, TENANT_A);
+    assert_eq!(first_page[0].actor, AuditPrincipal::User(CREATOR_A));
+    assert_eq!(first_page[0].action, AuditAction::PermissionGranted);
+    assert_eq!(
+        first_page[0].target_type,
+        AuditTargetType::ResourcePermission
+    );
+    assert_eq!(first_page[0].target_id, second_permission.id.to_string());
+
+    let second_page = AuditEventRepository::list_tenant_audit_events(
+        &store,
+        TENANT_A,
+        Some(AuditEventCursor {
+            occurred_at: first_page[0].occurred_at,
+            id: first_page[0].id,
+        }),
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].target_id, first_permission.id.to_string());
+    assert_ne!(second_page[0].id, first_page[0].id);
+    assert!(
+        AuditEventRepository::list_tenant_audit_events(&store, TENANT_B, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        AuditEventRepository::list_tenant_audit_events(&store, TENANT_A, None, 0).await,
+        Err(AuditEventError::InvalidLimit { .. })
+    ));
+}
+
+#[tokio::test]
+async fn sqlite_tenant_audit_list_is_tenant_scoped_keyset_ordered_and_limited_to_100_records() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_tenants(pool).await;
+
+    for _ in 0..101 {
+        store
+            .create_resource_permission(direct_device_permission())
+            .await
+            .unwrap();
+    }
+
+    let first_page = AuditEventRepository::list_tenant_audit_events(&store, TENANT_A, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(first_page.len(), 100);
+    assert!(first_page.iter().all(|event| event.tenant_id == TENANT_A));
+    assert!(first_page.windows(2).all(|events| {
+        (events[0].occurred_at, events[0].id) > (events[1].occurred_at, events[1].id)
+    }));
+
+    let second_page = AuditEventRepository::list_tenant_audit_events(
+        &store,
+        TENANT_A,
+        Some(AuditEventCursor {
+            occurred_at: first_page.last().unwrap().occurred_at,
+            id: first_page.last().unwrap().id,
+        }),
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert!(second_page.iter().all(|event| event.tenant_id == TENANT_A));
+    assert!(
+        AuditEventRepository::list_tenant_audit_events(&store, TENANT_B, None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_membership_and_permission_revocation_emit_tenant_audit_events() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_tenants(pool).await;
+
+    let group = store
+        .create_user_group(NewUserGroup {
+            tenant_id: TENANT_A,
+            owner_user_id: OWNER_A,
+            name: "audited-membership".to_owned(),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .add_user_to_group(TENANT_A, group.id, MEMBER_A)
+            .await
+            .unwrap()
+    );
+    let permission = store
+        .create_resource_permission(direct_device_permission())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .revoke_resource_permission(TENANT_A, permission.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .remove_user_from_group(TENANT_A, group.id, MEMBER_A)
+            .await
+            .unwrap()
+    );
+
+    let events = AuditEventRepository::list_tenant_audit_events(&store, TENANT_A, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.iter().map(|event| event.action).collect::<Vec<_>>(),
+        vec![
+            AuditAction::GroupMemberRemoved,
+            AuditAction::PermissionRevoked,
+            AuditAction::PermissionGranted,
+            AuditAction::GroupMemberAdded,
+        ]
+    );
+    assert_eq!(
+        events[0].actor,
+        AuditPrincipal::TenantAccount(TENANT_ACCOUNT_A)
+    );
+    assert_eq!(events[0].target_type, AuditTargetType::UserGroup);
+    assert_eq!(events[0].target_id, group.id.to_string());
+    assert_eq!(
+        events[0].changes,
+        json!({"member_user_id": MEMBER_A.to_string()})
+    );
+    assert_eq!(events[1].actor, AuditPrincipal::User(CREATOR_A));
+    assert_eq!(events[1].target_type, AuditTargetType::ResourcePermission);
+    assert_eq!(events[1].target_id, permission.id.to_string());
+    assert_eq!(events[1].changes, json!({"revoked": true}));
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use sqlx::{Postgres, Row, Sqlite, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{PlatformStore, PlatformStoreError};
+use crate::{AuditAction, AuditTargetType, PlatformStore, PlatformStoreError, audit};
 
 pub const RESERVED_GATEWAY_CHILD_RELATION_TYPE: &str = "gateway_child";
 
@@ -164,6 +164,21 @@ async fn create_device_relation(
             .execute(&mut *transaction)
             .await
             .map_err(map_relation_conflict)?;
+            let actor =
+                audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+            let event = audit::NewAuditEvent::new(
+                tenant_id,
+                actor,
+                AuditAction::DeviceRelationCreated,
+                AuditTargetType::DeviceRelation,
+                id.to_string(),
+                serde_json::json!({
+                    "from_device_id": relation.from_device_id,
+                    "to_device_id": relation.to_device_id,
+                    "relation_type": relation.relation_type,
+                }),
+            );
+            audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
             transaction.commit().await?;
         }
         PlatformStore::Timescale(pool) => {
@@ -185,6 +200,21 @@ async fn create_device_relation(
             .execute(&mut *transaction)
             .await
             .map_err(map_relation_conflict)?;
+            let actor =
+                audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+            let event = audit::NewAuditEvent::new(
+                tenant_id,
+                actor,
+                AuditAction::DeviceRelationCreated,
+                AuditTargetType::DeviceRelation,
+                id.to_string(),
+                serde_json::json!({
+                    "from_device_id": relation.from_device_id,
+                    "to_device_id": relation.to_device_id,
+                    "relation_type": relation.relation_type,
+                }),
+            );
+            audit::insert_timescale_audit_event(&mut transaction, &event).await?;
             transaction.commit().await?;
         }
     }
@@ -202,26 +232,82 @@ async fn delete_device_relation(
     tenant_id: Uuid,
     relation_id: Uuid,
 ) -> Result<bool, DeviceRelationError> {
-    let deleted = match store {
+    match store {
         PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+            let relation = sqlx::query(
+                "SELECT from_device_id, to_device_id, relation_type
+                 FROM device_relations
+                 WHERE id = ? AND tenant_id = ?",
+            )
+            .bind(relation_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DeviceRelationError::RelationNotFound)?;
+            let from_device_id: String = relation.try_get("from_device_id")?;
+            let to_device_id: String = relation.try_get("to_device_id")?;
+            let relation_type: String = relation.try_get("relation_type")?;
             sqlx::query("DELETE FROM device_relations WHERE id = ? AND tenant_id = ?")
                 .bind(relation_id.to_string())
                 .bind(tenant_id.to_string())
-                .execute(store.pool())
-                .await?
-                .rows_affected()
+                .execute(&mut *transaction)
+                .await?;
+            let actor =
+                audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+            let event = audit::NewAuditEvent::new(
+                tenant_id,
+                actor,
+                AuditAction::DeviceRelationDeleted,
+                AuditTargetType::DeviceRelation,
+                relation_id.to_string(),
+                serde_json::json!({
+                    "from_device_id": from_device_id,
+                    "to_device_id": to_device_id,
+                    "relation_type": relation_type,
+                }),
+            );
+            audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+            transaction.commit().await?;
         }
         PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            let relation = sqlx::query(
+                "SELECT from_device_id, to_device_id, relation_type
+                 FROM device_relations
+                 WHERE id = $1 AND tenant_id = $2
+                 FOR UPDATE",
+            )
+            .bind(relation_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DeviceRelationError::RelationNotFound)?;
+            let from_device_id: String = relation.try_get("from_device_id")?;
+            let to_device_id: String = relation.try_get("to_device_id")?;
+            let relation_type: String = relation.try_get("relation_type")?;
             sqlx::query("DELETE FROM device_relations WHERE id = $1 AND tenant_id = $2")
                 .bind(relation_id)
                 .bind(tenant_id)
-                .execute(pool)
-                .await?
-                .rows_affected()
+                .execute(&mut *transaction)
+                .await?;
+            let actor =
+                audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+            let event = audit::NewAuditEvent::new(
+                tenant_id,
+                actor,
+                AuditAction::DeviceRelationDeleted,
+                AuditTargetType::DeviceRelation,
+                relation_id.to_string(),
+                serde_json::json!({
+                    "from_device_id": from_device_id,
+                    "to_device_id": to_device_id,
+                    "relation_type": relation_type,
+                }),
+            );
+            audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+            transaction.commit().await?;
         }
-    };
-    if deleted == 0 {
-        return Err(DeviceRelationError::RelationNotFound);
     }
     Ok(true)
 }

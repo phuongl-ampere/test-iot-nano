@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod audit;
 mod device_relations;
 mod management;
 mod public_api;
@@ -38,6 +39,10 @@ const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform
 const SQLITE_PLATFORM_SCHEMA_VERSION: i64 = 1;
 const SET_SQLITE_PLATFORM_SCHEMA_VERSION: &str = "PRAGMA user_version = 1";
 
+pub use audit::{
+    AuditAction, AuditEvent, AuditEventCursor, AuditEventError, AuditEventRepository,
+    AuditPrincipal, AuditTargetType,
+};
 pub use device_relations::{
     CreateDeviceRelation, DeviceRelation, DeviceRelationError, DeviceRelationRepository,
     RESERVED_GATEWAY_CHILD_RELATION_TYPE,
@@ -478,6 +483,33 @@ CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_user_index
 CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_group_index
     ON resource_permissions (tenant_id, asset_id, subject_group_id)
     WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_group_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    occurred_at TEXT NOT NULL,
+    actor_principal_kind TEXT NOT NULL
+        CHECK (actor_principal_kind IN ('system_account', 'tenant_account', 'user')),
+    actor_principal_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    changes TEXT NOT NULL CHECK (json_valid(changes))
+);
+CREATE INDEX IF NOT EXISTS audit_events_tenant_occurred_at_id_index
+    ON audit_events (tenant_id, occurred_at DESC, id DESC);
+CREATE TRIGGER IF NOT EXISTS audit_events_immutable_update
+BEFORE UPDATE ON audit_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_events_immutable_delete
+BEFORE DELETE ON audit_events
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events are immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS device_tokens (
     id TEXT PRIMARY KEY,
@@ -1702,6 +1734,12 @@ pub enum PermissionCreator {
     TenantAccount(uuid::Uuid),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipTransferTarget {
+    Asset(uuid::Uuid),
+    Device(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewResourcePermission {
     pub tenant_id: uuid::Uuid,
@@ -1771,6 +1809,8 @@ pub enum TenantAuthorizationError {
     DevicePermissionCannotInherit,
     #[error("stored tenant authorization data is invalid")]
     InvalidStoredRecord,
+    #[error("system accounts cannot transfer tenant resource ownership")]
+    SystemAccountCannotTransferOwnership,
 }
 
 pub trait AuthorizationRepository: Send + Sync {
@@ -1929,6 +1969,13 @@ pub trait TenantAuthorizationRepository: Send + Sync {
         &'a self,
         tenant_id: uuid::Uuid,
         permission_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
+    fn transfer_resource_ownership<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
+        target: OwnershipTransferTarget,
+        new_owner_user_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
 }
 
@@ -4215,6 +4262,20 @@ impl PlatformStore {
                 .await?
                 .rows_affected()
                     > 0;
+                if inserted {
+                    let actor =
+                        audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id)
+                            .await?;
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::GroupMemberAdded,
+                        AuditTargetType::UserGroup,
+                        group_id.to_string(),
+                        serde_json::json!({"member_user_id": user_id.to_string()}),
+                    );
+                    audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+                }
                 transaction.commit().await?;
                 Ok(inserted)
             }
@@ -4234,6 +4295,20 @@ impl PlatformStore {
                 .await?
                 .rows_affected()
                     > 0;
+                if inserted {
+                    let actor =
+                        audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
+                            .await?;
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::GroupMemberAdded,
+                        AuditTargetType::UserGroup,
+                        group_id.to_string(),
+                        serde_json::json!({"member_user_id": user_id.to_string()}),
+                    );
+                    audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+                }
                 transaction.commit().await?;
                 Ok(inserted)
             }
@@ -4262,6 +4337,20 @@ impl PlatformStore {
                 .await?
                 .rows_affected()
                     > 0;
+                if removed {
+                    let actor =
+                        audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id)
+                            .await?;
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::GroupMemberRemoved,
+                        AuditTargetType::UserGroup,
+                        group_id.to_string(),
+                        serde_json::json!({"member_user_id": user_id.to_string()}),
+                    );
+                    audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+                }
                 transaction.commit().await?;
                 Ok(removed)
             }
@@ -4280,6 +4369,20 @@ impl PlatformStore {
                 .await?
                 .rows_affected()
                     > 0;
+                if removed {
+                    let actor =
+                        audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
+                            .await?;
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::GroupMemberRemoved,
+                        AuditTargetType::UserGroup,
+                        group_id.to_string(),
+                        serde_json::json!({"member_user_id": user_id.to_string()}),
+                    );
+                    audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+                }
                 transaction.commit().await?;
                 Ok(removed)
             }
@@ -4294,6 +4397,33 @@ impl PlatformStore {
         let id = uuid::Uuid::now_v7();
         let (created_by_user_id, created_by_tenant_account_id) =
             permission_creator_ids(permission.created_by);
+        let subject = match permission.subject_user_id {
+            Some(user_id) => serde_json::json!({"kind": "user", "id": user_id.to_string()}),
+            None => serde_json::json!({
+                "kind": "group",
+                "id": permission.subject_group_id.expect("validated resource permission").to_string(),
+            }),
+        };
+        let resource = match permission.asset_id {
+            Some(asset_id) => serde_json::json!({"kind": "asset", "id": asset_id.to_string()}),
+            None => serde_json::json!({
+                "kind": "device",
+                "id": permission.device_id.as_deref().expect("validated resource permission"),
+            }),
+        };
+        let audit_event = audit::NewAuditEvent::new(
+            permission.tenant_id,
+            audit_principal_for_permission_creator(permission.created_by),
+            AuditAction::PermissionGranted,
+            AuditTargetType::ResourcePermission,
+            id.to_string(),
+            serde_json::json!({
+                "subject": subject,
+                "resource": resource,
+                "permission": permission.permission.as_str(),
+                "inherit_children": permission.inherit_children,
+            }),
+        );
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -4316,6 +4446,7 @@ impl PlatformStore {
                 .bind(created_by_tenant_account_id.map(|value| value.to_string()))
                 .execute(&mut *transaction)
                 .await?;
+                audit::insert_sqlite_audit_event(&mut transaction, &audit_event).await?;
                 transaction.commit().await?;
             }
             Self::Timescale(pool) => {
@@ -4339,6 +4470,7 @@ impl PlatformStore {
                 .bind(created_by_tenant_account_id)
                 .execute(&mut *transaction)
                 .await?;
+                audit::insert_timescale_audit_event(&mut transaction, &audit_event).await?;
                 transaction.commit().await?;
             }
         }
@@ -4365,6 +4497,21 @@ impl PlatformStore {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
                 sqlite_require_tenant_permission(&mut transaction, tenant_id, permission_id)
                     .await?;
+                let creator = sqlx::query(
+                    "SELECT created_by_user_id, created_by_tenant_account_id
+                     FROM resource_permissions
+                     WHERE id = ? AND tenant_id = ?",
+                )
+                .bind(permission_id.to_string())
+                .bind(tenant_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+                let actor = audit_principal_for_permission_creator(permission_creator(
+                    tenant_authorization_optional_uuid(creator.try_get("created_by_user_id")?)?,
+                    tenant_authorization_optional_uuid(
+                        creator.try_get("created_by_tenant_account_id")?,
+                    )?,
+                )?);
                 let revoked = sqlx::query(
                     "UPDATE resource_permissions
                      SET revoked_at = ?
@@ -4377,6 +4524,17 @@ impl PlatformStore {
                 .await?
                 .rows_affected()
                     > 0;
+                if revoked {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::PermissionRevoked,
+                        AuditTargetType::ResourcePermission,
+                        permission_id.to_string(),
+                        serde_json::json!({"revoked": true}),
+                    );
+                    audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+                }
                 transaction.commit().await?;
                 Ok(revoked)
             }
@@ -4384,6 +4542,20 @@ impl PlatformStore {
                 let mut transaction = pool.begin().await?;
                 timescale_require_tenant_permission(&mut transaction, tenant_id, permission_id)
                     .await?;
+                let creator = sqlx::query(
+                    "SELECT created_by_user_id, created_by_tenant_account_id
+                     FROM resource_permissions
+                     WHERE id = $1 AND tenant_id = $2
+                     FOR UPDATE",
+                )
+                .bind(permission_id)
+                .bind(tenant_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                let actor = audit_principal_for_permission_creator(permission_creator(
+                    creator.try_get("created_by_user_id")?,
+                    creator.try_get("created_by_tenant_account_id")?,
+                )?);
                 let revoked = sqlx::query(
                     "UPDATE resource_permissions
                      SET revoked_at = now()
@@ -4395,8 +4567,212 @@ impl PlatformStore {
                 .await?
                 .rows_affected()
                     > 0;
+                if revoked {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::PermissionRevoked,
+                        AuditTargetType::ResourcePermission,
+                        permission_id.to_string(),
+                        serde_json::json!({"revoked": true}),
+                    );
+                    audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+                }
                 transaction.commit().await?;
                 Ok(revoked)
+            }
+        }
+    }
+
+    pub async fn transfer_resource_ownership(
+        &self,
+        tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
+        target: OwnershipTransferTarget,
+        new_owner_user_id: uuid::Uuid,
+    ) -> Result<bool, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
+                sqlite_require_tenant_user(&mut transaction, tenant_id, new_owner_user_id).await?;
+                let (target_type, target_id, previous_owner_user_id) = match &target {
+                    OwnershipTransferTarget::Asset(asset_id) => {
+                        let owner = sqlx::query_scalar::<_, Option<String>>(
+                            "SELECT owner_user_id FROM assets WHERE id = ? AND tenant_id = ?",
+                        )
+                        .bind(asset_id.to_string())
+                        .bind(tenant_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .ok_or(
+                            TenantAuthorizationError::AssetNotFound {
+                                tenant_id,
+                                asset_id: *asset_id,
+                            },
+                        )?;
+                        (AuditTargetType::Asset, asset_id.to_string(), owner)
+                    }
+                    OwnershipTransferTarget::Device(device_id) => {
+                        let owner = sqlx::query_scalar::<_, Option<String>>(
+                            "SELECT owner_user_id FROM devices
+                             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+                        )
+                        .bind(device_id)
+                        .bind(tenant_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .ok_or_else(|| {
+                            TenantAuthorizationError::DeviceNotFound {
+                                tenant_id,
+                                device_id: device_id.clone(),
+                            }
+                        })?;
+                        (AuditTargetType::Device, device_id.clone(), owner)
+                    }
+                };
+                let next_owner_user_id = new_owner_user_id.to_string();
+                if previous_owner_user_id.as_deref() == Some(next_owner_user_id.as_str()) {
+                    transaction.commit().await?;
+                    return Ok(false);
+                }
+                match target {
+                    OwnershipTransferTarget::Asset(asset_id) => {
+                        sqlx::query(
+                            "UPDATE assets SET owner_user_id = ? WHERE id = ? AND tenant_id = ?",
+                        )
+                        .bind(&next_owner_user_id)
+                        .bind(asset_id.to_string())
+                        .bind(tenant_id.to_string())
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                    OwnershipTransferTarget::Device(device_id) => {
+                        sqlx::query(
+                            "UPDATE devices
+                             SET owner_user_id = ?
+                             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+                        )
+                        .bind(&next_owner_user_id)
+                        .bind(device_id)
+                        .bind(tenant_id.to_string())
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                }
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::OwnershipTransferred,
+                    target_type,
+                    target_id,
+                    serde_json::json!({
+                        "owner_user_id": {
+                            "before": previous_owner_user_id,
+                            "after": next_owner_user_id,
+                        }
+                    }),
+                );
+                audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+                transaction.commit().await?;
+                Ok(true)
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
+                timescale_require_tenant_user(&mut transaction, tenant_id, new_owner_user_id)
+                    .await?;
+                let (target_type, target_id, previous_owner_user_id) = match &target {
+                    OwnershipTransferTarget::Asset(asset_id) => {
+                        let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                            "SELECT owner_user_id FROM assets
+                             WHERE id = $1 AND tenant_id = $2
+                             FOR UPDATE",
+                        )
+                        .bind(*asset_id)
+                        .bind(tenant_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .ok_or(
+                            TenantAuthorizationError::AssetNotFound {
+                                tenant_id,
+                                asset_id: *asset_id,
+                            },
+                        )?;
+                        (
+                            AuditTargetType::Asset,
+                            asset_id.to_string(),
+                            owner.map(|id| id.to_string()),
+                        )
+                    }
+                    OwnershipTransferTarget::Device(device_id) => {
+                        let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                            "SELECT owner_user_id FROM devices
+                             WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+                             FOR UPDATE",
+                        )
+                        .bind(device_id)
+                        .bind(tenant_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .ok_or_else(|| {
+                            TenantAuthorizationError::DeviceNotFound {
+                                tenant_id,
+                                device_id: device_id.clone(),
+                            }
+                        })?;
+                        (
+                            AuditTargetType::Device,
+                            device_id.clone(),
+                            owner.map(|id| id.to_string()),
+                        )
+                    }
+                };
+                let next_owner_user_id = new_owner_user_id.to_string();
+                if previous_owner_user_id.as_deref() == Some(next_owner_user_id.as_str()) {
+                    transaction.commit().await?;
+                    return Ok(false);
+                }
+                match target {
+                    OwnershipTransferTarget::Asset(asset_id) => {
+                        sqlx::query(
+                            "UPDATE assets SET owner_user_id = $1 WHERE id = $2 AND tenant_id = $3",
+                        )
+                        .bind(new_owner_user_id)
+                        .bind(asset_id)
+                        .bind(tenant_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                    OwnershipTransferTarget::Device(device_id) => {
+                        sqlx::query(
+                            "UPDATE devices
+                             SET owner_user_id = $1
+                             WHERE device_id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
+                        )
+                        .bind(new_owner_user_id)
+                        .bind(device_id)
+                        .bind(tenant_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                }
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::OwnershipTransferred,
+                    target_type,
+                    target_id,
+                    serde_json::json!({
+                        "owner_user_id": {
+                            "before": previous_owner_user_id,
+                            "after": next_owner_user_id,
+                        }
+                    }),
+                );
+                audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+                transaction.commit().await?;
+                Ok(true)
             }
         }
     }
@@ -8731,6 +9107,25 @@ impl TenantAuthorizationRepository for PlatformStore {
             PlatformStore::revoke_resource_permission(self, tenant_id, permission_id).await
         })
     }
+
+    fn transfer_resource_ownership<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        actor: AuditPrincipal,
+        target: OwnershipTransferTarget,
+        new_owner_user_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
+        Box::pin(async move {
+            PlatformStore::transfer_resource_ownership(
+                self,
+                tenant_id,
+                actor,
+                target,
+                new_owner_user_id,
+            )
+            .await
+        })
+    }
 }
 
 impl AlertIncidentRepository for PlatformStore {
@@ -9418,6 +9813,26 @@ fn permission_creator_ids(creator: PermissionCreator) -> (Option<uuid::Uuid>, Op
     }
 }
 
+fn audit_principal_for_permission_creator(creator: PermissionCreator) -> AuditPrincipal {
+    match creator {
+        PermissionCreator::User(user_id) => AuditPrincipal::User(user_id),
+        PermissionCreator::TenantAccount(tenant_account_id) => {
+            AuditPrincipal::TenantAccount(tenant_account_id)
+        }
+    }
+}
+
+fn permission_creator(
+    created_by_user_id: Option<uuid::Uuid>,
+    created_by_tenant_account_id: Option<uuid::Uuid>,
+) -> Result<PermissionCreator, TenantAuthorizationError> {
+    match (created_by_user_id, created_by_tenant_account_id) {
+        (Some(user_id), None) => Ok(PermissionCreator::User(user_id)),
+        (None, Some(tenant_account_id)) => Ok(PermissionCreator::TenantAccount(tenant_account_id)),
+        _ => Err(TenantAuthorizationError::InvalidStoredRecord),
+    }
+}
+
 fn tenant_authorization_uuid(value: String) -> Result<uuid::Uuid, TenantAuthorizationError> {
     uuid::Uuid::parse_str(&value).map_err(|_| TenantAuthorizationError::InvalidStoredRecord)
 }
@@ -9451,11 +9866,7 @@ fn resource_permission_record(
 ) -> Result<ResourcePermissionRecord, TenantAuthorizationError> {
     let permission = ResourcePermission::parse(&permission)
         .ok_or(TenantAuthorizationError::InvalidStoredRecord)?;
-    let created_by = match (created_by_user_id, created_by_tenant_account_id) {
-        (Some(user_id), None) => PermissionCreator::User(user_id),
-        (None, Some(tenant_account_id)) => PermissionCreator::TenantAccount(tenant_account_id),
-        _ => return Err(TenantAuthorizationError::InvalidStoredRecord),
-    };
+    let created_by = permission_creator(created_by_user_id, created_by_tenant_account_id)?;
     let record = ResourcePermissionRecord {
         id,
         tenant_id,
@@ -9532,6 +9943,24 @@ async fn sqlite_require_tenant_account(
             tenant_id,
             tenant_account_id,
         })
+    }
+}
+
+async fn sqlite_require_tenant_audit_actor(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    actor: AuditPrincipal,
+) -> Result<(), TenantAuthorizationError> {
+    match actor {
+        AuditPrincipal::User(user_id) => {
+            sqlite_require_tenant_user(transaction, tenant_id, user_id).await
+        }
+        AuditPrincipal::TenantAccount(tenant_account_id) => {
+            sqlite_require_tenant_account(transaction, tenant_id, tenant_account_id).await
+        }
+        AuditPrincipal::SystemAccount(_) => {
+            Err(TenantAuthorizationError::SystemAccountCannotTransferOwnership)
+        }
     }
 }
 
@@ -9703,6 +10132,24 @@ async fn timescale_require_tenant_account(
             tenant_id,
             tenant_account_id,
         })
+    }
+}
+
+async fn timescale_require_tenant_audit_actor(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    actor: AuditPrincipal,
+) -> Result<(), TenantAuthorizationError> {
+    match actor {
+        AuditPrincipal::User(user_id) => {
+            timescale_require_tenant_user(transaction, tenant_id, user_id).await
+        }
+        AuditPrincipal::TenantAccount(tenant_account_id) => {
+            timescale_require_tenant_account(transaction, tenant_id, tenant_account_id).await
+        }
+        AuditPrincipal::SystemAccount(_) => {
+            Err(TenantAuthorizationError::SystemAccountCannotTransferOwnership)
+        }
     }
 }
 

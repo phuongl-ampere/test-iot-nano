@@ -347,6 +347,32 @@ CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_user_index
 CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_group_index
     ON resource_permissions (tenant_id, asset_id, subject_group_id)
     WHERE revoked_at IS NULL AND asset_id IS NOT NULL AND subject_group_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    actor_principal_kind TEXT NOT NULL
+        CHECK (actor_principal_kind IN ('system_account', 'tenant_account', 'user')),
+    actor_principal_id UUID NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    changes JSONB NOT NULL CHECK (jsonb_typeof(changes) = 'object')
+);
+CREATE INDEX IF NOT EXISTS audit_events_tenant_occurred_at_id_index
+    ON audit_events (tenant_id, occurred_at DESC, id DESC);
+CREATE OR REPLACE FUNCTION prevent_audit_events_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_events are immutable';
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS audit_events_immutable ON audit_events;
+CREATE TRIGGER audit_events_immutable
+    BEFORE UPDATE OR DELETE ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_events_mutation();
+
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE TABLE IF NOT EXISTS device_runtime_state (
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,

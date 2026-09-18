@@ -35,6 +35,16 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, slug: &str) -> Uuid {
         .execute(pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
     tenant_id
 }
 

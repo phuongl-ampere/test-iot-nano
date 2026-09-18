@@ -8,7 +8,7 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AccountClass, PlatformStore, PlatformStoreError};
+use crate::{AccountClass, AuditAction, AuditTargetType, PlatformStore, PlatformStoreError, audit};
 
 pub const BUILT_IN_USER_WORKSPACE: &str = "/app";
 pub const MANAGEMENT_ALERT_LIST_LIMIT: usize = 100;
@@ -1894,6 +1894,14 @@ async fn update_management_asset(
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
             sqlite_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
+            let previous_parent_id: Option<String> = sqlx::query_scalar(
+                "SELECT parent_asset_id FROM assets WHERE id = ? AND tenant_id = ?",
+            )
+            .bind(asset_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            let next_parent_id = asset.parent_asset_id.map(|id| id.to_string());
             validate_sqlite_asset_references(
                 &mut transaction,
                 tenant_id,
@@ -1921,7 +1929,7 @@ async fn update_management_asset(
             )
             .bind(asset.name)
             .bind(asset.asset_profile_id.map(|id| id.to_string()))
-            .bind(asset.parent_asset_id.map(|id| id.to_string()))
+            .bind(next_parent_id.as_deref())
             .bind(asset.metadata.to_string())
             .bind(Utc::now().to_rfc3339())
             .bind(asset_id.to_string())
@@ -1935,6 +1943,24 @@ async fn update_management_asset(
                     sibling_parent_asset_id,
                 )
             })?;
+            if previous_parent_id != next_parent_id {
+                let actor =
+                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Asset,
+                    asset_id.to_string(),
+                    serde_json::json!({
+                        "parent_asset_id": {
+                            "before": previous_parent_id,
+                            "after": next_parent_id,
+                        }
+                    }),
+                );
+                audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+            }
             transaction.commit().await?;
         }
         PlatformStore::Timescale(pool) => {
@@ -1951,6 +1977,14 @@ async fn update_management_asset(
             )
             .await?;
             timescale_require_management_asset(&mut transaction, tenant_id, asset_id).await?;
+            let previous_parent_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT parent_asset_id FROM assets WHERE id = $1 AND tenant_id = $2",
+            )
+            .bind(asset_id)
+            .bind(tenant_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let next_parent_id = asset.parent_asset_id;
             validate_timescale_asset_references(
                 &mut transaction,
                 tenant_id,
@@ -1991,6 +2025,25 @@ async fn update_management_asset(
                     sibling_parent_asset_id,
                 )
             })?;
+            if previous_parent_id != next_parent_id {
+                let actor =
+                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
+                        .await?;
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Asset,
+                    asset_id.to_string(),
+                    serde_json::json!({
+                        "parent_asset_id": {
+                            "before": previous_parent_id.map(|id| id.to_string()),
+                            "after": next_parent_id.map(|id| id.to_string()),
+                        }
+                    }),
+                );
+                audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+            }
             transaction.commit().await?;
         }
     }
@@ -2015,20 +2068,62 @@ async fn delete_management_asset(
                     parent_asset_id: None,
                 });
             }
-            sqlx::query(
+            let detached_asset_ids = sqlx::query_scalar::<_, String>(
                 "UPDATE assets
                  SET parent_asset_id = NULL
-                 WHERE parent_asset_id = ? AND tenant_id = ?",
+                 WHERE parent_asset_id = ? AND tenant_id = ?
+                 RETURNING id",
             )
             .bind(asset_id.to_string())
             .bind(tenant_id.to_string())
-            .execute(&mut *transaction)
+            .fetch_all(&mut *transaction)
             .await?;
-            sqlx::query("UPDATE devices SET asset_id = NULL WHERE asset_id = ? AND tenant_id = ?")
-                .bind(asset_id.to_string())
-                .bind(tenant_id.to_string())
-                .execute(&mut *transaction)
-                .await?;
+            let detached_device_ids = sqlx::query_scalar::<_, String>(
+                "UPDATE devices
+                 SET asset_id = NULL
+                 WHERE asset_id = ? AND tenant_id = ?
+                 RETURNING device_id",
+            )
+            .bind(asset_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_all(&mut *transaction)
+            .await?;
+            if !detached_asset_ids.is_empty() || !detached_device_ids.is_empty() {
+                let actor =
+                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+                for detached_asset_id in detached_asset_ids {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::AssetContainmentChanged,
+                        AuditTargetType::Asset,
+                        detached_asset_id,
+                        serde_json::json!({
+                            "parent_asset_id": {
+                                "before": asset_id.to_string(),
+                                "after": null,
+                            }
+                        }),
+                    );
+                    audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+                }
+                for detached_device_id in detached_device_ids {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::AssetContainmentChanged,
+                        AuditTargetType::Device,
+                        detached_device_id,
+                        serde_json::json!({
+                            "asset_id": {
+                                "before": asset_id.to_string(),
+                                "after": null,
+                            }
+                        }),
+                    );
+                    audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+                }
+            }
             let deleted = sqlx::query("DELETE FROM assets WHERE id = ? AND tenant_id = ?")
                 .bind(asset_id.to_string())
                 .bind(tenant_id.to_string())
@@ -2050,22 +2145,63 @@ async fn delete_management_asset(
                     parent_asset_id: None,
                 });
             }
-            sqlx::query(
+            let detached_asset_ids = sqlx::query_scalar::<_, Uuid>(
                 "UPDATE assets
                  SET parent_asset_id = NULL
-                 WHERE parent_asset_id = $1 AND tenant_id = $2",
+                 WHERE parent_asset_id = $1 AND tenant_id = $2
+                 RETURNING id",
             )
             .bind(asset_id)
             .bind(tenant_id)
-            .execute(&mut *transaction)
+            .fetch_all(&mut *transaction)
             .await?;
-            sqlx::query(
-                "UPDATE devices SET asset_id = NULL WHERE asset_id = $1 AND tenant_id = $2",
+            let detached_device_ids = sqlx::query_scalar::<_, String>(
+                "UPDATE devices
+                 SET asset_id = NULL
+                 WHERE asset_id = $1 AND tenant_id = $2
+                 RETURNING device_id",
             )
             .bind(asset_id)
             .bind(tenant_id)
-            .execute(&mut *transaction)
+            .fetch_all(&mut *transaction)
             .await?;
+            if !detached_asset_ids.is_empty() || !detached_device_ids.is_empty() {
+                let actor =
+                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
+                        .await?;
+                for detached_asset_id in detached_asset_ids {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::AssetContainmentChanged,
+                        AuditTargetType::Asset,
+                        detached_asset_id.to_string(),
+                        serde_json::json!({
+                            "parent_asset_id": {
+                                "before": asset_id.to_string(),
+                                "after": null,
+                            }
+                        }),
+                    );
+                    audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+                }
+                for detached_device_id in detached_device_ids {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        actor,
+                        AuditAction::AssetContainmentChanged,
+                        AuditTargetType::Device,
+                        detached_device_id,
+                        serde_json::json!({
+                            "asset_id": {
+                                "before": asset_id.to_string(),
+                                "after": null,
+                            }
+                        }),
+                    );
+                    audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+                }
+            }
             let deleted = sqlx::query("DELETE FROM assets WHERE id = $1 AND tenant_id = $2")
                 .bind(asset_id)
                 .bind(tenant_id)
@@ -2734,6 +2870,15 @@ async fn update_management_device(
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin().await?;
             let current = sqlite_topology(&mut transaction, tenant_id, device_id).await?;
+            let previous_asset_id: Option<String> = sqlx::query_scalar(
+                "SELECT asset_id FROM devices
+                 WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+            )
+            .bind(device_id)
+            .bind(tenant_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            let next_asset_id = update.asset_id.map(|id| id.to_string());
             let topology = update.topology.unwrap_or(current.clone());
             validate_sqlite_topology(tenant_id, device_id, &current, &topology, &mut transaction)
                 .await?;
@@ -2753,7 +2898,7 @@ async fn update_management_device(
                  WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
             )
             .bind(display_name)
-            .bind(update.asset_id.map(|id| id.to_string()))
+            .bind(next_asset_id.as_deref())
             .bind(update.device_profile_id.map(|id| id.to_string()))
             .bind(attributes.map(|value| value.to_string()))
             .bind(i64::from(topology.is_gateway))
@@ -2763,6 +2908,45 @@ async fn update_management_device(
             .bind(tenant_id.to_string())
             .execute(&mut *transaction)
             .await?;
+            if previous_asset_id != next_asset_id {
+                let actor =
+                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Device,
+                    device_id.to_owned(),
+                    serde_json::json!({
+                        "asset_id": {
+                            "before": previous_asset_id,
+                            "after": next_asset_id,
+                        }
+                    }),
+                );
+                audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+            }
+            if topology_changed {
+                let actor =
+                    audit::sqlite_tenant_account_audit_actor(&mut transaction, tenant_id).await?;
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    gateway_audit_action(
+                        current.gateway_device_id.as_deref(),
+                        topology.gateway_device_id.as_deref(),
+                    ),
+                    AuditTargetType::Device,
+                    device_id.to_owned(),
+                    serde_json::json!({
+                        "gateway_device_id": {
+                            "before": current.gateway_device_id,
+                            "after": topology.gateway_device_id,
+                        }
+                    }),
+                );
+                audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+            }
             if topology.gateway_device_id.is_some() {
                 sqlx::query(
                     "UPDATE device_tokens
@@ -2790,6 +2974,16 @@ async fn update_management_device(
                 .execute(&mut *transaction)
                 .await?;
             let current = timescale_topology(&mut transaction, tenant_id, device_id).await?;
+            let previous_asset_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT asset_id FROM devices
+                 WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+                 FOR UPDATE",
+            )
+            .bind(device_id)
+            .bind(tenant_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            let next_asset_id = update.asset_id;
             let topology = update.topology.unwrap_or(current.clone());
             validate_timescale_topology(
                 tenant_id,
@@ -2825,6 +3019,47 @@ async fn update_management_device(
             .bind(tenant_id)
             .execute(&mut *transaction)
             .await?;
+            if previous_asset_id != next_asset_id {
+                let actor =
+                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
+                        .await?;
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    AuditAction::AssetContainmentChanged,
+                    AuditTargetType::Device,
+                    device_id.to_owned(),
+                    serde_json::json!({
+                        "asset_id": {
+                            "before": previous_asset_id.map(|id| id.to_string()),
+                            "after": next_asset_id.map(|id| id.to_string()),
+                        }
+                    }),
+                );
+                audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+            }
+            if topology_changed {
+                let actor =
+                    audit::timescale_tenant_account_audit_actor(&mut transaction, tenant_id)
+                        .await?;
+                let event = audit::NewAuditEvent::new(
+                    tenant_id,
+                    actor,
+                    gateway_audit_action(
+                        current.gateway_device_id.as_deref(),
+                        topology.gateway_device_id.as_deref(),
+                    ),
+                    AuditTargetType::Device,
+                    device_id.to_owned(),
+                    serde_json::json!({
+                        "gateway_device_id": {
+                            "before": current.gateway_device_id,
+                            "after": topology.gateway_device_id,
+                        }
+                    }),
+                );
+                audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+            }
             if topology.gateway_device_id.is_some() {
                 sqlx::query(
                     "UPDATE device_tokens
@@ -2846,6 +3081,18 @@ async fn update_management_device(
         }
     }
     management_device(store, tenant_id, device_id).await
+}
+
+fn gateway_audit_action(
+    previous_gateway_device_id: Option<&str>,
+    next_gateway_device_id: Option<&str>,
+) -> AuditAction {
+    match (previous_gateway_device_id, next_gateway_device_id) {
+        (None, Some(_)) => AuditAction::GatewayAssigned,
+        (Some(_), None) => AuditAction::GatewayDetached,
+        (Some(_), Some(_)) => AuditAction::GatewayReassigned,
+        (None, None) => unreachable!("gateway audit action requires a topology change"),
+    }
 }
 
 async fn delete_management_device(

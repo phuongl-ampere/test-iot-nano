@@ -36,6 +36,18 @@ async fn seed_devices(pool: &SqlitePool) {
     .await
     .unwrap();
     sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, password_hash, status, credential_version
+         ) VALUES (?, ?, 'unused', 'active', 1), (?, ?, 'unused', 'active', 1)",
+    )
+    .bind(Uuid::from_u128(101).to_string())
+    .bind(TENANT_A.to_string())
+    .bind(Uuid::from_u128(102).to_string())
+    .bind(TENANT_B.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO devices (device_id, tenant_id, display_name, is_gateway, gateway_device_id)
          VALUES (?, ?, 'Gateway A', 1, NULL),
                 (?, ?, 'Device A', 0, ?),
