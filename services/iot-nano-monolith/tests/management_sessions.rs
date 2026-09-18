@@ -1544,6 +1544,41 @@ async fn management_login_issues_a_cookie_used_by_the_oauth_session_verifier_and
 }
 
 #[tokio::test]
+async fn platform_logout_revokes_session_clears_cookie_and_redirects_to_login() {
+    let (_directory, _store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let cookie = system_account_cookie(&router).await;
+
+    let logout = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    assert_eq!(logout.headers()[LOCATION], "/login");
+    assert!(
+        logout.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+
+    let revoked = router
+        .oneshot(platform_get("/system", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn management_login_rejects_invalid_credentials_without_setting_a_session_cookie() {
     let (_directory, management) = management_session_router().await;
     let response = management

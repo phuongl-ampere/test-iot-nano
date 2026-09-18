@@ -16,7 +16,14 @@
             <small>{% block account_kind %}{% endblock %}</small>
           </span>
         </div>
-        <div class="account-label">{{ identity.label }}</div>
+        <div class="topbar-actions">
+          <div class="account-label">{{ identity.label }}</div>
+          {% block account_actions %}
+            <form class="logout-form" action="/logout" method="post">
+              <button class="logout-button" type="submit">Sign out</button>
+            </form>
+          {% endblock %}
+        </div>
       </header>
       <div class="console-body">
         <aside class="sidebar">

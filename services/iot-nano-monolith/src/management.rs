@@ -150,6 +150,7 @@ impl ManagementSessionRouter {
             .route("/login/system", post(platform_system_login))
             .route("/login/tenant", post(platform_tenant_login))
             .route("/login/user", post(platform_user_login))
+            .route("/logout", post(platform_logout))
             .route("/system", get(platform_system))
             .route(
                 "/system/infrastructure",
@@ -2563,6 +2564,14 @@ async fn platform_user_login(
         Ok((headers, _)) => (headers, Redirect::to("/app")),
         Err(_) => (HeaderMap::new(), Redirect::to("/login?error=invalid")),
     }
+}
+
+async fn platform_logout(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> (HeaderMap, Redirect) {
+    state.session_verifier.revoke(&headers);
+    (expired_session_cookie_headers(), Redirect::to("/login"))
 }
 
 fn login_error_requested(query: Option<&str>) -> bool {

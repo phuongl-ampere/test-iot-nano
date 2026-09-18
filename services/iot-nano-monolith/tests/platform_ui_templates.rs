@@ -1,5 +1,5 @@
 use iot_nano_monolith::{
-    PlatformUiIdentity, PlatformUiRenderer, SystemInfrastructurePage,
+    PlatformLoginPage, PlatformUiIdentity, PlatformUiRenderer, SystemInfrastructurePage,
     SystemInfrastructureStatusRow, SystemPlatformPage, SystemTenantRow, TenantAlertRow,
     TenantAlertsPage, TenantAuditPage, TenantAuditRow, TenantUserRow, TenantUsersPage,
     UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
@@ -212,6 +212,18 @@ fn system_layout_renders_only_system_navigation_and_escapes_identity() {
     assert_excludes_navigation_namespaces(&rendered, &["/tenant", "/app"]);
     assert!(rendered.contains("System &#60;operator&#62;"));
     assert!(!rendered.contains("System <operator>"));
+}
+
+#[test]
+fn authenticated_layouts_render_logout_but_login_layout_does_not() {
+    let identity = PlatformUiIdentity::new("System Account");
+    let system =
+        PlatformUiRenderer::render_system(&identity, &SystemPlatformPage::new(Vec::new())).unwrap();
+    let login = PlatformUiRenderer::render_login(&PlatformLoginPage::new(false)).unwrap();
+
+    assert!(system.contains("action=\"/logout\""));
+    assert!(system.contains("Sign out"));
+    assert!(!login.contains("action=\"/logout\""));
 }
 
 #[test]

@@ -75,6 +75,27 @@ body {
   white-space: nowrap;
 }
 
+.topbar-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.logout-form {
+  margin: 0;
+}
+
+.logout-button {
+  border: 1px solid #8ba2bb;
+  background: transparent;
+}
+
+.logout-button:hover,
+.logout-button:focus-visible {
+  background: #263952;
+}
+
 .console-body {
   display: grid;
   min-height: calc(100vh - 58px);
