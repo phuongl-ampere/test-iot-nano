@@ -1224,17 +1224,16 @@ Run:
 ```bash
 npm --prefix apps/powermonitor test
 npm --prefix apps/powermonitor run build
-npm --prefix web test
-npm --prefix web run build
 ```
 
 Expected: the extracted app passes OAuth and generic API tests; the platform
-console no longer contains PowerMonitor code.
+console is verified by the built-in monolith UI. The legacy `web/` console was
+removed by the tenant-platform rollout; do not recreate or build it.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add apps/powermonitor web
+git add apps/powermonitor
 git commit -m "feat: extract powermonitor external app"
 ```
 
@@ -1518,10 +1517,10 @@ cargo test -p iot-nano-mqttd -- --test-threads=1
 cargo test -p iot-nano-monolith -- --test-threads=1
 IOT_NANO_TIMESCALE_TEST_URL="$IOT_NANO_TIMESCALE_TEST_URL" \
   cargo test -p iot-nano-monolith --test e2e_timescale -- --test-threads=1
-npm --prefix web test
-npm --prefix web run build
 npm --prefix apps/powermonitor test
 npm --prefix apps/powermonitor run build
+cargo test -p iot-nano-monolith --test management_sessions -- --test-threads=1
+cargo test -p iot-nano-monolith --test platform_ui_templates -- --test-threads=1
 scripts/verify-monolith-topology.sh
 scripts/verify-no-legacy-runtime.sh
 scripts/e2e-monolith.sh
