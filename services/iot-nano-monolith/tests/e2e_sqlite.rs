@@ -15,7 +15,7 @@ use std::{
 use chrono::Utc;
 use reqwest::{
     Client, StatusCode,
-    header::{COOKIE, SET_COOKIE},
+    header::{COOKIE, LOCATION, SET_COOKIE},
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -260,7 +260,46 @@ async fn run_e2e_flow(
         .await?;
     assert_eq!(registered.status(), StatusCode::CREATED);
 
-    let token: serde_json::Value = client
+    let user = client
+        .post(format!(
+            "http://{}/api/management/users",
+            fixture.management_address
+        ))
+        .header(COOKIE, &tenant_cookie)
+        .json(&json!({
+            "username": "e2e-user",
+            "password": "E2eUserPassword@2026",
+            "default_app": "/apps/e2e-app",
+            "granted_apps": ["e2e-app"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(user.status(), StatusCode::CREATED);
+
+    let user_login = client
+        .post(format!(
+            "http://{}/api/user/auth/login",
+            fixture.management_address
+        ))
+        .json(&json!({
+            "tenant_slug": "e2e-tenant",
+            "username": "e2e-user",
+            "password": "E2eUserPassword@2026"
+        }))
+        .send()
+        .await?;
+    assert_eq!(user_login.status(), StatusCode::OK);
+    let user_cookie = user_login
+        .headers()
+        .get(SET_COOKIE)
+        .expect("user login did not issue a session cookie")
+        .to_str()?
+        .split(';')
+        .next()
+        .expect("user session cookie was empty")
+        .to_owned();
+
+    let application_token: serde_json::Value = client
         .post(format!("http://{}/oauth/token", fixture.public_address))
         .form(&[
             ("grant_type", "client_credentials"),
@@ -272,7 +311,70 @@ async fn run_e2e_flow(
         .await?
         .json()
         .await?;
-    let access_token = token["access_token"].as_str().unwrap();
+    let application_access_token = application_token["access_token"]
+        .as_str()
+        .expect("client credentials response omitted an access token");
+    assert_eq!(
+        client
+            .get(format!("http://{}/api/v1/devices", fixture.public_address))
+            .bearer_auth(application_access_token)
+            .send()
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let verifier = "e2e-sqlite-pkce-verifier-with-at-least-forty-three-characters";
+    let authorize = client
+        .get(format!("http://{}/oauth/authorize", fixture.public_address))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", "e2e-client"),
+            ("redirect_uri", "https://client.example.test/callback"),
+            ("scope", "devices:read devices:write telemetry:read"),
+            ("state", "e2e-state"),
+            (
+                "code_challenge",
+                "_I6nwrptyTxPi7QlVmOQ-wn6M_zoyYwmqc67KorJAwI",
+            ),
+            ("code_challenge_method", "S256"),
+        ])
+        .header(COOKIE, &user_cookie)
+        .send()
+        .await?;
+    assert_eq!(authorize.status(), StatusCode::FOUND);
+    let authorization_redirect = authorize
+        .headers()
+        .get(LOCATION)
+        .expect("authorization endpoint did not redirect to the registered callback")
+        .to_str()?;
+    let authorization_code = authorization_redirect
+        .split('?')
+        .nth(1)
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|parameter| parameter.strip_prefix("code="))
+        })
+        .expect("authorization redirect omitted the authorization code");
+
+    let token = client
+        .post(format!("http://{}/oauth/token", fixture.public_address))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", authorization_code),
+            ("redirect_uri", "https://client.example.test/callback"),
+            ("client_id", "e2e-client"),
+            ("client_secret", "E2eClientSecret@2026"),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await?;
+    assert_eq!(token.status(), StatusCode::OK);
+    let token: serde_json::Value = token.json().await?;
+    let access_token = token["access_token"]
+        .as_str()
+        .expect("authorization-code response omitted an access token");
 
     let created = client
         .post(format!("http://{}/api/v1/devices", fixture.public_address))
