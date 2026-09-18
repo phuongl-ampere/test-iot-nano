@@ -16,9 +16,15 @@ printf '<%s>\n' "$@" >"$IOT_NANO_TEST_CARGO_ARGUMENTS"
 EOF
 chmod +x "$temporary_directory/bin/cargo"
 
-PATH="$temporary_directory/bin:$PATH" \
+env -u IOT_NANO_TIMESCALE_TEST_URL \
+  PATH="$temporary_directory/bin:$PATH" \
   IOT_NANO_TEST_CARGO_ARGUMENTS="$capture_path" \
   "$root/scripts/e2e-monolith.sh"
+
+if ! grep -Fqx -- '<e2e_sqlite>' "$capture_path"; then
+  printf 'expected e2e-monolith.sh to invoke the SQLite E2E target\n' >&2
+  exit 1
+fi
 
 if ! grep -Fqx -- '<--ignored>' "$capture_path"; then
   printf 'expected e2e-monolith.sh to run the ignored SQLite E2E\n' >&2
