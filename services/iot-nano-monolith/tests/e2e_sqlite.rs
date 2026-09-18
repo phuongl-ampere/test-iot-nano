@@ -97,6 +97,7 @@ impl Fixture {
 }
 
 #[tokio::test]
+#[ignore = "release-only: starts a SQLite monolith process"]
 async fn sqlite_monolith_process_runs_management_oauth_public_api_and_graceful_shutdown() {
     let fixture = Fixture::new().await;
     let binary = env!("CARGO_BIN_EXE_iot-nano-monolith");

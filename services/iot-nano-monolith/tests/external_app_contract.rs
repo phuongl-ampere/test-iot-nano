@@ -242,6 +242,7 @@ struct PreparedPowerMonitor {
 }
 
 #[tokio::test]
+#[ignore = "release-only: installs and builds PowerMonitor with npm"]
 async fn powermonitor_bff_uses_only_public_oauth_and_v1_platform_contracts() {
     let npm = required_npm().await.expect(
         "external PowerMonitor contract prerequisite failed: npm is required; install Node.js and npm",
