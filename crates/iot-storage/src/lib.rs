@@ -4908,6 +4908,24 @@ async fn timescale_user_can_issue_command(
         return Ok(false);
     }
 
+    // Observe the asset without a row lock, then take the shared asset locks
+    // before the device lock. Asset deletion uses the same asset -> device order.
+    let observed_asset_id = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+        "SELECT asset_id
+         FROM devices
+         WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(device_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(observed_asset_id) = observed_asset_id else {
+        return Ok(false);
+    };
+    if let Some(asset_id) = observed_asset_id {
+        lock_timescale_command_asset_ancestors(transaction, tenant_id, asset_id).await?;
+    }
+
     let device = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<uuid::Uuid>)>(
         "SELECT owner_user_id, asset_id
          FROM devices
@@ -4921,29 +4939,11 @@ async fn timescale_user_can_issue_command(
     let Some((owner, asset_id)) = device else {
         return Ok(false);
     };
+    if asset_id != observed_asset_id {
+        return Ok(false);
+    }
     if owner == Some(user_id) {
         return Ok(true);
-    }
-
-    if let Some(asset_id) = asset_id {
-        sqlx::query(
-            "WITH RECURSIVE ancestors(id) AS (
-                 SELECT $1::uuid
-                 UNION
-                 SELECT asset.parent_asset_id
-                 FROM assets AS asset
-                 JOIN ancestors ON asset.id = ancestors.id
-                 WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
-             )
-             SELECT asset.id
-             FROM assets AS asset
-             JOIN ancestors ON asset.id = ancestors.id AND asset.tenant_id = $2
-             FOR SHARE OF asset",
-        )
-        .bind(asset_id)
-        .bind(tenant_id)
-        .fetch_all(&mut **transaction)
-        .await?;
     }
     sqlx::query(
         "SELECT group_id
@@ -5004,6 +5004,33 @@ async fn timescale_user_can_issue_command(
     .fetch_optional(&mut **transaction)
     .await?
     .is_some())
+}
+
+async fn lock_timescale_command_asset_ancestors(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    asset_id: uuid::Uuid,
+) -> Result<(), PlatformStoreError> {
+    sqlx::query(
+        "WITH RECURSIVE ancestors(id) AS (
+             SELECT $1::uuid
+             UNION
+             SELECT asset.parent_asset_id
+             FROM assets AS asset
+             JOIN ancestors ON asset.id = ancestors.id
+             WHERE asset.tenant_id = $2 AND asset.parent_asset_id IS NOT NULL
+         )
+         SELECT asset.id
+         FROM assets AS asset
+         JOIN ancestors ON asset.id = ancestors.id AND asset.tenant_id = $2
+         ORDER BY asset.id
+         FOR SHARE OF asset",
+    )
+    .bind(asset_id)
+    .bind(tenant_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn ingest_sqlite_gateway(
