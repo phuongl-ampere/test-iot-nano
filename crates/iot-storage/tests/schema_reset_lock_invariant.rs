@@ -17,6 +17,7 @@ const SHARED_SCHEMA_TEST_FILES: &[&str] = &[
     "alert_evaluation.rs",
     "alert_incident.rs",
     "application_registry.rs",
+    "audit_events.rs",
     "backend_contract.rs",
     "command_outbox.rs",
     "device_authorization.rs",
@@ -42,6 +43,10 @@ const RESETTERS: &[(&str, &str)] = &[
     (
         "application_registry.rs",
         "timescale_application_registry_matches_sqlite_contract",
+    ),
+    (
+        "audit_events.rs",
+        "timescale_audit_events_cover_permission_relation_and_containment_mutations",
     ),
     ("backend_contract.rs", "timescale_test_store"),
     ("command_outbox.rs", "timescale_store"),
@@ -183,7 +188,7 @@ fn common_reset_helper_locks_before_dropping_the_shared_schema() {
 
 #[test]
 fn every_shared_schema_resetter_routes_through_the_common_reset_helper() {
-    assert_eq!(RESETTERS.len(), 20);
+    assert_eq!(RESETTERS.len(), 21);
     for (file_name, function_name) in RESETTERS {
         let source = read_test_source(file_name);
         let body = function_body(&source, function_name);

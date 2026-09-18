@@ -583,6 +583,7 @@ async fn platform_store_opens_the_complete_sqlite_platform_schema() {
             "applications",
             "asset_profiles",
             "assets",
+            "audit_events",
             "command_outbox",
             "device_profiles",
             "device_relations",
