@@ -18,7 +18,8 @@ pub use config::{
 };
 pub use management::{BootstrapSystemError, ManagementSessionRouter, bootstrap_system};
 pub use platform_ui::{
-    PlatformUiIdentity, PlatformUiRenderer, SystemLayout, TenantLayout, UserLayout,
+    PlatformUiIdentity, PlatformUiRenderer, SystemLayout, SystemPlatformPage, SystemTenantRow,
+    TenantLayout, UserLayout,
 };
 pub use readiness::Readiness;
 pub use runtime::{MonolithRuntime, ShutdownError, StartupError};

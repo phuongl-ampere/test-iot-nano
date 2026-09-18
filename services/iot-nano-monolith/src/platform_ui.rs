@@ -27,13 +27,48 @@ impl PlatformUiIdentity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemTenantRow {
+    slug: String,
+    status: String,
+}
+
+impl SystemTenantRow {
+    pub fn new(slug: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            slug: slug.into(),
+            status: status.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPlatformPage {
+    tenants: Vec<SystemTenantRow>,
+    tenant_account_status: &'static str,
+    operational_health: &'static str,
+}
+
+impl SystemPlatformPage {
+    pub fn new(tenants: Vec<SystemTenantRow>) -> Self {
+        Self {
+            tenants,
+            tenant_account_status: "Not reported",
+            operational_health: "Not reported",
+        }
+    }
+}
+
 /// Renders the static platform layouts that future server handlers will use.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlatformUiRenderer;
 
 impl PlatformUiRenderer {
-    pub fn render_system(identity: &PlatformUiIdentity) -> Result<String, askama::Error> {
-        SystemLayout::new(identity).render()
+    pub fn render_system(
+        identity: &PlatformUiIdentity,
+        page: &SystemPlatformPage,
+    ) -> Result<String, askama::Error> {
+        SystemLayout::new(identity, page).render()
     }
 
     pub fn render_tenant(identity: &PlatformUiIdentity) -> Result<String, askama::Error> {
@@ -49,11 +84,12 @@ impl PlatformUiRenderer {
 #[template(path = "platform_ui/system.html")]
 pub struct SystemLayout<'a> {
     identity: &'a PlatformUiIdentity,
+    page: &'a SystemPlatformPage,
 }
 
 impl<'a> SystemLayout<'a> {
-    pub fn new(identity: &'a PlatformUiIdentity) -> Self {
-        Self { identity }
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a SystemPlatformPage) -> Self {
+        Self { identity, page }
     }
 }
 

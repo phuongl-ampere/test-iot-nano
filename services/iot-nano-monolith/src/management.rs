@@ -34,7 +34,7 @@ use iot_storage::{
     ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
     NewOAuthClientSecret, NewSystemAccount, NewTenant, NewTenantAccount, OAuthRepository,
     PlatformStore, PlatformStoreError, RedirectUri, SystemAccount, TenantIdentityError,
-    TenantIdentityRepository, UpdateManagementAsset, UpdateManagementAssetProfile,
+    TenantIdentityRepository, TenantStatus, UpdateManagementAsset, UpdateManagementAssetProfile,
     UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1940,7 +1940,7 @@ async fn platform_system(
     else {
         return Err(ManagementSessionError::Forbidden);
     };
-    platform_page(PlatformUiSession::System { system_account_id })
+    platform_page(&state, PlatformUiSession::System { system_account_id }).await
 }
 
 async fn platform_tenant(
@@ -1952,7 +1952,7 @@ async fn platform_tenant(
     else {
         return Err(ManagementSessionError::Forbidden);
     };
-    platform_page(PlatformUiSession::Tenant { tenant_id })
+    platform_page(&state, PlatformUiSession::Tenant { tenant_id }).await
 }
 
 async fn platform_app(
@@ -1964,15 +1964,33 @@ async fn platform_app(
     else {
         return Err(ManagementSessionError::Forbidden);
     };
-    platform_page(PlatformUiSession::User { user_id, tenant_id })
+    platform_page(&state, PlatformUiSession::User { user_id, tenant_id }).await
 }
 
-fn platform_page(session: PlatformUiSession) -> Result<Html<String>, ManagementSessionError> {
+async fn platform_page(
+    state: &ManagementState,
+    session: PlatformUiSession,
+) -> Result<Html<String>, ManagementSessionError> {
     let rendered = match session {
         PlatformUiSession::System { system_account_id } => {
-            crate::PlatformUiRenderer::render_system(&crate::PlatformUiIdentity::new(format!(
-                "System Account {system_account_id}"
-            )))
+            let tenants = TenantIdentityRepository::list_tenants(state.store.as_ref())
+                .await
+                .map_err(|_| ManagementSessionError::Unavailable)?;
+            let page = crate::SystemPlatformPage::new(
+                tenants
+                    .into_iter()
+                    .map(|tenant| {
+                        crate::SystemTenantRow::new(
+                            tenant.slug,
+                            system_tenant_status_label(tenant.status),
+                        )
+                    })
+                    .collect(),
+            );
+            crate::PlatformUiRenderer::render_system(
+                &crate::PlatformUiIdentity::new(format!("System Account {system_account_id}")),
+                &page,
+            )
         }
         PlatformUiSession::Tenant { tenant_id } => crate::PlatformUiRenderer::render_tenant(
             &crate::PlatformUiIdentity::new(format!("Tenant {tenant_id}")),
@@ -1983,6 +2001,14 @@ fn platform_page(session: PlatformUiSession) -> Result<Html<String>, ManagementS
     }
     .map_err(|_| ManagementSessionError::Unavailable)?;
     Ok(Html(rendered))
+}
+
+fn system_tenant_status_label(status: TenantStatus) -> &'static str {
+    match status {
+        TenantStatus::Active => "active",
+        TenantStatus::Suspended => "suspended",
+        TenantStatus::Deleted => "deleted",
+    }
 }
 
 async fn platform_stylesheet() -> ([(axum::http::HeaderName, HeaderValue); 1], &'static str) {

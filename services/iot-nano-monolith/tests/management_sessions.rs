@@ -332,6 +332,45 @@ async fn platform_routes_render_the_matching_server_layout_and_local_css() {
 }
 
 #[tokio::test]
+async fn system_page_lists_only_tenant_slug_and_status_with_neutral_runtime_fields() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "suspended".to_owned(),
+            metadata: json!({
+                "private_token": "system-page-private-metadata",
+            }),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("SeparateTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    TenantIdentityRepository::suspend_tenant(store.as_ref(), "suspended")
+        .await
+        .unwrap();
+
+    let router = management.router;
+    let system_cookie = system_account_cookie(&router).await;
+    let response = router
+        .oneshot(platform_get("/system", Some(&system_cookie)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("<td>test</td>"));
+    assert!(body.contains("<td>active</td>"));
+    assert!(body.contains("<td>suspended</td>"));
+    assert_eq!(body.matches("Not reported").count(), 3);
+    assert!(!body.contains("system-page-private-metadata"));
+    assert!(!body.contains("SeparateTenant@2026"));
+}
+
+#[tokio::test]
 async fn management_login_issues_a_cookie_used_by_the_oauth_session_verifier_and_logout_revokes_it()
 {
     let (_directory, management) = management_session_router().await;

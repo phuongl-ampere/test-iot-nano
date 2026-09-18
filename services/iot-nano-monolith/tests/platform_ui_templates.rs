@@ -1,4 +1,6 @@
-use iot_nano_monolith::{PlatformUiIdentity, PlatformUiRenderer};
+use iot_nano_monolith::{
+    PlatformUiIdentity, PlatformUiRenderer, SystemPlatformPage, SystemTenantRow,
+};
 
 fn navigation_hrefs(rendered: &str) -> Vec<&str> {
     let bytes = rendered.as_bytes();
@@ -197,7 +199,8 @@ fn route_namespace_matching_catches_nested_query_and_fragment_navigation() {
 fn system_layout_renders_only_system_navigation_and_escapes_identity() {
     let identity = PlatformUiIdentity::new("System <operator>");
 
-    let rendered = PlatformUiRenderer::render_system(&identity).unwrap();
+    let rendered =
+        PlatformUiRenderer::render_system(&identity, &SystemPlatformPage::new(Vec::new())).unwrap();
 
     assert!(rendered.contains("System Console"));
     assert!(rendered.contains("href=\"/system/tenants\""));
@@ -206,6 +209,22 @@ fn system_layout_renders_only_system_navigation_and_escapes_identity() {
     assert_excludes_navigation_namespaces(&rendered, &["/tenant", "/app"]);
     assert!(rendered.contains("System &#60;operator&#62;"));
     assert!(!rendered.contains("System <operator>"));
+}
+
+#[test]
+fn system_layout_renders_escaped_tenant_rows_and_neutral_runtime_fields() {
+    let identity = PlatformUiIdentity::new("System Account");
+    let page = SystemPlatformPage::new(vec![SystemTenantRow::new("tenant-<unsafe>", "suspended")]);
+
+    let rendered = PlatformUiRenderer::render_system(&identity, &page).unwrap();
+
+    assert!(rendered.contains("<th scope=\"col\">Tenant</th>"));
+    assert!(rendered.contains("<th scope=\"col\">Status</th>"));
+    assert!(rendered.contains("<th scope=\"col\">Tenant account</th>"));
+    assert!(rendered.contains("tenant-&#60;unsafe&#62;"));
+    assert!(!rendered.contains("tenant-<unsafe>"));
+    assert!(rendered.contains("suspended"));
+    assert_eq!(rendered.matches("Not reported").count(), 2);
 }
 
 #[test]
