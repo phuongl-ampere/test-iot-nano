@@ -122,6 +122,10 @@ impl ManagementSessionRouter {
         };
         let router = Router::new()
             .route("/", get(platform_root))
+            .route("/login", get(platform_login))
+            .route("/login/system", post(platform_system_login))
+            .route("/login/tenant", post(platform_tenant_login))
+            .route("/login/user", post(platform_user_login))
             .route("/system", get(platform_system))
             .route("/system/tenants", post(create_system_tenant_form))
             .route("/system/tenants/suspend", post(suspend_system_tenant_form))
@@ -2037,11 +2041,64 @@ async fn platform_root(
     State(state): State<ManagementState>,
     headers: HeaderMap,
 ) -> Result<Redirect, ManagementSessionError> {
-    match state.session_verifier.platform_session(&headers)? {
+    let session = match state.session_verifier.platform_session(&headers) {
+        Ok(session) => session,
+        Err(ManagementSessionError::Unauthorized) => return Ok(Redirect::to("/login")),
+        Err(error) => return Err(error),
+    };
+    match session {
         PlatformUiSession::System { .. } => Ok(Redirect::to("/system")),
         PlatformUiSession::Tenant { .. } => Ok(Redirect::to("/tenant")),
         PlatformUiSession::User { .. } => Ok(Redirect::to("/app")),
     }
+}
+
+async fn platform_login(request: Request) -> Result<Html<String>, ManagementSessionError> {
+    let page = crate::PlatformLoginPage::new(login_error_requested(request.uri().query()));
+    let rendered = crate::PlatformUiRenderer::render_login(&page)
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn platform_system_login(
+    State(state): State<ManagementState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Form(request): Form<SystemLoginRequest>,
+) -> (HeaderMap, Redirect) {
+    match system_login(State(state), ConnectInfo(address), Json(request)).await {
+        Ok((headers, _)) => (headers, Redirect::to("/system")),
+        Err(_) => (HeaderMap::new(), Redirect::to("/login?error=invalid")),
+    }
+}
+
+async fn platform_tenant_login(
+    State(state): State<ManagementState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Form(request): Form<TenantLoginRequest>,
+) -> (HeaderMap, Redirect) {
+    match tenant_login(State(state), ConnectInfo(address), Json(request)).await {
+        Ok((headers, _)) => (headers, Redirect::to("/tenant")),
+        Err(_) => (HeaderMap::new(), Redirect::to("/login?error=invalid")),
+    }
+}
+
+async fn platform_user_login(
+    State(state): State<ManagementState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Form(request): Form<UserLoginRequest>,
+) -> (HeaderMap, Redirect) {
+    match user_login(State(state), ConnectInfo(address), Json(request)).await {
+        Ok((headers, _)) => (headers, Redirect::to("/app")),
+        Err(_) => (HeaderMap::new(), Redirect::to("/login?error=invalid")),
+    }
+}
+
+fn login_error_requested(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        query
+            .split('&')
+            .any(|parameter| parameter == "error=invalid")
+    })
 }
 
 async fn platform_system(

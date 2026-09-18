@@ -583,7 +583,15 @@ async fn platform_routes_deny_unauthenticated_and_cross_kind_sessions() {
     let tenant_cookie = tenant_account_cookie(&router).await;
     let user_cookie = user_account_cookie(&router).await;
 
-    for path in ["/", "/system", "/tenant", "/app"] {
+    let root = router
+        .clone()
+        .oneshot(platform_get("/", None))
+        .await
+        .unwrap();
+    assert_eq!(root.status(), StatusCode::SEE_OTHER);
+    assert_eq!(root.headers()[LOCATION], "/login");
+
+    for path in ["/system", "/tenant", "/app"] {
         let response = router
             .clone()
             .oneshot(platform_get(path, None))
@@ -592,6 +600,135 @@ async fn platform_routes_deny_unauthenticated_and_cross_kind_sessions() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
 
+    for (cookie, path) in [
+        (&system_cookie, "/tenant"),
+        (&system_cookie, "/app"),
+        (&tenant_cookie, "/system"),
+        (&tenant_cookie, "/app"),
+        (&user_cookie, "/system"),
+        (&user_cookie, "/tenant"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(platform_get(path, Some(cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn platform_login_renders_the_three_server_side_forms() {
+    let (_directory, management) = management_session_router().await;
+    let response = management
+        .router
+        .oneshot(platform_get("/login", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for action in ["/login/system", "/login/tenant", "/login/user"] {
+        assert!(body.contains(&format!("action=\"{action}\"")), "{action}");
+    }
+    for field in [
+        "name=\"username\"",
+        "name=\"tenant_slug\"",
+        "name=\"password\"",
+    ] {
+        assert!(body.contains(field), "{field}");
+    }
+    assert!(!body.contains("<script"));
+    assert!(!body.contains("<select"));
+}
+
+#[tokio::test]
+async fn platform_login_forms_issue_sessions_redirect_and_preserve_cross_kind_guards() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+
+    let mut cookies = Vec::new();
+    for (path, body, destination) in [
+        (
+            "/login/system",
+            "username=system&password=SystemAccount@2026",
+            "/system",
+        ),
+        (
+            "/login/tenant",
+            "tenant_slug=test&password=TenantAccount@2026",
+            "/tenant",
+        ),
+        (
+            "/login/user",
+            "tenant_slug=test&username=viewer&password=NanoView@1234",
+            "/app",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(system_lifecycle_form(path, None, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(response.headers()[LOCATION], destination, "{path}");
+        let cookie = response.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let destination_response = router
+            .clone()
+            .oneshot(platform_get(destination, Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(destination_response.status(), StatusCode::OK, "{path}");
+        cookies.push(cookie);
+    }
+
+    let invalid = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/login/user",
+            None,
+            "tenant_slug=test&username=viewer&password=not-the-password",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::SEE_OTHER);
+    assert_eq!(invalid.headers()[LOCATION], "/login?error=invalid");
+    assert!(invalid.headers().get(SET_COOKIE).is_none());
+
+    let invalid_page = router
+        .clone()
+        .oneshot(platform_get("/login?error=invalid", None))
+        .await
+        .unwrap();
+    let invalid_body = String::from_utf8(
+        to_bytes(invalid_page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(invalid_body.contains("Unable to sign in. Check your credentials and try again."));
+    assert!(!invalid_body.contains("not-the-password"));
+
+    let [system_cookie, tenant_cookie, user_cookie]: [String; 3] = cookies.try_into().unwrap();
     for (cookie, path) in [
         (&system_cookie, "/tenant"),
         (&system_cookie, "/app"),

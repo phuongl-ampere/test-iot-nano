@@ -1,0 +1,46 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Sign in | IoT Nano{% endblock %}
+{% block account_kind %}Platform sign in{% endblock %}
+{% block navigation_label %}Sign in{% endblock %}
+{% block navigation %}{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <p class="eyebrow">Platform access</p>
+  <h1>Sign in</h1>
+  <p>Use the account type assigned to you.</p>
+</div>
+
+{% if page.has_error %}
+<p class="notice" role="alert">Unable to sign in. Check your credentials and try again.</p>
+{% endif %}
+
+<section class="workspace-panel">
+  <header><h2>System</h2></header>
+  <form class="form-grid" method="post" action="/login/system">
+    <label class="field">Username<input name="username" autocomplete="username" required></label>
+    <label class="field">Password<input type="password" name="password" autocomplete="current-password" required></label>
+    <div class="form-actions"><button type="submit">Sign in</button></div>
+  </form>
+</section>
+
+<section class="workspace-panel">
+  <header><h2>Tenant</h2></header>
+  <form class="form-grid" method="post" action="/login/tenant">
+    <label class="field">Tenant slug<input name="tenant_slug" autocomplete="organization" required></label>
+    <label class="field">Password<input type="password" name="password" autocomplete="current-password" required></label>
+    <div class="form-actions"><button type="submit">Sign in</button></div>
+  </form>
+</section>
+
+<section class="workspace-panel">
+  <header><h2>User</h2></header>
+  <form class="form-grid" method="post" action="/login/user">
+    <label class="field">Tenant slug<input name="tenant_slug" autocomplete="organization" required></label>
+    <label class="field">Username<input name="username" autocomplete="username" required></label>
+    <label class="field">Password<input type="password" name="password" autocomplete="current-password" required></label>
+    <div class="form-actions"><button type="submit">Sign in</button></div>
+  </form>
+</section>
+{% endblock %}

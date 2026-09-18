@@ -27,6 +27,17 @@ impl PlatformUiIdentity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformLoginPage {
+    has_error: bool,
+}
+
+impl PlatformLoginPage {
+    pub fn new(has_error: bool) -> Self {
+        Self { has_error }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemTenantRow {
     slug: String,
@@ -454,6 +465,11 @@ impl SystemPlatformPage {
 pub struct PlatformUiRenderer;
 
 impl PlatformUiRenderer {
+    pub fn render_login(page: &PlatformLoginPage) -> Result<String, askama::Error> {
+        let identity = PlatformUiIdentity::new("Sign in");
+        LoginLayout::new(&identity, page).render()
+    }
+
     pub fn render_system(
         identity: &PlatformUiIdentity,
         page: &SystemPlatformPage,
@@ -545,6 +561,19 @@ impl PlatformUiRenderer {
         identity: &PlatformUiIdentity,
     ) -> Result<String, askama::Error> {
         UserAssetUnavailableLayout::new(identity).render()
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/login.html")]
+pub struct LoginLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a PlatformLoginPage,
+}
+
+impl<'a> LoginLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a PlatformLoginPage) -> Self {
+        Self { identity, page }
     }
 }
 
