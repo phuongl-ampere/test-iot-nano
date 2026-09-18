@@ -10,7 +10,7 @@ use iot_storage::{
 use iot_storage::{NewCommandOutboxEntry, PlatformStore};
 #[cfg(feature = "test-support")]
 use tokio::{
-    sync::Notify,
+    sync::{Notify, oneshot},
     time::{Duration as TokioDuration, timeout},
 };
 use uuid::Uuid;
@@ -193,21 +193,17 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     let pool = store.sqlite_pool().unwrap();
     let owner_id = Uuid::now_v7();
     let viewer_id = Uuid::now_v7();
-    let unrelated_viewer_id = Uuid::now_v7();
     let permission_id = Uuid::now_v7();
     let device_id = format!("public-list-handoff-{}", Uuid::now_v7());
 
     sqlx::query(
         "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
          VALUES (?, ?, 'public-list-owner', 'unused', 'viewer', 'user'),
-                (?, ?, 'public-list-viewer', 'unused', 'viewer', 'user'),
-                (?, ?, 'public-list-unrelated-viewer', 'unused', 'viewer', 'user')",
+                (?, ?, 'public-list-viewer', 'unused', 'viewer', 'user')",
     )
     .bind(owner_id.to_string())
     .bind(tenant_id.to_string())
     .bind(viewer_id.to_string())
-    .bind(tenant_id.to_string())
-    .bind(unrelated_viewer_id.to_string())
     .bind(tenant_id.to_string())
     .execute(pool)
     .await
@@ -234,22 +230,24 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     .await
     .unwrap();
 
-    let entered = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let _hook = install_public_device_list_handoff_hook(
-        viewer_id,
-        Arc::clone(&entered),
-        Arc::clone(&release),
-    );
-    let entered_wait = entered.notified();
-    let list_store = Arc::clone(&store);
     let principal = PublicPrincipal {
         tenant_id,
         user_id: Some(viewer_id),
         app_id: "public-list-handoff-app".to_owned(),
         account_class: AccountClass::User,
     };
-    let task = tokio::spawn(async move {
+    let entered = Arc::new(Notify::new());
+    let (release_sender, release_receiver) = oneshot::channel();
+    let _hook = install_public_device_list_handoff_hook(
+        tenant_id,
+        viewer_id,
+        principal.app_id.clone(),
+        Arc::clone(&entered),
+        release_receiver,
+    );
+    let entered_wait = entered.notified();
+    let list_store = Arc::clone(&store);
+    let mut task = tokio::spawn(async move {
         PublicApiRepository::list_public_devices(list_store.as_ref(), &principal, None, 100).await
     });
     timeout(TokioDuration::from_secs(1), entered_wait)
@@ -259,8 +257,8 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     let unrelated_store = Arc::clone(&store);
     let unrelated_principal = PublicPrincipal {
         tenant_id,
-        user_id: Some(unrelated_viewer_id),
-        app_id: "public-list-unrelated-app".to_owned(),
+        user_id: Some(viewer_id),
+        app_id: "public-list-same-user-other-app".to_owned(),
         account_class: AccountClass::User,
     };
     let mut unrelated_task = tokio::spawn(async move {
@@ -279,15 +277,19 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
         .execute(pool)
         .await
         .unwrap();
-    release.notify_waiters();
+    release_sender
+        .send(())
+        .expect("selected list request must still await the test release");
 
+    let selected = match timeout(TokioDuration::from_secs(1), &mut task).await {
+        Ok(result) => result,
+        Err(_) => {
+            task.abort();
+            panic!("selected list request did not finish after the hook release");
+        }
+    };
     assert!(
-        timeout(TokioDuration::from_secs(1), task)
-            .await
-            .expect("selected list request must finish after the hook is released")
-            .unwrap()
-            .unwrap()
-            .is_empty(),
+        selected.unwrap().unwrap().is_empty(),
         "the detail query must not use identifiers authorized before revocation"
     );
 
@@ -296,8 +298,9 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
             result
                 .expect("unrelated list task must not panic")
                 .expect("unrelated list request must succeed")
-                .is_empty(),
-            "unrelated user has no authorized devices"
+                .len()
+                == 1,
+            "same-user request with a different app id must not be captured by the hook"
         ),
         Err(_) => {
             let _ = timeout(TokioDuration::from_secs(1), unrelated_task)
