@@ -18,7 +18,7 @@ use std::{
 use chrono::Utc;
 use reqwest::{
     Client, Response, StatusCode,
-    header::{COOKIE, SET_COOKIE},
+    header::{COOKIE, LOCATION, SET_COOKIE},
 };
 use serde_json::json;
 use sqlx::{Connection, PgConnection, postgres::PgConnectOptions};
@@ -498,6 +498,8 @@ async fn run_e2e_flow(
     let suffix = Uuid::now_v7().to_string();
     let app_id = format!("e2e-app-{suffix}");
     let device_id = format!("e2e-device-{suffix}");
+    let username = format!("e2e-user-{suffix}");
+    let password = format!("E2eTimescaleUser-{suffix}@2026");
     let registered = client
         .post(format!(
             "http://{}/api/management/applications",
@@ -518,7 +520,47 @@ async fn run_e2e_flow(
         .await?;
     require_status(&registered, StatusCode::CREATED, "application registration")?;
 
-    let oauth = client
+    let user = client
+        .post(format!(
+            "http://{}/api/management/users",
+            fixture.management_address
+        ))
+        .header(COOKIE, &tenant_cookie)
+        .json(&json!({
+            "username": username,
+            "password": password,
+            "default_app": format!("/apps/{app_id}"),
+            "granted_apps": [app_id]
+        }))
+        .send()
+        .await?;
+    require_status(&user, StatusCode::CREATED, "tenant user creation")?;
+
+    let user_login = client
+        .post(format!(
+            "http://{}/api/user/auth/login",
+            fixture.management_address
+        ))
+        .json(&json!({
+            "tenant_slug": credentials.tenant_slug,
+            "username": username,
+            "password": password,
+        }))
+        .send()
+        .await?;
+    require_status(&user_login, StatusCode::OK, "tenant user login")?;
+    let user_cookie = user_login
+        .headers()
+        .get(SET_COOKIE)
+        .ok_or_else(|| test_error("tenant user login did not issue a session cookie"))?
+        .to_str()?
+        .split(';')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| test_error("tenant user session cookie was empty"))?
+        .to_owned();
+
+    let application_oauth = client
         .post(format!("http://{}/oauth/token", fixture.public_address))
         .form(&[
             ("grant_type", "client_credentials"),
@@ -528,11 +570,78 @@ async fn run_e2e_flow(
         ])
         .send()
         .await?;
-    require_status(&oauth, StatusCode::OK, "OAuth client credentials")?;
+    require_status(
+        &application_oauth,
+        StatusCode::OK,
+        "OAuth client credentials",
+    )?;
+    let application_token: serde_json::Value = application_oauth.json().await?;
+    let application_access_token = application_token["access_token"]
+        .as_str()
+        .ok_or_else(|| test_error("client credentials response omitted access_token"))?;
+
+    let application_devices = client
+        .get(format!("http://{}/api/v1/devices", fixture.public_address))
+        .bearer_auth(application_access_token)
+        .send()
+        .await?;
+    require_status(
+        &application_devices,
+        StatusCode::FORBIDDEN,
+        "application-only public device listing denial",
+    )?;
+
+    let verifier = "e2e-timescale-pkce-verifier-with-at-least-forty-three-characters";
+    let authorize = client
+        .get(format!("http://{}/oauth/authorize", fixture.public_address))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", credentials.client_id.as_str()),
+            ("redirect_uri", "https://client.example.test/callback"),
+            ("scope", "devices:read devices:write telemetry:read"),
+            ("state", "e2e-state"),
+            (
+                "code_challenge",
+                "7fDBxwoy5XU0TMbGAkXF93CrHStWpR-noQW7sVSQ5fc",
+            ),
+            ("code_challenge_method", "S256"),
+        ])
+        .header(COOKIE, &user_cookie)
+        .send()
+        .await?;
+    require_status(&authorize, StatusCode::FOUND, "OAuth authorization redirect")?;
+    let authorization_redirect = authorize
+        .headers()
+        .get(LOCATION)
+        .ok_or_else(|| test_error("authorization endpoint did not redirect to callback"))?
+        .to_str()?;
+    let authorization_code = authorization_redirect
+        .split('?')
+        .nth(1)
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|parameter| parameter.strip_prefix("code="))
+        })
+        .ok_or_else(|| test_error("authorization redirect omitted authorization code"))?;
+
+    let oauth = client
+        .post(format!("http://{}/oauth/token", fixture.public_address))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", authorization_code),
+            ("redirect_uri", "https://client.example.test/callback"),
+            ("client_id", credentials.client_id.as_str()),
+            ("client_secret", credentials.client_secret.as_str()),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await?;
+    require_status(&oauth, StatusCode::OK, "OAuth authorization code")?;
     let token: serde_json::Value = oauth.json().await?;
     let access_token = token["access_token"]
         .as_str()
-        .ok_or_else(|| test_error("OAuth response omitted access_token"))?;
+        .ok_or_else(|| test_error("authorization-code response omitted access_token"))?;
 
     let created = client
         .post(format!("http://{}/api/v1/devices", fixture.public_address))
