@@ -38,8 +38,8 @@ use thiserror::Error;
 use url::Url;
 
 const PLATFORM_POSTGRES_SCHEMA: &str = include_str!("../migrations/0001_platform.sql");
-const SQLITE_PLATFORM_SCHEMA_VERSION: i64 = 1;
-const SET_SQLITE_PLATFORM_SCHEMA_VERSION: &str = "PRAGMA user_version = 1";
+const SQLITE_PLATFORM_SCHEMA_VERSION: i64 = 2;
+const SET_SQLITE_PLATFORM_SCHEMA_VERSION: &str = "PRAGMA user_version = 2";
 
 pub use audit::{
     AuditAction, AuditEvent, AuditEventCursor, AuditEventError, AuditEventRepository,
@@ -500,6 +500,13 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS audit_events_tenant_occurred_at_id_index
     ON audit_events (tenant_id, occurred_at DESC, id DESC);
+CREATE TRIGGER IF NOT EXISTS audit_events_immutable_insert
+BEFORE INSERT ON audit_events
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM audit_events WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events are immutable');
+END;
 CREATE TRIGGER IF NOT EXISTS audit_events_immutable_update
 BEFORE UPDATE ON audit_events
 FOR EACH ROW
@@ -11893,8 +11900,14 @@ impl SqliteStore {
         sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
             .execute(&pool)
             .await?;
+        let schema_version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        let audit_events_existed = sqlite_audit_events_table_exists(&pool).await?;
         sqlx::raw_sql(SQLITE_SCHEMA).execute(&pool).await?;
-        migrate_audit_events_schema(&pool).await?;
+        if schema_version < SQLITE_PLATFORM_SCHEMA_VERSION && audit_events_existed {
+            migrate_audit_events_schema(&pool).await?;
+        }
         migrate_root_asset_name_uniqueness(&pool).await?;
         migrate_command_outbox_schema(&pool).await?;
         migrate_resource_authorization_schema(&pool).await?;
@@ -12909,11 +12922,6 @@ async fn migrate_gateway_topology_schema(pool: &SqlitePool) -> Result<(), sqlx::
 }
 
 async fn migrate_audit_events_schema(pool: &SqlitePool) -> Result<(), SqliteStoreError> {
-    let schema: String = sqlx::query_scalar(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
-    )
-    .fetch_one(pool)
-    .await?;
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     let rows = sqlx::query(
         "SELECT
@@ -12924,11 +12932,9 @@ async fn migrate_audit_events_schema(pool: &SqlitePool) -> Result<(), SqliteStor
     .fetch_all(&mut *transaction)
     .await?;
     let mut events = Vec::with_capacity(rows.len());
-    let mut timestamps_are_canonical = true;
     for row in rows {
         let occurred_at: String = row.try_get("occurred_at")?;
         let canonical_occurred_at = canonical_sqlite_audit_occurred_at(&occurred_at)?;
-        timestamps_are_canonical &= occurred_at == canonical_occurred_at;
         events.push((
             row.try_get::<String, _>("id")?,
             row.try_get::<String, _>("tenant_id")?,
@@ -12940,10 +12946,6 @@ async fn migrate_audit_events_schema(pool: &SqlitePool) -> Result<(), SqliteStor
             row.try_get::<String, _>("target_id")?,
             row.try_get::<String, _>("changes")?,
         ));
-    }
-    if sqlite_audit_changes_constraint_is_object(&schema) && timestamps_are_canonical {
-        transaction.commit().await?;
-        return Ok(());
     }
 
     let non_object_changes: bool = sqlx::query_scalar(
@@ -13007,6 +13009,13 @@ async fn migrate_audit_events_schema(pool: &SqlitePool) -> Result<(), SqliteStor
          ALTER TABLE audit_events_rebuild RENAME TO audit_events;
          CREATE INDEX audit_events_tenant_occurred_at_id_index
              ON audit_events (tenant_id, occurred_at DESC, id DESC);
+         CREATE TRIGGER audit_events_immutable_insert
+         BEFORE INSERT ON audit_events
+         FOR EACH ROW
+         WHEN EXISTS (SELECT 1 FROM audit_events WHERE id = NEW.id)
+         BEGIN
+             SELECT RAISE(ABORT, 'audit_events are immutable');
+         END;
          CREATE TRIGGER audit_events_immutable_update
          BEFORE UPDATE ON audit_events
          FOR EACH ROW
@@ -13026,13 +13035,14 @@ async fn migrate_audit_events_schema(pool: &SqlitePool) -> Result<(), SqliteStor
     Ok(())
 }
 
-fn sqlite_audit_changes_constraint_is_object(schema: &str) -> bool {
-    let normalized = schema
-        .chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    normalized.contains("check(json_type(changes)='object')")
+async fn sqlite_audit_events_table_exists(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'
+         )",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 fn canonical_sqlite_audit_occurred_at(value: &str) -> Result<String, SqliteStoreError> {

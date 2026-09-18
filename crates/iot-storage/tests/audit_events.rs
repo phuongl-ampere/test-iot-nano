@@ -7,7 +7,7 @@ use iot_storage::{
     TenantAuthorizationRepository, UpdateManagementAsset, UpdateManagementDevice,
 };
 use serde_json::json;
-use sqlx::{Connection, PgConnection};
+use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
 
 mod common;
@@ -88,6 +88,89 @@ fn tenant_actor() -> AuditPrincipal {
 }
 
 #[tokio::test]
+async fn sqlite_audit_events_reject_replace_with_recursive_triggers_disabled() {
+    let (_directory, store) = sqlite_store().await;
+    seed_tenant(&store).await;
+    let mut connection = store.sqlite_pool().unwrap().acquire().await.unwrap();
+    sqlx::query("PRAGMA recursive_triggers = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+
+    let event_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO audit_events (
+            id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+            action, target_type, target_id, changes
+         ) VALUES (?, ?, '2026-01-01T00:00:00.000000000Z', 'tenant_account', ?,
+                   'permission.granted', 'resource_permission', 'original-target',
+                   '{\"state\":\"original\"}')",
+    )
+    .bind(&event_id)
+    .bind(TENANT_ID.to_string())
+    .bind(TENANT_ACCOUNT_ID.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+
+    let replacement = sqlx::query(
+        "INSERT OR REPLACE INTO audit_events (
+            id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+            action, target_type, target_id, changes
+         ) VALUES (?, ?, '2026-01-02T00:00:00.000000000Z', 'user', ?,
+                   'permission.revoked', 'device', 'replacement-target',
+                   '{\"state\":\"replacement\"}')",
+    )
+    .bind(&event_id)
+    .bind(TENANT_ID.to_string())
+    .bind(OWNER_A.to_string())
+    .execute(&mut *connection)
+    .await;
+    assert!(replacement.is_err());
+
+    let original = sqlx::query(
+        "SELECT occurred_at, actor_principal_kind, actor_principal_id, action,
+                target_type, target_id, changes
+         FROM audit_events
+         WHERE id = ?",
+    )
+    .bind(&event_id)
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        original.try_get::<String, _>("occurred_at").unwrap(),
+        "2026-01-01T00:00:00.000000000Z"
+    );
+    assert_eq!(
+        original
+            .try_get::<String, _>("actor_principal_kind")
+            .unwrap(),
+        "tenant_account"
+    );
+    assert_eq!(
+        original.try_get::<String, _>("actor_principal_id").unwrap(),
+        TENANT_ACCOUNT_ID.to_string()
+    );
+    assert_eq!(
+        original.try_get::<String, _>("action").unwrap(),
+        "permission.granted"
+    );
+    assert_eq!(
+        original.try_get::<String, _>("target_type").unwrap(),
+        "resource_permission"
+    );
+    assert_eq!(
+        original.try_get::<String, _>("target_id").unwrap(),
+        "original-target"
+    );
+    assert_eq!(
+        original.try_get::<String, _>("changes").unwrap(),
+        "{\"state\":\"original\"}"
+    );
+}
+
+#[tokio::test]
 async fn sqlite_audit_keyset_order_is_chronological_for_whole_and_fractional_seconds() {
     let (directory, store) = sqlite_store().await;
     seed_tenant(&store).await;
@@ -112,6 +195,10 @@ async fn sqlite_audit_keyset_order_is_chronological_for_whole_and_fractional_sec
         .await
         .unwrap();
     }
+    sqlx::query("PRAGMA user_version = 1")
+        .execute(pool)
+        .await
+        .unwrap();
     drop(store);
 
     let store = PlatformStore::open(&StorageConfiguration {
@@ -1031,5 +1118,21 @@ async fn timescale_audit_events_cover_permission_relation_and_containment_mutati
             .execute(pool)
             .await
             .is_err()
+    );
+    let truncate_error = sqlx::query("TRUNCATE audit_events")
+        .execute(pool)
+        .await
+        .unwrap_err();
+    assert!(
+        truncate_error
+            .to_string()
+            .contains("audit_events are immutable")
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_events")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        4
     );
 }

@@ -52,6 +52,19 @@ fn platform_store_owns_its_postgres_migration_source() {
     assert!(!storage_source.contains("services/iot-nano-core/migrations"));
 }
 
+#[test]
+fn timescale_audit_schema_rejects_truncate_without_role_configuration() {
+    let migration = include_str!("../migrations/0001_platform.sql");
+
+    assert!(migration.contains("CREATE TRIGGER audit_events_immutable_truncate"));
+    assert!(migration.contains("BEFORE TRUNCATE ON audit_events"));
+    assert!(
+        migration.contains("FOR EACH STATEMENT EXECUTE FUNCTION prevent_audit_events_mutation();")
+    );
+    assert!(!migration.contains("CREATE ROLE"));
+    assert!(!migration.contains("GRANT "));
+}
+
 fn sqlite_configuration(path: std::path::PathBuf) -> StorageConfiguration {
     StorageConfiguration {
         storage: DatabaseStorage::Sqlite,
@@ -306,7 +319,8 @@ async fn sqlite_open_upgrades_legacy_audit_changes_to_an_object_constraint() {
     seed_test_tenant(&store).await;
     let pool = store.sqlite_pool().unwrap();
     sqlx::raw_sql(
-        "DROP TABLE audit_events;
+        "PRAGMA user_version = 1;
+         DROP TABLE audit_events;
          CREATE TABLE audit_events (
              id TEXT PRIMARY KEY,
              tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
@@ -333,8 +347,46 @@ async fn sqlite_open_upgrades_legacy_audit_changes_to_an_object_constraint() {
     .unwrap();
     drop(store);
 
+    let first_backup = PlatformStore::backup_sqlite_before_migration(&configuration)
+        .await
+        .unwrap()
+        .expect("v1 audit schema must be backed up before the v2 upgrade");
+    let retry_backup = PlatformStore::backup_sqlite_before_migration(&configuration)
+        .await
+        .unwrap()
+        .expect("v1 upgrade retry must reuse its original backup");
+    assert_eq!(first_backup, retry_backup);
+    assert!(
+        first_backup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .contains(".backup-v1-")
+    );
+    let mut backup_connection =
+        SqliteConnection::connect(&format!("sqlite://{}?mode=ro", first_backup.display()))
+            .await
+            .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT occurred_at FROM audit_events WHERE id = 'legacy-audit-event'",
+        )
+        .fetch_one(&mut backup_connection)
+        .await
+        .unwrap(),
+        "2026-01-01T00:00:00Z"
+    );
+    backup_connection.close().await.unwrap();
+
     let reopened = PlatformStore::open(&configuration).await.unwrap();
     let pool = reopened.sqlite_pool().unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        2
+    );
     let schema: String = sqlx::query_scalar(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
     )
@@ -344,6 +396,15 @@ async fn sqlite_open_upgrades_legacy_audit_changes_to_an_object_constraint() {
     assert!(
         schema.contains("json_type(changes) = 'object'"),
         "audit_events schema did not enforce object changes: {schema}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT occurred_at FROM audit_events WHERE id = 'legacy-audit-event'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        "2026-01-01T00:00:00.000000000Z"
     );
     assert!(
         sqlx::query(
@@ -368,6 +429,78 @@ async fn sqlite_open_upgrades_legacy_audit_changes_to_an_object_constraint() {
         .await
         .unwrap(),
         "{}"
+    );
+
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA recursive_triggers = OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query(
+            "INSERT OR REPLACE INTO audit_events (
+                id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+                action, target_type, target_id, changes
+             ) VALUES (
+                'legacy-audit-event', ?, '2026-01-02T00:00:00.000000000Z', 'user', ?,
+                'permission.revoked', 'device', 'replacement-target', '{}'
+             )",
+        )
+        .bind(test_tenant_id().to_string())
+        .bind(test_tenant_id().to_string())
+        .execute(&mut *connection)
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT target_id FROM audit_events WHERE id = 'legacy-audit-event'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        "legacy-target"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_v2_restart_skips_the_audit_table_rebuild() {
+    let directory = tempfile::tempdir().unwrap();
+    let configuration = sqlite_configuration(directory.path().join("audit-events-restart.sqlite"));
+    let store = PlatformStore::open(&configuration).await.unwrap();
+    seed_test_tenant(&store).await;
+    let event_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO audit_events (
+            id, tenant_id, occurred_at, actor_principal_kind, actor_principal_id,
+            action, target_type, target_id, changes
+         ) VALUES (?, ?, '2026-01-03T00:00:00Z', 'user', ?,
+                   'permission.granted', 'resource_permission', 'restart-target', '{}')",
+    )
+    .bind(&event_id)
+    .bind(test_tenant_id().to_string())
+    .bind(test_tenant_id().to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    drop(store);
+
+    let reopened = PlatformStore::open(&configuration).await.unwrap();
+    let pool = reopened.sqlite_pool().unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT occurred_at FROM audit_events WHERE id = ?")
+            .bind(&event_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        "2026-01-03T00:00:00Z"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        2
     );
 }
 
