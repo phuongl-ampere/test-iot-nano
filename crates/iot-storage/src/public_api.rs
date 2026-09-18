@@ -1,20 +1,28 @@
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-support")]
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::*;
 use thiserror::Error;
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-support")]
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-#[cfg(debug_assertions)]
-static DEVICE_LIST_HANDOFF_HOOK: OnceLock<Mutex<Option<(Arc<Notify>, Arc<Notify>)>>> =
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct PublicDeviceListHandoffHook {
+    target_user_id: Uuid,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(feature = "test-support")]
+static DEVICE_LIST_HANDOFF_HOOK: OnceLock<Mutex<Option<PublicDeviceListHandoffHook>>> =
     OnceLock::new();
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-support")]
 pub struct PublicDeviceListHandoffHookGuard;
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-support")]
 impl Drop for PublicDeviceListHandoffHookGuard {
     fn drop(&mut self) {
         let hook = DEVICE_LIST_HANDOFF_HOOK.get_or_init(|| Mutex::new(None));
@@ -22,31 +30,37 @@ impl Drop for PublicDeviceListHandoffHookGuard {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-support")]
 pub fn install_public_device_list_handoff_hook(
+    target_user_id: Uuid,
     entered: Arc<Notify>,
     release: Arc<Notify>,
 ) -> PublicDeviceListHandoffHookGuard {
     let hook = DEVICE_LIST_HANDOFF_HOOK.get_or_init(|| Mutex::new(None));
-    *hook.lock().expect("public device list hook lock poisoned") = Some((entered, release));
+    *hook.lock().expect("public device list hook lock poisoned") =
+        Some(PublicDeviceListHandoffHook {
+            target_user_id,
+            entered,
+            release,
+        });
     PublicDeviceListHandoffHookGuard
 }
 
-#[cfg(debug_assertions)]
-async fn wait_for_public_device_list_handoff_hook() {
+#[cfg(feature = "test-support")]
+async fn wait_for_public_device_list_handoff_hook(user_id: Uuid) {
     let hook = DEVICE_LIST_HANDOFF_HOOK
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("public device list hook lock poisoned")
         .clone();
-    if let Some((entered, release)) = hook {
-        entered.notify_one();
-        release.notified().await;
+    if let Some(hook) = hook.filter(|hook| hook.target_user_id == user_id) {
+        hook.entered.notify_one();
+        hook.release.notified().await;
     }
 }
 
-#[cfg(not(debug_assertions))]
-async fn wait_for_public_device_list_handoff_hook() {}
+#[cfg(not(feature = "test-support"))]
+async fn wait_for_public_device_list_handoff_hook(_: Uuid) {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrincipal {
@@ -554,7 +568,7 @@ async fn list_public_devices(
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(Vec::new());
     };
-    wait_for_public_device_list_handoff_hook().await;
+    wait_for_public_device_list_handoff_hook(subject.user_id).await;
     let limit = i64::from(limit);
     match store {
         PlatformStore::Sqlite(store) => {

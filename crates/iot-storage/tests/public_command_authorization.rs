@@ -1,12 +1,18 @@
+#[cfg(feature = "test-support")]
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
+#[cfg(feature = "test-support")]
 use iot_storage::{
-    AccountClass, NewCommandOutboxEntry, PlatformStore, PublicApiRepository, PublicPrincipal,
-    install_public_device_list_handoff_hook,
+    AccountClass, PublicApiRepository, PublicPrincipal, install_public_device_list_handoff_hook,
 };
-use tokio::sync::Notify;
+use iot_storage::{NewCommandOutboxEntry, PlatformStore};
+#[cfg(feature = "test-support")]
+use tokio::{
+    sync::Notify,
+    time::{Duration as TokioDuration, timeout},
+};
 use uuid::Uuid;
 
 async fn sqlite_store() -> (tempfile::TempDir, PlatformStore, Uuid) {
@@ -179,24 +185,29 @@ async fn sqlite_authorized_command_denies_after_permission_revocation_or_device_
     );
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
-async fn sqlite_public_device_list_does_not_return_details_after_handoff_revocation() {
+async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     let (_directory, store, tenant_id) = sqlite_store().await;
     let store = Arc::new(store);
     let pool = store.sqlite_pool().unwrap();
     let owner_id = Uuid::now_v7();
     let viewer_id = Uuid::now_v7();
+    let unrelated_viewer_id = Uuid::now_v7();
     let permission_id = Uuid::now_v7();
     let device_id = format!("public-list-handoff-{}", Uuid::now_v7());
 
     sqlx::query(
         "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
          VALUES (?, ?, 'public-list-owner', 'unused', 'viewer', 'user'),
-                (?, ?, 'public-list-viewer', 'unused', 'viewer', 'user')",
+                (?, ?, 'public-list-viewer', 'unused', 'viewer', 'user'),
+                (?, ?, 'public-list-unrelated-viewer', 'unused', 'viewer', 'user')",
     )
     .bind(owner_id.to_string())
     .bind(tenant_id.to_string())
     .bind(viewer_id.to_string())
+    .bind(tenant_id.to_string())
+    .bind(unrelated_viewer_id.to_string())
     .bind(tenant_id.to_string())
     .execute(pool)
     .await
@@ -225,7 +236,11 @@ async fn sqlite_public_device_list_does_not_return_details_after_handoff_revocat
 
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let _hook = install_public_device_list_handoff_hook(Arc::clone(&entered), Arc::clone(&release));
+    let _hook = install_public_device_list_handoff_hook(
+        viewer_id,
+        Arc::clone(&entered),
+        Arc::clone(&release),
+    );
     let entered_wait = entered.notified();
     let list_store = Arc::clone(&store);
     let principal = PublicPrincipal {
@@ -237,16 +252,58 @@ async fn sqlite_public_device_list_does_not_return_details_after_handoff_revocat
     let task = tokio::spawn(async move {
         PublicApiRepository::list_public_devices(list_store.as_ref(), &principal, None, 100).await
     });
-    entered_wait.await;
+    timeout(TokioDuration::from_secs(1), entered_wait)
+        .await
+        .expect("selected list request must reach the handoff hook");
+
+    let unrelated_store = Arc::clone(&store);
+    let unrelated_principal = PublicPrincipal {
+        tenant_id,
+        user_id: Some(unrelated_viewer_id),
+        app_id: "public-list-unrelated-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let mut unrelated_task = tokio::spawn(async move {
+        PublicApiRepository::list_public_devices(
+            unrelated_store.as_ref(),
+            &unrelated_principal,
+            None,
+            100,
+        )
+        .await
+    });
+    let unrelated_before_release = timeout(TokioDuration::from_secs(1), &mut unrelated_task).await;
+
     sqlx::query("UPDATE resource_permissions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(permission_id.to_string())
         .execute(pool)
         .await
         .unwrap();
-    release.notify_one();
+    release.notify_waiters();
 
     assert!(
-        task.await.unwrap().unwrap().is_empty(),
+        timeout(TokioDuration::from_secs(1), task)
+            .await
+            .expect("selected list request must finish after the hook is released")
+            .unwrap()
+            .unwrap()
+            .is_empty(),
         "the detail query must not use identifiers authorized before revocation"
     );
+
+    match unrelated_before_release {
+        Ok(result) => assert!(
+            result
+                .expect("unrelated list task must not panic")
+                .expect("unrelated list request must succeed")
+                .is_empty(),
+            "unrelated user has no authorized devices"
+        ),
+        Err(_) => {
+            let _ = timeout(TokioDuration::from_secs(1), unrelated_task)
+                .await
+                .expect("unrelated list request must finish after the hook is released");
+            panic!("the handoff hook captured an unrelated public device list request");
+        }
+    }
 }

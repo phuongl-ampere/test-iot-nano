@@ -53,7 +53,7 @@ pub use public_api::{
     NewPublicAsset, NewPublicDevice, PublicAlert, PublicApiRepository, PublicAsset,
     PublicAssetError, PublicDevice, PublicDeviceError, PublicPrincipal, PublicTelemetry,
 };
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-support")]
 pub use public_api::{PublicDeviceListHandoffHookGuard, install_public_device_list_handoff_hook};
 pub use tenant_identity::{
     AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, SystemAccount,
