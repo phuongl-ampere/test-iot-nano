@@ -233,6 +233,55 @@ impl UserDeviceDetailPage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAssetRow {
+    asset_id: String,
+    name: String,
+    containment: String,
+    permission: String,
+    access_source: String,
+}
+
+impl UserAssetRow {
+    pub fn new(
+        asset_id: impl Into<String>,
+        name: impl Into<String>,
+        containment: impl Into<String>,
+        permission: impl Into<String>,
+        access_source: impl Into<String>,
+    ) -> Self {
+        Self {
+            asset_id: asset_id.into(),
+            name: name.into(),
+            containment: containment.into(),
+            permission: permission.into(),
+            access_source: access_source.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAssetListPage {
+    assets: Vec<UserAssetRow>,
+}
+
+impl UserAssetListPage {
+    pub fn new(assets: Vec<UserAssetRow>) -> Self {
+        Self { assets }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAssetDetailPage {
+    asset: UserAssetRow,
+}
+
+impl UserAssetDetailPage {
+    pub fn new(asset: UserAssetRow) -> Self {
+        Self { asset }
+    }
+}
+
 impl SystemPlatformPage {
     pub fn new(tenants: Vec<SystemTenantRow>) -> Self {
         Self {
@@ -301,6 +350,26 @@ impl PlatformUiRenderer {
         identity: &PlatformUiIdentity,
     ) -> Result<String, askama::Error> {
         UserDeviceUnavailableLayout::new(identity).render()
+    }
+
+    pub fn render_user_assets(
+        identity: &PlatformUiIdentity,
+        page: &UserAssetListPage,
+    ) -> Result<String, askama::Error> {
+        UserAssetLayout::new(identity, page).render()
+    }
+
+    pub fn render_user_asset(
+        identity: &PlatformUiIdentity,
+        page: &UserAssetDetailPage,
+    ) -> Result<String, askama::Error> {
+        UserAssetDetailLayout::new(identity, page).render()
+    }
+
+    pub fn render_user_asset_unavailable(
+        identity: &PlatformUiIdentity,
+    ) -> Result<String, askama::Error> {
+        UserAssetUnavailableLayout::new(identity).render()
     }
 }
 
@@ -388,6 +457,44 @@ pub struct UserDeviceUnavailableLayout<'a> {
 }
 
 impl<'a> UserDeviceUnavailableLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity) -> Self {
+        Self { identity }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/user_assets.html")]
+pub struct UserAssetLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a UserAssetListPage,
+}
+
+impl<'a> UserAssetLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a UserAssetListPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/user_asset.html")]
+pub struct UserAssetDetailLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a UserAssetDetailPage,
+}
+
+impl<'a> UserAssetDetailLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a UserAssetDetailPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/user_asset_unavailable.html")]
+pub struct UserAssetUnavailableLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+}
+
+impl<'a> UserAssetUnavailableLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity) -> Self {
         Self { identity }
     }

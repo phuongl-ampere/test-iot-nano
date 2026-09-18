@@ -34,6 +34,13 @@ const LIST_GROUP_DEVICE_A: &str = "list-b-group";
 const LIST_INHERITED_DEVICE_A: &str = "list-c-inherited";
 const LIST_MOVED_DEVICE_A: &str = "list-d-moved";
 const LIST_INHERITED_ONLY_MOVED_DEVICE_A: &str = "list-e-inherited-only-moved";
+const OWNED_ASSET_A: Uuid = Uuid::from_u128(70);
+const DIRECT_ASSET_A: Uuid = Uuid::from_u128(71);
+const GROUP_ASSET_A: Uuid = Uuid::from_u128(72);
+const INHERITED_ASSET_ROOT_A: Uuid = Uuid::from_u128(73);
+const INHERITED_ASSET_CHILD_A: Uuid = Uuid::from_u128(74);
+const UNSHARED_ASSET_A: Uuid = Uuid::from_u128(75);
+const ASSET_B: Uuid = Uuid::from_u128(76);
 
 fn subject(user_id: Uuid, tenant_id: Uuid, account_class: AccountClass) -> AuthorizationSubject {
     AuthorizationSubject {
@@ -343,6 +350,194 @@ async fn sqlite_inherits_asset_permission_for_assets_and_devices() {
         Some(ResourcePermission::Manager),
     )
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_authorized_asset_list_and_detail_resolve_tenant_scoped_access() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_identities(pool).await;
+    insert_asset(
+        pool,
+        OWNED_ASSET_A,
+        TENANT_A,
+        "owned asset",
+        None,
+        Some(USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        DIRECT_ASSET_A,
+        TENANT_A,
+        "direct asset",
+        None,
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        GROUP_ASSET_A,
+        TENANT_A,
+        "group asset",
+        None,
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        INHERITED_ASSET_ROOT_A,
+        TENANT_A,
+        "inherited root",
+        None,
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        INHERITED_ASSET_CHILD_A,
+        TENANT_A,
+        "inherited child",
+        Some(INHERITED_ASSET_ROOT_A),
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        UNSHARED_ASSET_A,
+        TENANT_A,
+        "unshared asset",
+        None,
+        Some(OTHER_USER_A),
+    )
+    .await;
+    insert_asset(
+        pool,
+        ASSET_B,
+        TENANT_B,
+        "other tenant asset",
+        None,
+        Some(USER_B),
+    )
+    .await;
+    insert_group_member(pool, TENANT_A, GROUP_A, OTHER_USER_A, USER_A).await;
+    insert_permission(
+        pool,
+        "asset-direct-viewer",
+        TENANT_A,
+        Some(USER_A),
+        None,
+        Some(DIRECT_ASSET_A),
+        None,
+        ResourcePermission::Viewer,
+        false,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+    insert_permission(
+        pool,
+        "asset-group-manager",
+        TENANT_A,
+        None,
+        Some(GROUP_A),
+        Some(GROUP_ASSET_A),
+        None,
+        ResourcePermission::Manager,
+        false,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+    insert_permission(
+        pool,
+        "asset-inherited-group-viewer",
+        TENANT_A,
+        None,
+        Some(GROUP_A),
+        Some(INHERITED_ASSET_ROOT_A),
+        None,
+        ResourcePermission::Viewer,
+        true,
+        OTHER_USER_A,
+        None,
+    )
+    .await;
+
+    let user = subject(USER_A, TENANT_A, AccountClass::User);
+    let first_page = store.list_authorized_assets(&user, None, 3).await.unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|asset| (asset.asset_id, asset.access))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                OWNED_ASSET_A,
+                access(ResourcePermission::Owner, ResourceAccessSource::Owner)
+            ),
+            (
+                DIRECT_ASSET_A,
+                access(ResourcePermission::Viewer, ResourceAccessSource::DirectUser),
+            ),
+            (
+                GROUP_ASSET_A,
+                access(ResourcePermission::Manager, ResourceAccessSource::Group),
+            ),
+        ],
+    );
+    let second_page = store
+        .list_authorized_assets(&user, Some(GROUP_ASSET_A), 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|asset| (asset.asset_id, asset.access))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                INHERITED_ASSET_ROOT_A,
+                access(ResourcePermission::Viewer, ResourceAccessSource::Group),
+            ),
+            (
+                INHERITED_ASSET_CHILD_A,
+                access(
+                    ResourcePermission::Viewer,
+                    ResourceAccessSource::InheritedGroup,
+                ),
+            ),
+        ],
+    );
+    assert_eq!(
+        store
+            .authorized_asset(&user, INHERITED_ASSET_CHILD_A)
+            .await
+            .unwrap()
+            .map(|asset| (asset.asset_id, asset.parent_asset_id, asset.access)),
+        Some((
+            INHERITED_ASSET_CHILD_A,
+            Some(INHERITED_ASSET_ROOT_A),
+            access(
+                ResourcePermission::Viewer,
+                ResourceAccessSource::InheritedGroup,
+            ),
+        )),
+    );
+    assert!(
+        store
+            .authorized_asset(&user, UNSHARED_ASSET_A)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .authorized_asset(&user, ASSET_B)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

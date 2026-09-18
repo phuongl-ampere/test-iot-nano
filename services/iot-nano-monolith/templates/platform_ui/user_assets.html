@@ -1,0 +1,48 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}My Assets | IoT Nano{% endblock %}
+{% block account_kind %}User Account{% endblock %}
+{% block navigation_label %}Workspace navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/app">Devices</a>
+  <a class="nav-link active" href="/app/assets" aria-current="page">Assets</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">User Account</p>
+    <h1>My Assets</h1>
+    <p>Assets you own or are permitted to view.</p>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Authorized assets</h2></header>
+    {% if page.assets.is_empty() %}
+      <p class="empty-state">No assets are available to this account.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Asset</th>
+              <th scope="col">Containment</th>
+              <th scope="col">Permission</th>
+              <th scope="col">Access source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for asset in page.assets %}
+              <tr>
+                <td>
+                  <a class="resource-link" href="/app/assets/{{ asset.asset_id|urlencode_strict }}">{{ asset.name }}</a>
+                  <span class="resource-id">{{ asset.asset_id }}</span>
+                </td>
+                <td>{{ asset.containment }}</td>
+                <td>{{ asset.permission }}</td>
+                <td>{{ asset.access_source }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

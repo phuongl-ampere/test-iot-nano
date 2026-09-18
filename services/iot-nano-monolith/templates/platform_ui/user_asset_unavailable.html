@@ -1,0 +1,16 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Asset unavailable | IoT Nano{% endblock %}
+{% block account_kind %}User Account{% endblock %}
+{% block navigation_label %}Workspace navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/app">Devices</a>
+  <a class="nav-link" href="/app/assets">Assets</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Asset</p>
+    <h1>Asset unavailable</h1>
+    <p>The asset is unavailable to this account.</p>
+  </section>
+{% endblock %}

@@ -1617,6 +1617,22 @@ pub struct AuthorizedDeviceListEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizedAssetSummary {
+    pub asset_id: uuid::Uuid,
+    pub name: String,
+    pub parent_asset_id: Option<uuid::Uuid>,
+    pub access: ResourceAccess,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthorizedAssetListEntry {
+    pub asset_id: uuid::Uuid,
+    pub name: String,
+    pub parent_asset_id: Option<uuid::Uuid>,
+    pub access: ResourceAccess,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct NewUserGroup {
     pub tenant_id: uuid::Uuid,
     pub owner_user_id: uuid::Uuid,
@@ -1747,6 +1763,18 @@ pub trait AuthorizationRepository: Send + Sync {
                 + 'a,
         >,
     >;
+    fn list_authorized_assets<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        after: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<AuthorizedAssetListEntry>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
     fn authorized_device<'a>(
         &'a self,
         subject: &'a AuthorizationSubject,
@@ -1754,6 +1782,17 @@ pub trait AuthorizationRepository: Send + Sync {
     ) -> Pin<
         Box<
             dyn Future<Output = Result<Option<AuthorizedDeviceSummary>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn authorized_asset<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        asset_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AuthorizedAssetSummary>, PlatformStoreError>>
                 + Send
                 + 'a,
         >,
@@ -3080,6 +3119,34 @@ impl PlatformStore {
             .await
     }
 
+    pub async fn list_authorized_assets(
+        &self,
+        subject: &AuthorizationSubject,
+        after: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> Result<Vec<AuthorizedAssetListEntry>, PlatformStoreError> {
+        self.list_authorized_assets_matching(subject, after, limit, None)
+            .await
+    }
+
+    pub async fn authorized_asset(
+        &self,
+        subject: &AuthorizationSubject,
+        asset_id: uuid::Uuid,
+    ) -> Result<Option<AuthorizedAssetSummary>, PlatformStoreError> {
+        Ok(self
+            .list_authorized_assets_matching(subject, None, 1, Some(asset_id))
+            .await?
+            .into_iter()
+            .next()
+            .map(|asset| AuthorizedAssetSummary {
+                asset_id: asset.asset_id,
+                name: asset.name,
+                parent_asset_id: asset.parent_asset_id,
+                access: asset.access,
+            }))
+    }
+
     async fn list_authorized_devices_matching(
         &self,
         subject: &AuthorizationSubject,
@@ -3359,6 +3426,259 @@ impl PlatformStore {
                             )?,
                         })
                     })
+                    .collect()
+            }
+        }
+    }
+
+    async fn list_authorized_assets_matching(
+        &self,
+        subject: &AuthorizationSubject,
+        after: Option<uuid::Uuid>,
+        limit: u32,
+        asset_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<AuthorizedAssetListEntry>, PlatformStoreError> {
+        let limit = i64::from(limit);
+        match self {
+            Self::Sqlite(store) => {
+                let user_id = subject.user_id.to_string();
+                let tenant_id = subject.tenant_id.to_string();
+                let after = after.map(|value| value.to_string());
+                let asset_id = asset_id.map(|value| value.to_string());
+                let rows = sqlx::query(
+                    "WITH RECURSIVE candidates(asset_id, name, parent_asset_id, owner_user_id) AS (
+                         SELECT id, name, parent_asset_id, owner_user_id
+                         FROM assets
+                         WHERE tenant_id = ?
+                           AND (? IS NULL OR id > ?)
+                           AND (? IS NULL OR id = ?)
+                     ),
+                     ancestors(asset_id, ancestor_asset_id, depth) AS (
+                         SELECT asset_id, asset_id, 0
+                         FROM candidates
+                         UNION ALL
+                         SELECT ancestors.asset_id, asset.parent_asset_id, ancestors.depth + 1
+                         FROM ancestors
+                         JOIN assets AS asset
+                           ON asset.id = ancestors.ancestor_asset_id AND asset.tenant_id = ?
+                         WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     ),
+                     access_candidates(asset_id, permission_rank, source_rank, access_source) AS (
+                         SELECT asset_id, 3, 1, 'owner'
+                         FROM candidates
+                         WHERE owner_user_id = ?
+                         UNION ALL
+                         SELECT candidate.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                2,
+                                'direct_user'
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.asset_id = candidate.asset_id
+                          AND permission.revoked_at IS NULL
+                         WHERE permission.subject_user_id = ?
+                         UNION ALL
+                         SELECT candidate.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                3,
+                                'group'
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.asset_id = candidate.asset_id
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = ?
+                         UNION ALL
+                         SELECT ancestors.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                4,
+                                'inherited_user'
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.asset_id = ancestors.ancestor_asset_id
+                          AND permission.inherit_children = 1
+                          AND permission.revoked_at IS NULL
+                         WHERE ancestors.depth > 0 AND permission.subject_user_id = ?
+                         UNION ALL
+                         SELECT ancestors.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                5,
+                                'inherited_group'
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = ?
+                          AND permission.asset_id = ancestors.ancestor_asset_id
+                          AND permission.inherit_children = 1
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = ?
+                         WHERE ancestors.depth > 0
+                     ),
+                     authorized(asset_id, effective_permission, access_source) AS (
+                         SELECT asset_id,
+                                CASE permission_rank
+                                    WHEN 3 THEN 'owner'
+                                    WHEN 2 THEN 'manager'
+                                    ELSE 'viewer'
+                                END,
+                                access_source
+                         FROM (
+                             SELECT access_candidates.*,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY asset_id
+                                        ORDER BY permission_rank DESC, source_rank ASC
+                                    ) AS access_rank
+                             FROM access_candidates
+                         ) AS ranked_access
+                         WHERE access_rank = 1
+                     )
+                     SELECT candidate.asset_id, candidate.name, candidate.parent_asset_id,
+                            authorized.effective_permission, authorized.access_source
+                     FROM candidates AS candidate
+                     JOIN authorized ON authorized.asset_id = candidate.asset_id
+                     ORDER BY candidate.asset_id
+                     LIMIT ?",
+                )
+                .bind(&tenant_id)
+                .bind(&after)
+                .bind(&after)
+                .bind(&asset_id)
+                .bind(&asset_id)
+                .bind(&tenant_id)
+                .bind(&user_id)
+                .bind(&tenant_id)
+                .bind(&user_id)
+                .bind(&tenant_id)
+                .bind(&user_id)
+                .bind(&tenant_id)
+                .bind(&user_id)
+                .bind(&tenant_id)
+                .bind(&user_id)
+                .bind(limit)
+                .fetch_all(store.pool())
+                .await?;
+                rows.into_iter()
+                    .map(sqlite_authorized_asset_from_row)
+                    .collect()
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "WITH RECURSIVE candidates(asset_id, name, parent_asset_id, owner_user_id) AS (
+                         SELECT id, name, parent_asset_id, owner_user_id
+                         FROM assets
+                         WHERE tenant_id = $1
+                           AND ($2::uuid IS NULL OR id > $2)
+                           AND ($4::uuid IS NULL OR id = $4)
+                     ),
+                     ancestors(asset_id, ancestor_asset_id, depth) AS (
+                         SELECT asset_id, asset_id, 0
+                         FROM candidates
+                         UNION ALL
+                         SELECT ancestors.asset_id, asset.parent_asset_id, ancestors.depth + 1
+                         FROM ancestors
+                         JOIN assets AS asset
+                           ON asset.id = ancestors.ancestor_asset_id AND asset.tenant_id = $1
+                         WHERE asset.parent_asset_id IS NOT NULL AND ancestors.depth < 64
+                     ),
+                     access_candidates(asset_id, permission_rank, source_rank, access_source) AS (
+                         SELECT asset_id, 3, 1, 'owner'
+                         FROM candidates
+                         WHERE owner_user_id = $3
+                         UNION ALL
+                         SELECT candidate.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                2,
+                                'direct_user'
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.asset_id = candidate.asset_id
+                          AND permission.revoked_at IS NULL
+                         WHERE permission.subject_user_id = $3
+                         UNION ALL
+                         SELECT candidate.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                3,
+                                'group'
+                         FROM candidates AS candidate
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.asset_id = candidate.asset_id
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = $3
+                         UNION ALL
+                         SELECT ancestors.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                4,
+                                'inherited_user'
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.asset_id = ancestors.ancestor_asset_id
+                          AND permission.inherit_children = TRUE
+                          AND permission.revoked_at IS NULL
+                         WHERE ancestors.depth > 0 AND permission.subject_user_id = $3
+                         UNION ALL
+                         SELECT ancestors.asset_id,
+                                CASE permission.permission WHEN 'manager' THEN 2 ELSE 1 END,
+                                5,
+                                'inherited_group'
+                         FROM ancestors
+                         JOIN resource_permissions AS permission
+                           ON permission.tenant_id = $1
+                          AND permission.asset_id = ancestors.ancestor_asset_id
+                          AND permission.inherit_children = TRUE
+                          AND permission.revoked_at IS NULL
+                         JOIN user_group_members AS membership
+                           ON membership.tenant_id = permission.tenant_id
+                          AND membership.group_id = permission.subject_group_id
+                          AND membership.user_id = $3
+                         WHERE ancestors.depth > 0
+                     ),
+                     authorized(asset_id, effective_permission, access_source) AS (
+                         SELECT asset_id,
+                                CASE permission_rank
+                                    WHEN 3 THEN 'owner'
+                                    WHEN 2 THEN 'manager'
+                                    ELSE 'viewer'
+                                END,
+                                access_source
+                         FROM (
+                             SELECT access_candidates.*,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY asset_id
+                                        ORDER BY permission_rank DESC, source_rank ASC
+                                    ) AS access_rank
+                             FROM access_candidates
+                         ) AS ranked_access
+                         WHERE access_rank = 1
+                     )
+                     SELECT candidate.asset_id, candidate.name, candidate.parent_asset_id,
+                            authorized.effective_permission, authorized.access_source
+                     FROM candidates AS candidate
+                     JOIN authorized ON authorized.asset_id = candidate.asset_id
+                     ORDER BY candidate.asset_id
+                     LIMIT $5",
+                )
+                .bind(subject.tenant_id)
+                .bind(after)
+                .bind(subject.user_id)
+                .bind(asset_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(timescale_authorized_asset_from_row)
                     .collect()
             }
         }
@@ -8015,6 +8335,23 @@ impl AuthorizationRepository for PlatformStore {
         })
     }
 
+    fn list_authorized_assets<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        after: Option<uuid::Uuid>,
+        limit: u32,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<AuthorizedAssetListEntry>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(
+            async move { PlatformStore::list_authorized_assets(self, subject, after, limit).await },
+        )
+    }
+
     fn authorized_device<'a>(
         &'a self,
         subject: &'a AuthorizationSubject,
@@ -8027,6 +8364,20 @@ impl AuthorizationRepository for PlatformStore {
         >,
     > {
         Box::pin(async move { PlatformStore::authorized_device(self, subject, device_id).await })
+    }
+
+    fn authorized_asset<'a>(
+        &'a self,
+        subject: &'a AuthorizationSubject,
+        asset_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Option<AuthorizedAssetSummary>, PlatformStoreError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { PlatformStore::authorized_asset(self, subject, asset_id).await })
     }
 
     fn device_permission<'a>(
@@ -8475,6 +8826,46 @@ fn resource_access_from_storage(
         ))
     })?;
     Ok(ResourceAccess { permission, source })
+}
+
+fn parse_authorized_asset_id(value: &str) -> Result<uuid::Uuid, PlatformStoreError> {
+    value.parse().map_err(|_| {
+        PlatformStoreError::Database(sqlx::Error::Protocol(
+            "invalid authorized asset ID".to_owned(),
+        ))
+    })
+}
+
+fn sqlite_authorized_asset_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<AuthorizedAssetListEntry, PlatformStoreError> {
+    Ok(AuthorizedAssetListEntry {
+        asset_id: parse_authorized_asset_id(&row.try_get::<String, _>("asset_id")?)?,
+        name: row.try_get("name")?,
+        parent_asset_id: row
+            .try_get::<Option<String>, _>("parent_asset_id")?
+            .as_deref()
+            .map(parse_authorized_asset_id)
+            .transpose()?,
+        access: resource_access_from_storage(
+            row.try_get("effective_permission")?,
+            row.try_get("access_source")?,
+        )?,
+    })
+}
+
+fn timescale_authorized_asset_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<AuthorizedAssetListEntry, PlatformStoreError> {
+    Ok(AuthorizedAssetListEntry {
+        asset_id: row.try_get("asset_id")?,
+        name: row.try_get("name")?,
+        parent_asset_id: row.try_get("parent_asset_id")?,
+        access: resource_access_from_storage(
+            row.try_get("effective_permission")?,
+            row.try_get("access_source")?,
+        )?,
+    })
 }
 
 async fn sqlite_device_resource_permission(

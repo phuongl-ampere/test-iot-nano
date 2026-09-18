@@ -404,6 +404,153 @@ async fn seed_user_workspace_devices(store: &PlatformStore) {
     .unwrap();
 }
 
+struct UserWorkspaceAssets {
+    direct_asset_id: uuid::Uuid,
+    other_tenant_asset_id: uuid::Uuid,
+}
+
+async fn seed_user_workspace_assets(store: &PlatformStore) -> UserWorkspaceAssets {
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let viewer_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let group_id = uuid::Uuid::now_v7().to_string();
+    let owned_asset_id = uuid::Uuid::now_v7().to_string();
+    let direct_asset_id = uuid::Uuid::now_v7();
+    let direct_asset_id_string = direct_asset_id.to_string();
+    let group_asset_id = uuid::Uuid::now_v7().to_string();
+    let inherited_root_id = uuid::Uuid::now_v7().to_string();
+    let inherited_child_id = uuid::Uuid::now_v7().to_string();
+    let unshared_asset_id = uuid::Uuid::now_v7().to_string();
+
+    for (asset_id, name, parent_asset_id, owner_user_id) in [
+        (
+            owned_asset_id.as_str(),
+            "Owned asset",
+            None,
+            Some(viewer_id.as_str()),
+        ),
+        (direct_asset_id_string.as_str(), "Direct asset", None, None),
+        (group_asset_id.as_str(), "Group asset", None, None),
+        (inherited_root_id.as_str(), "Shared root", None, None),
+        (
+            inherited_child_id.as_str(),
+            "Inherited asset",
+            Some(inherited_root_id.as_str()),
+            None,
+        ),
+        (unshared_asset_id.as_str(), "Unshared asset", None, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO assets (id, tenant_id, name, parent_asset_id, owner_user_id)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(asset_id)
+        .bind(&tenant_id)
+        .bind(name)
+        .bind(parent_asset_id)
+        .bind(owner_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO user_groups (id, tenant_id, owner_user_id, name)
+         VALUES (?, ?, ?, 'Asset operators')",
+    )
+    .bind(&group_id)
+    .bind(&tenant_id)
+    .bind(&viewer_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO user_group_members (tenant_id, group_id, user_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(&tenant_id)
+    .bind(&group_id)
+    .bind(&viewer_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    for (subject_user_id, subject_group_id, asset_id, permission, inherit_children) in [
+        (
+            Some(viewer_id.as_str()),
+            None,
+            direct_asset_id_string,
+            "viewer",
+            0_i64,
+        ),
+        (
+            None,
+            Some(group_id.as_str()),
+            group_asset_id,
+            "manager",
+            0_i64,
+        ),
+        (
+            None,
+            Some(group_id.as_str()),
+            inherited_root_id,
+            "viewer",
+            1_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_permissions (
+                id, tenant_id, subject_user_id, subject_group_id, asset_id, device_id,
+                permission, inherit_children, created_by_user_id
+             ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&tenant_id)
+        .bind(subject_user_id)
+        .bind(subject_group_id)
+        .bind(asset_id)
+        .bind(permission)
+        .bind(inherit_children)
+        .bind(&viewer_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store,
+        NewTenant {
+            slug: "asset-other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("AssetOtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let other_tenant_asset_id = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Cross tenant asset')")
+        .bind(other_tenant_asset_id.to_string())
+        .bind(other_tenant.id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+    UserWorkspaceAssets {
+        direct_asset_id,
+        other_tenant_asset_id,
+    }
+}
+
 #[tokio::test]
 async fn platform_root_redirects_each_authenticated_session_kind_to_its_workspace() {
     let (_directory, management) = management_session_router().await;
@@ -616,6 +763,110 @@ async fn user_workspace_device_detail_masks_unavailable_devices_and_denies_other
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn user_workspace_asset_list_shows_only_authorized_assets_and_resolved_links() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let assets = seed_user_workspace_assets(store.as_ref()).await;
+
+    let router = management.router;
+    let user_cookie = user_account_cookie(&router).await;
+    let response = router
+        .clone()
+        .oneshot(platform_get("/app/assets", Some(&user_cookie)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    for (asset_name, permission, access_source) in [
+        ("Owned asset", "Owner", "Owner"),
+        ("Direct asset", "Viewer", "Direct user permission"),
+        ("Group asset", "Manager", "Group permission"),
+        ("Inherited asset", "Viewer", "Inherited group permission"),
+    ] {
+        assert!(body.contains(asset_name), "missing {asset_name}");
+        assert!(body.contains(permission), "missing {permission}");
+        assert!(body.contains(access_source), "missing {access_source}");
+    }
+    assert!(!body.contains("Unshared asset"));
+    assert!(!body.contains("Cross tenant asset"));
+    assert!(!body.contains("href=\"/system"));
+    assert!(!body.contains("href=\"/tenant"));
+    assert!(!body.contains("<form"));
+
+    let direct_asset_route = format!("/app/assets/{}", assets.direct_asset_id);
+    assert!(body.contains(&format!("href=\"{direct_asset_route}\"")));
+    let detail = router
+        .oneshot(platform_get(&direct_asset_route, Some(&user_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn user_workspace_asset_detail_masks_unavailable_assets_and_requires_user_session() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let assets = seed_user_workspace_assets(store.as_ref()).await;
+
+    let router = management.router;
+    let user_cookie = user_account_cookie(&router).await;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let system_cookie = system_account_cookie(&router).await;
+    let authorized_route = format!("/app/assets/{}", assets.direct_asset_id);
+    let authorized = router
+        .clone()
+        .oneshot(platform_get(&authorized_route, Some(&user_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let authorized_body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
+    let authorized_body = String::from_utf8(authorized_body.to_vec()).unwrap();
+    assert!(authorized_body.contains("Direct asset"));
+    assert!(authorized_body.contains("Viewer"));
+    assert!(authorized_body.contains("Direct user permission"));
+    assert!(!authorized_body.contains("<form"));
+
+    for asset_id in [
+        assets.other_tenant_asset_id.to_string(),
+        "00000000-0000-0000-0000-000000000000".to_owned(),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(platform_get(
+                &format!("/app/assets/{asset_id}"),
+                Some(&user_cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{asset_id}");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Asset unavailable"));
+        assert!(!body.contains("Cross tenant asset"));
+    }
+
+    for cookie in [
+        None,
+        Some(tenant_cookie.as_str()),
+        Some(system_cookie.as_str()),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(platform_get(&authorized_route, cookie))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "unexpected status {}",
+            response.status()
+        );
     }
 }
 

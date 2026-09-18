@@ -58,6 +58,7 @@ const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: u8 = 5;
 const USER_DEVICE_LIST_LIMIT: u32 = 100;
+const USER_ASSET_LIST_LIMIT: u32 = 100;
 
 #[derive(Debug, Error)]
 pub enum BootstrapSystemError {
@@ -152,6 +153,8 @@ impl ManagementSessionRouter {
                 post(revoke_tenant_permission_form),
             )
             .route("/app", get(platform_app))
+            .route("/app/assets", get(platform_app_assets))
+            .route("/app/assets/{asset_id}", get(platform_app_asset_detail))
             .route("/app/devices/{device_id}", get(platform_app_device_detail))
             .route("/assets/platform-ui.css", get(platform_stylesheet))
             .route("/api/auth/login", post(login))
@@ -2323,6 +2326,88 @@ async fn platform_app_device_detail(
     }
 }
 
+async fn platform_app_assets(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let PlatformUiSession::User { user_id, tenant_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    let subject = user_authorization_subject(&state, user_id, tenant_id).await?;
+    let assets = AuthorizationRepository::list_authorized_assets(
+        state.store.as_ref(),
+        &subject,
+        None,
+        USER_ASSET_LIST_LIMIT,
+    )
+    .await
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    let page = crate::UserAssetListPage::new(
+        assets
+            .into_iter()
+            .map(|asset| {
+                user_asset_row(
+                    asset.asset_id,
+                    asset.name,
+                    asset.parent_asset_id,
+                    asset.access,
+                )
+            })
+            .collect(),
+    );
+    let rendered = crate::PlatformUiRenderer::render_user_assets(
+        &crate::PlatformUiIdentity::new(format!("User {user_id}")),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn platform_app_asset_detail(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(asset_id): Path<String>,
+) -> Result<Response, ManagementSessionError> {
+    let PlatformUiSession::User { user_id, tenant_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    let identity = crate::PlatformUiIdentity::new(format!("User {user_id}"));
+    let Some(asset_id) = Uuid::parse_str(&asset_id).ok() else {
+        return render_user_asset_unavailable(&identity);
+    };
+    let subject = user_authorization_subject(&state, user_id, tenant_id).await?;
+    let asset = AuthorizationRepository::authorized_asset(state.store.as_ref(), &subject, asset_id)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+
+    match asset {
+        Some(asset) => {
+            let page = crate::UserAssetDetailPage::new(user_asset_row(
+                asset.asset_id,
+                asset.name,
+                asset.parent_asset_id,
+                asset.access,
+            ));
+            let rendered = crate::PlatformUiRenderer::render_user_asset(&identity, &page)
+                .map_err(|_| ManagementSessionError::Unavailable)?;
+            Ok(Html(rendered).into_response())
+        }
+        None => render_user_asset_unavailable(&identity),
+    }
+}
+
+fn render_user_asset_unavailable(
+    identity: &crate::PlatformUiIdentity,
+) -> Result<Response, ManagementSessionError> {
+    let rendered = crate::PlatformUiRenderer::render_user_asset_unavailable(identity)
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok((StatusCode::NOT_FOUND, Html(rendered)).into_response())
+}
+
 async fn platform_page(
     state: &ManagementState,
     session: PlatformUiSession,
@@ -2421,6 +2506,25 @@ fn user_device_row(
         device_id,
         display_name,
         activity,
+        resource_permission_label(access.permission),
+        resource_access_source_label(access.source),
+    )
+}
+
+fn user_asset_row(
+    asset_id: Uuid,
+    name: String,
+    parent_asset_id: Option<Uuid>,
+    access: ResourceAccess,
+) -> crate::UserAssetRow {
+    crate::UserAssetRow::new(
+        asset_id,
+        name,
+        if parent_asset_id.is_some() {
+            "Nested asset"
+        } else {
+            "Root asset"
+        },
         resource_permission_label(access.permission),
         resource_access_source_label(access.source),
     )
