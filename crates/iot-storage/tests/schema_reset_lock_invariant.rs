@@ -75,11 +75,7 @@ const RESETTERS: &[(&str, &str)] = &[
         "oauth_persistence.rs",
         "timescale_oauth_repository_matches_sqlite_contract",
     ),
-    ("resource_authorization.rs", "timescale_store"),
-    ("telemetry_aggregate.rs", "timescale_store"),
-];
-
-const CONSUMERS: &[(&str, &str)] = &[
+    ("public_api.rs", "timescale_store"),
     (
         "public_api.rs",
         "timescale_public_repository_creates_and_reads_an_asset",
@@ -88,7 +84,27 @@ const CONSUMERS: &[(&str, &str)] = &[
         "public_api.rs",
         "timescale_public_device_repository_matches_sqlite_mutation_contract",
     ),
+    (
+        "public_api.rs",
+        "timescale_public_device_asset_assignment_requires_asset_manager_permission",
+    ),
+    (
+        "public_api.rs",
+        "timescale_public_device_create_rejects_an_unavailable_profile_atomically",
+    ),
+    (
+        "public_api.rs",
+        "timescale_public_device_assignment_serializes_with_management_asset_deletion",
+    ),
+    (
+        "public_api.rs",
+        "timescale_public_device_assignment_waits_for_device_profile_lock",
+    ),
+    ("resource_authorization.rs", "timescale_store"),
+    ("telemetry_aggregate.rs", "timescale_store"),
 ];
+
+const CONSUMERS: &[(&str, &str)] = &[];
 
 fn tests_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests")
@@ -188,7 +204,7 @@ fn common_reset_helper_locks_before_dropping_the_shared_schema() {
 
 #[test]
 fn every_shared_schema_resetter_routes_through_the_common_reset_helper() {
-    assert_eq!(RESETTERS.len(), 21);
+    assert_eq!(RESETTERS.len(), 28);
     for (file_name, function_name) in RESETTERS {
         let source = read_test_source(file_name);
         let body = function_body(&source, function_name);
@@ -205,7 +221,7 @@ fn every_shared_schema_resetter_routes_through_the_common_reset_helper() {
 
 #[test]
 fn every_non_reset_shared_schema_consumer_routes_through_the_common_lock_helper() {
-    assert_eq!(CONSUMERS.len(), 2);
+    assert_eq!(CONSUMERS.len(), 0);
     for (file_name, function_name) in CONSUMERS {
         let source = read_test_source(file_name);
         let body = function_body(&source, function_name);

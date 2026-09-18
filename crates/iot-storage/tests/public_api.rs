@@ -48,7 +48,7 @@ async fn timescale_store() -> (PgConnection, PlatformStore) {
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -1993,7 +1993,7 @@ async fn timescale_public_repository_creates_and_reads_an_asset() {
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -2065,7 +2065,7 @@ async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -2236,7 +2236,7 @@ async fn timescale_public_device_asset_assignment_requires_asset_manager_permiss
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -2345,7 +2345,7 @@ async fn timescale_public_device_create_rejects_an_unavailable_profile_atomicall
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -2406,7 +2406,7 @@ async fn timescale_public_device_assignment_serializes_with_management_asset_del
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
@@ -2530,7 +2530,7 @@ async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
         database_name.starts_with("iot_nano_test_"),
         "refusing to use non-test database {database_name:?}"
     );
-    common::lock_timescale_schema(&mut connection)
+    common::reset_timescale_schema(&mut connection)
         .await
         .unwrap();
     let store = PlatformStore::open(&StorageConfiguration {
