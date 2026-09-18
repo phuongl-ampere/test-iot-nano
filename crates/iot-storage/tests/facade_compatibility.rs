@@ -106,3 +106,18 @@ fn consumer_can_compile_against_the_root_storage_facade() {
     let _ = std::mem::size_of::<UserDeviceTelemetry>();
     let _ = std::mem::size_of::<UserDeviceAlert>();
 }
+
+#[test]
+fn consumer_can_call_application_oauth_and_identity_store_methods() {
+    let _ = PlatformStore::upsert_application;
+    let _ = PlatformStore::list_applications_for_tenant;
+    let _ = PlatformStore::find_application_by_app_id;
+    let _ = PlatformStore::find_application_by_client_id;
+    let _ = PlatformStore::register_client_secret;
+    let _ = PlatformStore::issue_authorization_code;
+    let _ = PlatformStore::consume_authorization_code_and_issue_access_token;
+    let _ = PlatformStore::issue_client_credentials_access_token;
+    let _ = PlatformStore::resolve_access_token;
+    let _ = PlatformStore::register_device;
+    let _ = PlatformStore::resolve_active_device_token;
+}
