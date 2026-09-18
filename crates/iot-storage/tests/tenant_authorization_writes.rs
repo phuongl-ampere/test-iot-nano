@@ -1,7 +1,7 @@
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     NewResourcePermission, NewUserGroup, PermissionCreator, PlatformStore, ResourcePermission,
-    TenantAuthorizationError,
+    TenantAuthorizationError, TenantAuthorizationRepository,
 };
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -353,4 +353,76 @@ async fn sqlite_tenant_authorization_writes_revoke_only_the_tenant_permission() 
         .unwrap(),
         1
     );
+}
+
+#[tokio::test]
+async fn sqlite_tenant_authorization_lists_tenant_groups_and_active_permissions() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    seed_tenants(pool).await;
+
+    let group_a = store
+        .create_user_group(NewUserGroup {
+            tenant_id: TENANT_A,
+            owner_user_id: OWNER_A,
+            name: "operators".to_owned(),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    store
+        .add_user_to_group(TENANT_A, group_a.id, MEMBER_A)
+        .await
+        .unwrap();
+    let group_b = store
+        .create_user_group(NewUserGroup {
+            tenant_id: TENANT_B,
+            owner_user_id: USER_B,
+            name: "other-operators".to_owned(),
+            metadata: json!({}),
+        })
+        .await
+        .unwrap();
+    store
+        .add_user_to_group(TENANT_B, group_b.id, USER_B)
+        .await
+        .unwrap();
+
+    let active = store
+        .create_resource_permission(NewResourcePermission {
+            tenant_id: TENANT_A,
+            subject_user_id: None,
+            subject_group_id: Some(group_a.id),
+            asset_id: Some(ASSET_A),
+            device_id: None,
+            permission: ResourcePermission::Manager,
+            inherit_children: true,
+            created_by: PermissionCreator::User(CREATOR_A),
+        })
+        .await
+        .unwrap();
+    let revoked = store
+        .create_resource_permission(direct_device_permission())
+        .await
+        .unwrap();
+    store
+        .revoke_resource_permission(TENANT_A, revoked.id)
+        .await
+        .unwrap();
+
+    let groups = TenantAuthorizationRepository::list_tenant_user_groups(&store, TENANT_A)
+        .await
+        .unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].id, group_a.id);
+    assert_eq!(groups[0].name, "operators");
+    assert_eq!(groups[0].members.len(), 1);
+    assert_eq!(groups[0].members[0].user_id, MEMBER_A);
+    assert_eq!(groups[0].members[0].username, "member-a");
+
+    let permissions =
+        TenantAuthorizationRepository::list_active_resource_permissions(&store, TENANT_A)
+            .await
+            .unwrap();
+    assert_eq!(permissions, vec![active]);
 }

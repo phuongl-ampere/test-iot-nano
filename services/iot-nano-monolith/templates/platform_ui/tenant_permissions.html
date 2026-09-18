@@ -1,0 +1,119 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Permissions | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link" href="/tenant/groups">Groups</a>
+  <a class="nav-link active" href="/tenant/permissions" aria-current="page">Permissions</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Resource Permissions</h1>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Asset permission</h2></header>
+    <form class="form-grid" action="/tenant/permissions" method="post">
+      <input name="scope" type="hidden" value="asset">
+      <label class="field">
+        <span>Subject</span>
+        <select name="subject" required>
+          {% for subject in page.subjects %}
+            <option value="{{ subject.value }}">{{ subject.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field">
+        <span>Asset</span>
+        <select name="resource_id" required>
+          {% for asset in page.assets %}
+            <option value="{{ asset.value }}">{{ asset.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field">
+        <span>Permission</span>
+        <select name="permission" required>
+          <option value="viewer">Viewer</option>
+          <option value="manager">Manager</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Asset inheritance</span>
+        <input name="inherit_children" type="checkbox" value="true">
+      </label>
+      <div class="form-actions"><button type="submit">Grant</button></div>
+    </form>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Device permission</h2></header>
+    <form class="form-grid" action="/tenant/permissions" method="post">
+      <input name="scope" type="hidden" value="device">
+      <label class="field">
+        <span>Subject</span>
+        <select name="subject" required>
+          {% for subject in page.subjects %}
+            <option value="{{ subject.value }}">{{ subject.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field">
+        <span>Device</span>
+        <select name="resource_id" required>
+          {% for device in page.devices %}
+            <option value="{{ device.value }}">{{ device.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field">
+        <span>Permission</span>
+        <select name="permission" required>
+          <option value="viewer">Viewer</option>
+          <option value="manager">Manager</option>
+        </select>
+      </label>
+      <div class="form-actions"><button type="submit">Grant</button></div>
+    </form>
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Active permissions</h2></header>
+    {% if page.permissions.is_empty() %}
+      <p class="empty-state">No active permissions.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Subject</th>
+              <th scope="col">Resource</th>
+              <th scope="col">Permission</th>
+              <th scope="col">Inheritance</th>
+              <th scope="col">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for permission in page.permissions %}
+              <tr>
+                <td>{{ permission.subject }}</td>
+                <td>{{ permission.resource }}</td>
+                <td>{{ permission.permission }}</td>
+                <td>{{ permission.inheritance }}</td>
+                <td>
+                  <form class="inline-form" action="/tenant/permissions/revoke" method="post">
+                    <input name="permission_id" type="hidden" value="{{ permission.id }}">
+                    <button type="submit">Revoke</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

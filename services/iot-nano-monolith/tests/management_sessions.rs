@@ -2500,3 +2500,344 @@ fn invalid_login_request_for(username: &str) -> Request<Body> {
 fn test_token_vault() -> TokenVault {
     TokenVault::from_key_material("management-session-test-vault-key-material-0001")
 }
+
+#[tokio::test]
+async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenant_account() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let system_cookie = system_account_cookie(&router).await;
+    let user_cookie = user_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let tenant_account_id =
+        sqlx::query_scalar::<_, String>("SELECT id FROM tenant_accounts WHERE tenant_id = ?")
+            .bind(&tenant_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let viewer_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let asset_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Tenant asset')")
+        .bind(&asset_id)
+        .bind(&tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name)
+         VALUES ('tenant-device', ?, 'Tenant device')",
+    )
+    .bind(&tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let tenant_home = router
+        .clone()
+        .oneshot(platform_get("/tenant", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(tenant_home.status(), StatusCode::OK);
+    let tenant_home_body = String::from_utf8(
+        to_bytes(tenant_home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    for path in ["/tenant/groups", "/tenant/permissions"] {
+        assert!(
+            tenant_home_body.contains(&format!("href=\"{path}\"")),
+            "{path}"
+        );
+        let response = router
+            .clone()
+            .oneshot(platform_get(path, Some(&tenant_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+
+    let create_group = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/groups",
+            Some(&tenant_cookie),
+            &format!("name=operators&owner_user_id={viewer_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_group.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        create_group.headers()[LOCATION],
+        "/tenant/groups?notice=group-created"
+    );
+    let group_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM user_groups WHERE tenant_id = ? AND name = 'operators'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    let add_member = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/groups/members",
+            Some(&tenant_cookie),
+            &format!("group_id={group_id}&user_id={viewer_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(add_member.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_group_members
+             WHERE tenant_id = ? AND group_id = ? AND user_id = ?",
+        )
+        .bind(&tenant_id)
+        .bind(&group_id)
+        .bind(&viewer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let groups = router
+        .clone()
+        .oneshot(platform_get("/tenant/groups", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    let groups_body = String::from_utf8(
+        to_bytes(groups.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(groups_body.contains("operators"));
+    assert!(groups_body.contains("viewer"));
+
+    let remove_member = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/groups/members/remove",
+            Some(&tenant_cookie),
+            &format!("group_id={group_id}&user_id={viewer_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(remove_member.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_group_members
+             WHERE tenant_id = ? AND group_id = ? AND user_id = ?",
+        )
+        .bind(&tenant_id)
+        .bind(&group_id)
+        .bind(&viewer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    for body in [
+        format!(
+            "subject=user%3A{viewer_id}&scope=asset&resource_id={asset_id}&permission=manager&inherit_children=on"
+        ),
+        format!(
+            "subject=group%3A{group_id}&scope=device&resource_id=tenant-device&permission=viewer"
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(system_lifecycle_form(
+                "/tenant/permissions",
+                Some(&tenant_cookie),
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[LOCATION],
+            "/tenant/permissions?notice=permission-created"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_permissions
+             WHERE tenant_id = ? AND created_by_tenant_account_id = ?
+               AND created_by_user_id IS NULL AND revoked_at IS NULL",
+        )
+        .bind(&tenant_id)
+        .bind(&tenant_account_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        2
+    );
+    let permissions = router
+        .clone()
+        .oneshot(platform_get("/tenant/permissions", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    let permissions_body = String::from_utf8(
+        to_bytes(permissions.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(permissions_body.contains("Tenant asset"));
+    assert!(permissions_body.contains("Tenant device"));
+    assert!(permissions_body.contains("Manager"));
+    assert!(permissions_body.contains("Viewer"));
+
+    let permission_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM resource_permissions WHERE tenant_id = ? AND asset_id = ?",
+    )
+    .bind(&tenant_id)
+    .bind(&asset_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let revoke = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/permissions/revoke",
+            Some(&tenant_cookie),
+            &format!("permission_id={permission_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_permissions WHERE id = ? AND revoked_at IS NOT NULL",
+        )
+        .bind(&permission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        1
+    );
+
+    let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "other-tenant".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let other_user_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'other-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(&other_user_id)
+    .bind(other_tenant.id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let other_group_id = uuid::Uuid::now_v7().to_string();
+    let other_asset_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO user_groups (id, tenant_id, owner_user_id, name)
+         VALUES (?, ?, ?, 'other-group')",
+    )
+    .bind(&other_group_id)
+    .bind(other_tenant.id.to_string())
+    .bind(&other_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Other asset')")
+        .bind(&other_asset_id)
+        .bind(other_tenant.id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+    for request in [
+        system_lifecycle_form(
+            "/tenant/groups/members",
+            Some(&tenant_cookie),
+            &format!("group_id={other_group_id}&user_id={viewer_id}"),
+        ),
+        system_lifecycle_form(
+            "/tenant/permissions",
+            Some(&tenant_cookie),
+            &format!(
+                "subject=user%3A{viewer_id}&scope=asset&resource_id={other_asset_id}&permission=viewer"
+            ),
+        ),
+    ] {
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_group_members WHERE group_id = ?",)
+            .bind(&other_group_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_permissions WHERE asset_id = ?",
+        )
+        .bind(&other_asset_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    for path in ["/tenant/groups", "/tenant/permissions"] {
+        let unauthenticated = router
+            .clone()
+            .oneshot(platform_get(path, None))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        for cookie in [&system_cookie, &user_cookie] {
+            let forbidden = router
+                .clone()
+                .oneshot(platform_get(path, Some(cookie)))
+                .await
+                .unwrap();
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+    for cookie in [&system_cookie, &user_cookie] {
+        let forbidden = router
+            .clone()
+            .oneshot(system_lifecycle_form(
+                "/tenant/groups",
+                Some(cookie),
+                "not=a+valid+form",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    }
+}

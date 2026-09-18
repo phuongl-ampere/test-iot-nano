@@ -19,7 +19,9 @@ pub use config::{
 pub use management::{BootstrapSystemError, ManagementSessionRouter, bootstrap_system};
 pub use platform_ui::{
     PlatformUiIdentity, PlatformUiRenderer, SystemLayout, SystemPlatformPage, SystemTenantRow,
-    TenantLayout, UserDeviceDetailPage, UserDeviceLayout, UserDeviceListPage, UserDeviceRow,
+    TenantGroupMemberRow, TenantGroupRow, TenantGroupsLayout, TenantGroupsPage, TenantLayout,
+    TenantPermissionRow, TenantPermissionsLayout, TenantPermissionsPage, TenantSelectOption,
+    UserDeviceDetailPage, UserDeviceLayout, UserDeviceListPage, UserDeviceRow,
     UserDeviceUnavailableLayout, UserLayout,
 };
 pub use readiness::Readiness;

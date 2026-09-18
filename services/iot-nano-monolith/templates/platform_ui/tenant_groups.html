@@ -1,0 +1,100 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Groups | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/tenant">Overview</a>
+  <a class="nav-link active" href="/tenant/groups" aria-current="page">Groups</a>
+  <a class="nav-link" href="/tenant/permissions">Permissions</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Groups</h1>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header><h2>Create group</h2></header>
+    {% if page.users.is_empty() %}
+      <p class="empty-state">Create a User before creating a group.</p>
+    {% else %}
+      <form class="form-grid" action="/tenant/groups" method="post">
+        <label class="field">
+          <span>Name</span>
+          <input name="name" type="text" maxlength="128" required>
+        </label>
+        <label class="field">
+          <span>Owner</span>
+          <select name="owner_user_id" required>
+            {% for user in page.users %}
+              <option value="{{ user.value }}">{{ user.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="form-actions"><button type="submit">Create</button></div>
+      </form>
+    {% endif %}
+  </section>
+  <section class="workspace-panel">
+    <header><h2>Groups</h2></header>
+    {% if page.groups.is_empty() %}
+      <p class="empty-state">No groups created.</p>
+    {% else %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Group</th>
+              <th scope="col">Owner</th>
+              <th scope="col">Members</th>
+              <th scope="col">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for group in page.groups %}
+              <tr>
+                <td>{{ group.name }}</td>
+                <td>{{ group.owner }}</td>
+                <td>
+                  {% if group.members.is_empty() %}
+                    <span>None</span>
+                  {% else %}
+                    {% for member in group.members %}
+                      <form class="inline-form" action="/tenant/groups/members/remove" method="post">
+                        <input name="group_id" type="hidden" value="{{ group.id }}">
+                        <input name="user_id" type="hidden" value="{{ member.user_id }}">
+                        <span>{{ member.username }}</span>
+                        <button type="submit">Remove</button>
+                      </form>
+                    {% endfor %}
+                  {% endif %}
+                </td>
+                <td>
+                  {% if page.users.is_empty() %}
+                    <span>Unavailable</span>
+                  {% else %}
+                    <form class="inline-form" action="/tenant/groups/members" method="post">
+                      <input name="group_id" type="hidden" value="{{ group.id }}">
+                      <label class="field">
+                        <span>User</span>
+                        <select name="user_id" required>
+                          {% for user in page.users %}
+                            <option value="{{ user.value }}">{{ user.label }}</option>
+                          {% endfor %}
+                        </select>
+                      </label>
+                      <button type="submit">Add</button>
+                    </form>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}

@@ -32,11 +32,13 @@ use iot_storage::{
     ManagementDeviceError, ManagementDeviceProfile, ManagementDeviceProfileError,
     ManagementDeviceProfileRepository, ManagementDeviceRepository, ManagementDeviceTopology,
     ManagementGatewayStatus, ManagementUser, ManagementUserError, ManagementUserRepository,
-    ManagementUserRole, NewApplication, NewOAuthClientSecret, NewSystemAccount, NewTenant,
-    NewTenantAccount, OAuthRepository, PlatformStore, PlatformStoreError, RedirectUri,
-    ResourceAccess, ResourceAccessSource, ResourcePermission, SystemAccount, TenantIdentityError,
-    TenantIdentityRepository, TenantStatus, UpdateManagementAsset, UpdateManagementAssetProfile,
-    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
+    ManagementUserRole, NewApplication, NewOAuthClientSecret, NewResourcePermission,
+    NewSystemAccount, NewTenant, NewTenantAccount, NewUserGroup, OAuthRepository,
+    PermissionCreator, PlatformStore, PlatformStoreError, RedirectUri, ResourceAccess,
+    ResourceAccessSource, ResourcePermission, SystemAccount, TenantAuthorizationError,
+    TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository, TenantStatus,
+    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
+    UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -132,6 +134,23 @@ impl ManagementSessionRouter {
                 post(reset_system_tenant_account_form),
             )
             .route("/tenant", get(platform_tenant))
+            .route(
+                "/tenant/groups",
+                get(platform_tenant_groups).post(create_tenant_group_form),
+            )
+            .route("/tenant/groups/members", post(add_tenant_group_member_form))
+            .route(
+                "/tenant/groups/members/remove",
+                post(remove_tenant_group_member_form),
+            )
+            .route(
+                "/tenant/permissions",
+                get(platform_tenant_permissions).post(create_tenant_permission_form),
+            )
+            .route(
+                "/tenant/permissions/revoke",
+                post(revoke_tenant_permission_form),
+            )
             .route("/app", get(platform_app))
             .route("/app/devices/{device_id}", get(platform_app_device_detail))
             .route("/assets/platform-ui.css", get(platform_stylesheet))
@@ -1531,6 +1550,33 @@ struct ResetTenantAccountForm {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct CreateTenantGroupForm {
+    name: String,
+    owner_user_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct TenantGroupMemberForm {
+    group_id: Uuid,
+    user_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct CreateTenantPermissionForm {
+    subject: String,
+    scope: String,
+    resource_id: String,
+    permission: String,
+    #[serde(default)]
+    inherit_children: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RevokeTenantPermissionForm {
+    permission_id: Uuid,
+}
+
 #[derive(Serialize)]
 struct SystemTenantResponse {
     id: Uuid,
@@ -1990,6 +2036,242 @@ async fn platform_tenant(
         return Err(ManagementSessionError::Forbidden);
     };
     platform_page(&state, PlatformUiSession::Tenant { tenant_id }, None).await
+}
+
+async fn platform_tenant_groups(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_groups_page(
+        &state,
+        tenant,
+        tenant_management_notice(request.uri().query()),
+    )
+    .await
+}
+
+async fn platform_tenant_permissions(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Html<String>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_permissions_page(
+        &state,
+        tenant,
+        tenant_management_notice(request.uri().query()),
+    )
+    .await
+}
+
+async fn tenant_groups_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let users =
+        ManagementUserRepository::list_management_users(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_user_error)?;
+    let groups = TenantAuthorizationRepository::list_tenant_user_groups(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(tenant_authorization_error)?;
+    let user_names: HashMap<Uuid, String> = users
+        .iter()
+        .map(|user| (user.id, user.username.clone()))
+        .collect();
+    let page = crate::TenantGroupsPage::new(
+        users
+            .into_iter()
+            .map(|user| crate::TenantSelectOption::new(user.id.to_string(), user.username))
+            .collect(),
+        groups
+            .into_iter()
+            .map(|group| {
+                let owner = user_names
+                    .get(&group.owner_user_id)
+                    .cloned()
+                    .unwrap_or_else(|| group.owner_user_id.to_string());
+                crate::TenantGroupRow::new(
+                    group.id.to_string(),
+                    group.name,
+                    owner,
+                    group
+                        .members
+                        .into_iter()
+                        .map(|member| {
+                            crate::TenantGroupMemberRow::new(
+                                member.user_id.to_string(),
+                                member.username,
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_groups(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_permissions_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    notice: Option<&'static str>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let users =
+        ManagementUserRepository::list_management_users(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_user_error)?;
+    let groups = TenantAuthorizationRepository::list_tenant_user_groups(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(tenant_authorization_error)?;
+    let assets =
+        ManagementAssetRepository::list_management_assets(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_asset_error)?;
+    let devices =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_device_error)?;
+    let permissions = TenantAuthorizationRepository::list_active_resource_permissions(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(tenant_authorization_error)?;
+
+    let user_names: HashMap<Uuid, String> = users
+        .iter()
+        .map(|user| (user.id, user.username.clone()))
+        .collect();
+    let group_names: HashMap<Uuid, String> = groups
+        .iter()
+        .map(|group| (group.id, group.name.clone()))
+        .collect();
+    let asset_names: HashMap<Uuid, String> = assets
+        .iter()
+        .map(|asset| (asset.id, asset.name.clone()))
+        .collect();
+    let device_names: HashMap<String, String> = devices
+        .iter()
+        .map(|device| {
+            (
+                device.device_id.clone(),
+                device
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| device.device_id.clone()),
+            )
+        })
+        .collect();
+
+    let mut subjects: Vec<_> = users
+        .iter()
+        .map(|user| {
+            crate::TenantSelectOption::new(
+                format!("user:{}", user.id),
+                format!("User: {}", user.username),
+            )
+        })
+        .collect();
+    subjects.extend(groups.iter().map(|group| {
+        crate::TenantSelectOption::new(
+            format!("group:{}", group.id),
+            format!("Group: {}", group.name),
+        )
+    }));
+    let page = crate::TenantPermissionsPage::new(
+        subjects,
+        assets
+            .into_iter()
+            .map(|asset| {
+                crate::TenantSelectOption::new(
+                    asset.id.to_string(),
+                    format!("Asset: {}", asset.name),
+                )
+            })
+            .collect(),
+        devices
+            .into_iter()
+            .map(|device| {
+                let label = device
+                    .display_name
+                    .unwrap_or_else(|| device.device_id.clone());
+                crate::TenantSelectOption::new(device.device_id, format!("Device: {label}"))
+            })
+            .collect(),
+        permissions
+            .into_iter()
+            .map(|permission| {
+                let subject = match (permission.subject_user_id, permission.subject_group_id) {
+                    (Some(user_id), None) => format!(
+                        "User: {}",
+                        user_names
+                            .get(&user_id)
+                            .cloned()
+                            .unwrap_or_else(|| user_id.to_string())
+                    ),
+                    (None, Some(group_id)) => format!(
+                        "Group: {}",
+                        group_names
+                            .get(&group_id)
+                            .cloned()
+                            .unwrap_or_else(|| group_id.to_string())
+                    ),
+                    _ => "Unavailable".to_owned(),
+                };
+                let resource = match (permission.asset_id, permission.device_id.as_deref()) {
+                    (Some(asset_id), None) => format!(
+                        "Asset: {}",
+                        asset_names
+                            .get(&asset_id)
+                            .cloned()
+                            .unwrap_or_else(|| asset_id.to_string())
+                    ),
+                    (None, Some(device_id)) => format!(
+                        "Device: {}",
+                        device_names
+                            .get(device_id)
+                            .cloned()
+                            .unwrap_or_else(|| device_id.to_owned())
+                    ),
+                    _ => "Unavailable".to_owned(),
+                };
+                crate::TenantPermissionRow::new(
+                    permission.id.to_string(),
+                    subject,
+                    resource,
+                    resource_permission_label(permission.permission),
+                    if permission.inherit_children {
+                        "Child assets"
+                    } else {
+                        "None"
+                    },
+                )
+            })
+            .collect(),
+        notice,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_permissions(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
 }
 
 async fn platform_app(
@@ -2485,6 +2767,339 @@ async fn reset_system_tenant_account_form(
             ))
         }
         Err(error) => system_lifecycle_form_error(system_tenant_error(error)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TenantManagementPage {
+    Groups,
+    Permissions,
+}
+
+#[derive(Clone, Copy)]
+enum TenantManagementNotice {
+    GroupCreated,
+    MemberAdded,
+    MemberRemoved,
+    PermissionCreated,
+    PermissionRevoked,
+    InvalidRequest,
+    MutationUnavailable,
+    ServiceUnavailable,
+}
+
+impl TenantManagementNotice {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::GroupCreated => "Group created.",
+            Self::MemberAdded => "Member added.",
+            Self::MemberRemoved => "Member removed.",
+            Self::PermissionCreated => "Permission created.",
+            Self::PermissionRevoked => "Permission revoked.",
+            Self::InvalidRequest => "Request could not be processed.",
+            Self::MutationUnavailable => "The requested tenant resource is unavailable.",
+            Self::ServiceUnavailable => "Tenant management service is unavailable.",
+        }
+    }
+}
+
+fn tenant_management_redirect(
+    page: TenantManagementPage,
+    notice: TenantManagementNotice,
+) -> Redirect {
+    let path = match page {
+        TenantManagementPage::Groups => match notice {
+            TenantManagementNotice::GroupCreated => "/tenant/groups?notice=group-created",
+            TenantManagementNotice::MemberAdded => "/tenant/groups?notice=member-added",
+            TenantManagementNotice::MemberRemoved => "/tenant/groups?notice=member-removed",
+            TenantManagementNotice::InvalidRequest => "/tenant/groups?notice=invalid-request",
+            TenantManagementNotice::MutationUnavailable => {
+                "/tenant/groups?notice=mutation-unavailable"
+            }
+            TenantManagementNotice::ServiceUnavailable => {
+                "/tenant/groups?notice=service-unavailable"
+            }
+            TenantManagementNotice::PermissionCreated
+            | TenantManagementNotice::PermissionRevoked => "/tenant/groups?notice=invalid-request",
+        },
+        TenantManagementPage::Permissions => match notice {
+            TenantManagementNotice::PermissionCreated => {
+                "/tenant/permissions?notice=permission-created"
+            }
+            TenantManagementNotice::PermissionRevoked => {
+                "/tenant/permissions?notice=permission-revoked"
+            }
+            TenantManagementNotice::InvalidRequest => "/tenant/permissions?notice=invalid-request",
+            TenantManagementNotice::MutationUnavailable => {
+                "/tenant/permissions?notice=mutation-unavailable"
+            }
+            TenantManagementNotice::ServiceUnavailable => {
+                "/tenant/permissions?notice=service-unavailable"
+            }
+            TenantManagementNotice::GroupCreated
+            | TenantManagementNotice::MemberAdded
+            | TenantManagementNotice::MemberRemoved => "/tenant/permissions?notice=invalid-request",
+        },
+    };
+    Redirect::to(path)
+}
+
+fn tenant_management_notice(query: Option<&str>) -> Option<&'static str> {
+    let notice = match query {
+        Some("notice=group-created") => TenantManagementNotice::GroupCreated,
+        Some("notice=member-added") => TenantManagementNotice::MemberAdded,
+        Some("notice=member-removed") => TenantManagementNotice::MemberRemoved,
+        Some("notice=permission-created") => TenantManagementNotice::PermissionCreated,
+        Some("notice=permission-revoked") => TenantManagementNotice::PermissionRevoked,
+        Some("notice=invalid-request") => TenantManagementNotice::InvalidRequest,
+        Some("notice=mutation-unavailable") => TenantManagementNotice::MutationUnavailable,
+        Some("notice=service-unavailable") => TenantManagementNotice::ServiceUnavailable,
+        _ => return None,
+    };
+    Some(notice.message())
+}
+
+fn tenant_management_form_error(
+    page: TenantManagementPage,
+    error: ManagementSessionError,
+) -> Result<Redirect, ManagementSessionError> {
+    let notice = match error {
+        ManagementSessionError::Unauthorized
+        | ManagementSessionError::TooManyRequests
+        | ManagementSessionError::Forbidden => return Err(error),
+        ManagementSessionError::BadRequest
+        | ManagementSessionError::UnsupportedMediaType
+        | ManagementSessionError::PayloadTooLarge => TenantManagementNotice::InvalidRequest,
+        ManagementSessionError::NotFound | ManagementSessionError::Conflict => {
+            TenantManagementNotice::MutationUnavailable
+        }
+        ManagementSessionError::Unavailable => TenantManagementNotice::ServiceUnavailable,
+    };
+    Ok(tenant_management_redirect(page, notice))
+}
+
+async fn create_tenant_group_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: CreateTenantGroupForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return tenant_management_form_error(TenantManagementPage::Groups, error),
+    };
+    let name = request.name.trim();
+    if name.is_empty() || name.len() > 128 {
+        return tenant_management_form_error(
+            TenantManagementPage::Groups,
+            ManagementSessionError::BadRequest,
+        );
+    }
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match TenantAuthorizationRepository::create_user_group(
+        state.store.as_ref(),
+        NewUserGroup {
+            tenant_id: tenant.tenant_id,
+            owner_user_id: request.owner_user_id,
+            name: name.to_owned(),
+            metadata: json!({}),
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(tenant_management_redirect(
+            TenantManagementPage::Groups,
+            TenantManagementNotice::GroupCreated,
+        )),
+        Err(error) => tenant_management_form_error(
+            TenantManagementPage::Groups,
+            tenant_authorization_error(error),
+        ),
+    }
+}
+
+async fn add_tenant_group_member_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    tenant_group_member_form(state, request, true).await
+}
+
+async fn remove_tenant_group_member_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    tenant_group_member_form(state, request, false).await
+}
+
+async fn tenant_group_member_form(
+    state: ManagementState,
+    request: Request,
+    add_member: bool,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: TenantGroupMemberForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => return tenant_management_form_error(TenantManagementPage::Groups, error),
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let result = if add_member {
+        TenantAuthorizationRepository::add_user_to_group(
+            state.store.as_ref(),
+            tenant.tenant_id,
+            request.group_id,
+            request.user_id,
+        )
+        .await
+    } else {
+        TenantAuthorizationRepository::remove_user_from_group(
+            state.store.as_ref(),
+            tenant.tenant_id,
+            request.group_id,
+            request.user_id,
+        )
+        .await
+    };
+    match result {
+        Ok(_) => Ok(tenant_management_redirect(
+            TenantManagementPage::Groups,
+            if add_member {
+                TenantManagementNotice::MemberAdded
+            } else {
+                TenantManagementNotice::MemberRemoved
+            },
+        )),
+        Err(error) => tenant_management_form_error(
+            TenantManagementPage::Groups,
+            tenant_authorization_error(error),
+        ),
+    }
+}
+
+async fn create_tenant_permission_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: CreateTenantPermissionForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => {
+            return tenant_management_form_error(TenantManagementPage::Permissions, error);
+        }
+    };
+    let (subject_user_id, subject_group_id) = match tenant_permission_subject(&request.subject) {
+        Ok(subject) => subject,
+        Err(error) => {
+            return tenant_management_form_error(TenantManagementPage::Permissions, error);
+        }
+    };
+    let permission = match tenant_permission_level(&request.permission) {
+        Ok(permission) => permission,
+        Err(error) => {
+            return tenant_management_form_error(TenantManagementPage::Permissions, error);
+        }
+    };
+    let (asset_id, device_id, inherit_children) = match request.scope.as_str() {
+        "asset" => match Uuid::parse_str(&request.resource_id) {
+            Ok(asset_id) => (Some(asset_id), None, request.inherit_children.is_some()),
+            Err(_) => {
+                return tenant_management_form_error(
+                    TenantManagementPage::Permissions,
+                    ManagementSessionError::BadRequest,
+                );
+            }
+        },
+        "device"
+            if request.inherit_children.is_none() && !request.resource_id.trim().is_empty() =>
+        {
+            (None, Some(request.resource_id), false)
+        }
+        _ => {
+            return tenant_management_form_error(
+                TenantManagementPage::Permissions,
+                ManagementSessionError::BadRequest,
+            );
+        }
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match TenantAuthorizationRepository::create_resource_permission(
+        state.store.as_ref(),
+        NewResourcePermission {
+            tenant_id: tenant.tenant_id,
+            subject_user_id,
+            subject_group_id,
+            asset_id,
+            device_id,
+            permission,
+            inherit_children,
+            created_by: PermissionCreator::TenantAccount(tenant.tenant_account_id),
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(tenant_management_redirect(
+            TenantManagementPage::Permissions,
+            TenantManagementNotice::PermissionCreated,
+        )),
+        Err(error) => tenant_management_form_error(
+            TenantManagementPage::Permissions,
+            tenant_authorization_error(error),
+        ),
+    }
+}
+
+async fn revoke_tenant_permission_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: RevokeTenantPermissionForm = match management_request_form(&state, request).await {
+        Ok(request) => request,
+        Err(error) => {
+            return tenant_management_form_error(TenantManagementPage::Permissions, error);
+        }
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    match TenantAuthorizationRepository::revoke_resource_permission(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        request.permission_id,
+    )
+    .await
+    {
+        Ok(_) => Ok(tenant_management_redirect(
+            TenantManagementPage::Permissions,
+            TenantManagementNotice::PermissionRevoked,
+        )),
+        Err(error) => tenant_management_form_error(
+            TenantManagementPage::Permissions,
+            tenant_authorization_error(error),
+        ),
+    }
+}
+
+fn tenant_permission_subject(
+    value: &str,
+) -> Result<(Option<Uuid>, Option<Uuid>), ManagementSessionError> {
+    let Some((kind, value)) = value.split_once(':') else {
+        return Err(ManagementSessionError::BadRequest);
+    };
+    let id = Uuid::parse_str(value).map_err(|_| ManagementSessionError::BadRequest)?;
+    match kind {
+        "user" => Ok((Some(id), None)),
+        "group" => Ok((None, Some(id))),
+        _ => Err(ManagementSessionError::BadRequest),
+    }
+}
+
+fn tenant_permission_level(value: &str) -> Result<ResourcePermission, ManagementSessionError> {
+    match value {
+        "viewer" => Ok(ResourcePermission::Viewer),
+        "manager" => Ok(ResourcePermission::Manager),
+        _ => Err(ManagementSessionError::BadRequest),
     }
 }
 
@@ -3060,6 +3675,26 @@ fn management_user_error(error: ManagementUserError) -> ManagementSessionError {
         | ManagementUserError::InvalidStoredRole(_)
         | ManagementUserError::InvalidStoredAccountClass(_)
         | ManagementUserError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn tenant_authorization_error(error: TenantAuthorizationError) -> ManagementSessionError {
+    match error {
+        TenantAuthorizationError::UserNotFound { .. }
+        | TenantAuthorizationError::TenantAccountNotFound { .. }
+        | TenantAuthorizationError::GroupNotFound { .. }
+        | TenantAuthorizationError::AssetNotFound { .. }
+        | TenantAuthorizationError::DeviceNotFound { .. }
+        | TenantAuthorizationError::PermissionNotFound { .. } => ManagementSessionError::NotFound,
+        TenantAuthorizationError::InvalidPermissionSubject
+        | TenantAuthorizationError::InvalidPermissionResource
+        | TenantAuthorizationError::InvalidPermissionLevel { .. }
+        | TenantAuthorizationError::DevicePermissionCannotInherit => {
+            ManagementSessionError::BadRequest
+        }
+        TenantAuthorizationError::InvalidStoredRecord | TenantAuthorizationError::Database(_) => {
+            ManagementSessionError::Unavailable
+        }
     }
 }
 

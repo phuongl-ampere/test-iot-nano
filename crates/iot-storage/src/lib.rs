@@ -1633,6 +1633,20 @@ pub struct UserGroup {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantUserGroupMember {
+    pub user_id: uuid::Uuid,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantUserGroup {
+    pub id: uuid::Uuid,
+    pub owner_user_id: uuid::Uuid,
+    pub name: String,
+    pub members: Vec<TenantUserGroupMember>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionCreator {
     User(uuid::Uuid),
@@ -1706,6 +1720,8 @@ pub enum TenantAuthorizationError {
     InvalidPermissionLevel { permission: ResourcePermission },
     #[error("device resource permissions cannot inherit children")]
     DevicePermissionCannotInherit,
+    #[error("stored tenant authorization data is invalid")]
+    InvalidStoredRecord,
 }
 
 pub trait AuthorizationRepository: Send + Sync {
@@ -1763,6 +1779,24 @@ pub trait AuthorizationRepository: Send + Sync {
 }
 
 pub trait TenantAuthorizationRepository: Send + Sync {
+    fn list_tenant_user_groups<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<TenantUserGroup>, TenantAuthorizationError>> + Send + 'a,
+        >,
+    >;
+    fn list_active_resource_permissions<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<ResourcePermissionRecord>, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    >;
     fn create_user_group<'a>(
         &'a self,
         group: NewUserGroup,
@@ -3372,6 +3406,177 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 timescale_asset_resource_permission(pool, subject, asset_id).await
+            }
+        }
+    }
+
+    pub async fn list_tenant_user_groups(
+        &self,
+        tenant_id: uuid::Uuid,
+    ) -> Result<Vec<TenantUserGroup>, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let rows = sqlx::query(
+                    "SELECT groups.id AS group_id, groups.owner_user_id, groups.name,
+                            members.user_id AS member_user_id, users.username AS member_username
+                     FROM user_groups AS groups
+                     LEFT JOIN user_group_members AS members
+                       ON members.tenant_id = groups.tenant_id AND members.group_id = groups.id
+                     LEFT JOIN users
+                       ON users.tenant_id = groups.tenant_id AND users.id = members.user_id
+                     WHERE groups.tenant_id = ?
+                     ORDER BY groups.name, groups.id, users.username, users.id",
+                )
+                .bind(tenant_id.to_string())
+                .fetch_all(store.pool())
+                .await?;
+                let mut groups = Vec::new();
+                for row in rows {
+                    let group_id = tenant_authorization_uuid(row.try_get("group_id")?)?;
+                    let owner_user_id = tenant_authorization_uuid(row.try_get("owner_user_id")?)?;
+                    let group_changed = groups
+                        .last()
+                        .is_none_or(|group: &TenantUserGroup| group.id != group_id);
+                    if group_changed {
+                        groups.push(TenantUserGroup {
+                            id: group_id,
+                            owner_user_id,
+                            name: row.try_get("name")?,
+                            members: Vec::new(),
+                        });
+                    }
+                    let member_user_id: Option<String> = row.try_get("member_user_id")?;
+                    let member_username: Option<String> = row.try_get("member_username")?;
+                    match (member_user_id, member_username) {
+                        (None, None) => {}
+                        (Some(user_id), Some(username)) => {
+                            groups
+                                .last_mut()
+                                .expect("group row was inserted")
+                                .members
+                                .push(TenantUserGroupMember {
+                                    user_id: tenant_authorization_uuid(user_id)?,
+                                    username,
+                                });
+                        }
+                        _ => return Err(TenantAuthorizationError::InvalidStoredRecord),
+                    }
+                }
+                Ok(groups)
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "SELECT groups.id AS group_id, groups.owner_user_id, groups.name,
+                            members.user_id AS member_user_id, users.username AS member_username
+                     FROM user_groups AS groups
+                     LEFT JOIN user_group_members AS members
+                       ON members.tenant_id = groups.tenant_id AND members.group_id = groups.id
+                     LEFT JOIN users
+                       ON users.tenant_id = groups.tenant_id AND users.id = members.user_id
+                     WHERE groups.tenant_id = $1
+                     ORDER BY groups.name, groups.id, users.username, users.id",
+                )
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await?;
+                let mut groups = Vec::new();
+                for row in rows {
+                    let group_id: uuid::Uuid = row.try_get("group_id")?;
+                    let owner_user_id: uuid::Uuid = row.try_get("owner_user_id")?;
+                    let group_changed = groups
+                        .last()
+                        .is_none_or(|group: &TenantUserGroup| group.id != group_id);
+                    if group_changed {
+                        groups.push(TenantUserGroup {
+                            id: group_id,
+                            owner_user_id,
+                            name: row.try_get("name")?,
+                            members: Vec::new(),
+                        });
+                    }
+                    let member_user_id: Option<uuid::Uuid> = row.try_get("member_user_id")?;
+                    let member_username: Option<String> = row.try_get("member_username")?;
+                    match (member_user_id, member_username) {
+                        (None, None) => {}
+                        (Some(user_id), Some(username)) => {
+                            groups
+                                .last_mut()
+                                .expect("group row was inserted")
+                                .members
+                                .push(TenantUserGroupMember { user_id, username });
+                        }
+                        _ => return Err(TenantAuthorizationError::InvalidStoredRecord),
+                    }
+                }
+                Ok(groups)
+            }
+        }
+    }
+
+    pub async fn list_active_resource_permissions(
+        &self,
+        tenant_id: uuid::Uuid,
+    ) -> Result<Vec<ResourcePermissionRecord>, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let rows = sqlx::query(
+                    "SELECT id, subject_user_id, subject_group_id, asset_id, device_id,
+                            permission, inherit_children, created_by_user_id,
+                            created_by_tenant_account_id
+                     FROM resource_permissions
+                     WHERE tenant_id = ? AND revoked_at IS NULL
+                     ORDER BY created_at, id",
+                )
+                .bind(tenant_id.to_string())
+                .fetch_all(store.pool())
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        resource_permission_record(
+                            tenant_id,
+                            tenant_authorization_uuid(row.try_get("id")?)?,
+                            tenant_authorization_optional_uuid(row.try_get("subject_user_id")?)?,
+                            tenant_authorization_optional_uuid(row.try_get("subject_group_id")?)?,
+                            tenant_authorization_optional_uuid(row.try_get("asset_id")?)?,
+                            row.try_get("device_id")?,
+                            row.try_get("permission")?,
+                            sqlite_permission_inheritance(row.try_get("inherit_children")?)?,
+                            tenant_authorization_optional_uuid(row.try_get("created_by_user_id")?)?,
+                            tenant_authorization_optional_uuid(
+                                row.try_get("created_by_tenant_account_id")?,
+                            )?,
+                        )
+                    })
+                    .collect()
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, subject_user_id, subject_group_id, asset_id, device_id,
+                            permission, inherit_children, created_by_user_id,
+                            created_by_tenant_account_id
+                     FROM resource_permissions
+                     WHERE tenant_id = $1 AND revoked_at IS NULL
+                     ORDER BY created_at, id",
+                )
+                .bind(tenant_id)
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        resource_permission_record(
+                            tenant_id,
+                            row.try_get("id")?,
+                            row.try_get("subject_user_id")?,
+                            row.try_get("subject_group_id")?,
+                            row.try_get("asset_id")?,
+                            row.try_get("device_id")?,
+                            row.try_get("permission")?,
+                            row.try_get("inherit_children")?,
+                            row.try_get("created_by_user_id")?,
+                            row.try_get("created_by_tenant_account_id")?,
+                        )
+                    })
+                    .collect()
             }
         }
     }
@@ -7850,6 +8055,32 @@ impl AuthorizationRepository for PlatformStore {
 }
 
 impl TenantAuthorizationRepository for PlatformStore {
+    fn list_tenant_user_groups<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<TenantUserGroup>, TenantAuthorizationError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move { PlatformStore::list_tenant_user_groups(self, tenant_id).await })
+    }
+
+    fn list_active_resource_permissions<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<ResourcePermissionRecord>, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(
+            async move { PlatformStore::list_active_resource_permissions(self, tenant_id).await },
+        )
+    }
+
     fn create_user_group<'a>(
         &'a self,
         group: NewUserGroup,
@@ -8539,6 +8770,68 @@ fn permission_creator_ids(creator: PermissionCreator) -> (Option<uuid::Uuid>, Op
         PermissionCreator::User(user_id) => (Some(user_id), None),
         PermissionCreator::TenantAccount(tenant_account_id) => (None, Some(tenant_account_id)),
     }
+}
+
+fn tenant_authorization_uuid(value: String) -> Result<uuid::Uuid, TenantAuthorizationError> {
+    uuid::Uuid::parse_str(&value).map_err(|_| TenantAuthorizationError::InvalidStoredRecord)
+}
+
+fn tenant_authorization_optional_uuid(
+    value: Option<String>,
+) -> Result<Option<uuid::Uuid>, TenantAuthorizationError> {
+    value.map(tenant_authorization_uuid).transpose()
+}
+
+fn sqlite_permission_inheritance(value: i64) -> Result<bool, TenantAuthorizationError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(TenantAuthorizationError::InvalidStoredRecord),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resource_permission_record(
+    tenant_id: uuid::Uuid,
+    id: uuid::Uuid,
+    subject_user_id: Option<uuid::Uuid>,
+    subject_group_id: Option<uuid::Uuid>,
+    asset_id: Option<uuid::Uuid>,
+    device_id: Option<String>,
+    permission: String,
+    inherit_children: bool,
+    created_by_user_id: Option<uuid::Uuid>,
+    created_by_tenant_account_id: Option<uuid::Uuid>,
+) -> Result<ResourcePermissionRecord, TenantAuthorizationError> {
+    let permission = ResourcePermission::parse(&permission)
+        .ok_or(TenantAuthorizationError::InvalidStoredRecord)?;
+    let created_by = match (created_by_user_id, created_by_tenant_account_id) {
+        (Some(user_id), None) => PermissionCreator::User(user_id),
+        (None, Some(tenant_account_id)) => PermissionCreator::TenantAccount(tenant_account_id),
+        _ => return Err(TenantAuthorizationError::InvalidStoredRecord),
+    };
+    let record = ResourcePermissionRecord {
+        id,
+        tenant_id,
+        subject_user_id,
+        subject_group_id,
+        asset_id,
+        device_id,
+        permission,
+        inherit_children,
+        created_by,
+    };
+    validate_new_resource_permission(&NewResourcePermission {
+        tenant_id: record.tenant_id,
+        subject_user_id: record.subject_user_id,
+        subject_group_id: record.subject_group_id,
+        asset_id: record.asset_id,
+        device_id: record.device_id.clone(),
+        permission: record.permission,
+        inherit_children: record.inherit_children,
+        created_by: record.created_by,
+    })?;
+    Ok(record)
 }
 
 async fn sqlite_tenant_uuid_record_exists(

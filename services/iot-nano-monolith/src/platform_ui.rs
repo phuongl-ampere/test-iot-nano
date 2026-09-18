@@ -52,6 +52,139 @@ pub struct SystemPlatformPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantSelectOption {
+    value: String,
+    label: String,
+}
+
+impl TenantSelectOption {
+    pub(crate) fn new(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantGroupMemberRow {
+    user_id: String,
+    username: String,
+}
+
+impl TenantGroupMemberRow {
+    pub(crate) fn new(user_id: impl Into<String>, username: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            username: username.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantGroupRow {
+    id: String,
+    name: String,
+    owner: String,
+    members: Vec<TenantGroupMemberRow>,
+}
+
+impl TenantGroupRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        owner: impl Into<String>,
+        members: Vec<TenantGroupMemberRow>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            owner: owner.into(),
+            members,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantGroupsPage {
+    users: Vec<TenantSelectOption>,
+    groups: Vec<TenantGroupRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantGroupsPage {
+    pub(crate) fn new(
+        users: Vec<TenantSelectOption>,
+        groups: Vec<TenantGroupRow>,
+        notice: Option<&'static str>,
+    ) -> Self {
+        Self {
+            users,
+            groups,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantPermissionRow {
+    id: String,
+    subject: String,
+    resource: String,
+    permission: String,
+    inheritance: String,
+}
+
+impl TenantPermissionRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        subject: impl Into<String>,
+        resource: impl Into<String>,
+        permission: impl Into<String>,
+        inheritance: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            subject: subject.into(),
+            resource: resource.into(),
+            permission: permission.into(),
+            inheritance: inheritance.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantPermissionsPage {
+    subjects: Vec<TenantSelectOption>,
+    assets: Vec<TenantSelectOption>,
+    devices: Vec<TenantSelectOption>,
+    permissions: Vec<TenantPermissionRow>,
+    notice: &'static str,
+    has_notice: bool,
+}
+
+impl TenantPermissionsPage {
+    pub(crate) fn new(
+        subjects: Vec<TenantSelectOption>,
+        assets: Vec<TenantSelectOption>,
+        devices: Vec<TenantSelectOption>,
+        permissions: Vec<TenantPermissionRow>,
+        notice: Option<&'static str>,
+    ) -> Self {
+        Self {
+            subjects,
+            assets,
+            devices,
+            permissions,
+            notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDeviceRow {
     device_id: String,
     display_name: String,
@@ -136,6 +269,20 @@ impl PlatformUiRenderer {
         TenantLayout::new(identity).render()
     }
 
+    pub fn render_tenant_groups(
+        identity: &PlatformUiIdentity,
+        page: &TenantGroupsPage,
+    ) -> Result<String, askama::Error> {
+        TenantGroupsLayout::new(identity, page).render()
+    }
+
+    pub fn render_tenant_permissions(
+        identity: &PlatformUiIdentity,
+        page: &TenantPermissionsPage,
+    ) -> Result<String, askama::Error> {
+        TenantPermissionsLayout::new(identity, page).render()
+    }
+
     pub fn render_user(
         identity: &PlatformUiIdentity,
         page: &UserDeviceListPage,
@@ -179,6 +326,32 @@ pub struct TenantLayout<'a> {
 impl<'a> TenantLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity) -> Self {
         Self { identity }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_groups.html")]
+pub struct TenantGroupsLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantGroupsPage,
+}
+
+impl<'a> TenantGroupsLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantGroupsPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_permissions.html")]
+pub struct TenantPermissionsLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantPermissionsPage,
+}
+
+impl<'a> TenantPermissionsLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantPermissionsPage) -> Self {
+        Self { identity, page }
     }
 }
 
