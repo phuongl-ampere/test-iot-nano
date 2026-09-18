@@ -66,12 +66,13 @@ not share Cargo fingerprints or locks.
 ./scripts/dev/test-cargo-lane.sh
 ./scripts/dev/cargo-lane.sh fast-storage -- test -p iot-storage --test identity
 ./scripts/dev/cargo-lane.sh sqlite-contract -- test -p iot-storage
-IOT_NANO_USE_SCCACHE=1 ./scripts/dev/cargo-lane.sh fast-monolith -- check -p iot-nano-monolith
+RUSTC_WRAPPER="$(command -v sccache)" ./scripts/dev/cargo-lane.sh fast-monolith -- check -p iot-nano-monolith
 ```
 
 The wrapper appends local elapsed-time entries to `.cargo-lane/timing.log`.
 Set `IOT_NANO_LANE_TARGET_ROOT` or `IOT_NANO_LANE_LOG` to override the local
-cache or timing-log locations.
+cache or timing-log locations. It never configures Rust compiler wrappers;
+callers opt into `sccache` and retain all Rust/Cargo wrapper settings.
 
 Run broad checks only in the release lane:
 

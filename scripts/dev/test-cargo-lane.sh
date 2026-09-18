@@ -30,6 +30,27 @@ capture_value() {
   sed -n "s/^${key}=//p" "$capture" | head -n 1
 }
 
+assert_wrappers() {
+  local capture="$1"
+  local rustc_wrapper="$2"
+  local rustc_workspace_wrapper="$3"
+  local cargo_build_rustc_wrapper="$4"
+  local cargo_build_rustc_workspace_wrapper="$5"
+
+  assert_equal "$rustc_wrapper" \
+    "$(capture_value rustc_wrapper "$capture")" \
+    'RUSTC_WRAPPER must be preserved exactly'
+  assert_equal "$rustc_workspace_wrapper" \
+    "$(capture_value rustc_workspace_wrapper "$capture")" \
+    'RUSTC_WORKSPACE_WRAPPER must be preserved exactly'
+  assert_equal "$cargo_build_rustc_wrapper" \
+    "$(capture_value cargo_build_rustc_wrapper "$capture")" \
+    'CARGO_BUILD_RUSTC_WRAPPER must be preserved exactly'
+  assert_equal "$cargo_build_rustc_workspace_wrapper" \
+    "$(capture_value cargo_build_rustc_workspace_wrapper "$capture")" \
+    'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER must be preserved exactly'
+}
+
 captured_args() {
   local capture="$1"
 
@@ -58,6 +79,25 @@ run_lane() {
     "$repository/scripts/dev/cargo-lane.sh" "$lane" -- "$@"
 }
 
+run_wrapper_case() {
+  local repository="$1"
+  local capture="$2"
+  shift 2
+
+  env \
+    -u RUSTC_WRAPPER \
+    -u RUSTC_WORKSPACE_WRAPPER \
+    -u CARGO_BUILD_RUSTC_WRAPPER \
+    -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
+    CAPTURE_FILE="$capture" \
+    IOT_NANO_LANE_TARGET_ROOT="$fixture/targets" \
+    IOT_NANO_LANE_LOG="$fixture/timing.log" \
+    IOT_NANO_USE_SCCACHE=1 \
+    PATH="$fixture/bin:$PATH" \
+    "$@" \
+    "$repository/scripts/dev/cargo-lane.sh" fast-storage -- check -p iot-storage
+}
+
 if [[ ! -x "$wrapper" ]]; then
   fail "expected executable wrapper at $wrapper"
 fi
@@ -70,7 +110,10 @@ set -euo pipefail
 : "${CAPTURE_FILE:?CAPTURE_FILE must be set}"
 {
   printf 'target=%s\n' "$CARGO_TARGET_DIR"
-  printf 'rustc_wrapper=%s\n' "${RUSTC_WRAPPER:-}"
+  printf 'rustc_wrapper=%s\n' "${RUSTC_WRAPPER-}"
+  printf 'rustc_workspace_wrapper=%s\n' "${RUSTC_WORKSPACE_WRAPPER-}"
+  printf 'cargo_build_rustc_wrapper=%s\n' "${CARGO_BUILD_RUSTC_WRAPPER-}"
+  printf 'cargo_build_rustc_workspace_wrapper=%s\n' "${CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER-}"
   printf 'args:\n'
   printf '%s\n' "$@"
 } >"$CAPTURE_FILE"
@@ -109,19 +152,26 @@ expected_args="$(printf '%s\n' "${command[@]}")"
 assert_equal "$expected_args" "$(captured_args "$fixture/a-first.capture")" \
   'the cargo command after the delimiter must be preserved exactly'
 
-CAPTURE_FILE="$fixture/sccache.capture" \
-  IOT_NANO_LANE_TARGET_ROOT="$fixture/targets" \
-  IOT_NANO_LANE_LOG="$fixture/timing.log" \
-  IOT_NANO_USE_SCCACHE=1 \
-  PATH="$fixture/bin:$PATH" \
-  "$repository_a/scripts/dev/cargo-lane.sh" fast-storage -- check -p iot-storage
+run_wrapper_case "$repository_a" "$fixture/rustc-wrapper.capture" \
+  RUSTC_WRAPPER='caller-rustc-wrapper'
+run_wrapper_case "$repository_a" "$fixture/rustc-workspace-wrapper.capture" \
+  RUSTC_WORKSPACE_WRAPPER='caller-rustc-workspace-wrapper'
+run_wrapper_case "$repository_a" "$fixture/cargo-build-rustc-wrapper.capture" \
+  CARGO_BUILD_RUSTC_WRAPPER='caller-cargo-build-rustc-wrapper'
+run_wrapper_case "$repository_a" "$fixture/cargo-build-rustc-workspace-wrapper.capture" \
+  CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER='caller-cargo-build-rustc-workspace-wrapper'
 
-assert_equal "$fixture/bin/sccache" \
-  "$(capture_value rustc_wrapper "$fixture/sccache.capture")" \
-  'sccache must be enabled only when explicitly requested'
+assert_wrappers "$fixture/rustc-wrapper.capture" \
+  'caller-rustc-wrapper' '' '' ''
+assert_wrappers "$fixture/rustc-workspace-wrapper.capture" \
+  '' 'caller-rustc-workspace-wrapper' '' ''
+assert_wrappers "$fixture/cargo-build-rustc-wrapper.capture" \
+  '' '' 'caller-cargo-build-rustc-wrapper' ''
+assert_wrappers "$fixture/cargo-build-rustc-workspace-wrapper.capture" \
+  '' '' '' 'caller-cargo-build-rustc-workspace-wrapper'
 
 [[ -f "$fixture/timing.log" ]] || fail 'wrapper must append a timing log'
-[[ "$(wc -l <"$fixture/timing.log" | tr -d ' ')" == 5 ]] || fail 'each lane invocation must append one timing entry'
+[[ "$(wc -l <"$fixture/timing.log" | tr -d ' ')" == 8 ]] || fail 'each lane invocation must append one timing entry'
 rg -q 'lane=fast-storage' "$fixture/timing.log" || fail 'timing log must include the lane name'
 
 printf 'test-cargo-lane: ok\n'

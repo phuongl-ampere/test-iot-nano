@@ -27,10 +27,6 @@ log_path="${IOT_NANO_LANE_LOG:-$root/.cargo-lane/timing.log}"
 
 mkdir -p "$target_dir" "$(dirname "$log_path")"
 
-if [[ "${IOT_NANO_USE_SCCACHE:-0}" == "1" && -z "${RUSTC_WRAPPER:-}" ]] && command -v sccache >/dev/null 2>&1; then
-  export RUSTC_WRAPPER="$(command -v sccache)"
-fi
-
 SECONDS=0
 if CARGO_TARGET_DIR="$target_dir" cargo "$@"; then
   status=0
