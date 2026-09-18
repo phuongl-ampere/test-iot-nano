@@ -609,7 +609,11 @@ async fn run_e2e_flow(
         .header(COOKIE, &user_cookie)
         .send()
         .await?;
-    require_status(&authorize, StatusCode::FOUND, "OAuth authorization redirect")?;
+    require_status(
+        &authorize,
+        StatusCode::FOUND,
+        "OAuth authorization redirect",
+    )?;
     let authorization_redirect = authorize
         .headers()
         .get(LOCATION)
