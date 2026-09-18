@@ -1602,6 +1602,7 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "/api/auth/logout",
         "/api/auth/me",
         "/api/management/alerts",
+        "/api/management/audit",
         "/api/management/applications",
         "/api/management/assets",
         "/api/management/assets/{asset_id}",
@@ -1622,6 +1623,7 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         ("/api/auth/logout", BTreeSet::from(["post"])),
         ("/api/auth/me", BTreeSet::from(["get"])),
         ("/api/management/alerts", BTreeSet::from(["get"])),
+        ("/api/management/audit", BTreeSet::from(["get"])),
         ("/api/management/applications", BTreeSet::from(["post"])),
         ("/api/management/assets", BTreeSet::from(["get", "post"])),
         (
@@ -1679,6 +1681,12 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
             "#/components/schemas/ManagementAlertList",
         ),
         (
+            "/api/management/audit",
+            "get",
+            "200",
+            "#/components/schemas/ManagementAuditEventPage",
+        ),
+        (
             "/api/management/devices",
             "post",
             "201",
@@ -1714,6 +1722,8 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "LoginRequest",
         "ManagementAlert",
         "ManagementAlertList",
+        "ManagementAuditEvent",
+        "ManagementAuditEventPage",
         "ManagementAsset",
         "ManagementAssetList",
         "ManagementAssetRequest",

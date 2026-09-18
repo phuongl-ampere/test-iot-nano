@@ -1,8 +1,8 @@
 use iot_nano_monolith::{
     PlatformUiIdentity, PlatformUiRenderer, SystemInfrastructurePage,
     SystemInfrastructureStatusRow, SystemPlatformPage, SystemTenantRow, TenantAlertRow,
-    TenantAlertsPage, TenantUserRow, TenantUsersPage, UserDeviceDetailPage, UserDeviceListPage,
-    UserDeviceRow,
+    TenantAlertsPage, TenantAuditPage, TenantAuditRow, TenantUserRow, TenantUsersPage,
+    UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
 };
 
 fn navigation_hrefs(rendered: &str) -> Vec<&str> {
@@ -313,6 +313,7 @@ fn tenant_layout_renders_only_tenant_navigation() {
     assert!(rendered.contains("href=\"/tenant/groups\""));
     assert!(rendered.contains("href=\"/tenant/permissions\""));
     assert!(rendered.contains("href=\"/tenant/alerts\""));
+    assert!(rendered.contains("href=\"/tenant/audit\""));
     assert!(rendered.contains("href=\"/tenant/profiles/device\""));
     assert!(rendered.contains("href=\"/tenant/profiles/asset\""));
     assert!(rendered.contains("href=\"/tenant/applications\""));
@@ -369,6 +370,41 @@ fn tenant_alerts_layout_is_read_only_and_escapes_server_rows() {
     assert!(rendered.contains("Status"));
     assert!(rendered.contains("Last value"));
     assert!(rendered.contains("Updated"));
+    assert!(!rendered.contains("<form"));
+    assert!(!rendered.contains("name=\"tenant_id\""));
+    assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
+}
+
+#[test]
+fn tenant_audit_layout_escapes_structured_changes_and_uses_tenant_navigation() {
+    let identity = PlatformUiIdentity::new("Tenant <account>");
+    let page = TenantAuditPage::new(
+        vec![TenantAuditRow::new(
+            "2026-09-18T10:20:30Z",
+            "Tenant account",
+            "actor-<unsafe>",
+            "gateway.assigned",
+            "device: device-<unsafe>",
+            r#"{"change":"<unsafe>"}"#,
+        )],
+        Some("/tenant/audit?after=opaque-cursor"),
+    );
+
+    let rendered = PlatformUiRenderer::render_tenant_audit(&identity, &page).unwrap();
+
+    assert!(rendered.contains("href=\"/tenant/audit\" aria-current=\"page\""));
+    assert!(rendered.contains("Audit log"));
+    assert!(rendered.contains("Timestamp"));
+    assert!(rendered.contains("Actor"));
+    assert!(rendered.contains("Action"));
+    assert!(rendered.contains("Target"));
+    assert!(rendered.contains("Changes"));
+    assert!(rendered.contains("Older events"));
+    assert!(rendered.contains("actor-&#60;unsafe&#62;"));
+    assert!(rendered.contains("device-&#60;unsafe&#62;"));
+    assert!(rendered.contains("&#60;unsafe&#62;"));
+    assert!(!rendered.contains("actor-<unsafe>"));
+    assert!(!rendered.contains("device-<unsafe>"));
     assert!(!rendered.contains("<form"));
     assert!(!rendered.contains("name=\"tenant_id\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);

@@ -403,6 +403,54 @@ impl TenantAlertsPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAuditRow {
+    occurred_at: String,
+    actor_kind: String,
+    actor_id: String,
+    action: String,
+    target: String,
+    changes: String,
+}
+
+impl TenantAuditRow {
+    pub fn new(
+        occurred_at: impl Into<String>,
+        actor_kind: impl Into<String>,
+        actor_id: impl Into<String>,
+        action: impl Into<String>,
+        target: impl Into<String>,
+        changes: impl Into<String>,
+    ) -> Self {
+        Self {
+            occurred_at: occurred_at.into(),
+            actor_kind: actor_kind.into(),
+            actor_id: actor_id.into(),
+            action: action.into(),
+            target: target.into(),
+            changes: changes.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantAuditPage {
+    events: Vec<TenantAuditRow>,
+    older_events_href: String,
+    has_older_events: bool,
+}
+
+impl TenantAuditPage {
+    pub fn new(events: Vec<TenantAuditRow>, older_events_href: Option<impl Into<String>>) -> Self {
+        let has_older_events = older_events_href.is_some();
+        Self {
+            events,
+            older_events_href: older_events_href.map(Into::into).unwrap_or_default(),
+            has_older_events,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantTopologyRow {
     display_name: String,
     device_id: String,
@@ -950,6 +998,13 @@ impl PlatformUiRenderer {
         TenantAlertsLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_audit(
+        identity: &PlatformUiIdentity,
+        page: &TenantAuditPage,
+    ) -> Result<String, askama::Error> {
+        TenantAuditLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_topology(
         identity: &PlatformUiIdentity,
         page: &TenantTopologyPage,
@@ -1177,6 +1232,19 @@ pub struct TenantAlertsLayout<'a> {
 
 impl<'a> TenantAlertsLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantAlertsPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_audit.html")]
+pub struct TenantAuditLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantAuditPage,
+}
+
+impl<'a> TenantAuditLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantAuditPage) -> Self {
         Self { identity, page }
     }
 }

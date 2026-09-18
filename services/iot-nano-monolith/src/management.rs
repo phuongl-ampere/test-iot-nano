@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     Form, Json, Router,
-    extract::{ConnectInfo, FromRequest, Path, Request, State},
+    extract::{ConnectInfo, FromRequest, Path, Query, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE},
@@ -25,24 +25,26 @@ use iot_api::{
 };
 use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    ApplicationKind, ApplicationRepository, AuthorizationRepository, AuthorizationSubject,
-    BUILT_IN_USER_WORKSPACE, ClientId, CreateDeviceRelation, CreateManagementAsset,
-    CreateManagementAssetProfile, CreateManagementDeviceProfile, CreateManagementUser,
-    DeviceRelationError, DeviceRelationRepository, DeviceTokenRepository,
-    DeviceTokenRepositoryError, ManagementAlert as StorageManagementAlert, ManagementAlertError,
-    ManagementAlertRepository, ManagementAsset as StorageManagementAsset, ManagementAssetError,
-    ManagementAssetProfile, ManagementAssetProfileError, ManagementAssetProfileRepository,
-    ManagementAssetRepository, ManagementChildStatus, ManagementDevice as StorageManagementDevice,
-    ManagementDeviceError, ManagementDeviceProfile, ManagementDeviceProfileError,
-    ManagementDeviceProfileRepository, ManagementDeviceRepository, ManagementDeviceTopology,
-    ManagementGatewayStatus, ManagementUser, ManagementUserError, ManagementUserRepository,
-    ManagementUserRole, NewApplication, NewOAuthClientSecret, NewResourcePermission,
-    NewSystemAccount, NewTenant, NewTenantAccount, NewUserGroup, OAuthRepository,
-    PermissionCreator, PlatformStore, PlatformStoreError, RedirectUri, ResourceAccess,
-    ResourceAccessSource, ResourcePermission, SystemAccount, TenantAuthorizationError,
-    TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository, TenantStatus,
-    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser, UserDeviceActivityRepository,
+    ApplicationKind, ApplicationRepository, AuditAction, AuditEvent, AuditEventCursor,
+    AuditEventError, AuditEventRepository, AuditPrincipal, AuditTargetType,
+    AuthorizationRepository, AuthorizationSubject, BUILT_IN_USER_WORKSPACE, ClientId,
+    CreateDeviceRelation, CreateManagementAsset, CreateManagementAssetProfile,
+    CreateManagementDeviceProfile, CreateManagementUser, DeviceRelationError,
+    DeviceRelationRepository, DeviceTokenRepository, DeviceTokenRepositoryError,
+    ManagementAlert as StorageManagementAlert, ManagementAlertError, ManagementAlertRepository,
+    ManagementAsset as StorageManagementAsset, ManagementAssetError, ManagementAssetProfile,
+    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
+    ManagementChildStatus, ManagementDevice as StorageManagementDevice, ManagementDeviceError,
+    ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
+    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
+    ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
+    NewOAuthClientSecret, NewResourcePermission, NewSystemAccount, NewTenant, NewTenantAccount,
+    NewUserGroup, OAuthRepository, PermissionCreator, PlatformStore, PlatformStoreError,
+    RedirectUri, ResourceAccess, ResourceAccessSource, ResourcePermission, SystemAccount,
+    TenantAuthorizationError, TenantAuthorizationRepository, TenantIdentityError,
+    TenantIdentityRepository, TenantStatus, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
+    UserDeviceActivityRepository,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -66,6 +68,8 @@ const MAX_LOGIN_FAILURES: u8 = 5;
 const USER_DEVICE_LIST_LIMIT: u32 = 100;
 const USER_ASSET_LIST_LIMIT: u32 = 100;
 const USER_DEVICE_ACTIVITY_LIMIT: u32 = 10;
+const DEFAULT_TENANT_AUDIT_LIMIT: usize = 50;
+const MAX_TENANT_AUDIT_LIMIT: usize = 100;
 
 #[derive(Debug, Error)]
 pub enum BootstrapSystemError {
@@ -201,6 +205,7 @@ impl ManagementSessionRouter {
                 get(platform_tenant_devices).post(provision_tenant_device_form),
             )
             .route("/tenant/alerts", get(platform_tenant_alerts))
+            .route("/tenant/audit", get(platform_tenant_audit))
             .route(
                 "/tenant/profiles/device",
                 get(platform_tenant_device_profiles).post(create_tenant_device_profile_form),
@@ -279,6 +284,7 @@ impl ManagementSessionRouter {
             .route("/api/user/auth/me", get(current_user_session))
             .route("/api/management/applications", post(create_application))
             .route("/api/management/alerts", get(list_management_alerts))
+            .route("/api/management/audit", get(list_management_audit_events))
             .route(
                 "/api/management/users",
                 get(list_management_users).post(create_management_user),
@@ -536,6 +542,17 @@ fn management_openapi() -> Value {
         vec![(
             "get",
             tenant_management_list_operation("List tenant alerts", "ManagementAlertList"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/audit",
+        vec![(
+            "get",
+            tenant_management_list_operation(
+                "List tenant audit events",
+                "ManagementAuditEventPage",
+            ),
         )],
     );
     documented_path(
@@ -1032,6 +1049,42 @@ fn management_openapi_schemas() -> Value {
                 "status",
                 "updated_at",
             ],
+        ),
+    );
+    schemas.insert(
+        "ManagementAuditEvent".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema_non_null(),
+                "occurred_at": {"type": "string", "format": "date-time"},
+                "actor_kind": {"type": "string"},
+                "actor_id": uuid_schema_non_null(),
+                "action": {"type": "string"},
+                "target_type": {"type": "string"},
+                "target_id": {"type": "string"},
+                "changes": json_object_schema()
+            }),
+            &[
+                "id",
+                "occurred_at",
+                "actor_kind",
+                "actor_id",
+                "action",
+                "target_type",
+                "target_id",
+                "changes",
+            ],
+        ),
+    );
+    schemas.insert(
+        "ManagementAuditEventPage".to_owned(),
+        object_schema(
+            json!({
+                "items": array_schema("ManagementAuditEvent"),
+                "next_cursor": {"type": ["string", "null"]},
+                "has_more": {"type": "boolean"}
+            }),
+            &["items", "next_cursor", "has_more"],
         ),
     );
     schemas.insert(
@@ -2012,6 +2065,47 @@ struct ManagementAlertResponse {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantAuditQuery {
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TenantAuditCursor {
+    version: u8,
+    tenant_id: Uuid,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    id: Uuid,
+}
+
+#[derive(Serialize)]
+struct ManagementAuditEventResponse {
+    id: Uuid,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    actor_kind: &'static str,
+    actor_id: Uuid,
+    action: &'static str,
+    target_type: &'static str,
+    target_id: String,
+    changes: Value,
+}
+
+#[derive(Serialize)]
+struct ManagementAuditEventPage {
+    items: Vec<ManagementAuditEventResponse>,
+    next_cursor: Option<String>,
+    has_more: bool,
+}
+
+struct TenantAuditEventPage {
+    events: Vec<AuditEvent>,
+    next_cursor: Option<String>,
+    has_more: bool,
+    limit: usize,
+}
+
 #[derive(Deserialize)]
 struct ManagementDeviceProfileRequest {
     name: String,
@@ -2557,6 +2651,15 @@ async fn platform_tenant_alerts(
     tenant_alerts_page(&state, tenant).await
 }
 
+async fn platform_tenant_audit(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Query(query): Query<TenantAuditQuery>,
+) -> Result<Html<String>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_audit_page(&state, tenant, &query).await
+}
+
 async fn platform_tenant_device_profiles(
     State(state): State<ManagementState>,
     request: Request,
@@ -2776,6 +2879,85 @@ async fn tenant_alerts_page(
     )
     .map_err(|_| ManagementSessionError::Unavailable)?;
     Ok(Html(rendered))
+}
+
+async fn tenant_audit_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+    query: &TenantAuditQuery,
+) -> Result<Html<String>, ManagementSessionError> {
+    let audit_events = tenant_audit_event_page(state, tenant.tenant_id, query).await?;
+    let older_events_href = audit_events
+        .next_cursor
+        .as_ref()
+        .map(|cursor| format!("/tenant/audit?after={cursor}&limit={}", audit_events.limit));
+    let page = crate::TenantAuditPage::new(
+        audit_events
+            .events
+            .into_iter()
+            .map(tenant_audit_row)
+            .collect::<Result<Vec<_>, _>>()?,
+        older_events_href,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_audit(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+async fn tenant_audit_event_page(
+    state: &ManagementState,
+    tenant_id: Uuid,
+    query: &TenantAuditQuery,
+) -> Result<TenantAuditEventPage, ManagementSessionError> {
+    let limit = tenant_audit_limit(query.limit)?;
+    let after = decode_tenant_audit_cursor(&state.token_vault, tenant_id, query.after.as_deref())?;
+    let fetch_limit = if limit == MAX_TENANT_AUDIT_LIMIT {
+        limit
+    } else {
+        limit + 1
+    };
+    let mut events = AuditEventRepository::list_tenant_audit_events(
+        state.store.as_ref(),
+        tenant_id,
+        after,
+        fetch_limit,
+    )
+    .await
+    .map_err(management_audit_error)?;
+    let mut has_more = events.len() > limit;
+    events.truncate(limit);
+
+    if !has_more && limit == MAX_TENANT_AUDIT_LIMIT && events.len() == limit {
+        if let Some(last_event) = events.last() {
+            let remaining = AuditEventRepository::list_tenant_audit_events(
+                state.store.as_ref(),
+                tenant_id,
+                Some(audit_event_cursor(last_event)),
+                1,
+            )
+            .await
+            .map_err(management_audit_error)?;
+            has_more = !remaining.is_empty();
+        }
+    }
+
+    let next_cursor = if has_more {
+        events
+            .last()
+            .map(|event| encode_tenant_audit_cursor(&state.token_vault, tenant_id, event))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(TenantAuditEventPage {
+        events,
+        next_cursor,
+        has_more,
+        limit,
+    })
 }
 
 async fn tenant_device_profiles_page(
@@ -5386,6 +5568,24 @@ async fn list_management_alerts(
         .map_err(management_alert_error)
 }
 
+async fn list_management_audit_events(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Query(query): Query<TenantAuditQuery>,
+) -> Result<Json<ManagementAuditEventPage>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let page = tenant_audit_event_page(&state, tenant.tenant_id, &query).await?;
+    Ok(Json(ManagementAuditEventPage {
+        items: page
+            .events
+            .into_iter()
+            .map(management_audit_event_response)
+            .collect(),
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+    }))
+}
+
 async fn create_management_user(
     State(state): State<ManagementState>,
     request: Request,
@@ -5817,6 +6017,131 @@ fn management_alert_response(alert: StorageManagementAlert) -> ManagementAlertRe
     }
 }
 
+fn management_audit_event_response(event: AuditEvent) -> ManagementAuditEventResponse {
+    let (actor_kind, actor_id) = audit_actor(event.actor);
+    ManagementAuditEventResponse {
+        id: event.id,
+        occurred_at: event.occurred_at,
+        actor_kind,
+        actor_id,
+        action: audit_action(event.action),
+        target_type: audit_target_type(event.target_type),
+        target_id: event.target_id,
+        changes: event.changes,
+    }
+}
+
+fn tenant_audit_row(event: AuditEvent) -> Result<crate::TenantAuditRow, ManagementSessionError> {
+    let (_, actor_id) = audit_actor(event.actor);
+    let target_type = audit_target_type(event.target_type);
+    let changes = serde_json::to_string_pretty(&event.changes)
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(crate::TenantAuditRow::new(
+        event.occurred_at.to_rfc3339(),
+        audit_actor_label(event.actor),
+        actor_id.to_string(),
+        audit_action(event.action),
+        format!("{target_type}: {}", event.target_id),
+        changes,
+    ))
+}
+
+fn audit_actor(actor: AuditPrincipal) -> (&'static str, Uuid) {
+    match actor {
+        AuditPrincipal::SystemAccount(id) => ("system_account", id),
+        AuditPrincipal::TenantAccount(id) => ("tenant_account", id),
+        AuditPrincipal::User(id) => ("user", id),
+    }
+}
+
+fn audit_actor_label(actor: AuditPrincipal) -> &'static str {
+    match actor {
+        AuditPrincipal::SystemAccount(_) => "System account",
+        AuditPrincipal::TenantAccount(_) => "Tenant account",
+        AuditPrincipal::User(_) => "User",
+    }
+}
+
+fn audit_action(action: AuditAction) -> &'static str {
+    match action {
+        AuditAction::PermissionGranted => "permission.granted",
+        AuditAction::PermissionRevoked => "permission.revoked",
+        AuditAction::GroupMemberAdded => "group.member_added",
+        AuditAction::GroupMemberRemoved => "group.member_removed",
+        AuditAction::OwnershipTransferred => "ownership.transferred",
+        AuditAction::AssetContainmentChanged => "asset.containment_changed",
+        AuditAction::GatewayAssigned => "gateway.assigned",
+        AuditAction::GatewayDetached => "gateway.detached",
+        AuditAction::GatewayReassigned => "gateway.reassigned",
+        AuditAction::DeviceRelationCreated => "device_relation.created",
+        AuditAction::DeviceRelationDeleted => "device_relation.deleted",
+    }
+}
+
+fn audit_target_type(target_type: AuditTargetType) -> &'static str {
+    match target_type {
+        AuditTargetType::ResourcePermission => "resource_permission",
+        AuditTargetType::UserGroup => "user_group",
+        AuditTargetType::Asset => "asset",
+        AuditTargetType::Device => "device",
+        AuditTargetType::DeviceRelation => "device_relation",
+    }
+}
+
+fn tenant_audit_limit(value: Option<usize>) -> Result<usize, ManagementSessionError> {
+    let value = value.unwrap_or(DEFAULT_TENANT_AUDIT_LIMIT);
+    if !(1..=MAX_TENANT_AUDIT_LIMIT).contains(&value) {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    Ok(value)
+}
+
+fn decode_tenant_audit_cursor(
+    vault: &TokenVault,
+    tenant_id: Uuid,
+    value: Option<&str>,
+) -> Result<Option<AuditEventCursor>, ManagementSessionError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let plaintext = vault
+        .decrypt(value)
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    let cursor: TenantAuditCursor =
+        serde_json::from_str(&plaintext).map_err(|_| ManagementSessionError::BadRequest)?;
+    if cursor.version != 1 || cursor.tenant_id != tenant_id {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    Ok(Some(AuditEventCursor {
+        occurred_at: cursor.occurred_at,
+        id: cursor.id,
+    }))
+}
+
+fn encode_tenant_audit_cursor(
+    vault: &TokenVault,
+    tenant_id: Uuid,
+    event: &AuditEvent,
+) -> Result<String, ManagementSessionError> {
+    let plaintext = serde_json::to_string(&TenantAuditCursor {
+        version: 1,
+        tenant_id,
+        occurred_at: event.occurred_at,
+        id: event.id,
+    })
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    vault
+        .encrypt(&plaintext)
+        .map_err(|_| ManagementSessionError::Unavailable)
+}
+
+fn audit_event_cursor(event: &AuditEvent) -> AuditEventCursor {
+    AuditEventCursor {
+        occurred_at: event.occurred_at,
+        id: event.id,
+    }
+}
+
 fn management_device_profile_response(
     profile: ManagementDeviceProfile,
 ) -> ManagementDeviceProfileResponse {
@@ -5862,6 +6187,15 @@ fn management_alert_error(error: ManagementAlertError) -> ManagementSessionError
         ManagementAlertError::InvalidStoredAlertId
         | ManagementAlertError::InvalidStoredAlertTimestamp
         | ManagementAlertError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_audit_error(error: AuditEventError) -> ManagementSessionError {
+    match error {
+        AuditEventError::InvalidLimit { .. } => ManagementSessionError::BadRequest,
+        AuditEventError::InvalidStoredEvent | AuditEventError::Database(_) => {
+            ManagementSessionError::Unavailable
+        }
     }
 }
 
