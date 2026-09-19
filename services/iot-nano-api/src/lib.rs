@@ -22,7 +22,8 @@ pub use core_facade::{
 };
 pub use device_tokens::{
     DeviceTokenResponse, DeviceTokenStoreError, create_platform_device_token,
-    provision_platform_device_token,
+    provision_management_device_token, provision_platform_device_token,
+    rotate_platform_device_token,
 };
 pub use oauth::{
     OAuthBrowserSessionVerifier, public_oauth_router,

@@ -21,7 +21,8 @@ use iot_api::{
     PrincipalKind, Role, TokenVault, authenticate_credentials, authenticate_credentials_sqlite,
     authenticate_system_account, authenticate_tenant_account, authenticate_user_account,
     create_platform_device_token, generate_session_id, hash_password,
-    provision_platform_device_token, validate_password,
+    provision_management_device_token, provision_platform_device_token,
+    rotate_platform_device_token, validate_password,
 };
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
@@ -31,15 +32,19 @@ use iot_storage::{
     CreateDeviceRelation, CreateManagementAsset, CreateManagementAssetProfile,
     CreateManagementDeviceProfile, CreateManagementUser, DeviceRelationError,
     DeviceRelationRepository, DeviceTokenRepository, DeviceTokenRepositoryError,
-    ManagementAlert as StorageManagementAlert, ManagementAlertError, ManagementAlertRepository,
-    ManagementAsset as StorageManagementAsset, ManagementAssetError, ManagementAssetProfile,
-    ManagementAssetProfileError, ManagementAssetProfileRepository, ManagementAssetRepository,
-    ManagementChildStatus, ManagementDevice as StorageManagementDevice, ManagementDeviceError,
-    ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
-    ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
-    ManagementUserError, ManagementUserRepository, ManagementUserRole, NewApplication,
-    NewOAuthClientSecret, NewResourcePermission, NewSystemAccount, NewTenant, NewTenantAccount,
-    NewUserGroup, OAuthRepository, PermissionCreator, PlatformStore, PlatformStoreError,
+    ManagementAlert as StorageManagementAlert, ManagementAlertError,
+    ManagementAlertIncident as StorageManagementAlertIncident, ManagementAlertIncidentError,
+    ManagementAlertIncidentRepository, ManagementAlertRepository,
+    ManagementAlertRule as StorageManagementAlertRule, ManagementAlertRuleError,
+    ManagementAlertRuleRepository, ManagementAsset as StorageManagementAsset, ManagementAssetError,
+    ManagementAssetProfile, ManagementAssetProfileError, ManagementAssetProfileRepository,
+    ManagementAssetRepository, ManagementChildStatus, ManagementDevice as StorageManagementDevice,
+    ManagementDeviceError, ManagementDeviceProfile, ManagementDeviceProfileError,
+    ManagementDeviceProfileRepository, ManagementDeviceRepository, ManagementDeviceTopology,
+    ManagementGatewayStatus, ManagementUser, ManagementUserError, ManagementUserRepository,
+    ManagementUserRole, NewApplication, NewOAuthClientSecret, NewResourcePermission,
+    NewSystemAccount, NewTenant, NewTenantAccount, NewUserGroup, OAuthRepository,
+    PermissionCreator, PlatformStore, PlatformStoreError, ProvisionManagementDeviceError,
     RedirectUri, ResourceAccess, ResourceAccessSource, ResourcePermission, SystemAccount,
     TenantAuthorizationError, TenantAuthorizationRepository, TenantIdentityError,
     TenantIdentityRepository, TenantStatus, UpdateManagementAsset, UpdateManagementAssetProfile,
@@ -285,6 +290,30 @@ impl ManagementSessionRouter {
             .route("/api/user/auth/me", get(current_user_session))
             .route("/api/management/applications", post(create_application))
             .route("/api/management/alerts", get(list_management_alerts))
+            .route(
+                "/api/management/alerts/summary",
+                get(management_alert_summary),
+            )
+            .route(
+                "/api/management/alert-rules",
+                get(list_management_alert_rules).post(create_management_alert_rule),
+            )
+            .route(
+                "/api/management/alert-rules/{rule_id}",
+                put(update_management_alert_rule),
+            )
+            .route(
+                "/api/management/alert-rules/{rule_id}/archive",
+                post(archive_management_alert_rule),
+            )
+            .route(
+                "/api/management/alert-incidents",
+                get(list_management_alert_incidents),
+            )
+            .route(
+                "/api/management/alert-incidents/{incident_id}/acknowledge",
+                post(acknowledge_management_alert_incident),
+            )
             .route("/api/management/audit", get(list_management_audit_events))
             .route(
                 "/api/management/users",
@@ -329,6 +358,10 @@ impl ManagementSessionRouter {
             .route(
                 "/api/management/devices/{device_id}/tokens",
                 post(create_device_token),
+            )
+            .route(
+                "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
+                post(rotate_management_device_token),
             )
             .with_state(state)
             .merge(
@@ -553,6 +586,85 @@ fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
+        "/api/management/alerts/summary",
+        vec![(
+            "get",
+            management_list_operation("Get tenant alert summary", "ManagementAlertSummary"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/alert-rules",
+        vec![
+            (
+                "get",
+                management_list_operation("List tenant alert rules", "ManagementAlertRuleList"),
+            ),
+            (
+                "post",
+                management_operation(
+                    "Create a tenant alert rule",
+                    "ManagementAlertRuleRequest",
+                    "201",
+                    "ManagementAlertRule",
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/alert-rules/{rule_id}",
+        vec![(
+            "put",
+            management_operation(
+                "Update a tenant alert rule",
+                "ManagementAlertRuleRequest",
+                "200",
+                "ManagementAlertRule",
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/alert-rules/{rule_id}/archive",
+        vec![(
+            "post",
+            management_no_content_operation("Archive a tenant alert rule"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/alert-incidents",
+        vec![(
+            "get",
+            management_list_operation("List tenant alert incidents", "ManagementAlertIncidentList"),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/alert-incidents/{incident_id}/acknowledge",
+        vec![(
+            "post",
+            documented_operation(
+                "Acknowledge a tenant alert incident",
+                Some("managementSession"),
+                None,
+                (
+                    "200",
+                    "Alert incident acknowledged",
+                    Some("ManagementAlertIncident"),
+                ),
+                &[
+                    ("401", "No active management session"),
+                    ("403", "Tenant account required"),
+                    ("404", "Alert incident not found"),
+                    ("503", "Service unavailable"),
+                ],
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
         "/api/management/audit",
         vec![(
             "get",
@@ -720,6 +832,31 @@ fn management_openapi() -> Value {
                     ("401", "No active management session"),
                     ("403", "Administrator role required"),
                     ("404", "Device not found"),
+                    ("503", "Service unavailable"),
+                ],
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
+        vec![(
+            "post",
+            documented_operation(
+                "Atomically rotate a device token",
+                Some("managementSession"),
+                None,
+                (
+                    "201",
+                    "Replacement device token issued",
+                    Some("DeviceToken"),
+                ),
+                &[
+                    ("400", "Invalid token identifier"),
+                    ("401", "No active management session"),
+                    ("403", "Tenant account required"),
+                    ("404", "Active device token not found"),
+                    ("409", "Device token cannot be rotated"),
                     ("503", "Service unavailable"),
                 ],
             ),
@@ -1087,6 +1224,111 @@ fn management_openapi_schemas() -> Value {
         ),
     );
     schemas.insert(
+        "ManagementAlertSummary".to_owned(),
+        object_schema(
+            json!({"open_incident_count": {"type": "integer", "minimum": 0}}),
+            &["open_incident_count"],
+        ),
+    );
+    schemas.insert(
+        "ManagementAlertRuleRequest".to_owned(),
+        object_schema(
+            json!({
+                "name": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "device_id": {"type": ["string", "null"]},
+                "metric_key": {"type": "string"},
+                "rule_type": {"type": "string", "enum": ["event_threshold", "window_average"]},
+                "comparison": {"type": "string", "enum": ["gt", "gte", "lt", "lte"]},
+                "threshold": {"type": "number"},
+                "window_seconds": {"type": ["integer", "null"], "minimum": 60},
+                "for_seconds": {"type": "integer", "minimum": 0},
+                "resolve_after_seconds": {"type": "integer", "minimum": 0},
+                "reopen_grace_seconds": {"type": "integer", "minimum": 0},
+                "hysteresis": {"type": ["number", "null"], "minimum": 0},
+                "severity": {"type": "string", "enum": ["info", "warning", "critical"]},
+                "reminder_interval_seconds": {"type": "integer", "minimum": 1}
+            }),
+            &[
+                "name",
+                "metric_key",
+                "rule_type",
+                "comparison",
+                "threshold",
+                "severity",
+            ],
+        ),
+    );
+    schemas.insert(
+        "ManagementAlertRule".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema_non_null(),
+                "name": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "device_id": {"type": ["string", "null"]},
+                "metric_key": {"type": "string"},
+                "rule_type": {"type": "string"},
+                "comparison": {"type": "string"},
+                "threshold": {"type": "number"},
+                "window_seconds": {"type": ["integer", "null"]},
+                "for_seconds": {"type": "integer"},
+                "resolve_after_seconds": {"type": "integer"},
+                "reopen_grace_seconds": {"type": "integer"},
+                "hysteresis": {"type": ["number", "null"]},
+                "severity": {"type": "string"},
+                "reminder_interval_seconds": {"type": "integer"},
+                "archived_at": {"type": ["string", "null"], "format": "date-time"},
+                "updated_at": {"type": "string", "format": "date-time"}
+            }),
+            &[
+                "id",
+                "name",
+                "enabled",
+                "metric_key",
+                "rule_type",
+                "comparison",
+                "threshold",
+                "for_seconds",
+                "resolve_after_seconds",
+                "reopen_grace_seconds",
+                "severity",
+                "reminder_interval_seconds",
+                "updated_at",
+            ],
+        ),
+    );
+    schemas.insert(
+        "ManagementAlertIncident".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema_non_null(),
+                "rule_id": uuid_schema_non_null(),
+                "rule_name": {"type": "string"},
+                "severity": {"type": "string"},
+                "device_id": {"type": "string"},
+                "status": {"type": "string"},
+                "last_value": {"type": ["number", "null"]},
+                "condition_started_at": {"type": "string", "format": "date-time"},
+                "opened_at": {"type": ["string", "null"], "format": "date-time"},
+                "resolved_at": {"type": ["string", "null"], "format": "date-time"},
+                "acknowledged_at": {"type": ["string", "null"], "format": "date-time"},
+                "acknowledged_by": {"type": ["string", "null"]},
+                "updated_at": {"type": "string", "format": "date-time"}
+            }),
+            &[
+                "id",
+                "rule_id",
+                "rule_name",
+                "severity",
+                "device_id",
+                "status",
+                "condition_started_at",
+                "updated_at",
+            ],
+        ),
+    );
+    schemas.insert(
         "ManagementAuditEvent".to_owned(),
         object_schema(
             json!({
@@ -1184,7 +1426,12 @@ fn management_openapi_schemas() -> Value {
     schemas.insert(
         "DeviceProvisionRequest".to_owned(),
         object_schema(
-            json!({"display_name": {"type": "string"}}),
+            json!({
+                "display_name": {"type": "string"},
+                "asset_id": uuid_schema(),
+                "device_profile_id": uuid_schema(),
+                "attributes": json_object_schema()
+            }),
             &["display_name"],
         ),
     );
@@ -1273,6 +1520,8 @@ fn management_openapi_schemas() -> Value {
     for (name, item) in [
         ("ManagementUserList", "ManagementUser"),
         ("ManagementAlertList", "ManagementAlert"),
+        ("ManagementAlertRuleList", "ManagementAlertRule"),
+        ("ManagementAlertIncidentList", "ManagementAlertIncident"),
         ("DeviceProfileList", "DeviceProfile"),
         ("AssetProfileList", "AssetProfile"),
         ("ManagementDeviceList", "ManagementDevice"),
@@ -2100,6 +2349,92 @@ struct ManagementAlertResponse {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagementAlertRuleRequest {
+    name: String,
+    #[serde(default = "default_alert_rule_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    device_id: Option<String>,
+    metric_key: String,
+    rule_type: String,
+    comparison: String,
+    threshold: f64,
+    #[serde(default)]
+    window_seconds: Option<u64>,
+    #[serde(default)]
+    for_seconds: u64,
+    #[serde(default = "default_alert_resolve_after_seconds")]
+    resolve_after_seconds: u64,
+    #[serde(default = "default_alert_reopen_grace_seconds")]
+    reopen_grace_seconds: u64,
+    #[serde(default)]
+    hysteresis: Option<f64>,
+    severity: String,
+    #[serde(default = "default_alert_reminder_interval_seconds")]
+    reminder_interval_seconds: u64,
+}
+
+fn default_alert_rule_enabled() -> bool {
+    true
+}
+
+fn default_alert_resolve_after_seconds() -> u64 {
+    300
+}
+
+fn default_alert_reopen_grace_seconds() -> u64 {
+    3_600
+}
+
+fn default_alert_reminder_interval_seconds() -> u64 {
+    86_400
+}
+
+#[derive(Serialize)]
+struct ManagementAlertRuleResponse {
+    id: Uuid,
+    name: String,
+    enabled: bool,
+    device_id: Option<String>,
+    metric_key: String,
+    rule_type: String,
+    comparison: String,
+    threshold: f64,
+    window_seconds: Option<u64>,
+    for_seconds: u64,
+    resolve_after_seconds: u64,
+    reopen_grace_seconds: u64,
+    hysteresis: Option<f64>,
+    severity: String,
+    reminder_interval_seconds: u64,
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+struct ManagementAlertIncidentResponse {
+    id: Uuid,
+    rule_id: Uuid,
+    rule_name: String,
+    severity: String,
+    device_id: String,
+    status: String,
+    last_value: Option<f64>,
+    condition_started_at: chrono::DateTime<chrono::Utc>,
+    opened_at: Option<chrono::DateTime<chrono::Utc>>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
+    acknowledged_by: Option<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+struct ManagementAlertSummaryResponse {
+    open_incident_count: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TenantAuditQuery {
@@ -2176,6 +2511,16 @@ struct ManagementAssetProfileResponse {
 #[derive(Deserialize)]
 struct ProvisionDeviceRequest {
     display_name: String,
+    #[serde(default)]
+    asset_id: Option<Uuid>,
+    #[serde(default)]
+    device_profile_id: Option<Uuid>,
+    #[serde(default = "empty_json_object")]
+    attributes: Value,
+}
+
+fn empty_json_object() -> Value {
+    Value::Object(Map::new())
 }
 
 #[derive(Deserialize)]
@@ -5576,7 +5921,14 @@ async fn create_application(
 async fn provision_device(
     State(state): State<ManagementState>,
     request: Request,
-) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::header::HeaderName, HeaderValue); 1],
+        Json<DeviceTokenResponse>,
+    ),
+    ManagementSessionError,
+> {
     let headers = request.headers().clone();
     let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ProvisionDeviceRequest = management_request_json(&state, request).await?;
@@ -5585,15 +5937,22 @@ async fn provision_device(
         return Err(ManagementSessionError::BadRequest);
     }
     let _lease = authorize_tenant_mutation(&state, &headers).await?;
-    let token = provision_platform_device_token(
+    let token = provision_management_device_token(
         &state.store,
         &state.token_vault,
         tenant.tenant_id,
         display_name,
+        request.asset_id,
+        request.device_profile_id,
+        request.attributes,
     )
     .await
-    .map_err(|_| ManagementSessionError::Unavailable)?;
-    Ok((StatusCode::CREATED, Json(token)))
+    .map_err(management_device_token_error)?;
+    Ok((
+        StatusCode::CREATED,
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(token),
+    ))
 }
 
 async fn list_management_users(
@@ -5616,6 +5975,175 @@ async fn list_management_alerts(
         .await
         .map(|alerts| Json(alerts.into_iter().map(management_alert_response).collect()))
         .map_err(management_alert_error)
+}
+
+async fn management_alert_summary(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<ManagementAlertSummaryResponse>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let open_incident_count =
+        ManagementAlertIncidentRepository::open_management_alert_incident_count(
+            state.store.as_ref(),
+            tenant.tenant_id,
+        )
+        .await
+        .map_err(management_alert_incident_error)?;
+    Ok(Json(ManagementAlertSummaryResponse {
+        open_incident_count,
+    }))
+}
+
+async fn list_management_alert_rules(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementAlertRuleResponse>>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementAlertRuleRepository::list_management_alert_rules(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map(|rules| {
+        Json(
+            rules
+                .into_iter()
+                .map(management_alert_rule_response)
+                .collect(),
+        )
+    })
+    .map_err(management_alert_rule_error)
+}
+
+async fn create_management_alert_rule(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<(StatusCode, Json<ManagementAlertRuleResponse>), ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: ManagementAlertRuleRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let rule = ManagementAlertRuleRepository::create_management_alert_rule(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        CreateManagementAlertRule {
+            name: request.name,
+            enabled: request.enabled,
+            device_id: request.device_id,
+            metric_key: request.metric_key,
+            rule_type: request.rule_type,
+            comparison: request.comparison,
+            threshold: request.threshold,
+            window_seconds: request.window_seconds,
+            for_seconds: request.for_seconds,
+            resolve_after_seconds: request.resolve_after_seconds,
+            reopen_grace_seconds: request.reopen_grace_seconds,
+            hysteresis: request.hysteresis,
+            severity: request.severity,
+            reminder_interval_seconds: request.reminder_interval_seconds,
+        },
+    )
+    .await
+    .map_err(management_alert_rule_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(management_alert_rule_response(rule)),
+    ))
+}
+
+async fn update_management_alert_rule(
+    State(state): State<ManagementState>,
+    Path(rule_id): Path<String>,
+    request: Request,
+) -> Result<Json<ManagementAlertRuleResponse>, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let rule_id = Uuid::parse_str(&rule_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let request: ManagementAlertRuleRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let rule = ManagementAlertRuleRepository::update_management_alert_rule(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        rule_id,
+        UpdateManagementAlertRule {
+            name: request.name,
+            enabled: request.enabled,
+            device_id: request.device_id,
+            metric_key: request.metric_key,
+            rule_type: request.rule_type,
+            comparison: request.comparison,
+            threshold: request.threshold,
+            window_seconds: request.window_seconds,
+            for_seconds: request.for_seconds,
+            resolve_after_seconds: request.resolve_after_seconds,
+            reopen_grace_seconds: request.reopen_grace_seconds,
+            hysteresis: request.hysteresis,
+            severity: request.severity,
+            reminder_interval_seconds: request.reminder_interval_seconds,
+        },
+    )
+    .await
+    .map_err(management_alert_rule_error)?;
+    Ok(Json(management_alert_rule_response(rule)))
+}
+
+async fn archive_management_alert_rule(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(rule_id): Path<String>,
+) -> Result<StatusCode, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let rule_id = Uuid::parse_str(&rule_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    ManagementAlertRuleRepository::archive_management_alert_rule(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        rule_id,
+    )
+    .await
+    .map_err(management_alert_rule_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_management_alert_incidents(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ManagementAlertIncidentResponse>>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    ManagementAlertIncidentRepository::list_management_alert_incidents(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map(|incidents| {
+        Json(
+            incidents
+                .into_iter()
+                .map(management_alert_incident_response)
+                .collect(),
+        )
+    })
+    .map_err(management_alert_incident_error)
+}
+
+async fn acknowledge_management_alert_incident(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path(incident_id): Path<String>,
+) -> Result<Json<ManagementAlertIncidentResponse>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let incident_id =
+        Uuid::parse_str(&incident_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let incident = ManagementAlertIncidentRepository::acknowledge_management_alert_incident(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        incident_id,
+        tenant.tenant_account_id.to_string(),
+    )
+    .await
+    .map_err(management_alert_incident_error)?;
+    Ok(Json(management_alert_incident_response(incident)))
 }
 
 async fn list_management_audit_events(
@@ -6072,6 +6600,48 @@ fn management_alert_response(alert: StorageManagementAlert) -> ManagementAlertRe
     }
 }
 
+fn management_alert_rule_response(rule: StorageManagementAlertRule) -> ManagementAlertRuleResponse {
+    ManagementAlertRuleResponse {
+        id: rule.id,
+        name: rule.name,
+        enabled: rule.enabled,
+        device_id: rule.device_id,
+        metric_key: rule.metric_key,
+        rule_type: rule.rule_type,
+        comparison: rule.comparison,
+        threshold: rule.threshold,
+        window_seconds: rule.window_seconds,
+        for_seconds: rule.for_seconds,
+        resolve_after_seconds: rule.resolve_after_seconds,
+        reopen_grace_seconds: rule.reopen_grace_seconds,
+        hysteresis: rule.hysteresis,
+        severity: rule.severity,
+        reminder_interval_seconds: rule.reminder_interval_seconds,
+        archived_at: rule.archived_at,
+        updated_at: rule.updated_at,
+    }
+}
+
+fn management_alert_incident_response(
+    incident: StorageManagementAlertIncident,
+) -> ManagementAlertIncidentResponse {
+    ManagementAlertIncidentResponse {
+        id: incident.id,
+        rule_id: incident.rule_id,
+        rule_name: incident.rule_name,
+        severity: incident.severity,
+        device_id: incident.device_id,
+        status: incident.status,
+        last_value: incident.last_value,
+        condition_started_at: incident.condition_started_at,
+        opened_at: incident.opened_at,
+        resolved_at: incident.resolved_at,
+        acknowledged_at: incident.acknowledged_at,
+        acknowledged_by: incident.acknowledged_by,
+        updated_at: incident.updated_at,
+    }
+}
+
 fn management_audit_event_response(event: AuditEvent) -> ManagementAuditEventResponse {
     let (actor_kind, actor_id) = audit_actor(event.actor);
     ManagementAuditEventResponse {
@@ -6242,6 +6812,34 @@ fn management_alert_error(error: ManagementAlertError) -> ManagementSessionError
         ManagementAlertError::InvalidStoredAlertId
         | ManagementAlertError::InvalidStoredAlertTimestamp
         | ManagementAlertError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_alert_rule_error(error: ManagementAlertRuleError) -> ManagementSessionError {
+    match error {
+        ManagementAlertRuleError::InvalidName
+        | ManagementAlertRuleError::InvalidMetricKey
+        | ManagementAlertRuleError::InvalidRuleType
+        | ManagementAlertRuleError::InvalidComparison
+        | ManagementAlertRuleError::InvalidThreshold
+        | ManagementAlertRuleError::InvalidWindow
+        | ManagementAlertRuleError::InvalidDuration
+        | ManagementAlertRuleError::InvalidHysteresis
+        | ManagementAlertRuleError::InvalidSeverity => ManagementSessionError::BadRequest,
+        ManagementAlertRuleError::DeviceUnavailable(_) => ManagementSessionError::Conflict,
+        ManagementAlertRuleError::RuleNotFound => ManagementSessionError::NotFound,
+        ManagementAlertRuleError::RuleArchived => ManagementSessionError::Conflict,
+        ManagementAlertRuleError::InvalidStoredRule | ManagementAlertRuleError::Storage { .. } => {
+            ManagementSessionError::Unavailable
+        }
+    }
+}
+
+fn management_alert_incident_error(error: ManagementAlertIncidentError) -> ManagementSessionError {
+    match error {
+        ManagementAlertIncidentError::IncidentNotFound => ManagementSessionError::NotFound,
+        ManagementAlertIncidentError::InvalidStoredIncident
+        | ManagementAlertIncidentError::Storage { .. } => ManagementSessionError::Unavailable,
     }
 }
 
@@ -6482,7 +7080,27 @@ fn management_device_token_error(error: DeviceTokenStoreError) -> ManagementSess
     match error {
         DeviceTokenStoreError::NotFound => ManagementSessionError::NotFound,
         DeviceTokenStoreError::GatewayChild => ManagementSessionError::Conflict,
+        DeviceTokenStoreError::ManagementProvision(error) => {
+            management_device_provision_error(error)
+        }
         _ => ManagementSessionError::Unavailable,
+    }
+}
+
+fn management_device_provision_error(
+    error: ProvisionManagementDeviceError,
+) -> ManagementSessionError {
+    match error {
+        ProvisionManagementDeviceError::InvalidDisplayName
+        | ProvisionManagementDeviceError::AttributesMustBeObject => {
+            ManagementSessionError::BadRequest
+        }
+        ProvisionManagementDeviceError::AssetUnavailable(_)
+        | ProvisionManagementDeviceError::DeviceProfileUnavailable(_) => {
+            ManagementSessionError::Conflict
+        }
+        ProvisionManagementDeviceError::Token(_)
+        | ProvisionManagementDeviceError::Storage { .. } => ManagementSessionError::Unavailable,
     }
 }
 
@@ -6504,7 +7122,14 @@ async fn create_device_token(
     State(state): State<ManagementState>,
     headers: HeaderMap,
     Path(device_id): Path<String>,
-) -> Result<(StatusCode, Json<DeviceTokenResponse>), ManagementSessionError> {
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::header::HeaderName, HeaderValue); 1],
+        Json<DeviceTokenResponse>,
+    ),
+    ManagementSessionError,
+> {
     let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let _lease = authorize_tenant_mutation(&state, &headers).await?;
     let token = create_platform_device_token(
@@ -6515,7 +7140,53 @@ async fn create_device_token(
     )
     .await
     .map_err(management_device_token_error)?;
-    Ok((StatusCode::CREATED, Json(token)))
+    Ok((
+        StatusCode::CREATED,
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(token),
+    ))
+}
+
+async fn rotate_management_device_token(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+    Path((device_id, token_id)): Path<(String, String)>,
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::header::HeaderName, HeaderValue); 1],
+        Json<DeviceTokenResponse>,
+    ),
+    ManagementSessionError,
+> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let token_id = Uuid::parse_str(&token_id).map_err(|_| ManagementSessionError::BadRequest)?;
+    let active = DeviceTokenRepository::active_device_token(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        token_id,
+    )
+    .await
+    .map_err(management_device_token_repository_error)?
+    .ok_or(ManagementSessionError::NotFound)?;
+    if active.device_id != device_id {
+        return Err(ManagementSessionError::NotFound);
+    }
+
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let token = rotate_platform_device_token(
+        state.store.as_ref(),
+        &state.token_vault,
+        tenant.tenant_id,
+        token_id,
+    )
+    .await
+    .map_err(management_device_token_error)?;
+    Ok((
+        StatusCode::CREATED,
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(token),
+    ))
 }
 
 async fn authenticate(
