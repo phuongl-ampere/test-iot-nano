@@ -17,8 +17,11 @@
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Save Application</h2></header>
-    <form class="form-grid" action="/tenant/applications" method="post">
+    <header>
+      <div class="panel-heading"><h2>Save application</h2></div>
+      <p class="panel-caption">Saving an existing application ID updates its registration.</p>
+    </header>
+    <form class="form-grid form-grid--application" action="/tenant/applications" method="post">
       <label class="field">
         <span>Application ID</span>
         <input name="app_id" type="text" maxlength="64" required>
@@ -47,18 +50,21 @@
         <textarea name="allowed_scopes" rows="3" required></textarea>
       </label>
       <label class="field">
-        <span><input name="enabled" type="checkbox" checked> Enabled</span>
+        <span class="field-checkbox"><input name="enabled" type="checkbox" checked> Enabled</span>
       </label>
-      <button type="submit">Save Application</button>
+      <div class="form-actions"><button type="submit">Save application</button></div>
     </form>
   </section>
   <section class="workspace-panel">
-    <header><h2>Applications</h2></header>
+    <header>
+      <div class="panel-heading"><h2>Registered applications</h2></div>
+      <p class="panel-caption">Client secrets are not displayed in the tenant console.</p>
+    </header>
     {% if page.applications.is_empty() %}
-      <p class="empty-state">No OAuth applications have been registered.</p>
+      <p class="empty-state">No OAuth applications have been registered for this tenant.</p>
     {% else %}
-      <div class="table-wrap">
-        <table>
+      <div class="table-scroll">
+        <table class="data-table">
           <thead>
             <tr>
               <th scope="col">Application ID</th>
@@ -73,13 +79,13 @@
           <tbody>
             {% for application in page.applications %}
               <tr>
-                <td>{{ application.app_id }}</td>
-                <td>{{ application.client_id }}</td>
-                <td>{{ application.kind }}</td>
+                <td><strong>{{ application.app_id }}</strong></td>
+                <td><code>{{ application.client_id }}</code></td>
+                <td><span class="status-chip status-chip--neutral">{{ application.kind }}</span></td>
                 <td>{{ application.launch_url }}</td>
                 <td>{{ application.redirect_uris }}</td>
                 <td>{{ application.scopes }}</td>
-                <td>{{ application.status }}</td>
+                <td><span class="status-chip status-chip--neutral">{{ application.status }}</span></td>
               </tr>
             {% endfor %}
           </tbody>

@@ -11,10 +11,15 @@
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
     <h1>Alerts</h1>
+    <p>Review current alert activity for this tenant.</p>
   </section>
   <section class="workspace-panel">
+    <header>
+      <div class="panel-heading"><h2>Current alert activity</h2><span class="operation-note">Read-only</span></div>
+      <p class="panel-caption">Alert rule configuration, acknowledgement, and archiving are not available in this console yet.</p>
+    </header>
     {% if page.alerts.is_empty() %}
-      <p class="empty-state">No alerts recorded.</p>
+      <p class="empty-state">No alert activity has been recorded for this tenant.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
@@ -32,9 +37,17 @@
             {% for alert in page.alerts %}
               <tr>
                 <td><code>{{ alert.device_id }}</code></td>
-                <td>{{ alert.rule_name }}</td>
-                <td>{{ alert.severity }}</td>
-                <td>{{ alert.status }}</td>
+                <td><strong>{{ alert.rule_name }}</strong></td>
+                <td>
+                  {% if alert.severity == "Critical" %}
+                    <span class="status-chip status-chip--critical">{{ alert.severity }}</span>
+                  {% else if alert.severity == "Warning" %}
+                    <span class="status-chip status-chip--warning">{{ alert.severity }}</span>
+                  {% else %}
+                    <span class="status-chip status-chip--neutral">{{ alert.severity }}</span>
+                  {% endif %}
+                </td>
+                <td><span class="status-chip status-chip--neutral">{{ alert.status }}</span></td>
                 <td>{{ alert.last_value }}</td>
                 <td>{{ alert.updated_at }}</td>
               </tr>

@@ -11,43 +11,82 @@
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
     <h1>Asset Profiles</h1>
+    <p>Define reusable fields and dashboard defaults for tenant assets.</p>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Create asset profile</h2></header>
-    <form class="form-grid" action="/tenant/profiles/asset" method="post">
+    <header>
+      <div class="panel-heading"><h2>Create asset profile</h2></div>
+      <p class="panel-caption">JSON syntax is checked in this browser before submit. Server validation remains authoritative.</p>
+    </header>
+    <form class="form-grid form-grid--profile" action="/tenant/profiles/asset" method="post" data-json-form>
       <label class="field">
         <span>Name</span>
         <input name="name" type="text" maxlength="128" required>
       </label>
       <label class="field">
-        <span>Fields</span>
-        <textarea name="fields" rows="4" required>{}</textarea>
+        <span>Fields (JSON)</span>
+        <textarea name="fields" rows="4" required data-json-input aria-describedby="asset-profile-fields-feedback">{}</textarea>
+        <span id="asset-profile-fields-feedback" class="json-feedback" data-json-feedback role="status"></span>
       </label>
       <label class="field">
-        <span>Dashboard defaults</span>
-        <textarea name="dashboard_defaults" rows="4" required>{}</textarea>
+        <span>Dashboard defaults (JSON)</span>
+        <textarea name="dashboard_defaults" rows="4" required data-json-input aria-describedby="asset-profile-dashboard-feedback">{}</textarea>
+        <span id="asset-profile-dashboard-feedback" class="json-feedback" data-json-feedback role="status"></span>
       </label>
-      <div class="form-actions"><button type="submit">Create</button></div>
+      <div class="form-actions"><button type="submit">Create asset profile</button></div>
     </form>
   </section>
   <section class="workspace-panel">
-    <header><h2>Asset profiles</h2></header>
+    <header>
+      <div class="panel-heading"><h2>Existing asset profiles</h2></div>
+      <p class="panel-caption">Editing and deletion are not available in this console yet.</p>
+    </header>
     {% if page.profiles.is_empty() %}
-      <p class="empty-state">No asset profiles created.</p>
+      <p class="empty-state">No asset profiles exist. Create one before assigning a profile to an asset.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
-          <thead><tr><th scope="col">Profile</th><th scope="col">Name</th></tr></thead>
+          <thead><tr><th scope="col">Profile ID</th><th scope="col">Name</th></tr></thead>
           <tbody>
             {% for profile in page.profiles %}
-              <tr><td><code>{{ profile.id }}</code></td><td>{{ profile.name }}</td></tr>
+              <tr><td><code>{{ profile.id }}</code></td><td><strong>{{ profile.name }}</strong></td></tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
     {% endif %}
   </section>
+  <script>
+    (() => {
+      const form = document.querySelector("[data-json-form]");
+      if (!form) return;
+      const inputs = [...form.querySelectorAll("[data-json-input]")];
+      const validate = (input) => {
+        const feedback = input.parentElement.querySelector("[data-json-feedback]");
+        try {
+          JSON.parse(input.value);
+          input.setAttribute("aria-invalid", "false");
+          feedback.textContent = "";
+          feedback.classList.remove("is-invalid");
+          return true;
+        } catch (_) {
+          input.setAttribute("aria-invalid", "true");
+          feedback.textContent = "Enter valid JSON before saving.";
+          feedback.classList.add("is-invalid");
+          return false;
+        }
+      };
+      inputs.forEach((input) => input.addEventListener("input", () => validate(input)));
+      form.addEventListener("submit", (event) => {
+        const invalid = inputs.find((input) => !validate(input));
+        if (invalid) {
+          event.preventDefault();
+          invalid.focus();
+        }
+      });
+    })();
+  </script>
 {% endblock %}

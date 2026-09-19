@@ -11,14 +11,18 @@
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
     <h1>Device Relations</h1>
+    <p>Create semantic relations between tenant devices. Gateway topology is managed separately.</p>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Create relation</h2></header>
+    <header>
+      <div class="panel-heading"><h2>Create relation</h2></div>
+      <p class="panel-caption">Use a stable relation type such as <code>depends_on</code> or <code>feeds</code>.</p>
+    </header>
     {% if page.devices.is_empty() %}
-      <p class="empty-state">Devices are required before creating relations.</p>
+      <p class="empty-state">Provision tenant devices before creating a relation.</p>
     {% else %}
       <form class="form-grid" action="/tenant/relations" method="post">
         <label class="field">
@@ -46,9 +50,12 @@
     {% endif %}
   </section>
   <section class="workspace-panel">
-    <header><h2>Relations</h2></header>
+    <header>
+      <div class="panel-heading"><h2>Existing relations</h2></div>
+      <p class="panel-caption">Delete only relations that are no longer part of the tenant model.</p>
+    </header>
     {% if page.relations.is_empty() %}
-      <p class="empty-state">No device relations configured.</p>
+      <p class="empty-state">No device relations have been configured for this tenant.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
@@ -57,20 +64,24 @@
               <th scope="col">From</th>
               <th scope="col">Type</th>
               <th scope="col">To</th>
-              <th scope="col"></th>
+              <th scope="col">Action</th>
             </tr>
           </thead>
           <tbody>
             {% for relation in page.relations %}
               <tr>
-                <td>{{ relation.from_device }}</td>
+                <td><strong>{{ relation.from_device }}</strong></td>
                 <td><code>{{ relation.relation_type }}</code></td>
-                <td>{{ relation.to_device }}</td>
+                <td><strong>{{ relation.to_device }}</strong></td>
                 <td>
-                  <form action="/tenant/relations/delete" method="post">
-                    <input type="hidden" name="relation_id" value="{{ relation.id }}">
-                    <button type="submit">Delete</button>
-                  </form>
+                  <details class="confirmation">
+                    <summary>Delete relation</summary>
+                    <p>This removes the relation from {{ relation.from_device }} to {{ relation.to_device }}.</p>
+                    <form class="inline-form inline-form--compact" action="/tenant/relations/delete" method="post">
+                      <input type="hidden" name="relation_id" value="{{ relation.id }}">
+                      <button class="danger-button" type="submit">Delete relation</button>
+                    </form>
+                  </details>
                 </td>
               </tr>
             {% endfor %}

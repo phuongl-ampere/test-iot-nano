@@ -11,10 +11,15 @@
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
     <h1>Audit log</h1>
+    <p>Review the immutable history of management activity within this tenant.</p>
   </section>
   <section class="workspace-panel">
+    <header>
+      <div class="panel-heading"><h2>Audit events</h2><span class="operation-note">Read-only</span></div>
+      <p class="panel-caption">Audit events cannot be edited or deleted from the tenant console.</p>
+    </header>
     {% if page.events.is_empty() %}
-      <p class="empty-state">No audit events recorded.</p>
+      <p class="empty-state">No audit events have been recorded for this tenant.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
@@ -32,11 +37,11 @@
             {% for event in page.events %}
               <tr>
                 <td>{{ event.occurred_at }}</td>
-                <td>{{ event.actor_kind }}</td>
+                <td><span class="status-chip status-chip--neutral">{{ event.actor_kind }}</span></td>
                 <td><code>{{ event.actor_id }}</code></td>
                 <td><code>{{ event.action }}</code></td>
                 <td><code>{{ event.target }}</code></td>
-                <td><pre><code>{{ event.changes }}</code></pre></td>
+                <td><pre class="audit-changes"><code>{{ event.changes }}</code></pre></td>
               </tr>
             {% endfor %}
           </tbody>

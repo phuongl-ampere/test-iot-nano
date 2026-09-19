@@ -54,6 +54,11 @@ fn platform_template_source(name: &str) -> String {
     .unwrap_or_else(|error| panic!("could not read platform template {name}: {error}"))
 }
 
+fn platform_stylesheet_source() -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/platform-ui.css"))
+        .unwrap_or_else(|error| panic!("could not read platform stylesheet: {error}"))
+}
+
 fn active_navigation_key(template: &str) -> &str {
     const DECLARATION: &str = r##"{% let active_nav = ""##;
 
@@ -698,5 +703,76 @@ fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
         assert!(!devices.contains(unsupported));
         assert!(!assets.contains(unsupported));
         assert!(!tokens.contains(unsupported));
+    }
+}
+
+#[test]
+fn tenant_operations_templates_make_supported_work_clear_without_inventing_backend_actions() {
+    let device_profiles = platform_template_source("tenant_device_profiles.html");
+    let asset_profiles = platform_template_source("tenant_asset_profiles.html");
+    let groups = platform_template_source("tenant_groups.html");
+    let permissions = platform_template_source("tenant_permissions.html");
+    let topology = platform_template_source("tenant_topology.html");
+    let relations = platform_template_source("tenant_relations.html");
+    let applications = platform_template_source("tenant_applications.html");
+    let alerts = platform_template_source("tenant_alerts.html");
+    let audit = platform_template_source("tenant_audit.html");
+    let stylesheet = platform_stylesheet_source();
+
+    for template in [&device_profiles, &asset_profiles] {
+        assert!(template.contains("data-json-input"));
+        assert!(template.contains("data-json-feedback"));
+        assert!(template.contains("JSON syntax is checked in this browser before submit."));
+        assert!(template.contains("JSON.parse"));
+        assert!(template.contains("aria-invalid"));
+    }
+
+    for marker in [
+        "Remove member",
+        "Add member",
+        "Revoke permission",
+        "Assign child to gateway",
+        "Detach child from gateway",
+        "Delete relation",
+        "Save application",
+    ] {
+        assert!(
+            [
+                groups.as_str(),
+                permissions.as_str(),
+                topology.as_str(),
+                relations.as_str(),
+                applications.as_str(),
+            ]
+            .iter()
+            .any(|template| template.contains(marker)),
+            "supported action is explicitly labelled: {marker}"
+        );
+    }
+
+    for template in [&groups, &permissions, &topology, &relations] {
+        assert!(template.contains("<details class=\"confirmation\">"));
+    }
+
+    for template in [&applications, &alerts, &audit] {
+        assert!(template.contains("class=\"data-table\""));
+    }
+
+    for template in [&alerts, &audit] {
+        assert!(template.contains("Read-only"));
+        assert!(!template.contains("<form"));
+        assert!(!template.contains("Acknowledge"));
+        assert!(!template.contains("Archive"));
+    }
+
+    for marker in [
+        ".field textarea",
+        ".json-feedback",
+        ".operation-note",
+        ".status-chip--neutral",
+        ".status-chip--critical",
+        ".confirmation",
+    ] {
+        assert!(stylesheet.contains(marker), "stylesheet contains {marker}");
     }
 }

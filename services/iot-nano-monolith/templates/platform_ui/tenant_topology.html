@@ -11,14 +11,18 @@
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
     <h1>Gateway Topology</h1>
+    <p>Manage gateway-child assignments separately from general device relations.</p>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Assign gateway child</h2></header>
+    <header>
+      <div class="panel-heading"><h2>Assign gateway child</h2></div>
+      <p class="panel-caption">Only direct devices can be assigned beneath a gateway.</p>
+    </header>
     {% if page.children.is_empty() || page.gateways.is_empty() %}
-      <p class="empty-state">A direct device and a gateway are required.</p>
+      <p class="empty-state">A direct device and a gateway are required before creating a gateway-child assignment.</p>
     {% else %}
       <form class="form-grid" action="/tenant/topology/assign" method="post">
         <label class="field">
@@ -37,14 +41,17 @@
             {% endfor %}
           </select>
         </label>
-        <div class="form-actions"><button type="submit">Assign</button></div>
+        <div class="form-actions"><button type="submit">Assign child to gateway</button></div>
       </form>
     {% endif %}
   </section>
   <section class="workspace-panel">
-    <header><h2>Detach gateway child</h2></header>
+    <header>
+      <div class="panel-heading"><h2>Detach gateway child</h2></div>
+      <p class="panel-caption">Detaching returns the child device to direct connectivity.</p>
+    </header>
     {% if page.assigned_children.is_empty() %}
-      <p class="empty-state">No gateway children assigned.</p>
+      <p class="empty-state">No devices are currently assigned to a gateway.</p>
     {% else %}
       <form class="form-grid" action="/tenant/topology/detach" method="post">
         <label class="field">
@@ -55,14 +62,21 @@
             {% endfor %}
           </select>
         </label>
-        <div class="form-actions"><button type="submit">Detach</button></div>
+        <details class="confirmation">
+          <summary>Detach selected child</summary>
+          <p>The selected device will no longer use its gateway parent.</p>
+          <button class="danger-button" type="submit">Detach child from gateway</button>
+        </details>
       </form>
     {% endif %}
   </section>
   <section class="workspace-panel">
-    <header><h2>Devices</h2></header>
+    <header>
+      <div class="panel-heading"><h2>Topology devices</h2></div>
+      <p class="panel-caption">Gateway role and parent assignment are shown independently.</p>
+    </header>
     {% if page.devices.is_empty() %}
-      <p class="empty-state">No devices provisioned.</p>
+      <p class="empty-state">No devices are available for topology management.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
@@ -78,9 +92,9 @@
             {% for device in page.devices %}
               <tr>
                 <td><code>{{ device.device_id }}</code></td>
-                <td>{{ device.display_name }}</td>
-                <td>{{ device.role }}</td>
-                <td>{{ device.gateway }}</td>
+                <td><strong>{{ device.display_name }}</strong></td>
+                <td><span class="status-chip status-chip--neutral">{{ device.role }}</span></td>
+                <td><span class="status-chip status-chip--neutral">{{ device.gateway }}</span></td>
               </tr>
             {% endfor %}
           </tbody>
