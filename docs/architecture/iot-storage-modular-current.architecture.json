@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "IoT Nano Storage Modular Architecture",
+    "quality_profile": "showcase",
+    "viewBox": [1380, 760],
+    "views": [
+      {
+        "id": "runtime",
+        "label": "Runtime dependencies",
+        "focus": ["services", "facade", "domains", "existing", "sqlite", "timescale"],
+        "note": "Services depend on one stable storage facade; private modules choose the backend."
+      },
+      {
+        "id": "contracts",
+        "label": "Facade contract",
+        "focus": ["services", "facade", "contracts", "domains"],
+        "note": "Public paths stay at iot_storage while contracts and domains are private."
+      },
+      {
+        "id": "developer-loop",
+        "label": "Build and test lanes",
+        "focus": ["developer", "lane", "target", "fast-tests", "release"],
+        "note": "Each worktree and lane receives an isolated persistent target."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "developer",
+      "type": "external",
+      "label": "Developer or Agent",
+      "sublabel": "per-worktree",
+      "pos": [40, 570],
+      "size": [150, 62]
+    },
+    {
+      "id": "lane",
+      "type": "backend",
+      "label": "Cargo Lane Wrapper",
+      "sublabel": "scripts/dev/cargo-lane.sh",
+      "tag": "timed + isolated",
+      "pos": [270, 570],
+      "size": [180, 62]
+    },
+    {
+      "id": "target",
+      "type": "database",
+      "label": "Persistent Target Cache",
+      "sublabel": "worktree key + lane",
+      "tag": "no shared global target",
+      "pos": [520, 570],
+      "size": [180, 62]
+    },
+    {
+      "id": "fast-tests",
+      "type": "backend",
+      "label": "Focused Test Targets",
+      "sublabel": "crate or named test",
+      "pos": [800, 510],
+      "size": [175, 62]
+    },
+    {
+      "id": "release",
+      "type": "backend",
+      "label": "Release Verification",
+      "sublabel": "workspace + E2E + external",
+      "tag": "explicit only",
+      "pos": [800, 650],
+      "size": [185, 62]
+    },
+    {
+      "id": "services",
+      "type": "backend",
+      "label": "Service Consumers",
+      "sublabel": "iot-nano-api, core, monolith",
+      "pos": [40, 260],
+      "size": [190, 68]
+    },
+    {
+      "id": "facade",
+      "type": "backend",
+      "label": "iot-storage Facade",
+      "sublabel": "root exports, PlatformStore, errors",
+      "tag": "stable public paths",
+      "pos": [300, 260],
+      "size": [200, 70]
+    },
+    {
+      "id": "contracts",
+      "type": "security",
+      "label": "Private Contracts",
+      "sublabel": "identity, resources, OAuth, commands",
+      "pos": [620, 100],
+      "size": [210, 70]
+    },
+    {
+      "id": "domains",
+      "type": "backend",
+      "label": "Private Domain Modules",
+      "sublabel": "six private domain modules",
+      "pos": [620, 260],
+      "size": [260, 76]
+    },
+    {
+      "id": "existing",
+      "type": "backend",
+      "label": "Focused Existing Modules",
+      "sublabel": "audit, management, public API, relations",
+      "pos": [620, 430],
+      "size": [230, 70]
+    },
+    {
+      "id": "sqlite",
+      "type": "database",
+      "label": "SQLite Platform Store",
+      "sublabel": "development and embedded runtime",
+      "pos": [1040, 180],
+      "size": [190, 70]
+    },
+    {
+      "id": "timescale",
+      "type": "database",
+      "label": "Timescale Platform Store",
+      "sublabel": "Postgres parity backend",
+      "pos": [1040, 400],
+      "size": [205, 70]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "iot-storage crate",
+      "wraps": ["facade", "contracts", "domains", "existing", "sqlite", "timescale"],
+      "pad": 34
+    },
+    {
+      "kind": "region",
+      "label": "Developer feedback lanes",
+      "wraps": ["developer", "lane", "target", "fast-tests", "release"],
+      "pad": 30
+    }
+  ],
+  "connections": [
+    {
+      "id": "consumer-facade",
+      "from": "services",
+      "to": "facade",
+      "label": "repository traits and PlatformStore",
+      "variant": "emphasis",
+      "labelDy": -38
+    },
+    {
+      "id": "facade-contracts",
+      "from": "facade",
+      "to": "contracts",
+      "label": "re-export public contracts",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [560, 96]
+    },
+    {
+      "id": "facade-domains",
+      "from": "facade",
+      "to": "domains",
+      "variant": "emphasis"
+    },
+    {
+      "id": "facade-existing",
+      "from": "facade",
+      "to": "existing",
+      "label": "private modules",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": 44
+    },
+    {
+      "id": "domain-sqlite",
+      "from": "domains",
+      "to": "sqlite",
+      "label": "SQLite transactions",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -32
+    },
+    {
+      "id": "domain-timescale",
+      "from": "domains",
+      "to": "timescale",
+      "label": "Timescale transactions",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": 38
+    },
+    {
+      "id": "developer-lane",
+      "from": "developer",
+      "to": "lane",
+      "label": "select lane"
+    },
+    {
+      "id": "lane-target",
+      "from": "lane",
+      "to": "target",
+      "label": "CARGO_TARGET_DIR",
+      "variant": "security",
+      "labelDy": -34
+    },
+    {
+      "id": "target-fast",
+      "from": "target",
+      "to": "fast-tests"
+    },
+    {
+      "id": "target-release",
+      "from": "target",
+      "to": "release",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Facade",
+      "items": [
+        "Consumers keep existing iot_storage import paths",
+        "Domain modules are private implementation detail"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Parity",
+      "items": [
+        "SQLite and Timescale stay behind one PlatformStore",
+        "Focused behavior tests cover each extracted domain"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Feedback",
+      "items": [
+        "Fast lane runs one crate or test target",
+        "Release lane owns workspace, process, Timescale, and external checks"
+      ]
+    }
+  ]
+}
