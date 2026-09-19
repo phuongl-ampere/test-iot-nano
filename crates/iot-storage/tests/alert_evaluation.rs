@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Timelike, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AlertEvaluationEvent, AlertEvaluationRepository, AlertEvaluationResult, PlatformStore,
 };

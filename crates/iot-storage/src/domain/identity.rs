@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use chrono::Utc;
-use iot_core::{device_token_prefix, verify_device_token};
+use iot_nano_foundation::{device_token_prefix, verify_device_token};
 use sqlx::Row;
 
 use crate::{

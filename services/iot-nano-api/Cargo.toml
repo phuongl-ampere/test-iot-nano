@@ -12,7 +12,7 @@ aes-gcm.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
-iot-core = { path = "../../crates/iot-core" }
+iot-nano-foundation = { path = "../../crates/iot-nano-foundation" }
 iot-storage = { path = "../../crates/iot-storage" }
 rand_core.workspace = true
 serde.workspace = true

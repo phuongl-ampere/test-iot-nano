@@ -1,5 +1,5 @@
 use chrono::{Duration, TimeZone, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, NewOAuthAuthorizationCode,
     NewOAuthClientSecret, OAuthAuthorizationCodeExchange, OAuthClientCredentialsToken,

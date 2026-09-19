@@ -121,7 +121,7 @@ rumqttd, Docker Compose, and systemd.
 - [ ] Create Core migrations for telemetry, rollups, alerts, outbox, and
   commands only, without foreign keys to API tables.
 - [ ] Move SQLite/Postgres adapters into their owner service and delete
-  `iot-storage`, predecessor aliases, and unneeded `iot-core` runtime DTOs.
+  `iot-storage`, predecessor aliases, and unneeded `iot-nano-foundation` runtime DTOs.
 - [ ] Run the service suites against independently configured SQLite and
   Timescale stores.
 

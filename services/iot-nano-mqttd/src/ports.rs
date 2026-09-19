@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use chrono::{DateTime, Utc};
-use iot_core::{DeviceTelemetryPayload, GatewayTelemetryPayload};
+use iot_nano_foundation::{DeviceTelemetryPayload, GatewayTelemetryPayload};
 use iot_nano_stream::{
     GatewayEvent, GatewayEventKind, GatewayMessage, StreamPort, TelemetryMessage,
 };

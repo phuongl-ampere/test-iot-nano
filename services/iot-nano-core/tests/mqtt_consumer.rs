@@ -7,10 +7,10 @@ use std::{
 };
 
 use chrono::{TimeZone, Utc};
-use iot_core::TelemetryEvent;
 use iot_nano_core::{
     CoreStreamConsumer, IngestOutcome, MqttRuntime, MqttRuntimeConfig, MqttStreamProducer,
 };
+use iot_nano_foundation::TelemetryEvent;
 use iot_stream::{LocalStream, StreamConfig};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use serde_json::json;

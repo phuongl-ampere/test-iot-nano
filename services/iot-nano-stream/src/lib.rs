@@ -129,7 +129,7 @@ pub enum StreamError {
     #[error("stream drain deadline elapsed with {remaining} in-flight claims")]
     DrainTimeout { remaining: u64 },
     #[error(transparent)]
-    InvalidTelemetry(#[from] iot_core::TelemetryValidationError),
+    InvalidTelemetry(#[from] iot_nano_foundation::TelemetryValidationError),
     #[error("invalid gateway event")]
     InvalidGatewayEvent,
     #[error(transparent)]

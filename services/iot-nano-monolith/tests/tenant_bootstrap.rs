@@ -1,4 +1,4 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::bootstrap_system;
 use iot_storage::PlatformStore;
 

@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use iot_core::{
+use iot_nano_foundation::{
     DEVICE_TELEMETRY_TOPIC, DeviceTelemetryPayload, TelemetryValidationError, device_token_prefix,
     generate_device_token,
 };

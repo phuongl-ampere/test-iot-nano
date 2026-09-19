@@ -1,4 +1,4 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountStatus, NewSystemAccount, NewTenant, NewTenantAccount, PlatformStore,
     TenantIdentityError, TenantIdentityRepository, TenantStatus,

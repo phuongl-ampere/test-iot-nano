@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use iot_core::{
+use iot_nano_foundation::{
     IngestTuning, MqttConfigurationUpdate, SmtpConfigurationUpdate, SystemConfigurationError,
     SystemConfigurationUpdate, apply_system_configuration_update, read_system_configuration,
 };

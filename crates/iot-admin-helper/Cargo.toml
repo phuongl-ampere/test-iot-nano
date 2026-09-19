@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 clap.workspace = true
-iot-core = { path = "../iot-core" }
+iot-nano-foundation = { path = "../iot-nano-foundation" }
 serde_json.workspace = true
 thiserror.workspace = true
 

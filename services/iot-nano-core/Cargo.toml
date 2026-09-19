@@ -8,7 +8,7 @@ autobins = false
 
 [dependencies]
 chrono.workspace = true
-iot-core = { path = "../../crates/iot-core" }
+iot-nano-foundation = { path = "../../crates/iot-nano-foundation" }
 iot-storage = { path = "../../crates/iot-storage" }
 iot-stream = { package = "iot-nano-stream", path = "../../services/iot-nano-stream" }
 lettre.workspace = true

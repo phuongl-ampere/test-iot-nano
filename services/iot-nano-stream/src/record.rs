@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use iot_core::TelemetryEvent;
+use iot_nano_foundation::TelemetryEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;

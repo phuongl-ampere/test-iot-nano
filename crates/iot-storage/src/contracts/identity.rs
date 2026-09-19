@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
-use iot_core::TelemetryEvent;
+use iot_nano_foundation::TelemetryEvent;
 use thiserror::Error;
 
 use crate::PlatformStoreError;

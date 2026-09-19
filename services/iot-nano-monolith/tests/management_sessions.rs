@@ -10,7 +10,7 @@ use axum::{
     },
 };
 use iot_api::{OAuthBrowserSessionVerifier, TokenVault, hash_password};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{ManagementSessionRouter, bootstrap_system};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret, NewTenant,

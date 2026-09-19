@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use iot_core::{DeviceTokenError, device_token_prefix, generate_device_token, hash_device_token};
+use iot_nano_foundation::{
+    DeviceTokenError, device_token_prefix, generate_device_token, hash_device_token,
+};
 use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;

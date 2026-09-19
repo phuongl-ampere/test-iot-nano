@@ -6,8 +6,8 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_nano_core::{CoreStreamConsumer, PlatformTelemetryWriter, WriterError};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_storage::{
     GatewayIngestEventKind, GatewayIngestRepository, GatewayIngestRequest, GatewayIngestResult,
     PlatformStore, PlatformStoreError, TelemetryRepository,

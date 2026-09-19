@@ -5,7 +5,7 @@ use iot_api::{
     CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreCommandResponseRequest,
     CoreFacade, CoreFacadeError, CoreTelemetryBucket, CoreTelemetryQuery,
 };
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
+use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use iot_nano_monolith::PlatformCoreFacade;
 use iot_storage::{PlatformStore, TopologyRepository};
 use serde_json::json;

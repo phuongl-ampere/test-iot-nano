@@ -7,7 +7,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use iot_admin_helper::{HelperError, apply_config_files_with_api, read_config_files_with_api};
-use iot_core::SystemConfigurationUpdate;
+use iot_nano_foundation::SystemConfigurationUpdate;
 
 const DEFAULT_INGEST_ENV_PATH: &str = "/etc/rush-iot-nano/ingest.env";
 const DEFAULT_SMTP_ENV_PATH: &str = "/etc/rush-iot-nano/smtp.env";

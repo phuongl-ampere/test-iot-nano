@@ -5,7 +5,7 @@ use std::{
 };
 
 use iot_api::{hash_password, seed_tenant_test_users_sqlite};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{MonolithConfig, MonolithRuntime, bootstrap_system};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, NewTenant, NewTenantAccount,

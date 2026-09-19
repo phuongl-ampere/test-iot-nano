@@ -11,7 +11,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
-iot-core = { path = "../../crates/iot-core" }
+iot-nano-foundation = { path = "../../crates/iot-nano-foundation" }
 iot-nano-stream = { path = "../iot-nano-stream" }
 rumqttd = { package = "iot-mqtt-core", path = "vendor/rumqttd" }
 rumqttc.workspace = true

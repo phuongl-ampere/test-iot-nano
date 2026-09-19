@@ -3,7 +3,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
-use iot_core::{RpcMode, RpcRequest};
+use iot_nano_foundation::{RpcMode, RpcRequest};
 use iot_storage::{
     CommandLifecycleRepository, CommandOutboxRecord as PlatformCommandOutboxRecord, PlatformStore,
     PlatformStoreError,

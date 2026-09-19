@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use iot_core::RpcRequest;
+use iot_nano_foundation::RpcRequest;
 use iot_nano_mqttd::{RpcSessionRouter, SessionRegistration};
 use serde_json::json;
 use uuid::Uuid;

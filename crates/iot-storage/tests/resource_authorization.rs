@@ -1,4 +1,4 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountClass, AuditPrincipal, AuthorizationSubject, ManagementDeviceRepository, PlatformStore,
     ResourceAccess, ResourceAccessSource, ResourcePermission, UpdateManagementDevice,

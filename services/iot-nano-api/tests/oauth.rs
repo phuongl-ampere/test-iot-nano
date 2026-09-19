@@ -13,7 +13,7 @@ use iot_api::{
     OAuthBrowserSessionVerifier, public_oauth_router,
     public_oauth_router_with_browser_session_verifier,
 };
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret, OAuthRepository,
     PlatformStore,

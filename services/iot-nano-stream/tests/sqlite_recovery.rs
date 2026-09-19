@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
-use iot_core::TelemetryEvent;
+use iot_nano_foundation::TelemetryEvent;
 use iot_nano_stream::{
     AcknowledgeRequest, ClaimRequest, GatewayEvent, GatewayEventKind, GatewayMessage, GroupStart,
     LocalStream, StreamConfig, StreamError, StreamMessage, TelemetryMessage,

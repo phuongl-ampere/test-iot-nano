@@ -2,7 +2,7 @@ use iot_api::{
     AuthError, PrincipalKind, authenticate_system_account, authenticate_tenant_account,
     authenticate_user_account, hash_password,
 };
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     NewSystemAccount, NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository,
 };

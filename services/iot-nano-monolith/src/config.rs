@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use thiserror::Error;
 
 pub const RETIRED_ENVIRONMENT_NAMES: &[&str] = &[

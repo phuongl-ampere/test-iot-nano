@@ -10,7 +10,7 @@ use axum::{
     },
 };
 use iot_api::{TokenVault, hash_password, seed_tenant_test_users_sqlite};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{ManagementSessionRouter, bootstrap_system};
 use iot_storage::{NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository};
 use serde_json::{Value, json};

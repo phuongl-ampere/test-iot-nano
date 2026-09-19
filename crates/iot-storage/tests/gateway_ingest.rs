@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_storage::{
     GatewayIngestEventKind, GatewayIngestRepository, GatewayIngestRequest,
     GatewayIngestValidationError, PlatformStore, PlatformStoreError,

@@ -1,5 +1,5 @@
 use chrono::{Duration as ChronoDuration, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountClass, AuditPrincipal, ManagementAssetRepository, NewPublicAsset, NewPublicDevice,
     PlatformStore, PublicApiRepository, PublicDeviceError, PublicPrincipal, ResourceAccess,

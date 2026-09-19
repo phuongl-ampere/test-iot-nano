@@ -1,4 +1,4 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     NewResourcePermission, NewUserGroup, PermissionCreator, PlatformStore, ResourcePermission,
     TenantAuthorizationError,

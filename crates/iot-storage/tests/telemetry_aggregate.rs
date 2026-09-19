@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Timelike, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{PlatformStore, PlatformStoreError, TelemetryAggregateRepository};
 use sqlx::{Connection, PgConnection};
 

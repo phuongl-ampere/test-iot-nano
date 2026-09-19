@@ -207,7 +207,7 @@ async fn token_authenticated_device_receives_virtual_me_rpc_and_acknowledges_it(
 
     let command_id = Uuid::now_v7();
     let issued_at = Utc::now();
-    let request = iot_core::RpcRequest::new(
+    let request = iot_nano_foundation::RpcRequest::new(
         command_id,
         "sample_now",
         serde_json::json!({}),
@@ -292,7 +292,7 @@ async fn gateway_session_receives_child_command_on_the_gateway_virtual_topic() {
     ));
 
     let issued_at = Utc::now();
-    let request = iot_core::RpcRequest::new(
+    let request = iot_nano_foundation::RpcRequest::new(
         Uuid::now_v7(),
         "gateway_child_rpc",
         serde_json::json!({
@@ -372,13 +372,13 @@ async fn two_way_response_is_forwarded_only_after_the_matching_virtual_rpc_is_pu
     ));
 
     let issued_at = Utc::now();
-    let request = iot_core::RpcRequest::with_mode(
+    let request = iot_nano_foundation::RpcRequest::with_mode(
         Uuid::now_v7(),
         "sample_now",
         serde_json::json!({}),
         issued_at,
         issued_at + Duration::seconds(30),
-        iot_core::RpcMode::TwoWay,
+        iot_nano_foundation::RpcMode::TwoWay,
     )
     .unwrap();
     let command_id = request.id;

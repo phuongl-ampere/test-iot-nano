@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_nano_monolith::PlatformCommandResponse;
 use iot_nano_mqttd::{CommandResponseError, CommandResponsePort, TransportRpcResponse};
 use iot_storage::{NewCommandOutboxEntry, PlatformStore};

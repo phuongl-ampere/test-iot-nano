@@ -12,7 +12,7 @@ clap.workspace = true
 chrono.workspace = true
 fs2.workspace = true
 iot-api = { package = "iot-nano-api", path = "../iot-nano-api" }
-iot-core = { path = "../../crates/iot-core" }
+iot-nano-foundation = { path = "../../crates/iot-nano-foundation" }
 iot-nano-core = { path = "../iot-nano-core" }
 iot-nano-mqttd = { path = "../iot-nano-mqttd" }
 iot-nano-stream = { path = "../iot-nano-stream" }

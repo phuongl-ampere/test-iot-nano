@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use iot_core::TelemetryEvent;
+use iot_nano_foundation::TelemetryEvent;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use serde_json::json;
 use thiserror::Error;

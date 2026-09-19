@@ -1,5 +1,5 @@
 use chrono::{Duration, Timelike, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AlertIncidentRepository, AlertIncidentStatus, NewAlertIncident, NewNotificationOutboxEntry,
     NotificationKind, PlatformStore,

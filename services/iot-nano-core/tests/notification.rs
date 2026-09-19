@@ -1,11 +1,11 @@
 use std::{future::Future, path::Path, pin::Pin, sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration};
 use iot_nano_core::{
     EmailSender, NotificationError, PlatformNotificationDispatcher, SmtpConfig, SmtpConfigInput,
     load_live_smtp_config,
 };
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{NotificationRepository, PlatformStore};
 use sqlx::{Connection, PgConnection, Row};
 use tokio::sync::Notify;

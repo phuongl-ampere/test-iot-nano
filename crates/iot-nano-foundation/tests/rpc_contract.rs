@@ -1,5 +1,7 @@
 use chrono::{Duration, TimeZone, Utc};
-use iot_core::{CommandState, RpcMode, RpcRequest, RpcRequestValidationError, RpcTarget};
+use iot_nano_foundation::{
+    CommandState, RpcMode, RpcRequest, RpcRequestValidationError, RpcTarget,
+};
 use serde_json::json;
 use uuid::Uuid;
 

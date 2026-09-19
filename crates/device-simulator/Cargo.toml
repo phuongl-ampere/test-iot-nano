@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-iot-core = { path = "../iot-core" }
+iot-nano-foundation = { path = "../iot-nano-foundation" }
 rumqttc.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

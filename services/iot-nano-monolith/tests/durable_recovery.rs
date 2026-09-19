@@ -7,7 +7,7 @@ use std::{
 
 use chrono::Utc;
 use iot_api::{TokenVault, create_platform_device_token};
-use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_nano_monolith::{CacheEntry, MonolithConfig, MonolithRuntime, ShutdownError, StartupError};
 use iot_nano_mqttd::{
     BrokerLifecycleHandle, BrokerStorage, ListenerConfiguration, MuxSettings,

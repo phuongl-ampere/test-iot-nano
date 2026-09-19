@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use chrono::{Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
-use iot_core::{RpcMode, RpcRequest};
+use iot_nano_foundation::{RpcMode, RpcRequest};
 use iot_nano_mqttd::{
     AuthenticatedDevice, DeviceAuthenticator, MqttdDeviceTransport, RpcResponseForwarder,
     TransportAuthRequest, TransportError, TransportRpcResponse, TransportUplink, UplinkForwarder,

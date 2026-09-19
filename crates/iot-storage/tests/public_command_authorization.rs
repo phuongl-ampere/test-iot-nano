@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration};
 #[cfg(feature = "test-support")]
 use iot_storage::{
     AccountClass, PublicApiRepository, PublicPrincipal, install_public_device_list_handoff_hook,

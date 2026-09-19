@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{Duration as ChronoDuration, Utc};
 use iot_api::{TokenVault, provision_platform_device_token};
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_nano_monolith::{MonolithConfig, MonolithRuntime, ShutdownError};
 use iot_storage::{NewCommandOutboxEntry, PlatformStore};
 use tempfile::TempDir;

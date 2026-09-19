@@ -11,7 +11,7 @@ test-support = []
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
-iot-core = { path = "../iot-core" }
+iot-nano-foundation = { path = "../iot-nano-foundation" }
 sqlx.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -1,4 +1,4 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{AccountClass, AuthorizationSubject, PlatformStore, ResourcePermission};
 use uuid::Uuid;
 

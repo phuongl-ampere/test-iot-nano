@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use iot_core::{DatabaseStorage, StorageConfiguration, StorageConfigurationError};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration, StorageConfigurationError};
 
 #[test]
 fn parses_timescale_and_sqlite_startup_configuration() {

@@ -3,7 +3,7 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use iot_admin_helper::{
     apply_config_file, apply_config_files, apply_config_files_with_api, read_config_file,
 };
-use iot_core::{
+use iot_nano_foundation::{
     IngestTuning, MqttConfigurationUpdate, SmtpConfigurationUpdate, SystemConfigurationUpdate,
 };
 

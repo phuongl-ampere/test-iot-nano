@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
 use std::process::Command;
 
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{
     ConfigError, MonolithConfig, RETIRED_ENVIRONMENT_NAMES, validate_retired_environment,
 };

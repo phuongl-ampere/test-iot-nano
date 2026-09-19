@@ -163,7 +163,7 @@ Make the target names and dependencies compile without aliases:
   contract types;
 - split `iot-storage` into API metadata storage and Core data-plane storage,
   then remove the shared crate dependency;
-- remove `iot-core` after each service owns its local implementation or
+- remove `iot-nano-foundation` after each service owns its local implementation or
   contract DTO;
 - remove old migrations and create only target API and Core schemas.
 

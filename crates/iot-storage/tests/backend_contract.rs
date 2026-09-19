@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
+use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use iot_storage::{
     CommandLifecycleRepository, CommandOutboxState, CommandRepository, NewCommandOutboxEntry,
     NewTenant, NewTenantAccount, PlatformStore, PlatformStoreError, TelemetryRepository,

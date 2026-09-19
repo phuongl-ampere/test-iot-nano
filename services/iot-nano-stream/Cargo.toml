@@ -9,7 +9,7 @@ autobins = false
 [dependencies]
 chrono.workspace = true
 crc32fast.workspace = true
-iot-core = { path = "../../crates/iot-core" }
+iot-nano-foundation = { path = "../../crates/iot-nano-foundation" }
 rusqlite = "0.37.0"
 serde.workspace = true
 serde_json.workspace = true

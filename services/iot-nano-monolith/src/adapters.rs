@@ -6,8 +6,8 @@ use iot_api::{
     CoreCommandResponseRequest, CoreFacade, CoreFacadeError, CoreTelemetryBucket,
     CoreTelemetryPoint, CoreTelemetryQuery,
 };
-use iot_core::RpcRequest;
 use iot_nano_core::{CommandTransport, CommandTransportError, TransportRpcPublishRequest};
+use iot_nano_foundation::RpcRequest;
 use iot_nano_mqttd::{
     AuthenticatedDevice, AuthorizationError, CommandResponseError, CommandResponsePort,
     DeviceAuthorizationPort, GatewayAuthorization, GatewayAuthorizationRequest, RpcSessionRouter,
@@ -315,10 +315,10 @@ fn command_state_name_from_database(state: &str) -> Result<&'static str, CoreFac
     }
 }
 
-fn rpc_mode_from_database(mode: &str) -> Result<iot_core::RpcMode, CoreFacadeError> {
+fn rpc_mode_from_database(mode: &str) -> Result<iot_nano_foundation::RpcMode, CoreFacadeError> {
     match mode {
-        "one_way" => Ok(iot_core::RpcMode::OneWay),
-        "two_way" => Ok(iot_core::RpcMode::TwoWay),
+        "one_way" => Ok(iot_nano_foundation::RpcMode::OneWay),
+        "two_way" => Ok(iot_nano_foundation::RpcMode::TwoWay),
         _ => Err(CoreFacadeError::Unavailable),
     }
 }

@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use sqlx::{Executor, PgPool, SqlitePool, postgres::PgPoolOptions, sqlite::SqlitePoolOptions};
 use thiserror::Error;
 

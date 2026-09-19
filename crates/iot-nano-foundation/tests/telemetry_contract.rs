@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use iot_core::{TelemetryEvent, TelemetryValidationError};
+use iot_nano_foundation::{TelemetryEvent, TelemetryValidationError};
 use serde_json::json;
 use uuid::Uuid;
 

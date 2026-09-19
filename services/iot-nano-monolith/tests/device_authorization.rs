@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use iot_core::{
+use iot_nano_foundation::{
     DatabaseStorage, StorageConfiguration, device_token_prefix, generate_device_token,
     hash_device_token,
 };

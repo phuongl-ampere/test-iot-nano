@@ -23,7 +23,7 @@ use iot_api::{
     create_platform_device_token, generate_session_id, hash_password,
     provision_platform_device_token, validate_password,
 };
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     ApplicationKind, ApplicationRepository, AuditAction, AuditEvent, AuditEventCursor,
     AuditEventError, AuditEventRepository, AuditPrincipal, AuditTargetType,

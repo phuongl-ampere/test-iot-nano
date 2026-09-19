@@ -8,7 +8,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{MonolithConfig, MonolithRuntime};
 
 struct Fixture {

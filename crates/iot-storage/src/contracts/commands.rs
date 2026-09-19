@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
-use iot_core::RpcMode;
+use iot_nano_foundation::RpcMode;
 
 use crate::{PlatformStoreError, SqliteStoreError};
 

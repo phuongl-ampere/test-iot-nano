@@ -1,7 +1,7 @@
 use std::{future::Future, sync::Arc};
 
 use chrono::{DateTime, Utc};
-use iot_core::TelemetryEvent;
+use iot_nano_foundation::TelemetryEvent;
 use iot_stream::{StreamError, StreamPort, TelemetryMessage};
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use thiserror::Error;
@@ -173,7 +173,7 @@ mod tests {
     };
 
     use chrono::{TimeZone, Utc};
-    use iot_core::TelemetryEvent;
+    use iot_nano_foundation::TelemetryEvent;
     use iot_stream::{
         AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment,
         HeartbeatRequest, PartitionId, StreamError, StreamMessage, StreamPort,

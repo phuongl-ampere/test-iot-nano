@@ -9,7 +9,7 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use iot_core::RpcMode;
+use iot_nano_foundation::RpcMode;
 use iot_storage::{
     AuthorizationRepository, NewPublicAsset, NewPublicDevice, PlatformStore, PublicAlert,
     PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice, PublicDeviceError,

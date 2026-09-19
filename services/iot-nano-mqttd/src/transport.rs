@@ -13,7 +13,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
-use iot_core::{RpcMode, RpcRequest};
+use iot_nano_foundation::{RpcMode, RpcRequest};
 use iot_nano_stream::StreamPort;
 use rumqttc::v5::mqttbytes::{
     QoS as V5QoS,

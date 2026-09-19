@@ -125,7 +125,7 @@ exist.
 - [ ] **Step 3: Register the package and define exact configuration**
 
 Add the workspace member, library dependencies on the four service libraries,
-`iot-core`, `iot-storage`, `tokio-util`, and `fs2`. Enable Tokio `signal`.
+`iot-nano-foundation`, `iot-storage`, `tokio-util`, and `fs2`. Enable Tokio `signal`.
 Parse no legacy service value.
 
 ```rust

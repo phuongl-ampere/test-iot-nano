@@ -12,7 +12,7 @@ use std::{
 
 use chrono::{Duration, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
-use iot_core::RpcRequest;
+use iot_nano_foundation::RpcRequest;
 use iot_nano_mqttd::{
     AuthenticatedDevice, AuthorizationError, CommandResponseError, CommandResponsePort,
     DeviceAuthenticator, DeviceAuthorizationPort, GatewayAuthorization,

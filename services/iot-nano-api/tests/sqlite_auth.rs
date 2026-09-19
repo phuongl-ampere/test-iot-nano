@@ -10,7 +10,7 @@ use iot_api::{
     CoreCommandResponseRequest, CoreFacade, CoreFacadeError, CoreTelemetryPoint,
     CoreTelemetryQuery, TokenVault, public_v1_router,
 };
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{ApplicationKind, ApplicationRepository, NewApplication, PlatformStore};
 use serde_json::json;
 use sha2::{Digest, Sha256};

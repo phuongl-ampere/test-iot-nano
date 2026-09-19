@@ -1,10 +1,10 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use chrono::{Duration, Utc};
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_nano_core::{
     CommandTransport, CommandTransportError, PlatformCommandDispatcher, TransportRpcPublishRequest,
 };
+use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_storage::{NewCommandOutboxEntry as PlatformCommand, PlatformStore};
 use serde_json::json;
 use sqlx::{Connection, PgConnection, Row};

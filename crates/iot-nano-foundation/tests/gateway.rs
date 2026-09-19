@@ -1,4 +1,4 @@
-use iot_core::{
+use iot_nano_foundation::{
     GATEWAY_CONNECT_TOPIC, GATEWAY_DISCONNECT_TOPIC, GATEWAY_TELEMETRY_TOPIC,
     GatewayTelemetryPayload,
 };

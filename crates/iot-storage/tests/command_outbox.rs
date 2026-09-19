@@ -1,7 +1,7 @@
 use std::env;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use iot_core::{DatabaseStorage, RpcMode, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_storage::{
     CommandOutboxState, NewCommandOutboxEntry, PlatformStore, PlatformStoreError, SqliteStore,
     SqliteStoreError,

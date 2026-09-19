@@ -9,13 +9,13 @@ use std::{
 };
 
 use chrono::Utc;
-use iot_core::RpcMode;
-use iot_core::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_nano_core::{
     CommandTransport, CommandTransportError, CoreRuntime, CoreRuntimeConfig, CoreRuntimeError,
     CoreRuntimeWorkerError, CoreStreamConsumer, EmailSender, IngestMetrics, NotificationError,
     PlatformTelemetryWriter, TransportRpcPublishRequest, WriterError,
 };
+use iot_nano_foundation::RpcMode;
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration, TelemetryEvent};
 use iot_storage::{NewCommandOutboxEntry as PlatformCommand, PlatformStore};
 use iot_stream::{
     AcknowledgeRequest, AppendReceipt, ClaimRequest, ClaimedRecord, GroupAssignment,

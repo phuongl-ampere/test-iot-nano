@@ -12,10 +12,10 @@ use std::{
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use fs2::FileExt;
 use iot_api::TokenVault;
-use iot_core::StorageConfiguration;
 use iot_nano_core::{
     CommandTransport, CoreRuntime, CoreRuntimeConfig, EmailSender, IngestMetrics, NotificationError,
 };
+use iot_nano_foundation::StorageConfiguration;
 use iot_nano_mqttd::{
     BrokerStorage, CachePort, CommandResponsePort, DeviceAuthorizationPort, MqttListenerConfig,
     MqttRuntime, MqttRuntimeConfig, RetentionPolicy, RpcSessionRouter, SqliteStorage,

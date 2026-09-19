@@ -23,7 +23,7 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Timelike, Utc};
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use sqlx::{
     PgPool, Postgres, Row, Sqlite, SqlitePool, Transaction,
     postgres::PgRow,

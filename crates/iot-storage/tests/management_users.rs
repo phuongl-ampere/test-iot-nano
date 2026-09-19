@@ -1,4 +1,4 @@
-use iot_core::{DatabaseStorage, StorageConfiguration};
+use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountClass, BUILT_IN_USER_WORKSPACE, CreateManagementUser, ManagementUserError,
     ManagementUserRepository, ManagementUserRole, PlatformStore, UpdateManagementUser,

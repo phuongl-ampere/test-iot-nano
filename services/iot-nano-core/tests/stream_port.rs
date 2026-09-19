@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use chrono::{TimeZone, Utc};
-use iot_core::TelemetryEvent;
 use iot_nano_core::CoreStreamConsumer;
+use iot_nano_foundation::TelemetryEvent;
 use iot_stream::{LocalStream, StreamConfig, TelemetryMessage};
 use serde_json::json;
 
