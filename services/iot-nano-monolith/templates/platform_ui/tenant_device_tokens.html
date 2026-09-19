@@ -18,19 +18,23 @@
   {% endif %}
   {% if page.has_credential %}
     <section class="workspace-panel">
-      <header><h2>New device token</h2></header>
-      <p><code id="device-token-credential" class="credential">{{ page.credential }}</code></p>
+      <header class="panel-heading"><div><h2>New device token</h2><p class="panel-caption">This token is shown once.</p></div></header>
+      <div class="credential-control credential-control-panel">
+        <code id="device-token-credential" class="credential">{{ page.credential }}</code>
+        <button class="icon-button credential-copy" type="button" data-copy-target="device-token-credential" data-copy-status="device-token-copy-status" aria-label="Copy device token" title="Copy device token">Copy</button>
+        <span id="device-token-copy-status" class="copy-status" role="status" aria-live="polite"></span>
+      </div>
       <p class="notice" role="status">Store this token before leaving this page.</p>
     </section>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Issue token</h2></header>
+    <header class="panel-heading"><div><h2>Issue token</h2><p class="panel-caption">Issues another credential for this device.</p></div></header>
     <form class="form-grid" action="/tenant/devices/{{ page.device_id|urlencode_strict }}/tokens/issue" method="post">
       <div class="form-actions"><button type="submit">Issue token</button></div>
     </form>
   </section>
   <section class="workspace-panel">
-    <header><h2>Device tokens</h2></header>
+    <header class="panel-heading"><div><h2>Device tokens</h2><p class="panel-caption">Revoke a token when it is no longer needed.</p></div></header>
     {% if page.tokens.is_empty() %}
       <p class="empty-state">No device tokens issued.</p>
     {% else %}
@@ -51,13 +55,17 @@
                 <td><code>{{ token.prefix }}</code></td>
                 <td>{{ token.created_at }}</td>
                 <td>{{ token.last_used_at }}</td>
-                <td>{{ token.status }}</td>
+                <td><span class="status-chip">{{ token.status }}</span></td>
                 <td>
                   {% if token.revocable %}
-                    <form action="/tenant/devices/{{ page.device_id|urlencode_strict }}/tokens/revoke" method="post">
-                      <input name="token_id" type="hidden" value="{{ token.id }}">
-                      <button type="submit">Revoke</button>
-                    </form>
+                    <details class="confirmation">
+                      <summary>Revoke token</summary>
+                      <p>Revoking this token cannot be undone.</p>
+                      <form action="/tenant/devices/{{ page.device_id|urlencode_strict }}/tokens/revoke" method="post">
+                        <input name="token_id" type="hidden" value="{{ token.id }}">
+                        <button class="danger-button" type="submit">Confirm revoke</button>
+                      </form>
+                    </details>
                   {% endif %}
                 </td>
               </tr>
@@ -67,4 +75,24 @@
       </div>
     {% endif %}
   </section>
+  <script>
+    (() => {
+      document.querySelectorAll("[data-copy-target]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const value = document.getElementById(button.dataset.copyTarget);
+          const status = document.getElementById(button.dataset.copyStatus);
+          if (!value || !status || !navigator.clipboard) {
+            if (status) status.textContent = "Copy is unavailable in this browser.";
+            return;
+          }
+          try {
+            await navigator.clipboard.writeText(value.textContent || "");
+            status.textContent = "Token copied.";
+          } catch (_) {
+            status.textContent = "Copy failed. Select the token and copy it manually.";
+          }
+        });
+      });
+    })();
+  </script>
 {% endblock %}

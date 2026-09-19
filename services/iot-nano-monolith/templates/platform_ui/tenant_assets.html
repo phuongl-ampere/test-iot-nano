@@ -16,7 +16,12 @@
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Create asset</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Create asset</h2>
+        <p class="panel-caption">Choose a parent only when this asset belongs below another asset.</p>
+      </div>
+    </header>
     <form class="form-grid" action="/tenant/assets" method="post">
       <label class="field">
         <span>Name</span>
@@ -35,7 +40,7 @@
     </form>
   </section>
   <section class="workspace-panel">
-    <header><h2>Assets</h2></header>
+    <header class="panel-heading"><div><h2>Assets</h2><p class="panel-caption">Use a row link to retain the selected asset in the page URL.</p></div></header>
     {% if page.assets.is_empty() %}
       <p class="empty-state">No assets created.</p>
     {% else %}
@@ -51,11 +56,11 @@
           </thead>
           <tbody>
             {% for asset in page.assets %}
-              <tr>
-                <td><code>{{ asset.id }}</code></td>
+              <tr id="asset-{{ asset.id|urlencode_strict }}">
+                <td><a class="row-anchor" href="#asset-{{ asset.id|urlencode_strict }}" aria-label="Link to asset {{ asset.name }}"><code>{{ asset.id }}</code></a></td>
                 <td>{{ asset.name }}</td>
                 <td>{{ asset.parent }}</td>
-                <td>{{ asset.status }}</td>
+                <td><span class="status-chip">{{ asset.status }}</span></td>
               </tr>
             {% endfor %}
           </tbody>

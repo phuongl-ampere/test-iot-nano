@@ -16,7 +16,12 @@
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header><h2>Provision device</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Provision device</h2>
+        <p class="panel-caption">A credential is shown once after provisioning.</p>
+      </div>
+    </header>
     <form class="form-grid" action="/tenant/devices" method="post">
       <label class="field">
         <span>Display name</span>
@@ -25,8 +30,33 @@
       <div class="form-actions"><button type="submit">Provision</button></div>
     </form>
   </section>
-  <section class="workspace-panel">
-    <header><h2>Devices</h2></header>
+  <section
+    id="devices-panel"
+    class="workspace-panel refresh-panel"
+    data-pause-when-hidden
+    aria-live="polite"
+    hx-get="/tenant/devices"
+    hx-trigger="every 10s, visibilityrefresh"
+    hx-select="#devices-panel"
+    hx-target="#devices-panel"
+    hx-swap="outerHTML"
+  >
+    <header class="panel-heading">
+      <div>
+        <h2>Devices</h2>
+        <p class="panel-caption">Refreshes every 10 seconds while this tab is visible.</p>
+      </div>
+      <a
+        class="button-link button-link-secondary refresh-control"
+        href="/tenant/devices"
+        hx-get="/tenant/devices"
+        hx-select="#devices-panel"
+        hx-target="#devices-panel"
+        hx-swap="outerHTML"
+        aria-label="Refresh device list"
+        title="Refresh device list"
+      >Refresh</a>
+    </header>
     {% if page.devices.is_empty() %}
       <p class="empty-state">No devices provisioned.</p>
     {% else %}
@@ -34,19 +64,21 @@
         <table class="data-table">
           <thead>
             <tr>
-              <th scope="col">Device</th>
-              <th scope="col">Name</th>
-              <th scope="col">Status</th>
+              <th scope="col">Device ID</th>
+              <th scope="col">Display name</th>
+              <th scope="col">Device status</th>
               <th scope="col">Assigned asset</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
             {% for device in page.devices %}
-              <tr>
-                <td><a class="resource-link" href="/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens"><code>{{ device.device_id }}</code></a></td>
+              <tr id="device-{{ device.device_id|urlencode_strict }}">
+                <td><a class="row-anchor" href="#device-{{ device.device_id|urlencode_strict }}" aria-label="Link to device {{ device.display_name }}"><code>{{ device.device_id }}</code></a></td>
                 <td>{{ device.display_name }}</td>
-                <td>{{ device.status }}</td>
+                <td><span class="status-chip">{{ device.status }}</span></td>
                 <td>{{ device.asset }}</td>
+                <td><a class="resource-link action-link" href="/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens">Manage tokens<span class="visually-hidden"> for {{ device.display_name }}</span></a></td>
               </tr>
             {% endfor %}
           </tbody>

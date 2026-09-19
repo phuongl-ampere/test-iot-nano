@@ -618,3 +618,57 @@ fn user_device_detail_renders_only_server_supplied_device_context() {
     assert_read_only_page_allows_only_logout_form(&rendered);
     assert!(!rendered.contains("/commands"));
 }
+
+#[test]
+fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
+    let devices = platform_template_source("tenant_devices.html");
+    let credential = platform_template_source("tenant_device_credential.html");
+    let tokens = platform_template_source("tenant_device_tokens.html");
+    let assets = platform_template_source("tenant_assets.html");
+
+    for marker in [
+        "id=\"devices-panel\"",
+        "hx-get=\"/tenant/devices\"",
+        "hx-trigger=\"every 10s, visibilityrefresh\"",
+        "hx-select=\"#devices-panel\"",
+        "hx-target=\"#devices-panel\"",
+        "hx-swap=\"outerHTML\"",
+        "data-pause-when-hidden",
+        "aria-live=\"polite\"",
+        "href=\"/tenant/devices\"",
+        "id=\"device-{{ device.device_id|urlencode_strict }}\"",
+        "href=\"/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens\"",
+        "action=\"/tenant/devices\"",
+    ] {
+        assert!(
+            devices.contains(marker),
+            "devices template contains {marker}"
+        );
+    }
+
+    for template in [&credential, &tokens] {
+        assert!(template.contains("data-copy-target"));
+        assert!(template.contains("navigator.clipboard.writeText"));
+        assert!(template.contains("Copy"));
+        assert!(!template.contains("href=\"?credential="));
+    }
+
+    for marker in [
+        "id=\"asset-{{ asset.id|urlencode_strict }}\"",
+        "href=\"#asset-{{ asset.id|urlencode_strict }}\"",
+        "action=\"/tenant/assets\"",
+    ] {
+        assert!(assets.contains(marker), "assets template contains {marker}");
+    }
+
+    assert!(tokens.contains("<details class=\"confirmation\""));
+    assert!(tokens.contains(
+        "action=\"/tenant/devices/{{ page.device_id|urlencode_strict }}/tokens/revoke\""
+    ));
+    // UI-only pages advertise only actions backed by the existing HTML forms.
+    for unsupported in ["/edit", "/delete", "/rotate"] {
+        assert!(!devices.contains(unsupported));
+        assert!(!assets.contains(unsupported));
+        assert!(!tokens.contains(unsupported));
+    }
+}
