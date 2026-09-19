@@ -508,6 +508,39 @@ fn base_layout_provides_the_local_htmx_visibility_pause_primitive() {
 }
 
 #[test]
+fn system_infrastructure_and_device_pages_load_local_htmx_exactly_once() {
+    let identity = PlatformUiIdentity::new("Platform operator");
+    let infrastructure = PlatformUiRenderer::render_system_infrastructure(
+        &identity,
+        &SystemInfrastructurePage::new("Ready", Vec::new(), Vec::new()),
+    )
+    .unwrap();
+    let base = platform_template_source("base.html");
+    let devices = platform_template_source("tenant_devices.html");
+    let htmx_src = r#"src="/assets/htmx.min.js""#;
+
+    assert_eq!(
+        infrastructure.matches(htmx_src).count(),
+        1,
+        "rendered System Infrastructure loads local HTMX once"
+    );
+    assert_eq!(
+        base.matches(htmx_src).count(),
+        1,
+        "the inherited base layout provides Device with local HTMX once"
+    );
+    assert!(
+        devices.contains(r#"{% extends "platform_ui/base.html" %}"#),
+        "Device inherits the shared base layout"
+    );
+    assert_eq!(
+        devices.matches(htmx_src).count(),
+        0,
+        "Device does not add a second local HTMX script"
+    );
+}
+
+#[test]
 fn tenant_users_layout_escapes_rows_and_contains_only_tenant_management_fields() {
     let identity = PlatformUiIdentity::new("Tenant <account>");
     let page = TenantUsersPage::new(
