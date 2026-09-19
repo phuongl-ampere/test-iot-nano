@@ -23,6 +23,9 @@ body {
 .topbar {
   display: flex;
   min-height: 58px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
@@ -103,6 +106,11 @@ body {
 }
 
 .sidebar {
+  align-self: start;
+  max-height: calc(100vh - 58px);
+  position: sticky;
+  top: 58px;
+  overflow-y: auto;
   padding: 14px 10px;
   background: #f9fbfd;
   border-right: 1px solid #d3dce8;
@@ -113,14 +121,52 @@ body {
   gap: 3px;
 }
 
+.nav-section {
+  display: grid;
+  gap: 3px;
+}
+
+.nav-section + .nav-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.nav-section-label {
+  margin: 0;
+  padding: 0 10px 3px;
+  color: #718198;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
 .nav-link {
-  display: block;
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 9px 10px;
   color: #536277;
   border-left: 3px solid transparent;
   font-size: 13px;
   font-weight: 650;
   text-decoration: none;
+}
+
+.nav-link-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-count-slot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
 }
 
 .nav-link:hover,
@@ -300,6 +346,25 @@ button:focus-visible {
   outline-offset: 1px;
 }
 
+.icon-button {
+  display: inline-grid;
+  width: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  place-items: center;
+}
+
+button:disabled,
+button[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+[data-pause-when-hidden][aria-busy="true"] {
+  opacity: 0.68;
+}
+
 .empty-state {
   margin: 0;
   padding: 22px 14px;
@@ -429,6 +494,7 @@ button:focus-visible {
 
   .sidebar {
     overflow-x: auto;
+    overflow-y: visible;
     padding: 6px 10px;
     border-right: 0;
     border-bottom: 1px solid #d3dce8;
@@ -437,7 +503,26 @@ button:focus-visible {
   .side-nav {
     display: flex;
     min-width: max-content;
+    gap: 14px;
+  }
+
+  .nav-section {
+    display: flex;
+    align-items: center;
     gap: 2px;
+  }
+
+  .nav-section + .nav-section {
+    margin-top: 0;
+    padding-top: 0;
+    padding-left: 14px;
+    border-top: 0;
+    border-left: 1px solid #d3dce8;
+  }
+
+  .nav-section-label {
+    padding: 0 4px;
+    white-space: nowrap;
   }
 
   .nav-link {

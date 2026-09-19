@@ -4,15 +4,8 @@
 {% block account_kind %}Tenant Account{% endblock %}
 {% block navigation_label %}Tenant navigation{% endblock %}
 {% block navigation %}
-  <a class="nav-link" href="/tenant">Overview</a>
-  <a class="nav-link active" href="/tenant/users" aria-current="page">Users</a>
-  <a class="nav-link" href="/tenant/assets">Assets</a>
-  <a class="nav-link" href="/tenant/devices">Devices</a>
-  <a class="nav-link" href="/tenant/profiles/device">Device profiles</a>
-  <a class="nav-link" href="/tenant/profiles/asset">Asset profiles</a>
-  <a class="nav-link" href="/tenant/topology">Topology</a>
-  <a class="nav-link" href="/tenant/groups">Groups</a>
-  <a class="nav-link" href="/tenant/permissions">Permissions</a>
+  {% let active_nav = "users" %}
+  {% include "platform_ui/tenant_navigation.html" %}
 {% endblock %}
 {% block content %}
   <section class="page-heading">

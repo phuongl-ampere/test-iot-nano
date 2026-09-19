@@ -5,6 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}IoT Nano{% endblock %}</title>
     <link rel="stylesheet" href="/assets/platform-ui.css">
+    <script>
+      (() => {
+        const refreshSelector = "[data-pause-when-hidden]";
+
+        document.addEventListener("htmx:beforeRequest", (event) => {
+          const target = event.target;
+          if (
+            document.hidden &&
+            target instanceof Element &&
+            target.matches(refreshSelector)
+          ) {
+            event.preventDefault();
+          }
+        });
+
+        document.addEventListener("visibilitychange", () => {
+          if (!document.hidden && window.htmx) {
+            document.querySelectorAll(refreshSelector).forEach((element) => {
+              window.htmx.trigger(element, "visibilityrefresh");
+            });
+          }
+        });
+      })();
+    </script>
   </head>
   <body>
     <div class="console-shell">

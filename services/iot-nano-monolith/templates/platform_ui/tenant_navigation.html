@@ -1,0 +1,25 @@
+<div class="nav-section">
+  <p class="nav-section-label">Operations</p>
+  <a class="nav-link{% if active_nav == "overview" %} active{% endif %}" href="/tenant"{% if active_nav == "overview" %} aria-current="page"{% endif %}><span class="nav-link-label">Overview</span></a>
+  <a class="nav-link{% if active_nav == "devices" %} active{% endif %}" href="/tenant/devices"{% if active_nav == "devices" %} aria-current="page"{% endif %}><span class="nav-link-label">Devices</span></a>
+  <a class="nav-link{% if active_nav == "assets" %} active{% endif %}" href="/tenant/assets"{% if active_nav == "assets" %} aria-current="page"{% endif %}><span class="nav-link-label">Assets</span></a>
+</div>
+<div class="nav-section">
+  <p class="nav-section-label">Monitoring</p>
+  <a class="nav-link{% if active_nav == "device-profiles" %} active{% endif %}" href="/tenant/profiles/device"{% if active_nav == "device-profiles" %} aria-current="page"{% endif %}><span class="nav-link-label">Device profiles</span></a>
+  <a class="nav-link{% if active_nav == "asset-profiles" %} active{% endif %}" href="/tenant/profiles/asset"{% if active_nav == "asset-profiles" %} aria-current="page"{% endif %}><span class="nav-link-label">Asset profiles</span></a>
+  <a class="nav-link{% if active_nav == "alerts" %} active{% endif %}" href="/tenant/alerts"{% if active_nav == "alerts" %} aria-current="page"{% endif %}><span class="nav-link-label">Alerts</span><span class="nav-count-slot" aria-hidden="true"></span></a>
+  <a class="nav-link{% if active_nav == "audit" %} active{% endif %}" href="/tenant/audit"{% if active_nav == "audit" %} aria-current="page"{% endif %}><span class="nav-link-label">Audit</span></a>
+</div>
+<div class="nav-section">
+  <p class="nav-section-label">Topology</p>
+  <a class="nav-link{% if active_nav == "topology" %} active{% endif %}" href="/tenant/topology"{% if active_nav == "topology" %} aria-current="page"{% endif %}><span class="nav-link-label">Topology</span></a>
+  <a class="nav-link{% if active_nav == "relations" %} active{% endif %}" href="/tenant/relations"{% if active_nav == "relations" %} aria-current="page"{% endif %}><span class="nav-link-label">Relations</span></a>
+</div>
+<div class="nav-section">
+  <p class="nav-section-label">Access</p>
+  <a class="nav-link{% if active_nav == "users" %} active{% endif %}" href="/tenant/users"{% if active_nav == "users" %} aria-current="page"{% endif %}><span class="nav-link-label">Users</span></a>
+  <a class="nav-link{% if active_nav == "groups" %} active{% endif %}" href="/tenant/groups"{% if active_nav == "groups" %} aria-current="page"{% endif %}><span class="nav-link-label">Groups</span></a>
+  <a class="nav-link{% if active_nav == "permissions" %} active{% endif %}" href="/tenant/permissions"{% if active_nav == "permissions" %} aria-current="page"{% endif %}><span class="nav-link-label">Permissions</span></a>
+  <a class="nav-link{% if active_nav == "applications" %} active{% endif %}" href="/tenant/applications"{% if active_nav == "applications" %} aria-current="page"{% endif %}><span class="nav-link-label">Applications</span></a>
+</div>

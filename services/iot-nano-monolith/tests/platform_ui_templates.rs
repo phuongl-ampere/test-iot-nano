@@ -4,6 +4,89 @@ use iot_nano_monolith::{
     TenantAlertsPage, TenantAuditPage, TenantAuditRow, TenantUserRow, TenantUsersPage,
     UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
 };
+use std::fs;
+use std::path::Path;
+
+const TENANT_NAVIGATION: [(&str, &str, &str); 13] = [
+    ("overview", "/tenant", "Overview"),
+    ("devices", "/tenant/devices", "Devices"),
+    ("assets", "/tenant/assets", "Assets"),
+    (
+        "device-profiles",
+        "/tenant/profiles/device",
+        "Device profiles",
+    ),
+    ("asset-profiles", "/tenant/profiles/asset", "Asset profiles"),
+    ("alerts", "/tenant/alerts", "Alerts"),
+    ("audit", "/tenant/audit", "Audit"),
+    ("topology", "/tenant/topology", "Topology"),
+    ("relations", "/tenant/relations", "Relations"),
+    ("users", "/tenant/users", "Users"),
+    ("groups", "/tenant/groups", "Groups"),
+    ("permissions", "/tenant/permissions", "Permissions"),
+    ("applications", "/tenant/applications", "Applications"),
+];
+
+const TENANT_TEMPLATES: [(&str, &str); 15] = [
+    ("tenant.html", "overview"),
+    ("tenant_devices.html", "devices"),
+    ("tenant_assets.html", "assets"),
+    ("tenant_device_profiles.html", "device-profiles"),
+    ("tenant_asset_profiles.html", "asset-profiles"),
+    ("tenant_alerts.html", "alerts"),
+    ("tenant_audit.html", "audit"),
+    ("tenant_topology.html", "topology"),
+    ("tenant_relations.html", "relations"),
+    ("tenant_users.html", "users"),
+    ("tenant_groups.html", "groups"),
+    ("tenant_permissions.html", "permissions"),
+    ("tenant_applications.html", "applications"),
+    ("tenant_device_credential.html", "devices"),
+    ("tenant_device_tokens.html", "devices"),
+];
+
+fn platform_template_source(name: &str) -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates/platform_ui")
+            .join(name),
+    )
+    .unwrap_or_else(|error| panic!("could not read platform template {name}: {error}"))
+}
+
+fn active_navigation_key(template: &str) -> &str {
+    const DECLARATION: &str = r##"{% let active_nav = ""##;
+
+    assert_eq!(
+        template.matches(DECLARATION).count(),
+        1,
+        "tenant templates declare one active navigation key"
+    );
+
+    let (_, declaration) = template
+        .split_once(DECLARATION)
+        .expect("tenant template declares its active navigation key");
+    declaration
+        .split_once('"')
+        .map(|(key, _)| key)
+        .expect("tenant template closes its active navigation key")
+}
+
+fn navigation_anchor_source<'a>(navigation: &'a str, href: &str) -> &'a str {
+    let href = format!("href=\"{href}\"");
+    let href_offset = navigation
+        .find(&href)
+        .unwrap_or_else(|| panic!("shared navigation contains {href}"));
+    let anchor_start = navigation[..href_offset]
+        .rfind("<a")
+        .expect("navigation href belongs to an anchor");
+    let anchor_end = navigation[href_offset..]
+        .find("</a>")
+        .map(|offset| href_offset + offset + "</a>".len())
+        .expect("navigation anchor is closed");
+
+    &navigation[anchor_start..anchor_end]
+}
 
 fn navigation_hrefs(rendered: &str) -> Vec<&str> {
     let bytes = rendered.as_bytes();
@@ -335,6 +418,72 @@ fn tenant_layout_renders_only_tenant_navigation() {
     assert!(rendered.contains("href=\"/tenant/profiles/asset\""));
     assert!(rendered.contains("href=\"/tenant/applications\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
+}
+
+#[test]
+fn every_tenant_page_uses_the_fixed_navigation_and_exactly_one_active_item() {
+    let navigation = platform_template_source("tenant_navigation.html");
+    let expected_hrefs: Vec<_> = TENANT_NAVIGATION.iter().map(|(_, href, _)| *href).collect();
+
+    assert_eq!(navigation_hrefs(&navigation), expected_hrefs);
+
+    for (key, href, label) in TENANT_NAVIGATION {
+        let anchor = navigation_anchor_source(&navigation, href);
+        let active_condition = format!(r#"active_nav == "{key}""#);
+
+        assert!(anchor.contains(label), "{href} keeps its approved label");
+        assert_eq!(
+            anchor.matches(&active_condition).count(),
+            2,
+            "{href} has one class and one aria-current condition"
+        );
+        assert!(anchor.contains(" active"), "{href} marks the active class");
+        assert!(
+            anchor.contains("aria-current=\"page\""),
+            "{href} marks the current page"
+        );
+    }
+
+    for (template_name, active_key) in TENANT_TEMPLATES {
+        let template = platform_template_source(template_name);
+
+        assert_eq!(
+            template
+                .matches(r#"{% include "platform_ui/tenant_navigation.html" %}"#)
+                .count(),
+            1,
+            "{template_name} includes the shared tenant navigation once"
+        );
+        assert_eq!(
+            active_navigation_key(&template),
+            active_key,
+            "{template_name} selects the expected active navigation item"
+        );
+        assert_eq!(
+            TENANT_NAVIGATION
+                .iter()
+                .filter(|(key, _, _)| *key == active_key)
+                .count(),
+            1,
+            "{template_name} resolves to exactly one active navigation item"
+        );
+    }
+}
+
+#[test]
+fn base_layout_provides_the_local_htmx_visibility_pause_primitive() {
+    let base = platform_template_source("base.html");
+
+    for marker in [
+        "htmx:beforeRequest",
+        "document.hidden",
+        "data-pause-when-hidden",
+        "visibilitychange",
+        "visibilityrefresh",
+        "window.htmx",
+    ] {
+        assert!(base.contains(marker), "base layout contains {marker}");
+    }
 }
 
 #[test]
