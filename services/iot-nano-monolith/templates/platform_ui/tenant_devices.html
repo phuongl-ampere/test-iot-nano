@@ -30,11 +30,13 @@
       <div class="form-actions"><button type="submit">Provision</button></div>
     </form>
   </section>
+  <p id="devices-refresh-status" class="visually-hidden" role="status" aria-live="polite">
+    Device list refreshes every 10 seconds while this tab is visible.
+  </p>
   <section
     id="devices-panel"
     class="workspace-panel refresh-panel"
     data-pause-when-hidden
-    aria-live="polite"
     hx-get="/tenant/devices"
     hx-trigger="every 10s, visibilityrefresh"
     hx-select="#devices-panel"

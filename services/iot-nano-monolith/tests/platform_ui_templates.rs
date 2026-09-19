@@ -634,7 +634,6 @@ fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
         "hx-target=\"#devices-panel\"",
         "hx-swap=\"outerHTML\"",
         "data-pause-when-hidden",
-        "aria-live=\"polite\"",
         "href=\"/tenant/devices\"",
         "id=\"device-{{ device.device_id|urlencode_strict }}\"",
         "href=\"/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens\"",
@@ -645,6 +644,35 @@ fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
             "devices template contains {marker}"
         );
     }
+
+    let (_, refresh_panel) = devices
+        .split_once("id=\"devices-panel\"")
+        .expect("devices template contains the refresh panel");
+    let (refresh_panel, _) = refresh_panel
+        .split_once("</section>")
+        .expect("devices refresh panel is closed");
+    assert!(
+        !refresh_panel.contains("aria-live"),
+        "the HTMX-swapped table container must not be a live region"
+    );
+    assert!(devices.contains(
+        "<p id=\"devices-refresh-status\" class=\"visually-hidden\" role=\"status\" aria-live=\"polite\">"
+    ));
+    assert_eq!(
+        devices.matches("aria-live=\"polite\"").count(),
+        1,
+        "only the concise refresh status owns live semantics"
+    );
+    let status_offset = devices
+        .find("id=\"devices-refresh-status\"")
+        .expect("devices template contains a concise refresh status");
+    let panel_offset = devices
+        .find("id=\"devices-panel\"")
+        .expect("devices template contains the refresh panel");
+    assert!(
+        status_offset < panel_offset,
+        "refresh status remains outside the HTMX-swapped table container"
+    );
 
     for template in [&credential, &tokens] {
         assert!(template.contains("data-copy-target"));
