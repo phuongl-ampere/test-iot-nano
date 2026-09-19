@@ -69,9 +69,10 @@ pub use device_relations::{
     RESERVED_GATEWAY_CHILD_RELATION_TYPE,
 };
 pub use management::{
-    BUILT_IN_USER_WORKSPACE, CreateManagementAsset, CreateManagementAssetProfile,
-    CreateManagementDeviceProfile, CreateManagementUser, DeviceTokenRecord, DeviceTokenRepository,
-    DeviceTokenRepositoryError, MANAGEMENT_ALERT_INCIDENT_LIST_LIMIT, MANAGEMENT_ALERT_LIST_LIMIT,
+    BUILT_IN_USER_WORKSPACE, CreateManagementAlertRule, CreateManagementAsset,
+    CreateManagementAssetProfile, CreateManagementDeviceProfile, CreateManagementUser,
+    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError,
+    MANAGEMENT_ALERT_INCIDENT_LIST_LIMIT, MANAGEMENT_ALERT_LIST_LIMIT,
     MANAGEMENT_ALERT_RULE_LIST_LIMIT, ManagementAlert, ManagementAlertError,
     ManagementAlertIncident, ManagementAlertIncidentError, ManagementAlertIncidentRepository,
     ManagementAlertRepository, ManagementAlertRule, ManagementAlertRuleError,
@@ -82,8 +83,8 @@ pub use management::{
     ManagementDeviceRepository, ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser,
     ManagementUserError, ManagementUserRepository, ManagementUserRole, NewDeviceToken,
     NewOwnedDeviceToken, ProvisionManagementDevice, ProvisionManagementDeviceError,
-    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser,
+    UpdateManagementAlertRule, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, PublicAlert, PublicApiRepository, PublicAsset,

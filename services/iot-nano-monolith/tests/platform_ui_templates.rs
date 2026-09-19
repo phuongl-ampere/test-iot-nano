@@ -793,6 +793,7 @@ fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
 
 #[test]
 fn tenant_operations_templates_make_supported_work_clear_without_inventing_backend_actions() {
+    let base = platform_template_source("base.html");
     let device_profiles = platform_template_source("tenant_device_profiles.html");
     let asset_profiles = platform_template_source("tenant_asset_profiles.html");
     let groups = platform_template_source("tenant_groups.html");
@@ -808,9 +809,11 @@ fn tenant_operations_templates_make_supported_work_clear_without_inventing_backe
         assert!(template.contains("data-json-input"));
         assert!(template.contains("data-json-feedback"));
         assert!(template.contains("JSON syntax is checked in this browser before submit."));
-        assert!(template.contains("JSON.parse"));
+        assert!(template.contains("ui.parseObject"));
         assert!(template.contains("aria-invalid"));
     }
+    assert!(base.contains("const parseObject = (value)"));
+    assert!(base.contains("JSON.parse(value)"));
 
     for marker in [
         "Remove member",

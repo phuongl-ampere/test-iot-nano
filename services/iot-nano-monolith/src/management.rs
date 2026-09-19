@@ -29,10 +29,10 @@ use iot_storage::{
     ApplicationKind, ApplicationRepository, AuditAction, AuditEvent, AuditEventCursor,
     AuditEventError, AuditEventRepository, AuditPrincipal, AuditTargetType,
     AuthorizationRepository, AuthorizationSubject, BUILT_IN_USER_WORKSPACE, ClientId,
-    CreateDeviceRelation, CreateManagementAsset, CreateManagementAssetProfile,
-    CreateManagementDeviceProfile, CreateManagementUser, DeviceRelationError,
-    DeviceRelationRepository, DeviceTokenRepository, DeviceTokenRepositoryError,
-    ManagementAlert as StorageManagementAlert, ManagementAlertError,
+    CreateDeviceRelation, CreateManagementAlertRule, CreateManagementAsset,
+    CreateManagementAssetProfile, CreateManagementDeviceProfile, CreateManagementUser,
+    DeviceRelationError, DeviceRelationRepository, DeviceTokenRepository,
+    DeviceTokenRepositoryError, ManagementAlert as StorageManagementAlert, ManagementAlertError,
     ManagementAlertIncident as StorageManagementAlertIncident, ManagementAlertIncidentError,
     ManagementAlertIncidentRepository, ManagementAlertRepository,
     ManagementAlertRule as StorageManagementAlertRule, ManagementAlertRuleError,
@@ -47,9 +47,9 @@ use iot_storage::{
     PermissionCreator, PlatformStore, PlatformStoreError, ProvisionManagementDeviceError,
     RedirectUri, ResourceAccess, ResourceAccessSource, ResourcePermission, SystemAccount,
     TenantAuthorizationError, TenantAuthorizationRepository, TenantIdentityError,
-    TenantIdentityRepository, TenantStatus, UpdateManagementAsset, UpdateManagementAssetProfile,
-    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser,
-    UserDeviceActivityRepository,
+    TenantIdentityRepository, TenantStatus, UpdateManagementAlertRule, UpdateManagementAsset,
+    UpdateManagementAssetProfile, UpdateManagementDevice, UpdateManagementDeviceProfile,
+    UpdateManagementUser, UserDeviceActivityRepository,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};

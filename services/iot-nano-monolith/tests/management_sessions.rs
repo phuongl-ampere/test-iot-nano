@@ -1144,8 +1144,8 @@ async fn system_page_lists_only_tenant_slug_and_status_without_runtime_placehold
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("<td>test</td>"));
-    assert!(body.contains("<td>active</td>"));
-    assert!(body.contains("<td>suspended</td>"));
+    assert!(body.contains("status-chip--ready\">active</span>"));
+    assert!(body.contains("status-chip--warning\">suspended</span>"));
     assert!(body.contains("Not ready"));
     assert!(!body.contains("Not reported"));
     assert!(!body.contains("system-page-private-metadata"));
@@ -1259,7 +1259,8 @@ async fn system_infrastructure_page_renders_non_secret_runtime_status() {
     assert!(!body.contains("SystemAccount@2026"));
     assert!(body.contains("src=\"/assets/htmx.min.js\""));
     assert!(body.contains("hx-get=\"/system/infrastructure/status\""));
-    assert!(body.contains("hx-trigger=\"every 5s\""));
+    assert!(body.contains("hx-trigger=\"every 5s, visibilityrefresh\""));
+    assert!(body.contains("data-pause-when-hidden"));
 
     let htmx = router
         .oneshot(platform_get("/assets/htmx.min.js", None))
@@ -2431,6 +2432,291 @@ async fn tenant_account_can_rotate_an_existing_device_token() {
             .as_str()
             .is_some_and(|token| token != first_token)
     );
+}
+
+#[tokio::test]
+async fn tenant_account_provisioning_accepts_assignment_and_attributes() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let cookie = tenant_account_cookie(&router).await;
+
+    let asset = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/assets")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"name":"Assigned Asset","metadata":{}}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::CREATED);
+    let asset: serde_json::Value =
+        serde_json::from_slice(&to_bytes(asset.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let profile = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/profiles/device-profiles")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    r#"{"name":"Assigned Profile","telemetry_schema":{},"metric_mapping":{},"reporting_settings":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile.status(), StatusCode::CREATED);
+    let profile: serde_json::Value =
+        serde_json::from_slice(&to_bytes(profile.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let provisioned = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Assigned Device",
+                        "asset_id": asset["id"],
+                        "device_profile_id": profile["id"],
+                        "attributes": {"site": "lab"},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::CREATED);
+    assert_eq!(provisioned.headers()[CACHE_CONTROL], "no-store");
+    let provisioned: serde_json::Value =
+        serde_json::from_slice(&to_bytes(provisioned.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let device_id = provisioned["device_id"].as_str().unwrap();
+
+    let stored_asset: Option<String> =
+        sqlx::query_scalar("SELECT asset_id FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    let stored_profile: Option<String> =
+        sqlx::query_scalar("SELECT device_profile_id FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    let stored_attributes: String =
+        sqlx::query_scalar("SELECT metadata FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(stored_asset.as_deref(), asset["id"].as_str());
+    assert_eq!(stored_profile.as_deref(), profile["id"].as_str());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored_attributes).unwrap(),
+        json!({"site": "lab"})
+    );
+}
+
+#[tokio::test]
+async fn tenant_account_rotates_a_specific_active_device_token() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let cookie = tenant_account_cookie(&router).await;
+    let provisioned = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"display_name":"Rotatable Device"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let provisioned: serde_json::Value =
+        serde_json::from_slice(&to_bytes(provisioned.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let device_id = provisioned["device_id"].as_str().unwrap();
+    let token_id = provisioned["id"].as_str().unwrap();
+    let first_token = provisioned["token"].as_str().unwrap();
+
+    let rotated = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/management/devices/{device_id}/tokens/{token_id}/rotate"
+                ))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::CREATED);
+    assert_eq!(rotated.headers()[CACHE_CONTROL], "no-store");
+    let rotated: serde_json::Value =
+        serde_json::from_slice(&to_bytes(rotated.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(rotated["device_id"], device_id);
+    assert_ne!(rotated["id"], token_id);
+    assert_ne!(rotated["token"].as_str().unwrap(), first_token);
+
+    let old_token_revoked: Option<String> =
+        sqlx::query_scalar("SELECT revoked_at FROM device_tokens WHERE id = ?")
+            .bind(token_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+    assert!(old_token_revoked.is_some());
+    let active_tokens: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM device_tokens WHERE device_id = ? AND revoked_at IS NULL",
+    )
+    .bind(device_id)
+    .fetch_one(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    assert_eq!(active_tokens, 1);
+}
+
+#[tokio::test]
+async fn tenant_account_manages_alert_rules_and_incidents() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let cookie = tenant_account_cookie(&router).await;
+    let device = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"display_name":"Alert Device"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let device: serde_json::Value =
+        serde_json::from_slice(&to_bytes(device.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let device_id = device["device_id"].as_str().unwrap();
+
+    let request = json!({
+        "name": "High Power",
+        "enabled": true,
+        "device_id": device_id,
+        "metric_key": "power_w",
+        "rule_type": "event_threshold",
+        "comparison": "gt",
+        "threshold": 500.0,
+        "severity": "warning",
+    });
+    let rule = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/alert-rules")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rule.status(), StatusCode::CREATED);
+    let rule: serde_json::Value =
+        serde_json::from_slice(&to_bytes(rule.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let rule_id = rule["id"].as_str().unwrap();
+
+    let tenant_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    let incident_id = uuid::Uuid::now_v7().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO alert_incidents (
+             id, tenant_id, rule_id, device_id, status, condition_started_at, opened_at, last_value
+         ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
+    )
+    .bind(&incident_id)
+    .bind(&tenant_id)
+    .bind(rule_id)
+    .bind(device_id)
+    .bind(&now)
+    .bind(&now)
+    .bind(750.0_f64)
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    let summary = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/management/alerts/summary")
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status(), StatusCode::OK);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&to_bytes(summary.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(summary["open_incident_count"], 1);
+
+    let acknowledged = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/management/alert-incidents/{incident_id}/acknowledge"
+                ))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(acknowledged.status(), StatusCode::OK);
+    let acknowledged: serde_json::Value = serde_json::from_slice(
+        &to_bytes(acknowledged.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(acknowledged["id"], incident_id);
+    assert!(acknowledged["acknowledged_at"].is_string());
+
+    let archived = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/management/alert-rules/{rule_id}/archive"))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived.status(), StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]

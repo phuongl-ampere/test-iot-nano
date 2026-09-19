@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}IoT Nano{% endblock %}</title>
     <link rel="stylesheet" href="/assets/platform-ui.css">
+    {% block enhancement_scripts %}
     <script src="/assets/htmx.min.js"></script>
     <script>
       (() => {
@@ -117,6 +118,7 @@
         });
       })();
     </script>
+    {% endblock %}
   </head>
   <body>
     <div class="console-shell">
