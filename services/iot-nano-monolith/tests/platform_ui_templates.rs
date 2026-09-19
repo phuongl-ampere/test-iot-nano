@@ -478,6 +478,22 @@ fn every_tenant_page_uses_the_fixed_navigation_and_exactly_one_active_item() {
 #[test]
 fn base_layout_provides_the_local_htmx_visibility_pause_primitive() {
     let base = platform_template_source("base.html");
+    let devices = platform_template_source("tenant_devices.html");
+
+    assert!(
+        devices.contains(r#"{% extends "platform_ui/base.html" %}"#),
+        "the Device page inherits the shared base layout"
+    );
+    assert!(
+        devices.contains("hx-get=\"/tenant/devices\""),
+        "the Device page uses HTMX refresh"
+    );
+    assert_eq!(
+        base.matches(r#"<script src="/assets/htmx.min.js"></script>"#)
+            .count(),
+        1,
+        "the shared base layout loads the local HTMX asset once"
+    );
 
     for marker in [
         "htmx:beforeRequest",
