@@ -5,6 +5,7 @@
 {% block navigation_label %}Workspace navigation{% endblock %}
 {% block navigation %}
   <a class="nav-link active" href="/app" aria-current="page">Devices</a>
+  <a class="nav-link" href="/app/assets">Assets</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
@@ -12,16 +13,26 @@
     <h1>{{ page.device.display_name }}</h1>
     <p class="resource-id">{{ page.device.device_id }}</p>
   </section>
+  <div class="page-actions">
+    <a class="button-link button-link-secondary" href="/app">Back to devices</a>
+    <a class="button-link button-link-secondary" href="/app/assets">View assets</a>
+  </div>
   <section class="workspace-panel">
-    <header><h2>Access</h2></header>
+    <header class="panel-heading">
+      <h2>Access</h2>
+      <span class="operation-note">Read-only</span>
+    </header>
     <dl class="resource-details">
-      <div><dt>State</dt><dd>{{ page.device.activity }}</dd></div>
-      <div><dt>Permission</dt><dd>{{ page.device.permission }}</dd></div>
+      <div><dt>State</dt><dd><span class="status-chip status-chip--neutral">{{ page.device.activity }}</span></dd></div>
+      <div><dt>Permission</dt><dd><span class="operation-note">{{ page.device.permission }}</span></dd></div>
       <div><dt>Access source</dt><dd>{{ page.device.access_source }}</dd></div>
     </dl>
   </section>
   <section class="workspace-panel">
-    <header><h2>Recent telemetry</h2></header>
+    <header class="panel-heading">
+      <h2>Recent telemetry</h2>
+      <span class="operation-note">Read-only</span>
+    </header>
     {% if page.has_telemetry %}
       <div class="table-scroll">
         <table class="data-table">
@@ -46,7 +57,10 @@
     {% endif %}
   </section>
   <section class="workspace-panel">
-    <header><h2>Recent alerts</h2></header>
+    <header class="panel-heading">
+      <h2>Recent alerts</h2>
+      <span class="operation-note">Read-only</span>
+    </header>
     {% if page.has_alerts %}
       <div class="table-scroll">
         <table class="data-table">

@@ -5,7 +5,7 @@
 {% block navigation_label %}Workspace navigation{% endblock %}
 {% block navigation %}
   <a class="nav-link" href="/app">Devices</a>
-  <a class="nav-link" href="/app/assets">Assets</a>
+  <a class="nav-link active" href="/app/assets" aria-current="page">Assets</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
@@ -13,4 +13,14 @@
     <h1>Asset unavailable</h1>
     <p>The asset is unavailable to this account.</p>
   </section>
+  <section class="workspace-panel">
+    <header class="panel-heading">
+      <h2>Access changed</h2>
+      <span class="status-chip status-chip--critical">Unavailable</span>
+    </header>
+    <p class="empty-state">Return to your asset list to view resources currently shared with this account.</p>
+  </section>
+  <div class="page-actions">
+    <a class="button-link button-link-secondary" href="/app/assets">Back to assets</a>
+  </div>
 {% endblock %}

@@ -11,10 +11,16 @@
   <section class="page-heading">
     <p class="eyebrow">User Account</p>
     <h1>My Assets</h1>
-    <p>Assets you own or are permitted to view.</p>
+    <p>Assets you own or are permitted to view. This workspace is read-only.</p>
   </section>
   <section class="workspace-panel">
-    <header><h2>Authorized assets</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Authorized assets</h2>
+        <p class="panel-caption">Open an asset to inspect its containment and access context.</p>
+      </div>
+      <span class="operation-note">Read-only</span>
+    </header>
     {% if page.assets.is_empty() %}
       <p class="empty-state">No assets are available to this account.</p>
     {% else %}
@@ -26,6 +32,7 @@
               <th scope="col">Containment</th>
               <th scope="col">Permission</th>
               <th scope="col">Access source</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
             </tr>
           </thead>
           <tbody>
@@ -36,8 +43,9 @@
                   <span class="resource-id">{{ asset.asset_id }}</span>
                 </td>
                 <td>{{ asset.containment }}</td>
-                <td>{{ asset.permission }}</td>
+                <td><span class="operation-note">{{ asset.permission }}</span></td>
                 <td>{{ asset.access_source }}</td>
+                <td><a class="button-link button-link-secondary action-link" href="/app/assets/{{ asset.asset_id|urlencode_strict }}">View asset</a></td>
               </tr>
             {% endfor %}
           </tbody>

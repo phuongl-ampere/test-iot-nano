@@ -195,6 +195,25 @@ body {
   max-width: 680px;
 }
 
+.page-heading-with-actions {
+  display: flex;
+  max-width: none;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.page-heading-with-actions > div {
+  max-width: 680px;
+}
+
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
 .eyebrow {
   margin: 0 0 6px;
   color: #087d78;
@@ -523,6 +542,17 @@ button[aria-disabled="true"] {
   white-space: nowrap;
 }
 
+.status-chip--ready {
+  color: #15573f;
+  background: #e6f5ec;
+  border-color: #9ed3b5;
+}
+
+.summary-item strong .status-chip {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 11px;
+}
+
 .status-chip--neutral {
   color: #44566d;
   background: #eef3f8;
@@ -553,6 +583,46 @@ button[aria-disabled="true"] {
   font-size: 11px;
   font-weight: 760;
   white-space: nowrap;
+}
+
+.capability-gap {
+  padding: 14px;
+}
+
+.capability-gap > p {
+  color: #536277;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.capability-gap > .panel-caption {
+  margin-bottom: 0;
+}
+
+.capability-list {
+  display: grid;
+  gap: 0;
+  margin: 14px 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid #dfe6ef;
+}
+
+.capability-list li {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  color: #182235;
+  border-bottom: 1px solid #dfe6ef;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.capability-list li:last-child {
+  border-bottom: 0;
 }
 
 .tenant-actions {
@@ -839,7 +909,8 @@ button[aria-disabled="true"] {
   }
 
   .workspace-panel .panel-heading,
-  .credential-control {
+  .credential-control,
+  .page-heading-with-actions {
     align-items: stretch;
     flex-direction: column;
   }
@@ -851,6 +922,11 @@ button[aria-disabled="true"] {
   .resource-details > div {
     grid-template-columns: 1fr;
     gap: 4px;
+  }
+
+  .capability-list li {
+    align-items: start;
+    flex-direction: column;
   }
 
   .member-row {

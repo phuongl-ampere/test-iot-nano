@@ -12,7 +12,7 @@
   <section class="page-heading">
     <p class="eyebrow">System Account</p>
     <h1>System Console</h1>
-    <p>Platform lifecycle and runtime status.</p>
+    <p>Tenant lifecycle, platform readiness, and configuration capability status.</p>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
@@ -20,11 +20,19 @@
   <section class="summary-grid" aria-label="System summary">
     <article class="summary-item">
       <span>Operational health</span>
-      <strong>{{ page.operational_health }}</strong>
+      <strong>
+        <span class="status-chip {% if page.operational_health == "Ready" %}status-chip--ready{% else %}status-chip--critical{% endif %}">{{ page.operational_health }}</span>
+      </strong>
     </article>
   </section>
   <section class="workspace-panel">
-    <header><h2>Create tenant</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Create tenant</h2>
+        <p class="panel-caption">Creates an isolated tenant and its first Tenant Account.</p>
+      </div>
+      <span class="operation-note">Lifecycle</span>
+    </header>
     <form class="form-grid" action="/system/tenants" method="post">
       <label class="field">
         <span>Tenant slug</span>
@@ -40,7 +48,12 @@
     </form>
   </section>
   <section class="workspace-panel">
-    <header><h2>Tenants</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Tenants</h2>
+        <p class="panel-caption">Lifecycle changes take effect for the selected tenant account.</p>
+      </div>
+    </header>
     {% if page.tenants.is_empty() %}
       <p class="empty-state">No tenants created.</p>
     {% else %}
@@ -57,7 +70,9 @@
             {% for tenant in page.tenants %}
               <tr>
                 <td>{{ tenant.slug }}</td>
-                <td>{{ tenant.status }}</td>
+                <td>
+                  <span class="status-chip {% if tenant.status == "active" %}status-chip--ready{% else %}status-chip--warning{% endif %}">{{ tenant.status }}</span>
+                </td>
                 <td class="tenant-actions">
                   {% if tenant.status == "active" %}
                     <form class="inline-form" action="/system/tenants/suspend" method="post">
@@ -70,14 +85,22 @@
                       <button type="submit">Reactivate</button>
                     </form>
                   {% endif %}
-                  <form class="inline-form" action="/system/tenants/delete" method="post">
-                    <input name="slug" type="hidden" value="{{ tenant.slug }}">
-                    <button type="submit">Delete</button>
-                  </form>
-                  <form class="inline-form" action="/system/tenants/tenant-account/disable" method="post">
-                    <input name="slug" type="hidden" value="{{ tenant.slug }}">
-                    <button type="submit">Disable account</button>
-                  </form>
+                  <details class="confirmation">
+                    <summary>Disable tenant account</summary>
+                    <p>Stops the Tenant Account from signing in. Tenant data remains available to the System Account.</p>
+                    <form class="inline-form" action="/system/tenants/tenant-account/disable" method="post">
+                      <input name="slug" type="hidden" value="{{ tenant.slug }}">
+                      <button class="danger-button" type="submit">Disable tenant account</button>
+                    </form>
+                  </details>
+                  <details class="confirmation">
+                    <summary>Delete tenant</summary>
+                    <p>Deletes this tenant and revokes its Tenant Account access. Confirm the impact before continuing.</p>
+                    <form class="inline-form" action="/system/tenants/delete" method="post">
+                      <input name="slug" type="hidden" value="{{ tenant.slug }}">
+                      <button class="danger-button" type="submit">Delete tenant</button>
+                    </form>
+                  </details>
                   <details class="password-reset">
                     <summary>Reset password</summary>
                     <form class="inline-form" action="/system/tenants/tenant-account/reset" method="post">
@@ -96,5 +119,24 @@
         </table>
       </div>
     {% endif %}
+  </section>
+  <section id="system-settings-gap" class="workspace-panel">
+    <header class="panel-heading">
+      <div>
+        <h2>System settings</h2>
+        <p class="panel-caption">Configuration visibility only</p>
+      </div>
+      <span class="operation-note">Backend follow-up</span>
+    </header>
+    <div class="capability-gap">
+      <p>SMTP, MQTT, retention, and worker tuning require backend configuration routes.</p>
+      <ul class="capability-list">
+        <li><span>SMTP notification delivery</span><span class="status-chip status-chip--neutral">Not available</span></li>
+        <li><span>MQTT host and listener configuration</span><span class="status-chip status-chip--neutral">Not available</span></li>
+        <li><span>Stream retention and segment limits</span><span class="status-chip status-chip--neutral">Not available</span></li>
+        <li><span>Worker batch, interval, lease, and retry tuning</span><span class="status-chip status-chip--neutral">Not available</span></li>
+      </ul>
+      <p class="panel-caption">No settings form is shown because this console does not yet have a server-side configuration update contract or live-versus-restart status.</p>
+    </div>
   </section>
 {% endblock %}

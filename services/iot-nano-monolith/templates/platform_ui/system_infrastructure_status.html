@@ -1,18 +1,28 @@
 <div
   id="infrastructure-status"
+  class="refresh-panel"
   hx-get="/system/infrastructure/status"
-  hx-trigger="every 5s"
+  hx-trigger="every 5s, visibilityrefresh"
   hx-target="#infrastructure-status"
   hx-swap="outerHTML"
+  data-pause-when-hidden
 >
   <section class="summary-grid" aria-label="Runtime health">
     <article class="summary-item">
       <span>Runtime health</span>
-      <strong>{{ page.health }}</strong>
+      <strong>
+        <span class="status-chip {% if page.health == "Ready" %}status-chip--ready{% else %}status-chip--critical{% endif %}">{{ page.health }}</span>
+      </strong>
     </article>
   </section>
   <section class="workspace-panel">
-    <header><h2>Listeners</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Listeners</h2>
+        <p class="panel-caption">Refreshes every 5 seconds while this browser tab is visible.</p>
+      </div>
+      <span class="operation-note">Live status</span>
+    </header>
     <div class="table-scroll">
       <table class="data-table">
         <thead>
@@ -25,7 +35,7 @@
           {% for listener in page.listeners %}
             <tr>
               <td>{{ listener.label }}</td>
-              <td>{{ listener.value }}</td>
+              <td><span class="status-chip status-chip--neutral">{{ listener.value }}</span></td>
             </tr>
           {% endfor %}
         </tbody>
@@ -33,7 +43,13 @@
     </div>
   </section>
   <section class="workspace-panel">
-    <header><h2>Runtime configuration</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Runtime configuration</h2>
+        <p class="panel-caption">Readiness evidence from the active process, not an editable settings screen.</p>
+      </div>
+      <span class="operation-note">Read-only</span>
+    </header>
     <div class="table-scroll">
       <table class="data-table">
         <thead>
@@ -46,7 +62,7 @@
           {% for item in page.configuration %}
             <tr>
               <td>{{ item.label }}</td>
-              <td>{{ item.value }}</td>
+              <td><span class="status-chip status-chip--neutral">{{ item.value }}</span></td>
             </tr>
           {% endfor %}
         </tbody>

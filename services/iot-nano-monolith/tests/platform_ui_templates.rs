@@ -625,6 +625,42 @@ fn user_device_detail_renders_only_server_supplied_device_context() {
 }
 
 #[test]
+fn system_and_user_templates_expose_only_supported_console_operations() {
+    let system = platform_template_source("system.html");
+    let infrastructure = platform_template_source("system_infrastructure.html");
+    let infrastructure_status = platform_template_source("system_infrastructure_status.html");
+    let user_devices = platform_template_source("user.html");
+    let user_assets = platform_template_source("user_assets.html");
+    let user_device = platform_template_source("user_device.html");
+    let user_asset = platform_template_source("user_asset.html");
+
+    assert!(system.contains("System settings"));
+    assert!(system.contains(
+        "SMTP, MQTT, retention, and worker tuning require backend configuration routes."
+    ));
+    assert!(!system.contains("action=\"/system/settings\""));
+    assert!(!system.contains("name=\"smtp_"));
+
+    assert!(infrastructure.contains("id=\"infrastructure-refresh\""));
+    assert!(infrastructure.contains("href=\"/system/infrastructure\""));
+    assert!(infrastructure_status.contains("data-pause-when-hidden"));
+    assert!(infrastructure_status.contains("hx-trigger=\"every 5s, visibilityrefresh\""));
+
+    assert!(user_devices.contains("View device"));
+    assert!(user_assets.contains("View asset"));
+    assert!(user_device.contains("Back to devices"));
+    assert!(user_device.contains("href=\"/app/assets\""));
+    assert!(user_asset.contains("Back to assets"));
+
+    for template in [&user_devices, &user_assets, &user_device, &user_asset] {
+        assert!(!template.contains("/tenant"));
+        assert!(!template.contains("/system"));
+        assert!(!template.contains("<form"));
+        assert!(!template.contains("/commands"));
+    }
+}
+
+#[test]
 fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
     let devices = platform_template_source("tenant_devices.html");
     let credential = platform_template_source("tenant_device_credential.html");

@@ -9,10 +9,13 @@
   <a class="nav-link active" href="/system/infrastructure" aria-current="page">Infrastructure</a>
 {% endblock %}
 {% block content %}
-  <section class="page-heading">
-    <p class="eyebrow">System Account</p>
-    <h1>System infrastructure</h1>
-    <p>Runtime state and configuration status.</p>
+  <section class="page-heading page-heading-with-actions">
+    <div>
+      <p class="eyebrow">System Account</p>
+      <h1>System infrastructure</h1>
+      <p>Listener, storage, migration, and TLS readiness reported by the running monolith.</p>
+    </div>
+    <a id="infrastructure-refresh" class="button-link button-link-secondary" href="/system/infrastructure">Refresh now</a>
   </section>
   {% include "platform_ui/system_infrastructure_status.html" %}
   <script src="/assets/htmx.min.js" defer></script>

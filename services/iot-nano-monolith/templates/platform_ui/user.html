@@ -11,10 +11,16 @@
   <section class="page-heading">
     <p class="eyebrow">User Account</p>
     <h1>My Devices</h1>
-    <p>Devices you own or are permitted to view.</p>
+    <p>Devices you own or are permitted to view. This workspace is read-only.</p>
   </section>
   <section class="workspace-panel">
-    <header><h2>Authorized devices</h2></header>
+    <header class="panel-heading">
+      <div>
+        <h2>Authorized devices</h2>
+        <p class="panel-caption">Open a device to inspect its access, telemetry, and alerts.</p>
+      </div>
+      <span class="operation-note">Read-only</span>
+    </header>
     {% if page.devices.is_empty() %}
       <p class="empty-state">No devices are available to this account.</p>
     {% else %}
@@ -26,6 +32,7 @@
               <th scope="col">State</th>
               <th scope="col">Permission</th>
               <th scope="col">Access source</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
             </tr>
           </thead>
           <tbody>
@@ -35,9 +42,10 @@
                   <a class="resource-link" href="/app/devices/{{ device.device_id|urlencode_strict }}">{{ device.display_name }}</a>
                   <span class="resource-id">{{ device.device_id }}</span>
                 </td>
-                <td>{{ device.activity }}</td>
-                <td>{{ device.permission }}</td>
+                <td><span class="status-chip status-chip--neutral">{{ device.activity }}</span></td>
+                <td><span class="operation-note">{{ device.permission }}</span></td>
                 <td>{{ device.access_source }}</td>
+                <td><a class="button-link button-link-secondary action-link" href="/app/devices/{{ device.device_id|urlencode_strict }}">View device</a></td>
               </tr>
             {% endfor %}
           </tbody>

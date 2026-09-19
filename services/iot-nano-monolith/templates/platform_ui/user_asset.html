@@ -13,11 +13,17 @@
     <h1>{{ page.asset.name }}</h1>
     <p class="resource-id">{{ page.asset.asset_id }}</p>
   </section>
+  <div class="page-actions">
+    <a class="button-link button-link-secondary" href="/app/assets">Back to assets</a>
+  </div>
   <section class="workspace-panel">
-    <header><h2>Access</h2></header>
+    <header class="panel-heading">
+      <h2>Access</h2>
+      <span class="operation-note">Read-only</span>
+    </header>
     <dl class="resource-details">
       <div><dt>Containment</dt><dd>{{ page.asset.containment }}</dd></div>
-      <div><dt>Permission</dt><dd>{{ page.asset.permission }}</dd></div>
+      <div><dt>Permission</dt><dd><span class="operation-note">{{ page.asset.permission }}</span></dd></div>
       <div><dt>Access source</dt><dd>{{ page.asset.access_source }}</dd></div>
     </dl>
   </section>

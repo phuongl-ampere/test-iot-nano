@@ -4,7 +4,8 @@
 {% block account_kind %}User Account{% endblock %}
 {% block navigation_label %}Workspace navigation{% endblock %}
 {% block navigation %}
-  <a class="nav-link" href="/app">Devices</a>
+  <a class="nav-link active" href="/app" aria-current="page">Devices</a>
+  <a class="nav-link" href="/app/assets">Assets</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
@@ -12,4 +13,14 @@
     <h1>Device unavailable</h1>
     <p>The device is unavailable to this account.</p>
   </section>
+  <section class="workspace-panel">
+    <header class="panel-heading">
+      <h2>Access changed</h2>
+      <span class="status-chip status-chip--critical">Unavailable</span>
+    </header>
+    <p class="empty-state">Return to your device list to view resources currently shared with this account.</p>
+  </section>
+  <div class="page-actions">
+    <a class="button-link button-link-secondary" href="/app">Back to devices</a>
+  </div>
 {% endblock %}
