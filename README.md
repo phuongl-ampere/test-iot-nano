@@ -69,6 +69,15 @@ not share Cargo fingerprints or locks.
 RUSTC_WRAPPER="$(command -v sccache)" ./scripts/dev/cargo-lane.sh fast-monolith -- check -p iot-nano-monolith
 ```
 
+For a focused test, do not run `cargo check` first unless a type-only result is
+all that is needed. The test command already compiles the selected crate and
+test harness; using the same lane reuses cached dependencies. For example:
+
+```bash
+./scripts/dev/cargo-lane.sh ui-console -- \
+  test -p iot-nano-monolith --test platform_ui_templates
+```
+
 The wrapper appends local elapsed-time entries to `.cargo-lane/timing.log`.
 Set `IOT_NANO_LANE_TARGET_ROOT` or `IOT_NANO_LANE_LOG` to override the local
 cache or timing-log locations. It never configures Rust compiler wrappers;

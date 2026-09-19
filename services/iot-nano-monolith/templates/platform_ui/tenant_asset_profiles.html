@@ -21,7 +21,7 @@
       <div class="panel-heading"><h2>Create asset profile</h2></div>
       <p class="panel-caption">JSON syntax is checked in this browser before submit. Server validation remains authoritative.</p>
     </header>
-    <form class="form-grid form-grid--profile" action="/tenant/profiles/asset" method="post" data-json-form>
+    <form class="form-grid form-grid--profile" action="/tenant/profiles/asset" method="post" data-json-form data-profile-create-form>
       <label class="field">
         <span>Name</span>
         <input name="name" type="text" maxlength="128" required>
@@ -42,50 +42,184 @@
   <section class="workspace-panel">
     <header>
       <div class="panel-heading"><h2>Existing asset profiles</h2></div>
-      <p class="panel-caption">Editing and deletion are not available in this console yet.</p>
+      <p class="panel-caption">Edit and delete actions use the tenant management API.</p>
     </header>
     {% if page.profiles.is_empty() %}
       <p class="empty-state">No asset profiles exist. Create one before assigning a profile to an asset.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
-          <thead><tr><th scope="col">Profile ID</th><th scope="col">Name</th></tr></thead>
+          <thead><tr><th scope="col">Profile ID</th><th scope="col">Name</th><th scope="col">Actions</th></tr></thead>
           <tbody>
             {% for profile in page.profiles %}
-              <tr><td><code>{{ profile.id }}</code></td><td><strong>{{ profile.name }}</strong></td></tr>
+              <tr>
+                <td><code>{{ profile.id }}</code></td>
+                <td><strong>{{ profile.name }}</strong></td>
+                <td>
+                  <div class="action-buttons">
+                    <button type="button" class="button-link-secondary" data-profile-edit data-profile-id="{{ profile.id }}" aria-label="Edit {{ profile.name }}" title="Edit profile">Edit</button>
+                    <button type="button" class="button-danger" data-profile-delete data-profile-id="{{ profile.id }}" aria-label="Delete {{ profile.name }}" title="Delete profile">Delete</button>
+                  </div>
+                </td>
+              </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
     {% endif %}
   </section>
+
+  <dialog id="asset-profile-editor" class="dialog" aria-labelledby="asset-profile-editor-title">
+    <header class="dialog-header">
+      <div>
+        <h2 id="asset-profile-editor-title">Edit asset profile</h2>
+        <p class="panel-caption">Each JSON field must be an object.</p>
+      </div>
+      <button type="button" class="dialog-close" data-dialog-close aria-label="Close profile editor" title="Close">Close</button>
+    </header>
+    <form data-profile-editor-form>
+      <label class="field">
+        <span>Name</span>
+        <input name="name" type="text" maxlength="128" required>
+      </label>
+      <label class="field">
+        <span>Fields (JSON)</span>
+        <textarea name="fields" rows="4" required data-json-input></textarea>
+      </label>
+      <label class="field">
+        <span>Dashboard defaults (JSON)</span>
+        <textarea name="dashboard_defaults" rows="4" required data-json-input></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="button-link-secondary" data-dialog-close>Cancel</button>
+        <button type="submit">Save changes</button>
+      </div>
+    </form>
+  </dialog>
+
   <script>
     (() => {
-      const form = document.querySelector("[data-json-form]");
-      if (!form) return;
-      const inputs = [...form.querySelectorAll("[data-json-input]")];
+      const ui = window.PlatformUi;
+      const endpoint = "/api/management/profiles/asset-profiles";
+      const form = document.querySelector("[data-profile-create-form]");
+      const editor = document.getElementById("asset-profile-editor");
+      const editorForm = document.querySelector("[data-profile-editor-form]");
+      let selectedProfile = null;
+
+      if (!ui || !form || !editor || !editorForm) return;
+
       const validate = (input) => {
         const feedback = input.parentElement.querySelector("[data-json-feedback]");
         try {
-          JSON.parse(input.value);
+          ui.parseObject(input.value);
           input.setAttribute("aria-invalid", "false");
-          feedback.textContent = "";
-          feedback.classList.remove("is-invalid");
+          if (feedback) {
+            feedback.textContent = "";
+            feedback.classList.remove("is-invalid");
+          }
           return true;
         } catch (_) {
           input.setAttribute("aria-invalid", "true");
-          feedback.textContent = "Enter valid JSON before saving.";
-          feedback.classList.add("is-invalid");
+          if (feedback) {
+            feedback.textContent = "Enter a JSON object before saving.";
+            feedback.classList.add("is-invalid");
+          }
           return false;
         }
       };
-      inputs.forEach((input) => input.addEventListener("input", () => validate(input)));
-      form.addEventListener("submit", (event) => {
-        const invalid = inputs.find((input) => !validate(input));
-        if (invalid) {
-          event.preventDefault();
-          invalid.focus();
+
+      const validateForm = (currentForm) => {
+        const invalid = [...currentForm.querySelectorAll("[data-json-input]")].find((input) => !validate(input));
+        if (invalid) invalid.focus();
+        return !invalid;
+      };
+
+      const payloadFor = (currentForm) => ({
+        name: currentForm.elements.name.value.trim(),
+        fields: ui.parseObject(currentForm.elements.fields.value),
+        dashboard_defaults: ui.parseObject(currentForm.elements.dashboard_defaults.value),
+      });
+
+      document.querySelectorAll("[data-dialog-close]").forEach((control) => {
+        control.addEventListener("click", () => control.closest("dialog")?.close());
+      });
+
+      form.querySelectorAll("[data-json-input]").forEach((input) => {
+        input.addEventListener("input", () => validate(input));
+      });
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!validateForm(form)) return;
+        const submit = event.submitter || form.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          await ui.request(endpoint, { method: "POST", body: payloadFor(form) });
+          ui.announce("Asset profile created.");
+          window.location.reload();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
         }
+      });
+
+      document.querySelectorAll("[data-profile-edit]").forEach((control) => {
+        control.addEventListener("click", async () => {
+          ui.setPending(control, true);
+          try {
+            const profiles = await ui.request(endpoint);
+            selectedProfile = profiles.find((profile) => profile.id === control.dataset.profileId);
+            if (!selectedProfile) throw new Error("The profile no longer exists.");
+            const fields = editorForm.elements;
+            fields.name.value = selectedProfile.name;
+            fields.fields.value = JSON.stringify(selectedProfile.fields, null, 2);
+            fields.dashboard_defaults.value = JSON.stringify(selectedProfile.dashboard_defaults, null, 2);
+            editor.showModal();
+            fields.name.focus();
+          } catch (error) {
+            ui.announce(error.message, "error");
+          } finally {
+            ui.setPending(control, false);
+          }
+        });
+      });
+
+      editorForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!selectedProfile || !validateForm(editorForm)) return;
+        const submit = event.submitter || editorForm.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          await ui.request(`${endpoint}/${encodeURIComponent(selectedProfile.id)}`, {
+            method: "PUT",
+            body: payloadFor(editorForm),
+          });
+          editor.close();
+          ui.announce("Asset profile changes saved.");
+          window.location.reload();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+
+      document.querySelectorAll("[data-profile-delete]").forEach((control) => {
+        control.addEventListener("click", async () => {
+          const profileId = control.dataset.profileId;
+          if (!window.confirm(`Delete asset profile ${profileId}? Assets using it will block this action.`)) return;
+          ui.setPending(control, true);
+          try {
+            await ui.request(`${endpoint}/${encodeURIComponent(profileId)}`, { method: "DELETE" });
+            ui.announce("Asset profile deleted.");
+            window.location.reload();
+          } catch (error) {
+            ui.announce(error.message, "error");
+          } finally {
+            ui.setPending(control, false);
+          }
+        });
       });
     })();
   </script>

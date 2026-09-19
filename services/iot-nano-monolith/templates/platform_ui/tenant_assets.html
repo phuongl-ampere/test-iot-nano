@@ -22,7 +22,7 @@
         <p class="panel-caption">Choose a parent only when this asset belongs below another asset.</p>
       </div>
     </header>
-    <form class="form-grid" action="/tenant/assets" method="post">
+    <form class="form-grid" action="/tenant/assets" method="post" data-asset-create-form>
       <label class="field">
         <span>Name</span>
         <input name="name" type="text" maxlength="128" required>
@@ -35,6 +35,14 @@
             <option value="{{ asset.value }}">{{ asset.label }}</option>
           {% endfor %}
         </select>
+      </label>
+      <label class="field" data-asset-profile-field hidden>
+        <span>Asset profile</span>
+        <select data-asset-profile-select></select>
+      </label>
+      <label class="field" data-asset-metadata-field hidden>
+        <span>Metadata (JSON)</span>
+        <textarea data-asset-metadata rows="3">{}</textarea>
       </label>
       <div class="form-actions"><button type="submit">Create</button></div>
     </form>
@@ -52,6 +60,7 @@
               <th scope="col">Name</th>
               <th scope="col">Parent asset</th>
               <th scope="col">State</th>
+              <th scope="col">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -61,6 +70,12 @@
                 <td>{{ asset.name }}</td>
                 <td>{{ asset.parent }}</td>
                 <td><span class="status-chip">{{ asset.status }}</span></td>
+                <td>
+                  <div class="action-buttons">
+                    <button type="button" class="button-link-secondary" data-asset-edit data-asset-id="{{ asset.id }}" aria-label="Edit {{ asset.name }}" title="Edit asset">Edit</button>
+                    <button type="button" class="button-danger" data-asset-delete data-asset-id="{{ asset.id }}" aria-label="Delete {{ asset.name }}" title="Delete asset">Delete</button>
+                  </div>
+                </td>
               </tr>
             {% endfor %}
           </tbody>
@@ -68,4 +83,185 @@
       </div>
     {% endif %}
   </section>
+
+  <dialog id="asset-editor" class="dialog" aria-labelledby="asset-editor-title">
+    <header class="dialog-header">
+      <div>
+        <h2 id="asset-editor-title">Edit asset</h2>
+        <p class="panel-caption">Parent, profile and metadata are saved through the tenant management API.</p>
+      </div>
+      <button type="button" class="dialog-close" data-dialog-close aria-label="Close asset editor" title="Close">Close</button>
+    </header>
+    <form data-asset-editor-form>
+      <label class="field">
+        <span>Name</span>
+        <input name="name" type="text" maxlength="128" required>
+      </label>
+      <label class="field">
+        <span>Parent asset</span>
+        <select name="parent_asset_id"></select>
+      </label>
+      <label class="field">
+        <span>Asset profile</span>
+        <select name="asset_profile_id"></select>
+      </label>
+      <label class="field">
+        <span>Metadata (JSON)</span>
+        <textarea name="metadata" rows="6" required></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="button-link-secondary" data-dialog-close>Cancel</button>
+        <button type="submit">Save changes</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    (() => {
+      const ui = window.PlatformUi;
+      const createForm = document.querySelector("[data-asset-create-form]");
+      const profileField = document.querySelector("[data-asset-profile-field]");
+      const metadataField = document.querySelector("[data-asset-metadata-field]");
+      const createProfileSelect = document.querySelector("[data-asset-profile-select]");
+      const createMetadata = document.querySelector("[data-asset-metadata]");
+      const editor = document.getElementById("asset-editor");
+      const editorForm = document.querySelector("[data-asset-editor-form]");
+      let selectedAsset = null;
+
+      if (!ui || !createForm || !editor || !editorForm) return;
+
+      const option = (value, label) => {
+        const node = document.createElement("option");
+        node.value = value || "";
+        node.textContent = label;
+        return node;
+      };
+
+      const replaceOptions = (select, items, selected, emptyLabel) => {
+        select.replaceChildren(option("", emptyLabel));
+        items.forEach((item) => {
+          const node = option(item.id, item.name);
+          node.selected = node.value === (selected || "");
+          select.append(node);
+        });
+      };
+
+      document.querySelectorAll("[data-dialog-close]").forEach((control) => {
+        control.addEventListener("click", () => control.closest("dialog")?.close());
+      });
+
+      const loadCreateProfiles = async () => {
+        try {
+          const profiles = await ui.request("/api/management/profiles/asset-profiles");
+          replaceOptions(createProfileSelect, profiles, null, "No profile");
+          profileField.hidden = false;
+          metadataField.hidden = false;
+        } catch (_) {
+          // The normal form remains usable when enhancement data is unavailable.
+        }
+      };
+
+      const openEditor = async (assetId, control) => {
+        ui.setPending(control, true);
+        try {
+          const [assets, profiles] = await Promise.all([
+            ui.request("/api/management/assets"),
+            ui.request("/api/management/profiles/asset-profiles"),
+          ]);
+          selectedAsset = assets.find((asset) => asset.id === assetId);
+          if (!selectedAsset) throw new Error("The asset no longer exists.");
+
+          const fields = editorForm.elements;
+          fields.name.value = selectedAsset.name;
+          replaceOptions(
+            fields.parent_asset_id,
+            assets.filter((asset) => asset.id !== selectedAsset.id),
+            selectedAsset.parent_asset_id,
+            "Root asset",
+          );
+          replaceOptions(fields.asset_profile_id, profiles, selectedAsset.asset_profile_id, "No profile");
+          fields.metadata.value = JSON.stringify(selectedAsset.metadata || {}, null, 2);
+          editor.showModal();
+          fields.name.focus();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(control, false);
+        }
+      };
+
+      createForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const submit = event.submitter || createForm.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          await ui.request("/api/management/assets", {
+            method: "POST",
+            body: {
+              name: createForm.elements.name.value.trim(),
+              parent_asset_id: createForm.elements.parent_asset_id.value || null,
+              asset_profile_id: createProfileSelect.value || null,
+              metadata: ui.parseObject(createMetadata.value),
+            },
+          });
+          ui.announce("Asset created.");
+          window.location.reload();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+
+      editorForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!selectedAsset) return;
+        const submit = event.submitter || editorForm.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          const fields = editorForm.elements;
+          await ui.request(`/api/management/assets/${encodeURIComponent(selectedAsset.id)}`, {
+            method: "PUT",
+            body: {
+              name: fields.name.value.trim(),
+              parent_asset_id: fields.parent_asset_id.value || null,
+              asset_profile_id: fields.asset_profile_id.value || null,
+              metadata: ui.parseObject(fields.metadata.value),
+              attributes: selectedAsset.attributes || null,
+            },
+          });
+          editor.close();
+          ui.announce("Asset changes saved.");
+          window.location.reload();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+
+      document.querySelectorAll("[data-asset-edit]").forEach((control) => {
+        control.addEventListener("click", () => openEditor(control.dataset.assetId, control));
+      });
+
+      document.querySelectorAll("[data-asset-delete]").forEach((control) => {
+        control.addEventListener("click", async () => {
+          const assetId = control.dataset.assetId;
+          if (!window.confirm(`Delete asset ${assetId}? Child assets and attached devices may be affected.`)) return;
+          ui.setPending(control, true);
+          try {
+            await ui.request(`/api/management/assets/${encodeURIComponent(assetId)}`, { method: "DELETE" });
+            ui.announce("Asset deleted.");
+            window.location.reload();
+          } catch (error) {
+            ui.announce(error.message, "error");
+          } finally {
+            ui.setPending(control, false);
+          }
+        });
+      });
+
+      loadCreateProfiles();
+    })();
+  </script>
 {% endblock %}

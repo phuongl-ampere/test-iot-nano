@@ -22,7 +22,7 @@
         <p class="panel-caption">A credential is shown once after provisioning.</p>
       </div>
     </header>
-    <form class="form-grid" action="/tenant/devices" method="post">
+    <form class="form-grid" action="/tenant/devices" method="post" data-device-provision-form>
       <label class="field">
         <span>Display name</span>
         <input name="display_name" type="text" maxlength="128" required>
@@ -80,7 +80,13 @@
                 <td>{{ device.display_name }}</td>
                 <td><span class="status-chip">{{ device.status }}</span></td>
                 <td>{{ device.asset }}</td>
-                <td><a class="resource-link action-link" href="/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens">Manage tokens<span class="visually-hidden"> for {{ device.display_name }}</span></a></td>
+                <td>
+                  <div class="action-buttons">
+                    <button type="button" class="button-link-secondary" data-device-edit data-device-id="{{ device.device_id }}" aria-label="Edit {{ device.display_name }}" title="Edit device">Edit</button>
+                    <a class="resource-link action-link" href="/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens">Tokens<span class="visually-hidden"> for {{ device.display_name }}</span></a>
+                    <button type="button" class="button-danger" data-device-delete data-device-id="{{ device.device_id }}" aria-label="Delete {{ device.display_name }}" title="Delete device">Delete</button>
+                  </div>
+                </td>
               </tr>
             {% endfor %}
           </tbody>
@@ -88,4 +94,237 @@
       </div>
     {% endif %}
   </section>
+
+  <dialog id="device-editor" class="dialog" aria-labelledby="device-editor-title">
+    <header class="dialog-header">
+      <div>
+        <h2 id="device-editor-title">Edit device</h2>
+        <p class="panel-caption">Changes are saved through the tenant management API.</p>
+      </div>
+      <button type="button" class="dialog-close" data-dialog-close aria-label="Close device editor" title="Close">Close</button>
+    </header>
+    <form data-device-editor-form>
+      <label class="field">
+        <span>Display name</span>
+        <input name="display_name" type="text" maxlength="128" required>
+      </label>
+      <label class="field">
+        <span>Assigned asset</span>
+        <select name="asset_id"></select>
+      </label>
+      <label class="field">
+        <span>Device profile</span>
+        <select name="device_profile_id"></select>
+      </label>
+      <label class="field field--checkbox">
+        <input name="is_gateway" type="checkbox">
+        <span>Gateway device</span>
+      </label>
+      <label class="field">
+        <span>Gateway parent</span>
+        <select name="gateway_device_id"></select>
+      </label>
+      <label class="field">
+        <span>Attributes (JSON)</span>
+        <textarea name="attributes" rows="5" required></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="button-link-secondary" data-dialog-close>Cancel</button>
+        <button type="submit">Save changes</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="device-credential" class="dialog" aria-labelledby="device-credential-title">
+    <header class="dialog-header">
+      <div>
+        <h2 id="device-credential-title">Device credential</h2>
+        <p class="panel-caption">Copy this credential now. It is cleared when this dialog closes.</p>
+      </div>
+      <button type="button" class="dialog-close" data-dialog-close aria-label="Close credential dialog" title="Close">Close</button>
+    </header>
+    <form method="dialog">
+      <output class="dialog-output" data-device-credential-value></output>
+      <div class="dialog-actions">
+        <span class="json-feedback" data-device-credential-status role="status"></span>
+        <button type="button" data-device-credential-copy>Copy credential</button>
+        <button type="submit" class="button-link-secondary">Done</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    (() => {
+      const ui = window.PlatformUi;
+      const provisionForm = document.querySelector("[data-device-provision-form]");
+      const editor = document.getElementById("device-editor");
+      const editorForm = document.querySelector("[data-device-editor-form]");
+      const credentialDialog = document.getElementById("device-credential");
+      const credentialValue = document.querySelector("[data-device-credential-value]");
+      const credentialStatus = document.querySelector("[data-device-credential-status]");
+      let selectedDevice = null;
+
+      if (!ui || !provisionForm || !editor || !editorForm || !credentialDialog) return;
+
+      const option = (value, label) => {
+        const node = document.createElement("option");
+        node.value = value || "";
+        node.textContent = label;
+        return node;
+      };
+
+      const replaceOptions = (select, items, selected, emptyLabel) => {
+        select.replaceChildren(option("", emptyLabel));
+        items.forEach((item) => {
+          const node = option(item.id || item.device_id, item.name || item.display_name || item.device_id);
+          node.selected = node.value === (selected || "");
+          select.append(node);
+        });
+      };
+
+      const closeEditor = () => editor.close();
+      document.querySelectorAll("[data-dialog-close]").forEach((control) => {
+        control.addEventListener("click", () => control.closest("dialog")?.close());
+      });
+
+      const refreshDevices = () => {
+        const panel = document.getElementById("devices-panel");
+        if (panel && window.htmx) {
+          window.htmx.trigger(panel, "visibilityrefresh");
+          return;
+        }
+        window.location.reload();
+      };
+
+      const openEditor = async (deviceId, control) => {
+        ui.setPending(control, true);
+        try {
+          const [devices, assets, profiles] = await Promise.all([
+            ui.request("/api/management/devices"),
+            ui.request("/api/management/assets"),
+            ui.request("/api/management/profiles/device-profiles"),
+          ]);
+          selectedDevice = devices.find((device) => device.device_id === deviceId);
+          if (!selectedDevice) throw new Error("The device no longer exists.");
+
+          const fields = editorForm.elements;
+          fields.display_name.value = selectedDevice.display_name || selectedDevice.device_id;
+          replaceOptions(fields.asset_id, assets, selectedDevice.asset_id, "Unassigned");
+          replaceOptions(fields.device_profile_id, profiles, selectedDevice.device_profile_id, "No profile");
+          replaceOptions(
+            fields.gateway_device_id,
+            devices.filter((device) => device.device_id !== selectedDevice.device_id),
+            selectedDevice.gateway_device_id,
+            "Direct device",
+          );
+          fields.is_gateway.checked = Boolean(selectedDevice.is_gateway);
+          fields.gateway_device_id.disabled = fields.is_gateway.checked;
+          fields.attributes.value = JSON.stringify(selectedDevice.attributes || {}, null, 2);
+          editor.showModal();
+          fields.display_name.focus();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(control, false);
+        }
+      };
+
+      provisionForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const submit = event.submitter || provisionForm.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          const response = await ui.request("/api/management/devices", {
+            method: "POST",
+            body: { display_name: provisionForm.elements.display_name.value.trim() },
+          });
+          provisionForm.reset();
+          credentialValue.textContent = response.token || "Credential was not returned.";
+          credentialStatus.textContent = "";
+          credentialDialog.showModal();
+          ui.announce("Device provisioned. Copy the credential before closing this dialog.");
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+
+      editorForm.elements.is_gateway.addEventListener("change", () => {
+        const gatewaySelect = editorForm.elements.gateway_device_id;
+        gatewaySelect.disabled = editorForm.elements.is_gateway.checked;
+        if (gatewaySelect.disabled) gatewaySelect.value = "";
+      });
+
+      editorForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!selectedDevice) return;
+        const submit = event.submitter || editorForm.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          const fields = editorForm.elements;
+          const isGateway = fields.is_gateway.checked;
+          await ui.request(`/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}`, {
+            method: "PUT",
+            body: {
+              display_name: fields.display_name.value.trim(),
+              asset_id: fields.asset_id.value || null,
+              device_profile_id: fields.device_profile_id.value || null,
+              attributes: ui.parseObject(fields.attributes.value),
+              topology: {
+                is_gateway: isGateway,
+                gateway_device_id: isGateway ? null : fields.gateway_device_id.value || null,
+              },
+            },
+          });
+          closeEditor();
+          ui.announce("Device changes saved.");
+          refreshDevices();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+
+      document.addEventListener("click", async (event) => {
+        if (!(event.target instanceof Element)) return;
+        const control = event.target.closest("[data-device-edit], [data-device-delete]");
+        if (!control) return;
+
+        if (control.matches("[data-device-edit]")) {
+          await openEditor(control.dataset.deviceId, control);
+          return;
+        }
+
+        const deviceId = control.dataset.deviceId;
+        if (!window.confirm(`Delete device ${deviceId}? Its active credentials will stop working.`)) return;
+        ui.setPending(control, true);
+        try {
+          await ui.request(`/api/management/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
+          ui.announce("Device deleted.");
+          refreshDevices();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(control, false);
+        }
+      });
+
+      document.querySelector("[data-device-credential-copy]")?.addEventListener("click", async () => {
+        try {
+          await ui.copyText(credentialValue.textContent || "");
+          credentialStatus.textContent = "Copied.";
+        } catch (_) {
+          credentialStatus.textContent = "Copy failed. Select and copy the credential manually.";
+        }
+      });
+
+      credentialDialog.addEventListener("close", () => {
+        credentialValue.textContent = "";
+        credentialStatus.textContent = "";
+        refreshDevices();
+      });
+    })();
+  </script>
 {% endblock %}
