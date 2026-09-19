@@ -898,6 +898,17 @@ async fn system_tenants_navigation_resolves_to_the_system_overview_for_a_system_
     assert!(body.contains("href=\"/system\">Tenants</a>"));
 }
 
+fn assert_read_only_user_workspace_page_allows_only_logout_form(body: &str) {
+    assert_eq!(body.matches("<form").count(), 1);
+    assert!(body.contains("<form class=\"logout-form\" action=\"/logout\" method=\"post\">"));
+    assert!(!body.contains("action=\"/system"));
+    assert!(!body.contains("action=\"/tenant"));
+    assert!(!body.contains("action=\"/commands"));
+    assert!(!body.contains("href=\"/system"));
+    assert!(!body.contains("href=\"/tenant"));
+    assert!(!body.contains("href=\"/commands"));
+}
+
 #[tokio::test]
 async fn user_workspace_lists_only_authorized_devices_with_server_resolved_access() {
     let (_directory, store, management) = management_session_router_with_store().await;
@@ -930,7 +941,7 @@ async fn user_workspace_lists_only_authorized_devices_with_server_resolved_acces
     assert!(!body.contains("href=\"/system"));
     assert!(!body.contains("href=\"/tenant"));
     assert!(!body.contains("/commands"));
-    assert!(!body.contains("<form"));
+    assert_read_only_user_workspace_page_allows_only_logout_form(&body);
 }
 
 #[tokio::test]
@@ -966,8 +977,8 @@ async fn user_workspace_device_detail_masks_unavailable_devices_and_denies_other
     assert!(!authorized_body.contains("cross-tenant-device-telemetry"));
     assert!(!authorized_body.contains("Unshared device alert"));
     assert!(!authorized_body.contains("Cross tenant device alert"));
-    assert!(!authorized_body.contains("<form"));
     assert!(!authorized_body.contains("/commands"));
+    assert_read_only_user_workspace_page_allows_only_logout_form(&authorized_body);
 
     for device_id in ["other-tenant-device", "guessed-device"] {
         let response = router
@@ -1027,7 +1038,7 @@ async fn user_workspace_asset_list_shows_only_authorized_assets_and_resolved_lin
     assert!(!body.contains("Cross tenant asset"));
     assert!(!body.contains("href=\"/system"));
     assert!(!body.contains("href=\"/tenant"));
-    assert!(!body.contains("<form"));
+    assert_read_only_user_workspace_page_allows_only_logout_form(&body);
 
     let direct_asset_route = format!("/app/assets/{}", assets.direct_asset_id);
     assert!(body.contains(&format!("href=\"{direct_asset_route}\"")));
@@ -1059,7 +1070,7 @@ async fn user_workspace_asset_detail_masks_unavailable_assets_and_requires_user_
     assert!(authorized_body.contains("Direct asset"));
     assert!(authorized_body.contains("Viewer"));
     assert!(authorized_body.contains("Direct user permission"));
-    assert!(!authorized_body.contains("<form"));
+    assert_read_only_user_workspace_page_allows_only_logout_form(&authorized_body);
 
     for asset_id in [
         assets.other_tenant_asset_id.to_string(),

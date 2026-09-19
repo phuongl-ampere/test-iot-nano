@@ -1232,6 +1232,16 @@ async fn management_alerts_are_guarded_and_scoped_to_the_authenticated_tenant() 
     assert_eq!(tenant_b_alerts[0]["rule_name"], "Tenant B alert");
 }
 
+fn assert_read_only_tenant_alert_page_allows_only_logout_form(page: &str) {
+    assert_eq!(page.matches("<form").count(), 1);
+    assert!(page.contains("<form class=\"logout-form\" action=\"/logout\" method=\"post\">"));
+    assert!(!page.contains("action=\"/system"));
+    assert!(!page.contains("action=\"/tenant"));
+    assert!(!page.contains("action=\"/commands"));
+    assert!(!page.contains("href=\"/system"));
+    assert!(!page.contains("href=\"/commands"));
+}
+
 #[tokio::test]
 async fn tenant_alert_page_is_guarded_and_renders_only_the_session_tenant() {
     let (_directory, store, router) = management_router().await;
@@ -1308,7 +1318,7 @@ async fn tenant_alert_page_is_guarded_and_renders_only_the_session_tenant() {
     assert!(page.contains("Tenant A page alert"));
     assert!(!page.contains("Tenant B page alert"));
     assert!(page.contains("href=\"/tenant/alerts\" aria-current=\"page\""));
-    assert!(!page.contains("<form"));
+    assert_read_only_tenant_alert_page_allows_only_logout_form(&page);
 }
 
 #[tokio::test]
