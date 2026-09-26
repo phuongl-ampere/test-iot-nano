@@ -58,12 +58,12 @@ export type LiveView = {
   charts: LiveChart[];
 };
 
-export type ApplicationDomainProfile = {
+export type TenantProfile = {
   id: string;
   name: string;
 };
 
-export type ApplicationProfileAssignment = {
+export type TenantProfileAssignment = {
   profile_id: string | null;
 };
 
@@ -157,28 +157,28 @@ export async function listResourceInvitations(): Promise<ResourceInvitation[]> {
   return listResponse<ResourceInvitation>("/api/v1/resource-invitations");
 }
 
-export async function listApplicationDomainProfiles(
+export async function listTenantProfiles(
   kind: "asset" | "device",
-): Promise<ApplicationDomainProfile[]> {
-  return (await request<PublicProfile[]>("/api/v1/application-domain/profiles?kind=" + kind)).map(normalizeProfile);
+): Promise<TenantProfile[]> {
+  return (await request<PublicProfile[]>("/api/v1/tenant-profile/profiles?kind=" + kind)).map(normalizeProfile);
 }
 
-export async function assignDeviceApplicationProfile(
+export async function assignDeviceTenantProfile(
   deviceId: string,
   profileId: string | null,
-): Promise<ApplicationProfileAssignment> {
-  return request<ApplicationProfileAssignment>(
-    "/api/v1/devices/" + encodeURIComponent(deviceId) + "/application-profile",
+): Promise<TenantProfileAssignment> {
+  return request<TenantProfileAssignment>(
+    "/api/v1/devices/" + encodeURIComponent(deviceId) + "/tenant-profile",
     jsonRequest({ profile_id: profileId }, "PUT"),
   );
 }
 
-export async function assignAssetApplicationProfile(
+export async function assignAssetTenantProfile(
   assetId: string,
   profileId: string | null,
-): Promise<ApplicationProfileAssignment> {
-  return request<ApplicationProfileAssignment>(
-    "/api/v1/assets/" + encodeURIComponent(assetId) + "/application-profile",
+): Promise<TenantProfileAssignment> {
+  return request<TenantProfileAssignment>(
+    "/api/v1/assets/" + encodeURIComponent(assetId) + "/tenant-profile",
     jsonRequest({ profile_id: profileId }, "PUT"),
   );
 }
@@ -589,7 +589,7 @@ function normalizeLiveView(response: PublicLiveView): LiveView {
   };
 }
 
-function normalizeProfile(value: PublicProfile): ApplicationDomainProfile {
+function normalizeProfile(value: PublicProfile): TenantProfile {
   const id = stringValue(value.id)?.trim();
   const name = stringValue(value.name)?.trim();
   if (id === undefined || id.length === 0 || name === undefined || name.length === 0) {

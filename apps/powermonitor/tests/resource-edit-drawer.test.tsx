@@ -14,7 +14,7 @@ describe("ResourceEditDrawer", () => {
   it("keeps device configuration in the edit drawer", async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const path = typeof input === "string" ? input : input.toString();
-      if (path === "/api/v1/application-domain/profiles?kind=device") {
+      if (path === "/api/v1/tenant-profile/profiles?kind=device") {
         return json([{ id: "power-meter", name: "Power meter" }]);
       }
       if (path === "/api/v1/devices/meter-1/live-view") {
@@ -58,7 +58,7 @@ describe("ResourceEditDrawer", () => {
   it("uses an asset drawer without token or device alert controls", async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const path = typeof input === "string" ? input : input.toString();
-      if (path === "/api/v1/application-domain/profiles?kind=asset") {
+      if (path === "/api/v1/tenant-profile/profiles?kind=asset") {
         return json([{ id: "farm-profile", name: "Power farm" }]);
       }
       if (path === "/api/v1/assets/farm-1/live-view") {

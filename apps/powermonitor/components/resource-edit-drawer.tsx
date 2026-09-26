@@ -5,21 +5,21 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   BffApiError,
   archiveDeviceAlertRule,
-  assignAssetApplicationProfile,
-  assignDeviceApplicationProfile,
+  assignAssetTenantProfile,
+  assignDeviceTenantProfile,
   createAssetResourceInvitation,
   createDeviceAlertRule,
   createDeviceResourceInvitation,
   getAssetLiveView,
   getDeviceLiveView,
-  listApplicationDomainProfiles,
+  listTenantProfiles,
   listDeviceAlertRules,
   regenerateDeviceToken,
   revealDeviceToken,
   updateAsset,
   updateDevice,
   updateDeviceAlertRule,
-  type ApplicationDomainProfile,
+  type TenantProfile,
   type Asset,
   type DeviceAlertRule,
   type DeviceAlertRuleInput,
@@ -70,7 +70,7 @@ export function ResourceEditDrawer({
   const [assignmentId, setAssignmentId] = useState(
     isDevice ? resource.asset_id ?? "" : resource.parent_id ?? "",
   );
-  const [profiles, setProfiles] = useState<ApplicationDomainProfile[]>([]);
+  const [profiles, setProfiles] = useState<TenantProfile[]>([]);
   const [profileId, setProfileId] = useState("");
   const [profilesLoading, setProfilesLoading] = useState(canManage);
   const [saving, setSaving] = useState(false);
@@ -102,7 +102,7 @@ export function ResourceEditDrawer({
       };
     }
     void Promise.all([
-      listApplicationDomainProfiles(resource.kind),
+      listTenantProfiles(resource.kind),
       isDevice ? getDeviceLiveView(resource.id) : getAssetLiveView(resource.id),
     ])
       .then(([items, liveView]) => {
@@ -179,13 +179,13 @@ export function ResourceEditDrawer({
           asset_id: assignmentId === "" ? null : assignmentId,
           display_name: name,
         });
-        await assignDeviceApplicationProfile(resource.id, profileId === "" ? null : profileId);
+        await assignDeviceTenantProfile(resource.id, profileId === "" ? null : profileId);
       } else {
         await updateAsset(resource.id, {
           name,
           parent_asset_id: assignmentId === "" ? null : assignmentId,
         });
-        await assignAssetApplicationProfile(resource.id, profileId === "" ? null : profileId);
+        await assignAssetTenantProfile(resource.id, profileId === "" ? null : profileId);
       }
       await onSaved();
       setNotice("Configuration saved.");

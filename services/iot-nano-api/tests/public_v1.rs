@@ -17,9 +17,9 @@ use iot_api::{
 };
 use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration};
 use iot_storage::{
-    ApplicationDomainProfileRepository, ApplicationDomainResourceKind, ApplicationKind,
-    ApplicationRepository, CreateApplicationDomainProfile, DeviceClaimPolicy,
-    DeviceClaimRepository, NewApplication, PlatformStore,
+    ApplicationDomainResourceKind, ApplicationKind, ApplicationRepository, DeviceClaimPolicy,
+    DeviceClaimRepository, NewApplication, PlatformStore, TenantProfileConfiguration,
+    TenantProfileDefinition, TenantProfileRepository,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -741,25 +741,31 @@ async fn exported_public_device_live_view_ignores_a_legacy_global_profile_withou
 }
 
 #[tokio::test]
-async fn exported_public_application_domain_profile_routes_use_the_oauth_application() {
+async fn exported_public_tenant_profile_routes_resolve_by_oauth_tenant() {
     let (_directory, app, _core, store) = exported_router_with_store().await;
-    let profile = ApplicationDomainProfileRepository::create_application_domain_profile(
+    let profile = TenantProfileDefinition {
+        id: Uuid::now_v7(),
+        resource_kind: ApplicationDomainResourceKind::Device,
+        name: "Power Meter".to_owned(),
+        definition: json!({"telemetry_schema": {"power_w": {"type": "number"}}}),
+        live_view: json!({
+            "live_charts": [{
+                "metric": "power_w",
+                "label": "Active power",
+                "unit": "W",
+                "color": "#167b83",
+                "aggregation": "last"
+            }]
+        }),
+    };
+    TenantProfileRepository::replace_tenant_profile_configuration(
         store.as_ref(),
         tenant_id(),
-        CreateApplicationDomainProfile {
-            app_id: APP_ID.parse().unwrap(),
-            resource_kind: ApplicationDomainResourceKind::Device,
-            name: "Power Meter".to_owned(),
-            definition: json!({"telemetry_schema": {"power_w": {"type": "number"}}}),
-            live_view: json!({
-                "live_charts": [{
-                    "metric": "power_w",
-                    "label": "Active power",
-                    "unit": "W",
-                    "color": "#167b83",
-                    "aggregation": "last"
-                }]
-            }),
+        TenantProfileConfiguration {
+            version: 1,
+            profiles: vec![profile.clone()],
+            containment_rules: vec![],
+            permission_definitions: json!({}),
         },
     )
     .await
@@ -769,7 +775,7 @@ async fn exported_public_application_domain_profile_routes_use_the_oauth_applica
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/v1/application-domain/profiles?kind=device")
+                .uri("/api/v1/tenant-profile/profiles?kind=device")
                 .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -789,7 +795,7 @@ async fn exported_public_application_domain_profile_routes_use_the_oauth_applica
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/v1/devices/{DEVICE_ID}/application-profile"))
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/tenant-profile"))
                 .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(json!({"profile_id": profile.id}).to_string()))

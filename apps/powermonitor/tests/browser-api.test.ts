@@ -3,8 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   acceptResourceInvitation,
   archiveDeviceAlertRule,
-  assignAssetApplicationProfile,
-  assignDeviceApplicationProfile,
+  assignAssetTenantProfile,
+  assignDeviceTenantProfile,
   cancelResourceInvitation,
   claimDevice,
   createAsset,
@@ -15,7 +15,7 @@ import {
   getDeviceLiveView,
   getDeviceTelemetry,
   listDeviceAlertRules,
-  listApplicationDomainProfiles,
+  listTenantProfiles,
   listAlerts,
   listAssets,
   listDevices,
@@ -277,7 +277,7 @@ describe("browser PowerMonitor API", () => {
     );
   });
 
-  it("loads application-scoped profile catalogs and saves assignments through dedicated routes", async () => {
+  it("loads tenant profile catalogs and saves assignments through dedicated routes", async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify([
         { id: "meter-v1", name: "Power Meter v1" },
@@ -289,24 +289,24 @@ describe("browser PowerMonitor API", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ profile_id: null }), { status: 200 }));
     vi.stubGlobal("fetch", fetcher);
 
-    await expect(listApplicationDomainProfiles("device")).resolves.toEqual([{ id: "meter-v1", name: "Power Meter v1" }]);
-    await expect(listApplicationDomainProfiles("asset")).resolves.toEqual([{ id: "farm-v1", name: "Power Farm v1" }]);
-    await expect(assignDeviceApplicationProfile("meter-1", "meter-v1")).resolves.toEqual({ profile_id: "meter-v1" });
-    await expect(assignAssetApplicationProfile("farm-1", null)).resolves.toEqual({ profile_id: null });
+    await expect(listTenantProfiles("device")).resolves.toEqual([{ id: "meter-v1", name: "Power Meter v1" }]);
+    await expect(listTenantProfiles("asset")).resolves.toEqual([{ id: "farm-v1", name: "Power Farm v1" }]);
+    await expect(assignDeviceTenantProfile("meter-1", "meter-v1")).resolves.toEqual({ profile_id: "meter-v1" });
+    await expect(assignAssetTenantProfile("farm-1", null)).resolves.toEqual({ profile_id: null });
 
     expect(fetcher).toHaveBeenNthCalledWith(
       1,
-      "/api/v1/application-domain/profiles?kind=device",
+      "/api/v1/tenant-profile/profiles?kind=device",
       expect.objectContaining({ credentials: "same-origin" }),
     );
     expect(fetcher).toHaveBeenNthCalledWith(
       2,
-      "/api/v1/application-domain/profiles?kind=asset",
+      "/api/v1/tenant-profile/profiles?kind=asset",
       expect.objectContaining({ credentials: "same-origin" }),
     );
     expect(fetcher).toHaveBeenNthCalledWith(
       3,
-      "/api/v1/devices/meter-1/application-profile",
+      "/api/v1/devices/meter-1/tenant-profile",
       expect.objectContaining({
         body: JSON.stringify({ profile_id: "meter-v1" }),
         method: "PUT",
@@ -314,7 +314,7 @@ describe("browser PowerMonitor API", () => {
     );
     expect(fetcher).toHaveBeenNthCalledWith(
       4,
-      "/api/v1/assets/farm-1/application-profile",
+      "/api/v1/assets/farm-1/tenant-profile",
       expect.objectContaining({
         body: JSON.stringify({ profile_id: null }),
         method: "PUT",

@@ -11,14 +11,14 @@ use axum::{
 use chrono::Utc;
 use iot_nano_foundation::RpcMode;
 use iot_storage::{
-    ApplicationDomainProfileRepository, ApplicationDomainResourceKind, AuthorizationRepository,
-    CreateManagementAlertRule, DeviceClaimError, DeviceClaimRepository, ManagementAlertRule,
-    ManagementAlertRuleError, ManagementAlertRuleRepository, ManagementAssetProfileRepository,
-    ManagementAssetRepository, ManagementDeviceProfileRepository, ManagementDeviceRepository,
-    ManagementUserRepository, NewPublicAsset, NewPublicDevice, OwnershipTransferTarget,
-    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice,
-    PublicDeviceError, PublicPrincipal, PublicTelemetry, ResourceInvitation,
-    ResourceInvitationRepository, ResourcePermission, UpdateManagementAlertRule, UserCapability,
+    ApplicationDomainResourceKind, AuthorizationRepository, CreateManagementAlertRule,
+    DeviceClaimError, DeviceClaimRepository, ManagementAlertRule, ManagementAlertRuleError,
+    ManagementAlertRuleRepository, ManagementAssetProfileRepository, ManagementAssetRepository,
+    ManagementDeviceProfileRepository, ManagementDeviceRepository, ManagementUserRepository,
+    NewPublicAsset, NewPublicDevice, OwnershipTransferTarget, PlatformStore, PublicAlert,
+    PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice, PublicDeviceError,
+    PublicPrincipal, PublicTelemetry, ResourceInvitation, ResourceInvitationRepository,
+    ResourcePermission, TenantProfileRepository, UpdateManagementAlertRule, UserCapability,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -57,10 +57,7 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
-        .route(
-            "/api/v1/application-domain/profiles",
-            get(list_application_domain_profiles),
-        )
+        .route("/api/v1/tenant-profile/profiles", get(list_tenant_profiles))
         .route("/api/v1/user-capabilities", get(list_user_capabilities))
         .route("/api/v1/asset-profiles", get(list_asset_profiles))
         .route("/api/v1/assets", get(list_assets).post(create_asset))
@@ -77,8 +74,8 @@ where
             get(get_asset_live_view),
         )
         .route(
-            "/api/v1/assets/{asset_id}/application-profile",
-            put(assign_asset_application_profile),
+            "/api/v1/assets/{asset_id}/tenant-profile",
+            put(assign_asset_tenant_profile),
         )
         .route("/api/v1/telemetry", get(list_telemetry))
         .route("/api/v1/telemetry/{device_id}", get(get_telemetry))
@@ -116,8 +113,8 @@ where
             get(get_device_live_view),
         )
         .route(
-            "/api/v1/devices/{device_id}/application-profile",
-            put(assign_device_application_profile),
+            "/api/v1/devices/{device_id}/tenant-profile",
+            put(assign_device_tenant_profile),
         )
         .route(
             "/api/v1/devices/{device_id}/commands",
@@ -336,17 +333,17 @@ struct ProfileCatalogEntryResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApplicationDomainProfileQuery {
+struct TenantProfileQuery {
     kind: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ApplicationProfileAssignmentRequest {
+struct TenantProfileAssignmentRequest {
     profile_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
-struct ApplicationProfileAssignmentResponse {
+struct TenantProfileAssignmentResponse {
     profile_id: Option<Uuid>,
 }
 
@@ -619,10 +616,10 @@ async fn list_assets(
     }))
 }
 
-async fn list_application_domain_profiles(
+async fn list_tenant_profiles(
     Extension(context): Extension<PublicApiContext>,
     headers: HeaderMap,
-    Query(query): Query<ApplicationDomainProfileQuery>,
+    Query(query): Query<TenantProfileQuery>,
 ) -> Result<Json<Vec<ProfileCatalogEntryResponse>>, PublicApiError> {
     let resource_kind =
         ApplicationDomainResourceKind::parse(&query.kind).ok_or(PublicApiError::BadRequest)?;
@@ -631,10 +628,9 @@ async fn list_application_domain_profiles(
         ApplicationDomainResourceKind::Device => "devices:read",
     };
     let (store, principal) = authenticate(&context, &headers, scope).await?;
-    let profiles = ApplicationDomainProfileRepository::list_application_domain_profiles(
+    let profiles = TenantProfileRepository::list_tenant_profile_definitions(
         store.as_ref(),
         principal.tenant_id,
-        &principal.app_id,
         Some(resource_kind),
     )
     .await
@@ -697,10 +693,9 @@ async fn get_asset_live_view(
         .await
         .map_err(|_| PublicApiError::Unavailable)?
         .ok_or(PublicApiError::Forbidden)?;
-    let Some(profile) = ApplicationDomainProfileRepository::application_domain_profile_assignment(
+    let Some(profile) = TenantProfileRepository::tenant_profile_assignment(
         store.as_ref(),
         principal.tenant_id,
-        &principal.app_id,
         ApplicationDomainResourceKind::Asset,
         &asset_id.to_string(),
     )
@@ -718,12 +713,12 @@ async fn get_asset_live_view(
     }))
 }
 
-async fn assign_asset_application_profile(
+async fn assign_asset_tenant_profile(
     Extension(context): Extension<PublicApiContext>,
     headers: HeaderMap,
     Path(asset_id): Path<String>,
-    Json(request): Json<ApplicationProfileAssignmentRequest>,
-) -> Result<Json<ApplicationProfileAssignmentResponse>, PublicApiError> {
+    Json(request): Json<TenantProfileAssignmentRequest>,
+) -> Result<Json<TenantProfileAssignmentResponse>, PublicApiError> {
     let (store, principal) = authenticate(&context, &headers, "assets:write").await?;
     require_user_capability(
         store.as_ref(),
@@ -739,10 +734,9 @@ async fn assign_asset_application_profile(
     {
         return Err(PublicApiError::Forbidden);
     }
-    ApplicationDomainProfileRepository::assign_application_domain_profile(
+    TenantProfileRepository::assign_tenant_profile(
         store.as_ref(),
         principal.tenant_id,
-        &principal.app_id,
         ApplicationDomainResourceKind::Asset,
         &asset_id.to_string(),
         request.profile_id,
@@ -754,7 +748,7 @@ async fn assign_asset_application_profile(
         | iot_storage::ApplicationDomainProfileError::ResourceNotFound => PublicApiError::Conflict,
         _ => PublicApiError::Unavailable,
     })?;
-    Ok(Json(ApplicationProfileAssignmentResponse {
+    Ok(Json(TenantProfileAssignmentResponse {
         profile_id: request.profile_id,
     }))
 }
@@ -1073,10 +1067,9 @@ async fn get_device_live_view(
         .await
         .map_err(|_| PublicApiError::Unavailable)?
         .ok_or(PublicApiError::Forbidden)?;
-    let Some(profile) = ApplicationDomainProfileRepository::application_domain_profile_assignment(
+    let Some(profile) = TenantProfileRepository::tenant_profile_assignment(
         store.as_ref(),
         principal.tenant_id,
-        &principal.app_id,
         ApplicationDomainResourceKind::Device,
         &device_id,
     )
@@ -1094,12 +1087,12 @@ async fn get_device_live_view(
     }))
 }
 
-async fn assign_device_application_profile(
+async fn assign_device_tenant_profile(
     Extension(context): Extension<PublicApiContext>,
     headers: HeaderMap,
     Path(device_id): Path<String>,
-    Json(request): Json<ApplicationProfileAssignmentRequest>,
-) -> Result<Json<ApplicationProfileAssignmentResponse>, PublicApiError> {
+    Json(request): Json<TenantProfileAssignmentRequest>,
+) -> Result<Json<TenantProfileAssignmentResponse>, PublicApiError> {
     let (store, principal) = authenticate(&context, &headers, "devices:write").await?;
     require_user_capability(
         store.as_ref(),
@@ -1114,10 +1107,9 @@ async fn assign_device_application_profile(
     {
         return Err(PublicApiError::Forbidden);
     }
-    ApplicationDomainProfileRepository::assign_application_domain_profile(
+    TenantProfileRepository::assign_tenant_profile(
         store.as_ref(),
         principal.tenant_id,
-        &principal.app_id,
         ApplicationDomainResourceKind::Device,
         &device_id,
         request.profile_id,
@@ -1129,7 +1121,7 @@ async fn assign_device_application_profile(
         | iot_storage::ApplicationDomainProfileError::ResourceNotFound => PublicApiError::Conflict,
         _ => PublicApiError::Unavailable,
     })?;
-    Ok(Json(ApplicationProfileAssignmentResponse {
+    Ok(Json(TenantProfileAssignmentResponse {
         profile_id: request.profile_id,
     }))
 }
