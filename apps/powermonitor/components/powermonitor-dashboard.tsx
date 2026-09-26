@@ -15,6 +15,7 @@ import {
   listAlerts,
   listAssets,
   listDevices,
+  listResourceProfiles,
   listResourceInvitations,
   listUserCapabilities,
   sendDeviceCommandAndWait,
@@ -28,6 +29,7 @@ import {
   type TelemetryPoint,
   type TimeRange,
 } from "../lib/browser-api";
+import { powerProfilePresentation } from "../lib/power-profiles";
 import { CommandPanel } from "./command-panel";
 import { DeviceControlPanel } from "./device-control-panel";
 import { LiveTelemetryCharts } from "./live-telemetry-charts";
@@ -46,6 +48,7 @@ export function PowerMonitorDashboard({
   initialDeviceId,
 }: PowerMonitorDashboardProps) {
   const [assets, setAssets] = useState<Asset[]>([]);
+  const [assetProfileNames, setAssetProfileNames] = useState<Record<string, string>>({});
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [assetBusy, setAssetBusy] = useState(false);
   const [assetName, setAssetName] = useState("");
@@ -59,6 +62,7 @@ export function PowerMonitorDashboard({
   const [claimOpen, setClaimOpen] = useState(false);
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [deviceProfileNames, setDeviceProfileNames] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [invitationBusyId, setInvitationBusyId] = useState<string | null>(null);
   const [invitations, setInvitations] = useState<ResourceInvitation[]>([]);
@@ -103,6 +107,7 @@ export function PowerMonitorDashboard({
       name: selectedAsset.name,
       parent_id: selectedAsset.parent_id,
       permission: selectedAsset.permission,
+      asset_profile_id: selectedAsset.asset_profile_id,
     }
     : selectedDevice !== null
       ? {
@@ -111,6 +116,7 @@ export function PowerMonitorDashboard({
         kind: "device" as const,
         name: selectedDevice.name,
         permission: selectedDevice.permission,
+        device_profile_id: selectedDevice.device_profile_id,
       }
       : null;
   const canManageSelectedResource = selectedResource?.permission === "manager"
@@ -121,6 +127,24 @@ export function PowerMonitorDashboard({
     () => getResourcePath(assets, selectedAsset, selectedDevice),
     [assets, selectedAsset, selectedDevice],
   );
+  const selectedProfileName = selectedDevice?.device_profile_id
+    ? deviceProfileNames[selectedDevice.device_profile_id]
+    : selectedAsset?.asset_profile_id
+      ? assetProfileNames[selectedAsset.asset_profile_id]
+      : undefined;
+  const profilePresentation = powerProfilePresentation(
+    selectedDevice !== null ? "device" : "asset",
+    selectedProfileName,
+  );
+  const effectiveLiveView = liveView.profile !== null || profilePresentation === null
+    ? liveView
+    : {
+      charts: profilePresentation.charts,
+      profile: {
+        id: selectedDevice?.device_profile_id ?? selectedAsset?.asset_profile_id ?? profilePresentation.label,
+        name: profilePresentation.label,
+      },
+    };
 
   const refresh = useCallback(async (): Promise<boolean> => {
     const requestId = workspaceRequestIdRef.current + 1;
@@ -429,6 +453,7 @@ export function PowerMonitorDashboard({
                   {selectedDevice.online ? "Online" : "Offline"}
                 </span>
               )}
+              {profilePresentation !== null && <span>{profilePresentation.label}</span>}
               <span>{selectedDevice?.id ?? selectedAsset?.id ?? "All accessible resources"}</span>
             </div>
           </div>
@@ -591,13 +616,13 @@ export function PowerMonitorDashboard({
             <>
               {liveViewLoading ? (
                 <p className="empty-state">Loading configured live view...</p>
-              ) : liveView.profile === null ? (
+              ) : effectiveLiveView.profile === null ? (
                 <PowerTelemetryTable points={telemetry} />
-              ) : liveView.charts.length === 0 ? (
+              ) : effectiveLiveView.charts.length === 0 ? (
                 <p className="empty-state">This profile has no live widgets configured.</p>
               ) : (
                 <LiveTelemetryCharts
-                  charts={liveView.charts}
+                  charts={effectiveLiveView.charts}
                   isAsset={selectedAsset !== null}
                   points={telemetry}
                   range={range}

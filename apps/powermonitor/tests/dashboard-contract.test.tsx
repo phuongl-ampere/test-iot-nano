@@ -134,17 +134,18 @@ describe("PowerMonitor dashboard", () => {
       if (path === "/api/v1/devices") {
         return json({ items: [{
           device_id: "meter-1",
+          device_profile_id: "meter-v1",
           display_name: "Main meter",
           effective_permission: "manager",
         }] });
       }
-      if (path === "/api/v1/assets" || path === "/api/v1/alerts") {
+      if (path === "/api/v1/assets" || path === "/api/v1/alerts" || path === "/api/v1/asset-profiles") {
         return json({ items: [] });
       }
       if (path === "/api/v1/resource-invitations") {
         return json({ items: [] });
       }
-      if (path === "/api/v1/tenant-profile/profiles?kind=device") {
+      if (path === "/api/v1/device-profiles") {
         return json([
           { id: "meter-v1", name: "Power Meter v1" },
           { id: "inverter-v1", name: "Solar Inverter v1" },
@@ -171,10 +172,7 @@ describe("PowerMonitor dashboard", () => {
         return json({ items: [] });
       }
       if (path === "/api/v1/devices/meter-1" && init?.method === "PATCH") {
-        return json({ device_id: "meter-1", display_name: "Main meter" });
-      }
-      if (path === "/api/v1/devices/meter-1/tenant-profile" && init?.method === "PUT") {
-        return json({ profile_id: "inverter-v1" });
+        return json({ device_id: "meter-1", device_profile_id: "inverter-v1", display_name: "Main meter" });
       }
       throw new Error("Unexpected BFF request: " + path);
     });
@@ -190,10 +188,10 @@ describe("PowerMonitor dashboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
 
     await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
-      "/api/v1/devices/meter-1/tenant-profile",
+      "/api/v1/devices/meter-1",
       expect.objectContaining({
-        body: JSON.stringify({ profile_id: "inverter-v1" }),
-        method: "PUT",
+        body: JSON.stringify({ asset_id: null, device_profile_id: "inverter-v1", display_name: "Main meter" }),
+        method: "PATCH",
       }),
     ));
     expect(await screen.findByText("Updated device power")).toBeTruthy();
@@ -207,6 +205,7 @@ describe("PowerMonitor dashboard", () => {
       }
       if (path === "/api/v1/assets") {
         return json({ items: [{
+          asset_profile_id: "farm-v1",
           effective_permission: "manager",
           id: "farm-1",
           name: "Main farm",
@@ -215,8 +214,11 @@ describe("PowerMonitor dashboard", () => {
       if (path === "/api/v1/resource-invitations") {
         return json({ items: [] });
       }
-      if (path === "/api/v1/tenant-profile/profiles?kind=asset") {
+      if (path === "/api/v1/asset-profiles") {
         return json([{ id: "farm-v1", name: "Power Farm v1" }]);
+      }
+      if (path === "/api/v1/device-profiles") {
+        return json([]);
       }
       if (path === "/api/v1/assets/farm-1/live-view") {
         return json({
@@ -228,10 +230,7 @@ describe("PowerMonitor dashboard", () => {
         return json({ items: [] });
       }
       if (path === "/api/v1/assets/farm-1" && init?.method === "PATCH") {
-        return json({ id: "farm-1", name: "Main farm" });
-      }
-      if (path === "/api/v1/assets/farm-1/tenant-profile" && init?.method === "PUT") {
-        return json({ profile_id: null });
+        return json({ asset_profile_id: null, id: "farm-1", name: "Main farm" });
       }
       throw new Error("Unexpected BFF request: " + path);
     });
@@ -246,10 +245,10 @@ describe("PowerMonitor dashboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
 
     await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
-      "/api/v1/assets/farm-1/tenant-profile",
+      "/api/v1/assets/farm-1",
       expect.objectContaining({
-        body: JSON.stringify({ profile_id: null }),
-        method: "PUT",
+        body: JSON.stringify({ asset_profile_id: null, name: "Main farm", parent_asset_id: null }),
+        method: "PATCH",
       }),
     ));
   });

@@ -6,6 +6,7 @@ export type Device = {
   id: string;
   name?: string;
   asset_id?: string | null;
+  device_profile_id?: string | null;
   attributes?: Record<string, unknown>;
   online?: boolean;
   last_seen_at?: string | null;
@@ -19,6 +20,7 @@ export type Device = {
 export type Asset = {
   id: string;
   name: string;
+  asset_profile_id?: string | null;
   attributes?: Record<string, unknown>;
   parent_id?: string | null;
   permission?: Permission;
@@ -59,6 +61,11 @@ export type LiveView = {
 };
 
 export type TenantProfile = {
+  id: string;
+  name: string;
+};
+
+export type ResourceProfile = {
   id: string;
   name: string;
 };
@@ -163,6 +170,13 @@ export async function listTenantProfiles(
   return (await request<PublicProfile[]>("/api/v1/tenant-profile/profiles?kind=" + kind)).map(normalizeProfile);
 }
 
+export async function listResourceProfiles(
+  kind: "asset" | "device",
+): Promise<ResourceProfile[]> {
+  const path = kind === "asset" ? "/api/v1/asset-profiles" : "/api/v1/device-profiles";
+  return (await listResponse<PublicProfile>(path)).map(normalizeProfile);
+}
+
 export async function assignDeviceTenantProfile(
   deviceId: string,
   profileId: string | null,
@@ -185,7 +199,7 @@ export async function assignAssetTenantProfile(
 
 export async function updateDevice(
   deviceId: string,
-  input: { display_name?: string; asset_id?: string | null },
+  input: { display_name?: string; asset_id?: string | null; device_profile_id?: string | null },
 ): Promise<Device> {
   return normalizeDevice(await request<PublicDevice>(
     "/api/v1/devices/" + encodeURIComponent(deviceId),
@@ -195,7 +209,7 @@ export async function updateDevice(
 
 export async function updateAsset(
   assetId: string,
-  input: { name?: string; parent_asset_id?: string | null },
+  input: { name?: string; parent_asset_id?: string | null; asset_profile_id?: string | null },
 ): Promise<Asset> {
   return normalizeAsset(await request<PublicAsset>(
     "/api/v1/assets/" + encodeURIComponent(assetId),
@@ -458,6 +472,7 @@ type CursorPage<T> = {
 
 type PublicDevice = {
   asset_id?: string | null;
+  device_profile_id?: string | null;
   attributes?: unknown;
   brightness_pct?: unknown;
   capabilities?: unknown;
@@ -475,6 +490,7 @@ type PublicDevice = {
 
 type PublicAsset = {
   attributes?: unknown;
+  asset_profile_id?: string | null;
   effective_permission?: Permission;
   id: string;
   metadata?: unknown;
@@ -523,6 +539,7 @@ function normalizeDevice(response: PublicDevice): Device {
     name: response.name ?? response.display_name ?? id,
   };
   if (response.asset_id !== undefined) device.asset_id = response.asset_id;
+  if (response.device_profile_id !== undefined) device.device_profile_id = response.device_profile_id;
   const permission = response.permission ?? response.effective_permission;
   if (permission !== undefined) device.permission = permission;
   const attributes = recordValue(response.attributes ?? response.metadata);
@@ -550,6 +567,7 @@ function normalizeAsset(response: PublicAsset): Asset {
   };
   const parentId = response.parent_id ?? response.parent_asset_id;
   if (parentId !== undefined) asset.parent_id = parentId;
+  if (response.asset_profile_id !== undefined) asset.asset_profile_id = response.asset_profile_id;
   const permission = response.permission ?? response.effective_permission;
   if (permission !== undefined) asset.permission = permission;
   if (response.attributes !== undefined || response.metadata !== undefined) {

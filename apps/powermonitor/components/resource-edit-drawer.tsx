@@ -5,21 +5,17 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   BffApiError,
   archiveDeviceAlertRule,
-  assignAssetTenantProfile,
-  assignDeviceTenantProfile,
   createAssetResourceInvitation,
   createDeviceAlertRule,
   createDeviceResourceInvitation,
-  getAssetLiveView,
-  getDeviceLiveView,
-  listTenantProfiles,
+  listResourceProfiles,
   listDeviceAlertRules,
   regenerateDeviceToken,
   revealDeviceToken,
   updateAsset,
   updateDevice,
   updateDeviceAlertRule,
-  type TenantProfile,
+  type ResourceProfile,
   type Asset,
   type DeviceAlertRule,
   type DeviceAlertRuleInput,
@@ -32,6 +28,8 @@ type EditableResource = {
   name?: string;
   permission?: Permission;
   asset_id?: string | null;
+  asset_profile_id?: string | null;
+  device_profile_id?: string | null;
   parent_id?: string | null;
 };
 
@@ -70,8 +68,10 @@ export function ResourceEditDrawer({
   const [assignmentId, setAssignmentId] = useState(
     isDevice ? resource.asset_id ?? "" : resource.parent_id ?? "",
   );
-  const [profiles, setProfiles] = useState<TenantProfile[]>([]);
-  const [profileId, setProfileId] = useState("");
+  const [profiles, setProfiles] = useState<ResourceProfile[]>([]);
+  const [profileId, setProfileId] = useState(
+    isDevice ? resource.device_profile_id ?? "" : resource.asset_profile_id ?? "",
+  );
   const [profilesLoading, setProfilesLoading] = useState(canManage);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -101,14 +101,10 @@ export function ResourceEditDrawer({
         active = false;
       };
     }
-    void Promise.all([
-      listTenantProfiles(resource.kind),
-      isDevice ? getDeviceLiveView(resource.id) : getAssetLiveView(resource.id),
-    ])
-      .then(([items, liveView]) => {
+    void listResourceProfiles(resource.kind)
+      .then((items) => {
         if (!active) return;
         setProfiles(items);
-        setProfileId(liveView.profile?.id ?? "");
       })
       .catch((reason) => {
         if (active) setError(messageFor(reason));
@@ -177,15 +173,15 @@ export function ResourceEditDrawer({
       if (isDevice) {
         await updateDevice(resource.id, {
           asset_id: assignmentId === "" ? null : assignmentId,
+          device_profile_id: profileId === "" ? null : profileId,
           display_name: name,
         });
-        await assignDeviceTenantProfile(resource.id, profileId === "" ? null : profileId);
       } else {
         await updateAsset(resource.id, {
+          asset_profile_id: profileId === "" ? null : profileId,
           name,
           parent_asset_id: assignmentId === "" ? null : assignmentId,
         });
-        await assignAssetTenantProfile(resource.id, profileId === "" ? null : profileId);
       }
       await onSaved();
       setNotice("Configuration saved.");

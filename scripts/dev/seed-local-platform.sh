@@ -53,6 +53,7 @@ source "$seed_file"
 : "${IOT_NANO_SEED_UNASSIGNED_USERNAME:=seed-unassigned}"
 : "${IOT_NANO_SEED_UNASSIGNED_PASSWORD:=SeedUnassignedOnly2026!}"
 
+
 require_seed_variables() {
   local variable
 

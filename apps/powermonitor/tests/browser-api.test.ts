@@ -15,6 +15,7 @@ import {
   getDeviceLiveView,
   getDeviceTelemetry,
   listDeviceAlertRules,
+  listResourceProfiles,
   listTenantProfiles,
   listAlerts,
   listAssets,
@@ -88,6 +89,7 @@ describe("browser PowerMonitor API", () => {
       new Response(JSON.stringify({
         items: [{
           asset_id: "asset-1",
+          device_profile_id: "profile-meter",
           device_id: "meter-1",
           display_name: "Main meter",
           effective_permission: "viewer",
@@ -106,11 +108,38 @@ describe("browser PowerMonitor API", () => {
       brightness_pct: 72,
       capabilities: ["switch", "brightness"],
       id: "meter-1",
+      device_profile_id: "profile-meter",
       name: "Main meter",
       online: true,
       permission: "viewer",
       switch_state: false,
     }]);
+  });
+
+  it("preserves resource profile IDs and loads the matching public catalog", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        items: [{ asset_profile_id: "profile-farm", id: "farm-1", name: "Power Farm 1" }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        items: [{ id: "profile-farm", name: "Power Farm" }],
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listAssets()).resolves.toEqual([{
+      asset_profile_id: "profile-farm",
+      id: "farm-1",
+      name: "Power Farm 1",
+    }]);
+    await expect(listResourceProfiles("asset")).resolves.toEqual([{
+      id: "profile-farm",
+      name: "Power Farm",
+    }]);
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/v1/asset-profiles",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
   });
 
   it("uses same-origin generic BFF resources without a bearer token", async () => {
