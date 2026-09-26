@@ -162,6 +162,37 @@ pub trait TenantProfileRepository: Send + Sync {
         tenant_id: Uuid,
         configuration: TenantProfileConfiguration,
     ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationDomainProfileError>> + Send + 'a>>;
+    fn list_tenant_profile_definitions<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        resource_kind: Option<ApplicationDomainResourceKind>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<TenantProfileDefinition>, ApplicationDomainProfileError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn assign_tenant_profile<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        resource_kind: ApplicationDomainResourceKind,
+        resource_id: &'a str,
+        profile_id: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationDomainProfileError>> + Send + 'a>>;
+    fn tenant_profile_assignment<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        resource_kind: ApplicationDomainResourceKind,
+        resource_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Option<TenantProfileDefinition>, ApplicationDomainProfileError>,
+                > + Send
+                + 'a,
+        >,
+    >;
 }
 
 impl From<PlatformStoreError> for ApplicationDomainProfileError {

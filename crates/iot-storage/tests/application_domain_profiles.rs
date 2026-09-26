@@ -378,3 +378,93 @@ async fn sqlite_tenant_profile_configuration_replaces_atomically() {
         configuration
     );
 }
+
+#[tokio::test]
+async fn sqlite_tenant_profile_runtime_catalog_and_assignments_are_tenant_scoped() {
+    let (_directory, store, tenant_id) = sqlite_store().await;
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES ('meter-a', ?)")
+        .bind(tenant_id.to_string())
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    let farm = TenantProfileDefinition {
+        id: Uuid::now_v7(),
+        resource_kind: ApplicationDomainResourceKind::Asset,
+        name: "Power Farm".to_owned(),
+        definition: json!({"level": "farm"}),
+        live_view: json!({}),
+    };
+    let meter = TenantProfileDefinition {
+        id: Uuid::now_v7(),
+        resource_kind: ApplicationDomainResourceKind::Device,
+        name: "Power Meter".to_owned(),
+        definition: json!({"telemetry_schema": {"power_w": {"type": "number"}}}),
+        live_view: json!({"live_charts": [{"metric": "power_w"}]}),
+    };
+    TenantProfileRepository::replace_tenant_profile_configuration(
+        &store,
+        tenant_id,
+        TenantProfileConfiguration {
+            version: 1,
+            profiles: vec![farm, meter.clone()],
+            containment_rules: vec![],
+            permission_definitions: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        TenantProfileRepository::list_tenant_profile_definitions(
+            &store,
+            tenant_id,
+            Some(ApplicationDomainResourceKind::Device),
+        )
+        .await
+        .unwrap(),
+        vec![meter.clone()],
+    );
+
+    TenantProfileRepository::assign_tenant_profile(
+        &store,
+        tenant_id,
+        ApplicationDomainResourceKind::Device,
+        "meter-a",
+        Some(meter.id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        TenantProfileRepository::tenant_profile_assignment(
+            &store,
+            tenant_id,
+            ApplicationDomainResourceKind::Device,
+            "meter-a",
+        )
+        .await
+        .unwrap(),
+        Some(meter),
+    );
+
+    TenantProfileRepository::assign_tenant_profile(
+        &store,
+        tenant_id,
+        ApplicationDomainResourceKind::Device,
+        "meter-a",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        TenantProfileRepository::tenant_profile_assignment(
+            &store,
+            tenant_id,
+            ApplicationDomainResourceKind::Device,
+            "meter-a",
+        )
+        .await
+        .unwrap(),
+        None,
+    );
+}

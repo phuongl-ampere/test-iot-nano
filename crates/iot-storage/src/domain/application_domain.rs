@@ -12,7 +12,8 @@ use crate::{
     ApplicationAssetProfileRelation, ApplicationDomainProfile, ApplicationDomainProfileError,
     ApplicationDomainProfileRepository, ApplicationDomainResourceKind, ApplicationId,
     CreateApplicationAssetProfileRelation, CreateApplicationDomainProfile, PlatformStore,
-    TenantProfileConfiguration, TenantProfileRepository, UpdateApplicationDomainProfile,
+    TenantProfileConfiguration, TenantProfileDefinition, TenantProfileRepository,
+    UpdateApplicationDomainProfile,
 };
 
 impl TenantProfileRepository for PlatformStore {
@@ -36,6 +37,52 @@ impl TenantProfileRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationDomainProfileError>> + Send + 'a>> {
         Box::pin(async move {
             replace_tenant_profile_configuration(self, tenant_id, configuration).await
+        })
+    }
+
+    fn list_tenant_profile_definitions<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        resource_kind: Option<ApplicationDomainResourceKind>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<TenantProfileDefinition>, ApplicationDomainProfileError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(
+            async move { list_tenant_profile_definitions(self, tenant_id, resource_kind).await },
+        )
+    }
+
+    fn assign_tenant_profile<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        resource_kind: ApplicationDomainResourceKind,
+        resource_id: &'a str,
+        profile_id: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationDomainProfileError>> + Send + 'a>> {
+        Box::pin(async move {
+            assign_tenant_profile(self, tenant_id, resource_kind, resource_id, profile_id).await
+        })
+    }
+
+    fn tenant_profile_assignment<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        resource_kind: ApplicationDomainResourceKind,
+        resource_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Option<TenantProfileDefinition>, ApplicationDomainProfileError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            tenant_profile_assignment(self, tenant_id, resource_kind, resource_id).await
         })
     }
 }
@@ -1064,6 +1111,150 @@ async fn replace_tenant_profile_configuration(
         }
     }
     Ok(())
+}
+
+async fn list_tenant_profile_definitions(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    resource_kind: Option<ApplicationDomainResourceKind>,
+) -> Result<Vec<TenantProfileDefinition>, ApplicationDomainProfileError> {
+    let configuration = export_tenant_profile_configuration(store, tenant_id).await?;
+    Ok(configuration
+        .profiles
+        .into_iter()
+        .filter(|profile| resource_kind.is_none_or(|kind| profile.resource_kind == kind))
+        .collect())
+}
+
+async fn assign_tenant_profile(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    resource_kind: ApplicationDomainResourceKind,
+    resource_id: &str,
+    profile_id: Option<Uuid>,
+) -> Result<(), ApplicationDomainProfileError> {
+    if !resource_exists(store, tenant_id, resource_kind, resource_id).await? {
+        return Err(ApplicationDomainProfileError::ResourceNotFound);
+    }
+    if let Some(profile_id) = profile_id {
+        let profile = tenant_profile_definition(store, tenant_id, profile_id).await?;
+        if profile.resource_kind != resource_kind {
+            return Err(ApplicationDomainProfileError::ProfileKindMismatch);
+        }
+    }
+    match (store, profile_id) {
+        (PlatformStore::Sqlite(store), Some(profile_id)) => {
+            sqlx::query(
+                "INSERT INTO resource_tenant_profile_assignments \
+                    (tenant_id, resource_kind, resource_id, profile_id, updated_at) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(tenant_id, resource_kind, resource_id) DO UPDATE SET \
+                    profile_id = excluded.profile_id, updated_at = excluded.updated_at",
+            )
+            .bind(tenant_id.to_string())
+            .bind(resource_kind.as_str())
+            .bind(resource_id)
+            .bind(profile_id.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .execute(store.pool())
+            .await?;
+        }
+        (PlatformStore::Sqlite(store), None) => {
+            sqlx::query(
+                "DELETE FROM resource_tenant_profile_assignments \
+                 WHERE tenant_id = ? AND resource_kind = ? AND resource_id = ?",
+            )
+            .bind(tenant_id.to_string())
+            .bind(resource_kind.as_str())
+            .bind(resource_id)
+            .execute(store.pool())
+            .await?;
+        }
+        (PlatformStore::Timescale(pool), Some(profile_id)) => {
+            sqlx::query(
+                "INSERT INTO resource_tenant_profile_assignments \
+                    (tenant_id, resource_kind, resource_id, profile_id) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT(tenant_id, resource_kind, resource_id) DO UPDATE SET \
+                    profile_id = EXCLUDED.profile_id, updated_at = now()",
+            )
+            .bind(tenant_id)
+            .bind(resource_kind.as_str())
+            .bind(resource_id)
+            .bind(profile_id)
+            .execute(pool)
+            .await?;
+        }
+        (PlatformStore::Timescale(pool), None) => {
+            sqlx::query(
+                "DELETE FROM resource_tenant_profile_assignments \
+                 WHERE tenant_id = $1 AND resource_kind = $2 AND resource_id = $3",
+            )
+            .bind(tenant_id)
+            .bind(resource_kind.as_str())
+            .bind(resource_id)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn tenant_profile_assignment(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    resource_kind: ApplicationDomainResourceKind,
+    resource_id: &str,
+) -> Result<Option<TenantProfileDefinition>, ApplicationDomainProfileError> {
+    let profile_id = match store {
+        PlatformStore::Sqlite(store) => sqlx::query_scalar::<_, String>(
+            "SELECT profile_id FROM resource_tenant_profile_assignments \
+             WHERE tenant_id = ? AND resource_kind = ? AND resource_id = ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(resource_kind.as_str())
+        .bind(resource_id)
+        .fetch_optional(store.pool())
+        .await?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| ApplicationDomainProfileError::InvalidStoredProfile)
+        })
+        .transpose()?,
+        PlatformStore::Timescale(pool) => {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT profile_id FROM resource_tenant_profile_assignments \
+             WHERE tenant_id = $1 AND resource_kind = $2 AND resource_id = $3",
+            )
+            .bind(tenant_id)
+            .bind(resource_kind.as_str())
+            .bind(resource_id)
+            .fetch_optional(pool)
+            .await?
+        }
+    };
+    let Some(profile_id) = profile_id else {
+        return Ok(None);
+    };
+    let profile = tenant_profile_definition(store, tenant_id, profile_id).await?;
+    if profile.resource_kind != resource_kind {
+        return Err(ApplicationDomainProfileError::InvalidStoredProfile);
+    }
+    Ok(Some(profile))
+}
+
+async fn tenant_profile_definition(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    profile_id: Uuid,
+) -> Result<TenantProfileDefinition, ApplicationDomainProfileError> {
+    export_tenant_profile_configuration(store, tenant_id)
+        .await?
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or(ApplicationDomainProfileError::ProfileNotFound)
 }
 
 fn validate_tenant_profile_configuration(
