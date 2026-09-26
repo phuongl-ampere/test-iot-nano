@@ -23,7 +23,7 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 12] = [
     ("profile", "/tenant/profile", "Profile"),
 ];
 
-const TENANT_TEMPLATES: [(&str, &str); 15] = [
+const TENANT_TEMPLATES: [(&str, &str); 14] = [
     ("tenant.html", "overview"),
     ("tenant_devices.html", "devices"),
     ("tenant_assets.html", "assets"),
@@ -35,7 +35,6 @@ const TENANT_TEMPLATES: [(&str, &str); 15] = [
     ("tenant_groups.html", "groups"),
     ("tenant_permissions.html", "permissions"),
     ("tenant_applications.html", "applications"),
-    ("tenant_application_domain.html", "applications"),
     ("tenant_profile.html", "profile"),
     ("tenant_device_credential.html", "devices"),
     ("tenant_device_claim_policy.html", "devices"),
@@ -438,6 +437,14 @@ fn tenant_profile_template_keeps_json_import_export_separate_from_profile_tabs()
     assert!(template.contains("type=\"file\""));
     assert!(asset_profiles.contains("action=\"/tenant/profiles/asset\""));
     assert!(device_profiles.contains("action=\"/tenant/profiles/device\""));
+}
+
+#[test]
+fn tenant_applications_template_does_not_link_to_an_application_profile_page() {
+    let template = platform_template_source("tenant_applications.html");
+
+    assert!(!template.contains("Domain profile"));
+    assert!(!template.contains("/tenant/applications/{{ application.app_id }}"));
 }
 
 #[test]

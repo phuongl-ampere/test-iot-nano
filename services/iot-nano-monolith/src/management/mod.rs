@@ -26,18 +26,16 @@ use iot_api::{
 };
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
-    ApplicationDomainProfileError, ApplicationDomainProfileRepository,
-    ApplicationDomainResourceKind, ApplicationKind, ApplicationRepository, AuditAction, AuditEvent,
+    ApplicationDomainProfileError, ApplicationKind, ApplicationRepository, AuditAction, AuditEvent,
     AuditEventCursor, AuditEventError, AuditEventRepository, AuditPrincipal, AuditTargetType,
-    AuthorizationRepository, AuthorizationSubject, ClientId, CreateApplicationAssetProfileRelation,
-    CreateApplicationDomainProfile, CreateDeviceAssetRelation, CreateDeviceRelation,
-    CreateManagementAlertRule, CreateManagementAsset, CreateManagementAssetProfile,
-    CreateManagementDeviceProfile, CreateManagementUser, DeviceClaimError, DeviceClaimPolicy,
-    DeviceClaimRepository, DeviceRelationError, DeviceRelationRepository, DeviceTokenRepository,
-    DeviceTokenRepositoryError, MANAGEMENT_DEVICE_TELEMETRY_LIMIT,
-    ManagementAlert as StorageManagementAlert, ManagementAlertError,
-    ManagementAlertIncident as StorageManagementAlertIncident, ManagementAlertIncidentError,
-    ManagementAlertIncidentRepository, ManagementAlertRepository,
+    AuthorizationRepository, AuthorizationSubject, ClientId, CreateDeviceAssetRelation,
+    CreateDeviceRelation, CreateManagementAlertRule, CreateManagementAsset,
+    CreateManagementAssetProfile, CreateManagementDeviceProfile, CreateManagementUser,
+    DeviceClaimError, DeviceClaimPolicy, DeviceClaimRepository, DeviceRelationError,
+    DeviceRelationRepository, DeviceTokenRepository, DeviceTokenRepositoryError,
+    MANAGEMENT_DEVICE_TELEMETRY_LIMIT, ManagementAlert as StorageManagementAlert,
+    ManagementAlertError, ManagementAlertIncident as StorageManagementAlertIncident,
+    ManagementAlertIncidentError, ManagementAlertIncidentRepository, ManagementAlertRepository,
     ManagementAlertRule as StorageManagementAlertRule, ManagementAlertRuleError,
     ManagementAlertRuleRepository, ManagementAsset as StorageManagementAsset, ManagementAssetError,
     ManagementAssetProfile, ManagementAssetProfileError, ManagementAssetProfileRepository,
@@ -51,10 +49,10 @@ use iot_storage::{
     ProvisionManagementDeviceError, RedirectUri, ResourceAccess, ResourceAccessSource,
     ResourceInvitationRepository, ResourcePermission, SystemAccount, TenantAuthorizationError,
     TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository,
-    TenantProfileConfiguration, TenantProfileRepository, TenantStatus,
-    UpdateApplicationDomainProfile, UpdateManagementAlertRule, UpdateManagementAsset,
-    UpdateManagementAssetProfile, UpdateManagementDevice, UpdateManagementDeviceProfile,
-    UpdateManagementUser, UserCapability, UserDeviceActivityRepository,
+    TenantProfileConfiguration, TenantProfileRepository, TenantStatus, UpdateManagementAlertRule,
+    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
+    UpdateManagementDeviceProfile, UpdateManagementUser, UserCapability,
+    UserDeviceActivityRepository,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -271,10 +269,6 @@ impl ManagementSessionRouter {
                 "/tenant/applications",
                 get(platform_tenant_applications).post(save_tenant_application_form),
             )
-            .route(
-                "/tenant/applications/{app_id}",
-                get(platform_tenant_application_domain),
-            )
             .route("/app", get(platform_app))
             .route("/app/devices", post(create_user_device_form))
             .route("/app/devices/claim", post(claim_user_device_form))
@@ -359,33 +353,6 @@ impl ManagementSessionRouter {
             .route(
                 "/api/management/profile/import",
                 put(replace_management_tenant_profile_configuration),
-            )
-            .route(
-                "/api/management/applications/{app_id}/domain-profiles",
-                get(list_management_application_domain_profiles)
-                    .post(create_management_application_domain_profile),
-            )
-            .route(
-                "/api/management/applications/{app_id}/domain-profiles/{profile_id}",
-                put(update_management_application_domain_profile)
-                    .delete(delete_management_application_domain_profile),
-            )
-            .route(
-                "/api/management/applications/{app_id}/asset-profile-relations",
-                get(list_management_application_asset_profile_relations)
-                    .post(create_management_application_asset_profile_relation),
-            )
-            .route(
-                "/api/management/applications/{app_id}/asset-profile-relations/{relation_id}",
-                axum::routing::delete(delete_management_application_asset_profile_relation),
-            )
-            .route(
-                "/api/management/applications/{app_id}/assets/{asset_id}/domain-profile",
-                put(assign_management_asset_application_profile),
-            )
-            .route(
-                "/api/management/applications/{app_id}/devices/{device_id}/domain-profile",
-                put(assign_management_device_application_profile),
             )
             .route("/api/management/alerts", get(list_management_alerts))
             .route(
@@ -1114,45 +1081,6 @@ struct ManagementAssetProfileResponse {
     name: String,
     fields: Value,
     dashboard_defaults: Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManagementApplicationDomainProfileRequest {
-    #[serde(default)]
-    resource_kind: Option<String>,
-    name: String,
-    definition: Value,
-    live_view: Value,
-}
-
-#[derive(Serialize)]
-struct ManagementApplicationDomainProfileResponse {
-    id: Uuid,
-    resource_kind: &'static str,
-    name: String,
-    definition: Value,
-    live_view: Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManagementApplicationAssetProfileRelationRequest {
-    parent_profile_id: Uuid,
-    child_profile_id: Uuid,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManagementApplicationProfileAssignmentRequest {
-    profile_id: Option<Uuid>,
-}
-
-#[derive(Serialize)]
-struct ManagementApplicationAssetProfileRelationResponse {
-    id: Uuid,
-    parent_profile_id: Uuid,
-    child_profile_id: Uuid,
 }
 
 #[derive(Deserialize)]

@@ -11,7 +11,7 @@
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
     <h1>Applications</h1>
-    <p>Create and update OAuth application registrations and their application domain profiles.</p>
+    <p>Create and update OAuth application registrations.</p>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
@@ -131,7 +131,6 @@
               <th scope="col">Redirect URIs</th>
               <th scope="col">Scopes</th>
               <th scope="col">Status</th>
-              <th scope="col">Domain</th>
             </tr>
           </thead>
           <tbody>
@@ -144,7 +143,6 @@
                 <td>{{ application.redirect_uris }}</td>
                 <td>{{ application.scopes }}</td>
                 <td><span class="status-chip status-chip--neutral">{{ application.status }}</span></td>
-                <td><a class="button-link-secondary" href="/tenant/applications/{{ application.app_id }}">Domain profile</a></td>
               </tr>
             {% endfor %}
           </tbody>

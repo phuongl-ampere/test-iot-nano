@@ -68,6 +68,68 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
+        "/api/management/profile",
+        vec![
+            (
+                "get",
+                documented_operation(
+                    "Export the current tenant profile configuration",
+                    Some("managementSession"),
+                    None,
+                    (
+                        "200",
+                        "Tenant profile configuration",
+                        Some("TenantProfileConfiguration"),
+                    ),
+                    &tenant_management_errors(),
+                ),
+            ),
+            (
+                "put",
+                documented_operation(
+                    "Replace the current tenant profile configuration",
+                    Some("managementSession"),
+                    Some(("application/json", "TenantProfileConfiguration")),
+                    ("204", "Tenant profile configuration replaced", None),
+                    &tenant_management_errors(),
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/profile/export",
+        vec![(
+            "get",
+            documented_operation(
+                "Export the current tenant profile configuration",
+                Some("managementSession"),
+                None,
+                (
+                    "200",
+                    "Tenant profile configuration",
+                    Some("TenantProfileConfiguration"),
+                ),
+                &tenant_management_errors(),
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/profile/import",
+        vec![(
+            "put",
+            documented_operation(
+                "Validate and atomically replace the tenant profile configuration",
+                Some("managementSession"),
+                Some(("application/json", "TenantProfileConfiguration")),
+                ("204", "Tenant profile configuration replaced", None),
+                &tenant_management_errors(),
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
         "/api/management/alerts",
         vec![(
             "get",
@@ -757,6 +819,41 @@ fn management_openapi_schemas() -> Value {
         object_schema(
             json!({"app_id": {"type": "string"}, "client_id": {"type": "string"}}),
             &["app_id", "client_id"],
+        ),
+    );
+    schemas.insert(
+        "TenantProfileConfiguration".to_owned(),
+        object_schema(
+            json!({
+                "version": {"type": "integer", "minimum": 1},
+                "profiles": {"type": "array", "items": schema_reference("TenantProfileDefinition")},
+                "containment_rules": {"type": "array", "items": schema_reference("TenantProfileContainmentRule")},
+                "permission_definitions": {"type": "object"}
+            }),
+            &["version", "profiles", "containment_rules", "permission_definitions"],
+        ),
+    );
+    schemas.insert(
+        "TenantProfileDefinition".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema_non_null(),
+                "resource_kind": {"type": "string", "enum": ["asset", "device"]},
+                "name": {"type": "string"},
+                "definition": {"type": "object"},
+                "live_view": {"type": "object"}
+            }),
+            &["id", "resource_kind", "name", "definition", "live_view"],
+        ),
+    );
+    schemas.insert(
+        "TenantProfileContainmentRule".to_owned(),
+        object_schema(
+            json!({
+                "parent_profile_id": uuid_schema_non_null(),
+                "child_profile_id": uuid_schema_non_null()
+            }),
+            &["parent_profile_id", "child_profile_id"],
         ),
     );
     schemas.insert(

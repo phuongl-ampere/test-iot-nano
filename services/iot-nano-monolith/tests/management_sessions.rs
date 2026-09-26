@@ -2747,6 +2747,9 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "/api/management/profiles/asset-profiles/{profile_id}",
         "/api/management/profiles/device-profiles",
         "/api/management/profiles/device-profiles/{profile_id}",
+        "/api/management/profile",
+        "/api/management/profile/export",
+        "/api/management/profile/import",
         "/api/management/users",
         "/api/management/users/{username}",
         "/api/management/users/{username}/capabilities",
@@ -2832,6 +2835,9 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
             "/api/management/profiles/device-profiles/{profile_id}",
             BTreeSet::from(["delete", "put"]),
         ),
+        ("/api/management/profile", BTreeSet::from(["get", "put"])),
+        ("/api/management/profile/export", BTreeSet::from(["get"])),
+        ("/api/management/profile/import", BTreeSet::from(["put"])),
         ("/api/management/users", BTreeSet::from(["get", "post"])),
         ("/api/management/users/{username}", BTreeSet::from(["put"])),
         (
@@ -2983,6 +2989,9 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "ManagementUserUpdateRequest",
         "PlatformLoginResponse",
         "SessionResponse",
+        "TenantProfileConfiguration",
+        "TenantProfileContainmentRule",
+        "TenantProfileDefinition",
     ]);
     assert_eq!(actual_schemas, expected_schemas);
 
@@ -6510,7 +6519,7 @@ async fn tenant_application_page_scopes_list_upserts_and_hides_client_secrets() 
 }
 
 #[tokio::test]
-async fn tenant_account_manages_domain_profiles_inside_its_application() {
+async fn tenant_account_has_no_application_scoped_profile_page_or_api() {
     let (_directory, _store, management) = management_session_router_with_store().await;
     let router = management.router;
     let tenant_cookie = tenant_account_cookie(&router).await;
@@ -6523,27 +6532,16 @@ async fn tenant_account_manages_domain_profiles_inside_its_application() {
         ))
         .await
         .unwrap();
-    assert_eq!(page.status(), StatusCode::OK);
-    let page = String::from_utf8(
-        to_bytes(page.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(page.contains("PowerMonitor domain profile"));
-    assert!(page.contains("Asset containment rules"));
-    assert!(page.contains("const profileEndpoint"));
-    assert!(page.contains("/domain-profiles"));
+    assert_eq!(page.status(), StatusCode::NOT_FOUND);
 
-    let missing = router
+    let api = router
         .oneshot(platform_get(
-            "/tenant/applications/not-registered",
+            "/api/management/applications/powermonitor/domain-profiles",
             Some(&tenant_cookie),
         ))
         .await
         .unwrap();
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(api.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -6751,215 +6749,6 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
     )
     .unwrap();
     assert_eq!(other_export, initial);
-}
-
-#[tokio::test]
-async fn tenant_account_application_domain_api_saves_profiles_and_asset_containment() {
-    let (_directory, _store, management) = management_session_router_with_store().await;
-    let router = management.router;
-    let tenant_cookie = tenant_account_cookie(&router).await;
-    let endpoint = "/api/management/applications/powermonitor/domain-profiles";
-
-    let create_profile = |name: &'static str| {
-        Request::builder()
-            .method("POST")
-            .uri(endpoint)
-            .header(CONTENT_TYPE, "application/json")
-            .header(COOKIE, &tenant_cookie)
-            .body(Body::from(
-                json!({
-                    "resource_kind": "asset",
-                    "name": name,
-                    "definition": {"fields": {"location": {"type": "string"}}},
-                    "live_view": {"live_charts": []}
-                })
-                .to_string(),
-            ))
-            .unwrap()
-    };
-
-    let farm = router
-        .clone()
-        .oneshot(create_profile("Power Farm"))
-        .await
-        .unwrap();
-    assert_eq!(farm.status(), StatusCode::CREATED);
-    let farm: serde_json::Value =
-        serde_json::from_slice(&to_bytes(farm.into_body(), usize::MAX).await.unwrap()).unwrap();
-
-    let updated_farm = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!("{endpoint}/{}", farm["id"].as_str().unwrap()))
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &tenant_cookie)
-                .body(Body::from(
-                    json!({
-                        "name": "Primary Power Farm",
-                        "definition": {"fields": {"location": {"type": "string"}}},
-                        "live_view": {"live_charts": []}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(updated_farm.status(), StatusCode::OK);
-
-    let zone = router
-        .clone()
-        .oneshot(create_profile("Power Zone"))
-        .await
-        .unwrap();
-    assert_eq!(zone.status(), StatusCode::CREATED);
-    let zone: serde_json::Value =
-        serde_json::from_slice(&to_bytes(zone.into_body(), usize::MAX).await.unwrap()).unwrap();
-
-    let meter = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(endpoint)
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &tenant_cookie)
-                .body(Body::from(
-                    json!({
-                        "resource_kind": "device",
-                        "name": "Power Meter",
-                        "definition": {"telemetry_schema": {"power_w": {"type": "number"}}},
-                        "live_view": {"live_charts": []}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(meter.status(), StatusCode::CREATED);
-    let meter: serde_json::Value =
-        serde_json::from_slice(&to_bytes(meter.into_body(), usize::MAX).await.unwrap()).unwrap();
-
-    let relation = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/management/applications/powermonitor/asset-profile-relations")
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &tenant_cookie)
-                .body(Body::from(
-                    json!({
-                        "parent_profile_id": farm["id"],
-                        "child_profile_id": zone["id"]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(relation.status(), StatusCode::CREATED);
-
-    let profiles = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(endpoint)
-                .header(COOKIE, &tenant_cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(profiles.status(), StatusCode::OK);
-    let profiles: serde_json::Value =
-        serde_json::from_slice(&to_bytes(profiles.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(profiles.as_array().unwrap().len(), 3);
-
-    let asset = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/management/assets")
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &tenant_cookie)
-                .body(Body::from(
-                    json!({
-                        "name": "Application Domain Asset",
-                        "asset_profile_id": null,
-                        "parent_asset_id": null,
-                        "metadata": {},
-                        "attributes": {}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(asset.status(), StatusCode::CREATED);
-    let asset: serde_json::Value =
-        serde_json::from_slice(&to_bytes(asset.into_body(), usize::MAX).await.unwrap()).unwrap();
-
-    let device = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/management/devices")
-                .header(CONTENT_TYPE, "application/json")
-                .header(COOKIE, &tenant_cookie)
-                .body(Body::from(
-                    json!({
-                        "display_name": "Application Domain Device",
-                        "asset_id": asset["id"],
-                        "device_profile_id": null,
-                        "attributes": {}
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(device.status(), StatusCode::CREATED);
-    let device: serde_json::Value =
-        serde_json::from_slice(&to_bytes(device.into_body(), usize::MAX).await.unwrap()).unwrap();
-
-    for (resource_kind, resource_id, profile_id) in [
-        (
-            "assets",
-            asset["id"].as_str().unwrap(),
-            farm["id"].as_str().unwrap(),
-        ),
-        (
-            "devices",
-            device["device_id"].as_str().unwrap(),
-            meter["id"].as_str().unwrap(),
-        ),
-    ] {
-        let assignment = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/api/management/applications/powermonitor/{resource_kind}/{resource_id}/domain-profile"
-                    ))
-                    .header(CONTENT_TYPE, "application/json")
-                    .header(COOKIE, &tenant_cookie)
-                    .body(Body::from(json!({ "profile_id": profile_id }).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(assignment.status(), StatusCode::NO_CONTENT);
-    }
 }
 
 #[tokio::test]

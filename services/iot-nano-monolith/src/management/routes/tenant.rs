@@ -170,16 +170,6 @@ pub(in crate::management) async fn platform_tenant_applications(
     .await
 }
 
-pub(in crate::management) async fn platform_tenant_application_domain(
-    State(state): State<ManagementState>,
-    Path(app_id): Path<String>,
-    request: Request,
-) -> Result<Html<String>, ManagementSessionError> {
-    let headers = request.headers().clone();
-    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
-    tenant_application_domain_page(&state, tenant, &app_id).await
-}
-
 pub(in crate::management) async fn tenant_assets_page(
     state: &ManagementState,
     tenant: TenantSession,
@@ -770,88 +760,6 @@ pub(in crate::management) async fn tenant_applications_page(
     )
     .map_err(|_| ManagementSessionError::Unavailable)?;
     Ok(Html(rendered))
-}
-
-pub(in crate::management) async fn tenant_application_domain_page(
-    state: &ManagementState,
-    tenant: TenantSession,
-    app_id: &str,
-) -> Result<Html<String>, ManagementSessionError> {
-    let application =
-        ApplicationRepository::find_application_by_app_id(state.store.as_ref(), app_id)
-            .await
-            .map_err(tenant_application_error)?
-            .filter(|application| application.tenant_id == tenant.tenant_id)
-            .ok_or(ManagementSessionError::NotFound)?;
-    let profiles = ApplicationDomainProfileRepository::list_application_domain_profiles(
-        state.store.as_ref(),
-        tenant.tenant_id,
-        application.app_id.as_str(),
-        None,
-    )
-    .await
-    .map_err(application_domain_profile_error)?;
-    let profile_names: HashMap<Uuid, String> = profiles
-        .iter()
-        .map(|profile| (profile.id, profile.name.clone()))
-        .collect();
-    let relations = ApplicationDomainProfileRepository::list_application_asset_profile_relations(
-        state.store.as_ref(),
-        tenant.tenant_id,
-        application.app_id.as_str(),
-    )
-    .await
-    .map_err(application_domain_profile_error)?;
-    let page = crate::TenantApplicationDomainPage::new(
-        application.app_id.as_str(),
-        application_domain_display_name(application.app_id.as_str()),
-        profiles
-            .iter()
-            .map(|profile| {
-                crate::TenantApplicationDomainProfileRow::new(
-                    profile.id.to_string(),
-                    profile.name.clone(),
-                    profile.resource_kind.as_str(),
-                )
-            })
-            .collect(),
-        profiles
-            .iter()
-            .filter(|profile| profile.resource_kind == ApplicationDomainResourceKind::Asset)
-            .map(|profile| {
-                crate::TenantSelectOption::new(profile.id.to_string(), profile.name.clone())
-            })
-            .collect(),
-        relations
-            .into_iter()
-            .map(|relation| {
-                crate::TenantApplicationAssetProfileRelationRow::new(
-                    relation.id.to_string(),
-                    profile_names
-                        .get(&relation.parent_profile_id)
-                        .cloned()
-                        .unwrap_or_else(|| relation.parent_profile_id.to_string()),
-                    profile_names
-                        .get(&relation.child_profile_id)
-                        .cloned()
-                        .unwrap_or_else(|| relation.child_profile_id.to_string()),
-                )
-            })
-            .collect(),
-    );
-    let rendered = crate::PlatformUiRenderer::render_tenant_application_domain(
-        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
-        &page,
-    )
-    .map_err(|_| ManagementSessionError::Unavailable)?;
-    Ok(Html(rendered))
-}
-
-pub(in crate::management) fn application_domain_display_name(app_id: &str) -> String {
-    match app_id {
-        "powermonitor" => "PowerMonitor".to_owned(),
-        _ => app_id.to_owned(),
-    }
 }
 
 pub(in crate::management) async fn create_tenant_asset_form(

@@ -720,75 +720,6 @@ pub struct TenantApplicationsPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantApplicationDomainProfileRow {
-    id: String,
-    name: String,
-    resource_kind: String,
-}
-
-impl TenantApplicationDomainProfileRow {
-    pub(crate) fn new(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        resource_kind: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            name: name.into(),
-            resource_kind: resource_kind.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantApplicationAssetProfileRelationRow {
-    id: String,
-    parent_name: String,
-    child_name: String,
-}
-
-impl TenantApplicationAssetProfileRelationRow {
-    pub(crate) fn new(
-        id: impl Into<String>,
-        parent_name: impl Into<String>,
-        child_name: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            parent_name: parent_name.into(),
-            child_name: child_name.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantApplicationDomainPage {
-    app_id: String,
-    application_name: String,
-    profiles: Vec<TenantApplicationDomainProfileRow>,
-    asset_profiles: Vec<TenantSelectOption>,
-    relations: Vec<TenantApplicationAssetProfileRelationRow>,
-}
-
-impl TenantApplicationDomainPage {
-    pub(crate) fn new(
-        app_id: impl Into<String>,
-        application_name: impl Into<String>,
-        profiles: Vec<TenantApplicationDomainProfileRow>,
-        asset_profiles: Vec<TenantSelectOption>,
-        relations: Vec<TenantApplicationAssetProfileRelationRow>,
-    ) -> Self {
-        Self {
-            app_id: app_id.into(),
-            application_name: application_name.into(),
-            profiles,
-            asset_profiles,
-            relations,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantProfilePage {
     configuration_json: String,
 }
@@ -1401,13 +1332,6 @@ impl PlatformUiRenderer {
         TenantApplicationsLayout::new(identity, page).render()
     }
 
-    pub fn render_tenant_application_domain(
-        identity: &PlatformUiIdentity,
-        page: &TenantApplicationDomainPage,
-    ) -> Result<String, askama::Error> {
-        TenantApplicationDomainLayout::new(identity, page).render()
-    }
-
     pub fn render_tenant_profile(
         identity: &PlatformUiIdentity,
         page: &TenantProfilePage,
@@ -1677,19 +1601,6 @@ pub struct TenantRelationsLayout<'a> {
 pub struct TenantApplicationsLayout<'a> {
     identity: &'a PlatformUiIdentity,
     page: &'a TenantApplicationsPage,
-}
-
-#[derive(Template)]
-#[template(path = "platform_ui/tenant_application_domain.html")]
-pub struct TenantApplicationDomainLayout<'a> {
-    identity: &'a PlatformUiIdentity,
-    page: &'a TenantApplicationDomainPage,
-}
-
-impl<'a> TenantApplicationDomainLayout<'a> {
-    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantApplicationDomainPage) -> Self {
-        Self { identity, page }
-    }
 }
 
 #[derive(Template)]
