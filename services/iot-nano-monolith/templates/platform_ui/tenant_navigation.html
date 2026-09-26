@@ -15,10 +15,15 @@
   <a class="nav-link{% if active_nav == "relations" %} active{% endif %}" href="/tenant/relations"{% if active_nav == "relations" %} aria-current="page"{% endif %}><span class="nav-link-label">Relations</span></a>
 </div>
 <div class="nav-section">
+  <p class="nav-section-label">Profiles</p>
+  <a class="nav-link{% if active_nav == "profile-configuration" %} active{% endif %}" href="/tenant/profile"{% if active_nav == "profile-configuration" %} aria-current="page"{% endif %}><span class="nav-link-label">Profile Configuration</span></a>
+  <a class="nav-link{% if active_nav == "asset-profiles" %} active{% endif %}" href="/tenant/profiles/asset"{% if active_nav == "asset-profiles" %} aria-current="page"{% endif %}><span class="nav-link-label">Asset Profiles</span></a>
+  <a class="nav-link{% if active_nav == "device-profiles" %} active{% endif %}" href="/tenant/profiles/device"{% if active_nav == "device-profiles" %} aria-current="page"{% endif %}><span class="nav-link-label">Device Profiles</span></a>
+</div>
+<div class="nav-section">
   <p class="nav-section-label">Access</p>
   <a class="nav-link{% if active_nav == "users" %} active{% endif %}" href="/tenant/users"{% if active_nav == "users" %} aria-current="page"{% endif %}><span class="nav-link-label">Users</span></a>
   <a class="nav-link{% if active_nav == "groups" %} active{% endif %}" href="/tenant/groups"{% if active_nav == "groups" %} aria-current="page"{% endif %}><span class="nav-link-label">Groups</span></a>
   <a class="nav-link{% if active_nav == "permissions" %} active{% endif %}" href="/tenant/permissions"{% if active_nav == "permissions" %} aria-current="page"{% endif %}><span class="nav-link-label">Permissions</span></a>
   <a class="nav-link{% if active_nav == "applications" %} active{% endif %}" href="/tenant/applications"{% if active_nav == "applications" %} aria-current="page"{% endif %}><span class="nav-link-label">Applications</span></a>
-  <a class="nav-link{% if active_nav == "profile" %} active{% endif %}" href="/tenant/profile"{% if active_nav == "profile" %} aria-current="page"{% endif %}><span class="nav-link-label">Profile</span></a>
 </div>

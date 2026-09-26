@@ -8,7 +8,7 @@ use iot_nano_monolith::{
 use std::fs;
 use std::path::Path;
 
-const TENANT_NAVIGATION: [(&str, &str, &str); 12] = [
+const TENANT_NAVIGATION: [(&str, &str, &str); 14] = [
     ("overview", "/tenant", "Overview"),
     ("devices", "/tenant/devices", "Devices"),
     ("assets", "/tenant/assets", "Assets"),
@@ -16,11 +16,21 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 12] = [
     ("audit", "/tenant/audit", "Audit"),
     ("topology", "/tenant/topology", "Topology"),
     ("relations", "/tenant/relations", "Relations"),
+    (
+        "profile-configuration",
+        "/tenant/profile",
+        "Profile Configuration",
+    ),
+    ("asset-profiles", "/tenant/profiles/asset", "Asset Profiles"),
+    (
+        "device-profiles",
+        "/tenant/profiles/device",
+        "Device Profiles",
+    ),
     ("users", "/tenant/users", "Users"),
     ("groups", "/tenant/groups", "Groups"),
     ("permissions", "/tenant/permissions", "Permissions"),
     ("applications", "/tenant/applications", "Applications"),
-    ("profile", "/tenant/profile", "Profile"),
 ];
 
 const TENANT_TEMPLATES: [(&str, &str); 16] = [
@@ -35,9 +45,9 @@ const TENANT_TEMPLATES: [(&str, &str); 16] = [
     ("tenant_groups.html", "groups"),
     ("tenant_permissions.html", "permissions"),
     ("tenant_applications.html", "applications"),
-    ("tenant_profile.html", "profile"),
-    ("tenant_asset_profiles.html", "profile"),
-    ("tenant_device_profiles.html", "profile"),
+    ("tenant_profile.html", "profile-configuration"),
+    ("tenant_asset_profiles.html", "asset-profiles"),
+    ("tenant_device_profiles.html", "device-profiles"),
     ("tenant_device_credential.html", "devices"),
     ("tenant_device_claim_policy.html", "devices"),
 ];
