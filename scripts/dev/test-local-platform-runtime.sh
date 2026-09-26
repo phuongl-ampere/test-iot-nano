@@ -165,7 +165,7 @@ assert_file_contains "$seed" "'{tenant_slug: \$tenant_slug, password: \$password
 assert_file_contains "$helper" '"$IOT_NANO_LOCAL_LAUNCHCTL_BIN" submit'
 assert_file_contains "$helper" 'IOT_NANO_LOCAL_SERVICE_LABEL'
 assert_file_contains "$helper" 'IOT_NANO_LOCAL_CARGO_BIN_DIR'
-assert_file_contains "$helper" 'IOT_NANO_LOCAL_LEGACY_SERVICE_LABEL'
+assert_file_contains "$helper" 'export IOT_NANO_LANE_TARGET_ROOT=%q'
 assert_file_contains "$helper" "cd %q\\n' \"\$local_platform_helper_root\""
 assert_file_contains "$helper" 'IOT_NANO_LOCAL_STARTUP_ATTEMPTS'
 assert_file_contains "$helper" 'local_platform_wait_for_management'

@@ -45,7 +45,6 @@ local_platform_configure() {
   IOT_NANO_LOCAL_KILL_BIN="${IOT_NANO_LOCAL_KILL_BIN:-/bin/kill}"
   IOT_NANO_LOCAL_LAUNCHCTL_BIN="${IOT_NANO_LOCAL_LAUNCHCTL_BIN:-/bin/launchctl}"
   IOT_NANO_LOCAL_SERVICE_LABEL="${IOT_NANO_LOCAL_SERVICE_LABEL:-io.rush-iot-nano.local-platform.$IOT_NANO_LOCAL_WORKSPACE_KEY}"
-  IOT_NANO_LOCAL_LEGACY_SERVICE_LABEL="io.rush-iot-nano.local-platform.$(id -u)"
 }
 
 local_platform_fail() {
@@ -252,7 +251,6 @@ local_platform_preflight() {
 local_platform_remove_launch_agent() {
   if [[ "$(uname -s)" == Darwin && -x "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" ]]; then
     "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" remove "$IOT_NANO_LOCAL_SERVICE_LABEL" 2>/dev/null || true
-    "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" remove "$IOT_NANO_LOCAL_LEGACY_SERVICE_LABEL" 2>/dev/null || true
   fi
 }
 
@@ -329,6 +327,7 @@ local_platform_write_runner() {
     printf 'export IOT_NANO_MQTT_TCP_ADDRESS=%q\n' "$IOT_NANO_MQTT_TCP_ADDRESS"
     printf 'export IOT_NANO_MQTT_TLS_ADDRESS=%q\n' "$IOT_NANO_MQTT_TLS_ADDRESS"
     printf 'export IOT_DEVICE_TOKEN_VAULT_KEY=%q\n' "$IOT_DEVICE_TOKEN_VAULT_KEY"
+    printf 'export IOT_NANO_LANE_TARGET_ROOT=%q\n' "$IOT_NANO_LOCAL_LANE_TARGET_ROOT"
     printf 'export PATH=%q\n' "$IOT_NANO_LOCAL_CARGO_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
     printf 'cd %q\n' "$local_platform_helper_root"
     printf 'exec %q local-platform -- run -p iot-nano-monolith\n' "$IOT_NANO_LOCAL_CARGO_LANE"
