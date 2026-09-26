@@ -2,7 +2,6 @@
 members = [
     "crates/device-simulator",
     "crates/iot-admin-helper",
-    "crates/iot-sqldb-common",
     "services/iot-nano-api",
     "crates/iot-nano-foundation",
     "services/iot-nano-core",

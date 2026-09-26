@@ -528,9 +528,7 @@ async fn run_e2e_flow(
         .header(COOKIE, &tenant_cookie)
         .json(&json!({
             "username": username,
-            "password": password,
-            "default_app": format!("/apps/{app_id}"),
-            "granted_apps": [app_id]
+            "password": password
         }))
         .send()
         .await?;

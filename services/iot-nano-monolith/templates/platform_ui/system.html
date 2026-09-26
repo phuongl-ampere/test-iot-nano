@@ -5,7 +5,7 @@
 {% block navigation_label %}System navigation{% endblock %}
 {% block navigation %}
   <a class="nav-link active" href="/system" aria-current="page">Overview</a>
-  <a class="nav-link" href="/system">Tenants</a>
+  <a class="nav-link" href="/system#tenants">Tenants</a>
   <a class="nav-link" href="/system/infrastructure">Infrastructure</a>
 {% endblock %}
 {% block content %}
@@ -25,7 +25,7 @@
       </strong>
     </article>
   </section>
-  <section class="workspace-panel">
+  <section id="tenants" class="workspace-panel">
     <header class="panel-heading">
       <div>
         <h2>Create tenant</h2>
@@ -37,6 +37,10 @@
       <label class="field">
         <span>Tenant slug</span>
         <input name="slug" type="text" autocomplete="off" required>
+      </label>
+      <label class="field">
+        <span>Tenant Account username</span>
+        <input name="tenant_account_username" type="text" autocomplete="username" required>
       </label>
       <label class="field">
         <span>Tenant Account password</span>

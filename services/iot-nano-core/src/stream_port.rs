@@ -89,7 +89,9 @@ impl CoreStreamConsumer {
             .await
         {
             Ok(_) => Ok(()),
-            Err(StreamError::GroupMemberNotFound { .. }) => self.claim(0).await.map(|_| ()),
+            Err(StreamError::GroupMemberNotFound { .. } | StreamError::LeaseExpired { .. }) => {
+                self.claim(0).await.map(|_| ())
+            }
             Err(error) => Err(error),
         }
     }

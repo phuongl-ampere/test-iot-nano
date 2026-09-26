@@ -26,11 +26,16 @@ describe("PowerMonitor terminal commands", () => {
             id: "device-1",
             name: "Main meter",
             online: true,
+            device_profile_id: "power-meter-v1",
             switch_state: deviceRead > 1,
           }],
         });
       }
-      if (path === "/api/v1/assets" || path === "/api/v1/alerts") {
+      if (
+        path === "/api/v1/assets"
+        || path === "/api/v1/alerts"
+        || path === "/api/v1/resource-invitations"
+      ) {
         return json({ items: [] });
       }
       if (path.startsWith("/api/v1/telemetry/device-1?")) {
@@ -41,6 +46,18 @@ describe("PowerMonitor terminal commands", () => {
           });
         }
         return json({ items: [{ at: "2026-09-13T10:00:00Z", power_w: 75 }] });
+      }
+      if (path === "/api/v1/devices/device-1/live-view") {
+        return json({
+          profile: { id: "power-meter-v1", name: "Power Meter v1" },
+          charts: [{
+            aggregation: "last",
+            color: "#167b83",
+            label: "Active power",
+            metric: "power_w",
+            unit: "W",
+          }],
+        });
       }
       if (path === "/api/v1/devices/device-1/commands") {
         return json({ id: "command-1", state: "responded" });

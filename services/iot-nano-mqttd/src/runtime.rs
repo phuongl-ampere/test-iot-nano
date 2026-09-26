@@ -55,6 +55,7 @@ pub struct MqttRuntimeConfig {
     pub authorization: Arc<dyn DeviceAuthorizationPort>,
     pub stream: Arc<dyn StreamPort>,
     pub command_responses: Arc<dyn CommandResponsePort>,
+    pub device_claim_codes: Option<Arc<dyn crate::DeviceClaimCodePort>>,
     pub cache: Arc<dyn CachePort>,
     pub session_router: RpcSessionRouter,
     pub cancellation: CancellationToken,
@@ -468,12 +469,15 @@ impl MqttRuntime {
         let authorization: Arc<dyn DeviceAuthorizationPort> = Arc::new(
             CachedDeviceAuthorization::new(config.authorization, Arc::clone(&config.cache)),
         );
-        let transport = MqttdDeviceTransport::with_local_ports_and_router(
+        let mut transport = MqttdDeviceTransport::with_local_ports_and_router(
             config.session_router.clone(),
             authorization,
             config.stream,
             config.command_responses,
         );
+        if let Some(device_claim_codes) = config.device_claim_codes {
+            transport = transport.with_device_claim_code_port(device_claim_codes);
+        }
         let v311_transport = transport.clone();
         let v311_admission = device_admission.clone();
         let v311_force_cancellation = force_cancellation.clone();

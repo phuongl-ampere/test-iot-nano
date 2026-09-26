@@ -48,9 +48,7 @@ fn api_crate_exposes_only_the_monolith_library_boundary() {
         "pub use public_v1::public_v1_router;",
         "CoreFacade",
         "TokenVault",
-        "authenticate_credentials",
-        "authenticate_credentials_sqlite",
-        "seed_tenant_test_users_sqlite",
+        "authenticate_platform_account",
         "create_platform_device_token",
         "provision_platform_device_token",
     ] {

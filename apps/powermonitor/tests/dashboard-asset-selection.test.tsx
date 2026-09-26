@@ -56,6 +56,9 @@ function installDashboardFetch() {
     if (path === "/api/v1/alerts") {
       return json({ items: [] });
     }
+    if (path === "/api/v1/resource-invitations") {
+      return json({ items: [] });
+    }
     if (path.startsWith("/api/v1/telemetry?asset_id=asset-1&aggregate=asset&")) {
       return json({ items: [{ at: "2026-09-13T10:00:00Z", power_w: 42 }] });
     }

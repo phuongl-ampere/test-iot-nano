@@ -15,7 +15,14 @@ struct Arguments {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let arguments = Arguments::parse();
 
     if arguments.migrate_only {

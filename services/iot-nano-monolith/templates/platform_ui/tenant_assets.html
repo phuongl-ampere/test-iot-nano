@@ -114,6 +114,18 @@
         <button type="submit">Save changes</button>
       </div>
     </form>
+    <section class="field resource-access-editor" aria-labelledby="asset-owner-title">
+      <span id="asset-owner-title">Assigned user</span>
+      <p class="panel-caption">Assign one regular user as owner. Transfer or unassigning clears existing shares.</p>
+      <form class="form-grid form-grid--profile" data-asset-owner-form>
+        <label class="field">
+          <span>User</span>
+          <select name="user_id"><option value="">Unassigned</option></select>
+        </label>
+        <div class="form-actions"><button type="submit" data-asset-owner-submit>Save assigned user</button></div>
+      </form>
+      <p class="json-feedback" data-asset-owner-status role="status"></p>
+    </section>
   </dialog>
 
   <script>
@@ -126,9 +138,12 @@
       const createMetadata = document.querySelector("[data-asset-metadata]");
       const editor = document.getElementById("asset-editor");
       const editorForm = document.querySelector("[data-asset-editor-form]");
+      const ownerForm = editor.querySelector("[data-asset-owner-form]");
+      const ownerStatus = editor.querySelector("[data-asset-owner-status]");
+      const ownerSubmit = editor.querySelector("[data-asset-owner-submit]");
       let selectedAsset = null;
 
-      if (!ui || !createForm || !editor || !editorForm) return;
+      if (!ui || !createForm || !editor || !editorForm || !ownerForm || !ownerStatus || !ownerSubmit) return;
 
       const option = (value, label) => {
         const node = document.createElement("option");
@@ -140,7 +155,7 @@
       const replaceOptions = (select, items, selected, emptyLabel) => {
         select.replaceChildren(option("", emptyLabel));
         items.forEach((item) => {
-          const node = option(item.id, item.name);
+          const node = option(item.id, item.name || item.username);
           node.selected = node.value === (selected || "");
           select.append(node);
         });
@@ -158,6 +173,26 @@
           metadataField.hidden = false;
         } catch (_) {
           // The normal form remains usable when enhancement data is unavailable.
+        }
+      };
+
+      const loadOwner = async () => {
+        if (!selectedAsset) return;
+        const assetId = selectedAsset.id;
+        ownerStatus.textContent = "Loading users...";
+        try {
+          const users = await ui.request("/api/management/users");
+          if (!editor.open || selectedAsset?.id !== assetId) return;
+          replaceOptions(
+            ownerForm.elements.user_id,
+            users.filter((user) => user.account_class === "user"),
+            selectedAsset.owner_user_id,
+            "Unassigned",
+          );
+          ownerStatus.textContent = "";
+        } catch (error) {
+          if (!editor.open || selectedAsset?.id !== assetId) return;
+          ownerStatus.textContent = error.message || "Users are unavailable.";
         }
       };
 
@@ -182,6 +217,7 @@
           replaceOptions(fields.asset_profile_id, profiles, selectedAsset.asset_profile_id, "No profile");
           fields.metadata.value = JSON.stringify(selectedAsset.metadata || {}, null, 2);
           editor.showModal();
+          void loadOwner();
           fields.name.focus();
         } catch (error) {
           ui.announce(error.message, "error");
@@ -210,6 +246,30 @@
           ui.announce(error.message, "error");
         } finally {
           ui.setPending(submit, false);
+        }
+      });
+
+      ownerForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!selectedAsset) return;
+        const fields = ownerForm.elements;
+        const ownerUserId = fields.user_id.value || null;
+        if (ownerUserId === (selectedAsset.owner_user_id || null)) return;
+        if (!window.confirm("Changing the assigned user clears all existing shares for this asset.")) return;
+        ui.setPending(ownerSubmit, true);
+        try {
+          await ui.request(`/api/management/assets/${encodeURIComponent(selectedAsset.id)}/owner`, {
+            method: "PUT",
+            body: { user_id: ownerUserId },
+          });
+          selectedAsset.owner_user_id = ownerUserId;
+          ownerStatus.textContent = "";
+          ui.announce(ownerUserId ? "Assigned user updated. Existing shares were cleared." : "User assignment removed. Existing shares were cleared.");
+          window.location.reload();
+        } catch (error) {
+          ownerStatus.textContent = error.message || "The assigned user could not be saved.";
+        } finally {
+          ui.setPending(ownerSubmit, false);
         }
       });
 

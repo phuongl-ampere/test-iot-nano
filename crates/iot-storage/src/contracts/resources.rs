@@ -204,6 +204,50 @@ pub enum OwnershipTransferTarget {
     Device(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceInvitationState {
+    Pending,
+    Accepted,
+    Cancelled,
+    Withdrawn,
+    Invalidated,
+}
+
+impl ResourceInvitationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Cancelled => "cancelled",
+            Self::Withdrawn => "withdrawn",
+            Self::Invalidated => "invalidated",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "accepted" => Some(Self::Accepted),
+            "cancelled" => Some(Self::Cancelled),
+            "withdrawn" => Some(Self::Withdrawn),
+            "invalidated" => Some(Self::Invalidated),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceInvitation {
+    pub id: uuid::Uuid,
+    pub tenant_id: uuid::Uuid,
+    pub sender_user_id: uuid::Uuid,
+    pub recipient_user_id: uuid::Uuid,
+    pub asset_id: Option<uuid::Uuid>,
+    pub device_id: Option<String>,
+    pub permission: ResourcePermission,
+    pub state: ResourceInvitationState,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewResourcePermission {
     pub tenant_id: uuid::Uuid,
@@ -238,6 +282,18 @@ pub enum TenantAuthorizationError {
         tenant_id: uuid::Uuid,
         user_id: uuid::Uuid,
     },
+    #[error("user {user_id} is not a regular user in tenant {tenant_id}")]
+    OwnerMustBeRegularUser {
+        tenant_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    },
+    #[error("user {user_id} does not own the requested resource in tenant {tenant_id}")]
+    ResourceOwnerRequired {
+        tenant_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    },
+    #[error("an owner cannot share a resource with themselves")]
+    OwnerCannotShareWithSelf,
     #[error("tenant account {tenant_account_id} does not belong to tenant {tenant_id}")]
     TenantAccountNotFound {
         tenant_id: uuid::Uuid,
@@ -263,6 +319,13 @@ pub enum TenantAuthorizationError {
         tenant_id: uuid::Uuid,
         permission_id: uuid::Uuid,
     },
+    #[error("invitation {invitation_id} does not belong to tenant {tenant_id}")]
+    InvitationNotFound {
+        tenant_id: uuid::Uuid,
+        invitation_id: uuid::Uuid,
+    },
+    #[error("invitation {invitation_id} is not pending")]
+    InvitationNotPending { invitation_id: uuid::Uuid },
     #[error("resource permission must select exactly one user or group subject")]
     InvalidPermissionSubject,
     #[error("resource permission must select exactly one asset or device scope")]
@@ -275,6 +338,8 @@ pub enum TenantAuthorizationError {
     InvalidStoredRecord,
     #[error("system accounts cannot transfer tenant resource ownership")]
     SystemAccountCannotTransferOwnership,
+    #[error("tenant accounts are required to transfer tenant resource ownership")]
+    TenantAccountRequiredForOwnership,
 }
 
 pub trait AuthorizationRepository: Send + Sync {
@@ -437,11 +502,70 @@ pub trait TenantAuthorizationRepository: Send + Sync {
         actor: AuditPrincipal,
         permission_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
+    fn create_owner_resource_permission<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        owner_user_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission: ResourcePermission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ResourcePermissionRecord, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn revoke_owner_resource_permission<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        owner_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
     fn transfer_resource_ownership<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
         actor: AuditPrincipal,
         target: OwnershipTransferTarget,
-        new_owner_user_id: uuid::Uuid,
+        new_owner_user_id: Option<uuid::Uuid>,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
+}
+
+pub trait ResourceInvitationRepository: Send + Sync {
+    fn create_owner_resource_invitation<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        sender_user_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission: ResourcePermission,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ResourceInvitation, TenantAuthorizationError>> + Send + 'a>,
+    >;
+    fn accept_resource_invitation<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        invitation_id: uuid::Uuid,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ResourceInvitation, TenantAuthorizationError>> + Send + 'a>,
+    >;
+    fn cancel_resource_invitation<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        invitation_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
+    fn list_pending_resource_invitations<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<ResourceInvitation>, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    >;
 }

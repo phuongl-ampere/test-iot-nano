@@ -33,8 +33,8 @@ async fn sqlite_store() -> (tempfile::TempDir, PlatformStore) {
         .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES (?, ?, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?1, ?2, ?1, 'unused', 'active', 1)",
     )
     .bind(provisioning_tenant_id().to_string())
     .bind(provisioning_tenant_id().to_string())
@@ -78,8 +78,8 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore) {
         .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES ($1, $2, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES ($1, $2, $1, 'unused', 'active', 1)",
     )
     .bind(provisioning_tenant_id())
     .bind(provisioning_tenant_id())
@@ -236,8 +236,8 @@ async fn sqlite_device_token_repository_rejects_cross_tenant_token_issuance_and_
     .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES (?, ?, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?1, ?2, ?1, 'unused', 'active', 1)",
     )
     .bind(other_tenant_id.to_string())
     .bind(other_tenant_id.to_string())
@@ -339,8 +339,8 @@ async fn sqlite_management_token_revocations_remain_tenant_scoped_after_device_m
     .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES (?, ?, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?1, ?2, ?1, 'unused', 'active', 1)",
     )
     .bind(other_tenant_id.to_string())
     .bind(other_tenant_id.to_string())

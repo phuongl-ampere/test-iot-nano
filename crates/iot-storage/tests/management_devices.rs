@@ -34,8 +34,8 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, slug: &str) -> Uuid {
         .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES (?, ?, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?1, ?2, ?1, 'unused', 'active', 1)",
     )
     .bind(tenant_id.to_string())
     .bind(tenant_id.to_string())
@@ -310,8 +310,8 @@ async fn timescale_store() -> (TimescaleTestLock, PlatformStore, Uuid) {
     .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES ($1, $2, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES ($1, $2, $1, 'unused', 'active', 1)",
     )
     .bind(tenant_id)
     .bind(tenant_id)
@@ -644,7 +644,7 @@ async fn sqlite_management_device_health_uses_the_five_minute_online_window() {
 
 #[test]
 fn timescale_management_reference_validation_uses_boolean_exists_queries() {
-    let source = include_str!("../src/management.rs");
+    let source = include_str!("../src/management/devices.rs");
     assert!(
         source.contains("SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2)")
     );

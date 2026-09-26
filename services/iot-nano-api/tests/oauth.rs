@@ -175,8 +175,8 @@ async fn exported_public_oauth_router_issues_and_exchanges_pkce_codes_from_a_tru
     let (directory, store) = public_oauth_store().await;
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
-         VALUES (?, ?, 'oauth-browser-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'oauth-browser-user', 'unused', 'admin', 'admin')",
     )
     .bind(user_id.to_string())
     .bind(tenant_id().to_string())
@@ -275,8 +275,8 @@ async fn exported_public_oauth_router_denies_a_trusted_user_from_another_tenant(
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
-         VALUES (?, ?, 'oauth-foreign-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'oauth-foreign-user', 'unused', 'admin', 'admin')",
     )
     .bind(foreign_user_id.to_string())
     .bind(foreign_tenant_id.to_string())
@@ -322,8 +322,8 @@ async fn exported_public_oauth_router_rejects_a_short_pkce_verifier_even_when_it
     let (directory, store) = public_oauth_store().await;
     let user_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
-         VALUES (?, ?, 'oauth-short-verifier-user', 'unused', 'admin', 'admin', '/apps/powermonitor')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'oauth-short-verifier-user', 'unused', 'admin', 'admin')",
     )
     .bind(user_id.to_string())
     .bind(tenant_id().to_string())

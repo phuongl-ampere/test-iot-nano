@@ -7,11 +7,11 @@ import queue
 import sys
 import threading
 import unittest
-from datetime import datetime
+import uuid
 from unittest import mock
 
 
-SCRIPT_PATH = pathlib.Path(__file__).with_name("demo_lighting_switcher.py")
+SCRIPT_PATH = pathlib.Path(__file__).with_name("device_lighting_switcher_simulation.py")
 
 
 def load_module():
@@ -246,17 +246,17 @@ class LightingSwitcherTests(unittest.TestCase):
             configuration = module.configuration_from_environment()
 
         self.assertEqual(configuration.host, "127.0.0.1")
-        self.assertEqual(configuration.port, 1883)
+        self.assertEqual(configuration.port, 18883)
         self.assertIsNone(configuration.ca_file)
 
-    def test_configuration_uses_hard_coded_demo_defaults_without_environment(self):
+    def test_configuration_uses_the_development_default_token_when_unset(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             configuration = module.configuration_from_environment()
 
-        self.assertEqual(configuration.token, module.DEVICE_TOKEN)
-        self.assertEqual(configuration.host, "127.0.0.1")
-        self.assertEqual(configuration.port, 1883)
-        self.assertEqual(configuration.publish_interval_seconds, 10)
+        self.assertEqual(
+            configuration.token,
+            module.DEVELOPMENT_DEVICE_TOKEN,
+        )
 
     def test_configuration_reads_custom_listener_and_optional_tls_settings(self):
         environment = {
@@ -308,6 +308,67 @@ class LightingSwitcherTests(unittest.TestCase):
 
         self.assertEqual(configuration.publish_interval_seconds, 10)
 
+    def test_main_sends_the_device_token_as_the_mqtt_password(self):
+        RecordingMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token", "SIMULATE_VALUES": "false"},
+                clear=True,
+            ),
+            mock.patch.object(module.mqtt, "Client", side_effect=RecordingMqttClient),
+            mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            module.main()
+
+        client = RecordingMqttClient.instances[0]
+        self.assertEqual(client.username, ("iotd_device_token", "test-token"))
+
+    def test_manual_pairing_subscribes_before_requesting_a_code_once(self):
+        RecordingMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token", "SIMULATE_VALUES": "false"},
+                clear=True,
+            ),
+            mock.patch.object(module.mqtt, "Client", side_effect=RecordingMqttClient),
+            mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            module.main(request_pairing=True)
+
+        client = RecordingMqttClient.instances[0]
+        self.assertIn((module.PAIRING_RESPONSE_FILTER, 1), client.subscriptions)
+        pairing_index = next(
+            index
+            for index, (topic, _payload, _qos) in enumerate(client.published)
+            if topic == module.PAIRING_REQUEST_TOPIC
+        )
+        self.assertGreaterEqual(pairing_index, 0)
+
+    def test_main_starts_with_randomized_telemetry_values(self):
+        RecordingMqttClient.instances = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token", "SIMULATION_RANDOM_SEED": "7"},
+                clear=True,
+            ),
+            mock.patch.object(module.mqtt, "Client", side_effect=RecordingMqttClient),
+            mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
+        ):
+            module.main()
+
+        client = RecordingMqttClient.instances[0]
+        telemetry = next(
+            json.loads(payload)
+            for topic, payload, _qos in client.published
+            if topic == module.TELEMETRY_TOPIC
+        )
+        self.assertTrue(telemetry["switch_state"])
+        self.assertGreater(telemetry["brightness_pct"], 0)
+        self.assertGreater(telemetry["power_w"], 0)
+
     def test_set_brightness_updates_state_and_two_way_result(self):
         state = module.LightingSwitcherState()
         outcome = state.handle_rpc(
@@ -323,6 +384,33 @@ class LightingSwitcherTests(unittest.TestCase):
             outcome.response,
             {"ok": True, "result": {"switch_state": True, "brightness_pct": 75}},
         )
+
+    def test_sample_now_returns_current_state_without_changing_the_meter(self):
+        state = module.LightingSwitcherState()
+        state.handle_rpc({"method": "set_brightness", "params": {"brightness_pct": 75}})
+        energy_before = state.measurements(10)["energy_kwh"]
+
+        outcome = state.handle_rpc({"method": "sample_now", "params": {}, "mode": "two_way"})
+
+        self.assertTrue(outcome.applied)
+        self.assertEqual(
+            outcome.response,
+            {"ok": True, "result": {"switch_state": True, "brightness_pct": 75}},
+        )
+        self.assertEqual(state.measurements(0)["energy_kwh"], energy_before)
+
+    def test_reboot_records_a_restart_without_resetting_cumulative_energy(self):
+        state = module.LightingSwitcherState()
+        state.handle_rpc({"method": "switch_on"})
+        energy_before = state.measurements(60)["energy_kwh"]
+
+        outcome = state.handle_rpc({"method": "reboot", "params": {}, "mode": "two_way"})
+
+        self.assertTrue(outcome.applied)
+        self.assertEqual(state.reboot_count, 1)
+        telemetry = state.measurements(0)
+        self.assertEqual(telemetry["reboot_count"], 1)
+        self.assertEqual(telemetry["energy_kwh"], energy_before)
 
     def test_off_measurement_has_zero_power_and_unchanged_energy(self):
         state = module.LightingSwitcherState()
@@ -406,24 +494,20 @@ class LightingSwitcherTests(unittest.TestCase):
 
         self.assertIsNone(request)
 
-    def test_telemetry_contains_envelope_and_measurements(self):
+    def test_telemetry_is_a_measurements_object(self):
         state = module.LightingSwitcherState()
-        telemetry = module.build_telemetry(state, "boot-1", 7, 10)
+        telemetry = module.build_telemetry(state, 10)
 
-        self.assertEqual(telemetry["schema_version"], 1)
-        self.assertEqual(telemetry["boot_id"], "boot-1")
-        self.assertEqual(telemetry["sequence"], 7)
         self.assertEqual(
-            telemetry["measurements"],
+            telemetry,
             {
                 "switch_state": False,
                 "brightness_pct": 0,
                 "power_w": 0.0,
                 "energy_kwh": 0.0,
+                "reboot_count": 0,
             },
         )
-        parsed = datetime.fromisoformat(telemetry["event_at"].replace("Z", "+00:00"))
-        self.assertIsNotNone(parsed.tzinfo)
 
     def test_publish_ack_timeout_is_bounded_and_detected(self):
         self.assertGreater(module.PUBLISH_ACK_TIMEOUT_SECONDS, 0)
@@ -461,6 +545,17 @@ class LightingSwitcherTests(unittest.TestCase):
             module.rpc_response_topic("#")
         with self.assertRaises(ValueError):
             module.rpc_response_topic("cmd+1")
+
+    def test_manual_pairing_request_uses_a_v7_id_and_never_puts_a_code_on_the_request(self):
+        client = RecordingMqttClient()
+
+        request_id = module.request_pairing_code(client)
+
+        self.assertEqual(uuid.UUID(request_id).version, 7)
+        topic, payload, qos = client.published[0]
+        self.assertEqual(topic, module.PAIRING_REQUEST_TOPIC)
+        self.assertEqual(qos, 1)
+        self.assertEqual(json.loads(payload), {"request_id": request_id})
 
     def test_subscription_requires_every_grant_to_be_exactly_qos_one(self):
         self.assertTrue(module.subscription_granted([1]))
@@ -557,13 +652,18 @@ class LightingSwitcherTests(unittest.TestCase):
     def test_main_worker_processes_command_and_ack_checks_two_way_response(self):
         RecordingMqttClient.instances = []
         with (
-            mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True),
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token", "SIMULATE_VALUES": "false"},
+                clear=True,
+            ),
             mock.patch.object(
                 module.mqtt, "Client", side_effect=RecordingMqttClient
             ),
             mock.patch.object(module.time, "sleep", side_effect=KeyboardInterrupt),
         ):
-            module.main()
+            with self.assertLogs(module.LOGGER, level="INFO") as logs:
+                module.main()
 
         client = RecordingMqttClient.instances[0]
         response_info = next(
@@ -575,12 +675,21 @@ class LightingSwitcherTests(unittest.TestCase):
             response_info.wait_timeout,
             module.PUBLISH_ACK_TIMEOUT_SECONDS,
         )
-        telemetry_sequences = [
-            json.loads(payload)["sequence"]
+        telemetry = [
+            json.loads(payload)
             for topic, payload, _qos in client.published
             if topic == module.TELEMETRY_TOPIC
         ]
-        self.assertEqual(telemetry_sequences, [0, 1])
+        self.assertEqual(len(telemetry), 2)
+        self.assertEqual(telemetry[0]["switch_state"], False)
+        self.assertEqual(telemetry[1]["switch_state"], True)
+        self.assertEqual(telemetry[1]["brightness_pct"], 75)
+        log_output = "\n".join(logs.output)
+        self.assertIn(
+            "command id=cmd-1 method=set_brightness mode=two_way applied=True",
+            log_output,
+        )
+        self.assertIn("command response id=cmd-1 published", log_output)
 
     def test_main_stops_after_rejected_reconnect_and_cleans_up(self):
         RejectedReconnectMqttClient.instances = []
@@ -708,7 +817,11 @@ class LightingSwitcherTests(unittest.TestCase):
         RapidCommandMqttClient.instances = []
         monotonic_values = iter((100.0, 101.0, 101.1, 101.2))
         with (
-            mock.patch.dict(os.environ, {"DEVICE_TOKEN": "test-token"}, clear=True),
+            mock.patch.dict(
+                os.environ,
+                {"DEVICE_TOKEN": "test-token", "SIMULATE_VALUES": "false"},
+                clear=True,
+            ),
             mock.patch.object(
                 module.mqtt, "Client", side_effect=RapidCommandMqttClient
             ),
@@ -726,7 +839,7 @@ class LightingSwitcherTests(unittest.TestCase):
             if topic == module.TELEMETRY_TOPIC
         ]
         self.assertEqual(len(telemetry), 3)
-        self.assertEqual(telemetry[-1]["measurements"]["energy_kwh"], 0.000006944)
+        self.assertEqual(telemetry[-1]["energy_kwh"], 0.000006944)
 
     def test_immediate_subscribe_failure_degrades_to_telemetry_and_cleans_up(self):
         ImmediateSubscribeFailureMqttClient.instances = []
@@ -768,7 +881,7 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertEqual(
             client.constructor_args[0], module.mqtt.CallbackAPIVersion.VERSION2
         )
-        self.assertEqual(client.username, ("test-token", ""))
+        self.assertEqual(client.username, ("iotd_device_token", "test-token"))
         self.assertEqual(
             client.subscriptions,
             [("v1/devices/me/rpc/request/+", 1)],
@@ -792,7 +905,7 @@ class LightingSwitcherTests(unittest.TestCase):
         self.assertEqual(json.loads(responses[0][1])["ok"], True)
         log_output = "\n".join(logs.output)
         self.assertIn("connected", log_output)
-        self.assertIn("telemetry sequence=0", log_output)
+        self.assertIn("telemetry published", log_output)
         self.assertNotIn("test-token", log_output)
 
     def test_main_enables_tls_only_for_configured_ca_file(self):

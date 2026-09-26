@@ -21,6 +21,7 @@
         <h2>Provision device</h2>
         <p class="panel-caption">A credential is shown once after provisioning.</p>
       </div>
+      <a class="button-link button-link-secondary" href="/tenant/devices/claim-policy">Pairing policy</a>
     </header>
     <form class="form-grid" action="/tenant/devices" method="post" data-device-provision-form>
       <label class="field">
@@ -70,6 +71,7 @@
               <th scope="col">Display name</th>
               <th scope="col">Device status</th>
               <th scope="col">Assigned asset</th>
+              <th scope="col">Pairing</th>
               <th scope="col">Actions</th>
             </tr>
           </thead>
@@ -81,9 +83,16 @@
                 <td><span class="status-chip">{{ device.status }}</span></td>
                 <td>{{ device.asset }}</td>
                 <td>
+                  <span class="operation-note">{{ device.claim_status }}</span>
+                  {% if device.has_active_claim_code %}
+                    <form action="/tenant/devices/{{ device.device_id|urlencode_strict }}/claim-code/revoke" method="post">
+                      <button type="submit" class="button-link-secondary" aria-label="Revoke pairing code for {{ device.display_name }}" title="Revoke pairing code">Revoke</button>
+                    </form>
+                  {% endif %}
+                </td>
+                <td>
                   <div class="action-buttons">
                     <button type="button" class="button-link-secondary" data-device-edit data-device-id="{{ device.device_id }}" aria-label="Edit {{ device.display_name }}" title="Edit device">Edit</button>
-                    <a class="resource-link action-link" href="/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens">Tokens<span class="visually-hidden"> for {{ device.display_name }}</span></a>
                     <button type="button" class="button-danger" data-device-delete data-device-id="{{ device.device_id }}" aria-label="Delete {{ device.display_name }}" title="Delete device">Delete</button>
                   </div>
                 </td>
@@ -128,11 +137,126 @@
         <span>Attributes (JSON)</span>
         <textarea name="attributes" rows="5" required></textarea>
       </label>
+      <section class="field" aria-labelledby="device-token-title">
+        <span id="device-token-title">Device token</span>
+        <p class="panel-caption">Only one token is active. Creating a new token invalidates the current token.</p>
+        <div class="form-actions">
+          <button type="button" class="button-link-secondary" data-device-token-issue>Create new token</button>
+        </div>
+        <div data-device-token-reveal>
+          <p class="panel-caption">Copy the active token for this device.</p>
+          <output class="dialog-output" data-device-token-value></output>
+          <div class="dialog-actions">
+            <span class="json-feedback" data-device-token-status role="status"></span>
+            <button type="button" data-device-token-copy disabled>Copy token</button>
+          </div>
+        </div>
+      </section>
+      <section class="field" aria-labelledby="device-claim-code-title">
+        <span id="device-claim-code-title">Pairing code</span>
+        <p class="panel-caption">Generate a short-lived code for manual pairing. A new code revokes the active code and is shown once.</p>
+        <div class="form-actions">
+          <button type="button" class="button-link-secondary" data-device-claim-code-issue>Generate new code</button>
+        </div>
+        <div data-device-claim-code-reveal>
+          <output class="dialog-output" data-device-claim-code-value></output>
+          <div class="dialog-actions">
+            <span class="json-feedback" data-device-claim-code-status role="status"></span>
+            <button type="button" data-device-claim-code-copy disabled>Copy code</button>
+          </div>
+        </div>
+      </section>
+      <section class="field" aria-labelledby="device-telemetry-title">
+        <span id="device-telemetry-title">Recent telemetry</span>
+        <label class="field">
+          <span>Range</span>
+          <select data-device-telemetry-range aria-label="Telemetry range">
+            <option value="1h">Last hour</option>
+            <option value="1d">Last day</option>
+            <option value="7d">Last 7 days</option>
+          </select>
+        </label>
+        <p class="panel-caption" data-device-telemetry-status role="status"></p>
+        <div class="table-scroll device-telemetry-scroll" data-device-telemetry-scroll>
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th scope="col">Recorded at</th>
+                <th scope="col">Value</th>
+              </tr>
+            </thead>
+            <tbody data-device-telemetry-items></tbody>
+          </table>
+        </div>
+      </section>
       <div class="dialog-actions">
         <button type="button" class="button-link-secondary" data-dialog-close>Cancel</button>
         <button type="submit">Save changes</button>
       </div>
     </form>
+    <section class="field resource-access-editor" aria-labelledby="device-owner-title">
+      <span id="device-owner-title">Assigned user</span>
+      <p class="panel-caption">Assign one regular user as owner. Transfer or unassigning clears existing shares.</p>
+      <form class="form-grid form-grid--profile" data-device-owner-form>
+        <label class="field">
+          <span>User</span>
+          <select name="user_id"><option value="">Unassigned</option></select>
+        </label>
+        <div class="form-actions"><button type="submit" data-device-owner-submit>Save assigned user</button></div>
+      </form>
+      <p class="json-feedback" data-device-owner-status role="status"></p>
+    </section>
+    <section class="field device-relations-editor" aria-labelledby="device-relations-title">
+      <span id="device-relations-title">General relations</span>
+      <p class="panel-caption">Gateway-child topology is managed separately. Each relation is outgoing from this device.</p>
+      <form action="/tenant/relations" method="post" data-device-device-relation-form>
+        <input name="from_device_id" type="hidden">
+        <input name="target_kind" value="device" type="hidden">
+        <div class="form-grid form-grid--profile">
+          <label class="field">
+            <span>Device relation</span>
+            <select name="relation_type">
+              <option value="depends_on">Depends on</option>
+              <option value="feeds">Feeds</option>
+              <option value="controls">Controls</option>
+              <option value="monitors">Monitors</option>
+              <option value="located_with">Located with</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Related device</span>
+            <select name="to_device_id" required></select>
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button type="submit" data-device-device-relation-submit>Add device relation</button>
+        </div>
+      </form>
+      <form action="/tenant/relations" method="post" data-device-asset-relation-form>
+        <input name="from_device_id" type="hidden">
+        <input name="target_kind" value="asset" type="hidden">
+        <div class="form-grid form-grid--profile">
+          <label class="field">
+            <span>Asset relation</span>
+            <select name="relation_type">
+              <option value="installed_in">Installed in</option>
+              <option value="measures">Measures</option>
+              <option value="serves">Serves</option>
+              <option value="monitors">Monitors</option>
+              <option value="located_with">Located with</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Related asset</span>
+            <select name="to_asset_id" required></select>
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <a class="button-link button-link-secondary" href="/tenant/relations">Manage all relations</a>
+          <button type="submit" data-device-asset-relation-submit>Add asset relation</button>
+        </div>
+      </form>
+    </section>
   </dialog>
 
   <dialog id="device-credential" class="dialog" aria-labelledby="device-credential-title">
@@ -162,9 +286,32 @@
       const credentialDialog = document.getElementById("device-credential");
       const credentialValue = document.querySelector("[data-device-credential-value]");
       const credentialStatus = document.querySelector("[data-device-credential-status]");
+      const issueToken = editorForm.querySelector("[data-device-token-issue]");
+      const tokenReveal = editorForm.querySelector("[data-device-token-reveal]");
+      const tokenValue = editorForm.querySelector("[data-device-token-value]");
+      const tokenStatus = editorForm.querySelector("[data-device-token-status]");
+      const copyToken = editorForm.querySelector("[data-device-token-copy]");
+      const issueClaimCode = editorForm.querySelector("[data-device-claim-code-issue]");
+      const claimCodeValue = editorForm.querySelector("[data-device-claim-code-value]");
+      const claimCodeStatus = editorForm.querySelector("[data-device-claim-code-status]");
+      const copyClaimCode = editorForm.querySelector("[data-device-claim-code-copy]");
+      const telemetryRange = editorForm.querySelector("[data-device-telemetry-range]");
+      const telemetryItems = editorForm.querySelector("[data-device-telemetry-items]");
+      const telemetryStatus = editorForm.querySelector("[data-device-telemetry-status]");
+      const ownerForm = editor.querySelector("[data-device-owner-form]");
+      const ownerStatus = editor.querySelector("[data-device-owner-status]");
+      const ownerSubmit = editor.querySelector("[data-device-owner-submit]");
+      const deviceRelationForm = editor.querySelector("[data-device-device-relation-form]");
+      const deviceRelationSubmit = editor.querySelector("[data-device-device-relation-submit]");
+      const assetRelationForm = editor.querySelector("[data-device-asset-relation-form]");
+      const assetRelationSubmit = editor.querySelector("[data-device-asset-relation-submit]");
+      const TELEMETRY_REFRESH_INTERVAL_MS = 2_000;
       let selectedDevice = null;
+      let telemetryFingerprint = null;
+      let telemetryRequest = 0;
+      let telemetryRefreshTimer = null;
 
-      if (!ui || !provisionForm || !editor || !editorForm || !credentialDialog) return;
+      if (!ui || !provisionForm || !editor || !editorForm || !credentialDialog || !issueToken || !tokenReveal || !tokenValue || !tokenStatus || !copyToken || !issueClaimCode || !claimCodeValue || !claimCodeStatus || !copyClaimCode || !telemetryRange || !telemetryItems || !telemetryStatus || !ownerForm || !ownerStatus || !ownerSubmit || !deviceRelationForm || !deviceRelationSubmit || !assetRelationForm || !assetRelationSubmit) return;
 
       const option = (value, label) => {
         const node = document.createElement("option");
@@ -176,13 +323,137 @@
       const replaceOptions = (select, items, selected, emptyLabel) => {
         select.replaceChildren(option("", emptyLabel));
         items.forEach((item) => {
-          const node = option(item.id || item.device_id, item.name || item.display_name || item.device_id);
+          const node = option(item.id || item.device_id, item.name || item.display_name || item.username || item.device_id);
           node.selected = node.value === (selected || "");
           select.append(node);
         });
       };
 
       const closeEditor = () => editor.close();
+      const clearIssuedToken = () => {
+        tokenValue.textContent = "";
+        tokenStatus.textContent = "";
+        copyToken.disabled = true;
+      };
+      const clearIssuedClaimCode = () => {
+        claimCodeValue.textContent = "";
+        claimCodeStatus.textContent = "";
+        copyClaimCode.disabled = true;
+      };
+      const clearTelemetry = () => {
+        telemetryRequest += 1;
+        telemetryFingerprint = null;
+        telemetryItems.replaceChildren();
+        telemetryStatus.textContent = "";
+      };
+      const appendTelemetryMessage = (message) => {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 2;
+        cell.textContent = message;
+        row.append(cell);
+        telemetryItems.append(row);
+      };
+      const formatTelemetryTimestamp = (value) => {
+        const date = new Date(value);
+        return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+      };
+      const formatTelemetryValue = (value) => {
+        if (typeof value === "string") return value;
+        return JSON.stringify(value);
+      };
+      const telemetryFingerprintFor = (items) => JSON.stringify(
+        items.map((event) => [event.event_at, event.boot_id, event.sequence]),
+      );
+      const renderTelemetry = (items) => {
+        telemetryItems.replaceChildren();
+        if (!items.length) {
+          appendTelemetryMessage("No telemetry in this range.");
+          return;
+        }
+        items.forEach((event) => {
+          const row = document.createElement("tr");
+          const timestamp = document.createElement("td");
+          const value = document.createElement("td");
+          timestamp.textContent = formatTelemetryTimestamp(event.event_at);
+          value.className = "device-telemetry-value";
+          value.textContent = formatTelemetryValue(event.measurements);
+          row.append(timestamp, value);
+          telemetryItems.append(row);
+        });
+      };
+      const loadTelemetry = async () => {
+        if (!selectedDevice) return;
+        const deviceId = selectedDevice.device_id;
+        const range = telemetryRange.value;
+        const request = ++telemetryRequest;
+        const isInitialLoad = telemetryFingerprint === null;
+        if (isInitialLoad) telemetryStatus.textContent = "Loading telemetry...";
+        try {
+          const response = await ui.request(
+            `/api/management/devices/${encodeURIComponent(deviceId)}/telemetry?range=${encodeURIComponent(range)}`,
+          );
+          if (!editor.open || selectedDevice?.device_id !== deviceId || telemetryRange.value !== range || request !== telemetryRequest) return;
+          if (!Array.isArray(response.items)) throw new Error("Telemetry response is invalid.");
+          const fingerprint = telemetryFingerprintFor(response.items);
+          if (fingerprint !== telemetryFingerprint) renderTelemetry(response.items);
+          telemetryFingerprint = fingerprint;
+          telemetryStatus.textContent = "";
+        } catch (error) {
+          if (!editor.open || selectedDevice?.device_id !== deviceId || telemetryRange.value !== range || request !== telemetryRequest) return;
+          if (isInitialLoad) appendTelemetryMessage("Telemetry is unavailable.");
+          telemetryFingerprint = "error";
+          telemetryStatus.textContent = error.message || "Telemetry is unavailable.";
+        }
+      };
+      const stopTelemetryRefresh = () => {
+        if (telemetryRefreshTimer !== null) window.clearInterval(telemetryRefreshTimer);
+        telemetryRefreshTimer = null;
+      };
+      const startTelemetryRefresh = () => {
+        stopTelemetryRefresh();
+        telemetryRefreshTimer = window.setInterval(() => {
+          if (editor.open && !document.hidden) void loadTelemetry();
+        }, TELEMETRY_REFRESH_INTERVAL_MS);
+      };
+      const loadOwner = async () => {
+        if (!selectedDevice) return;
+        const deviceId = selectedDevice.device_id;
+        ownerStatus.textContent = "Loading users...";
+        try {
+          const users = await ui.request("/api/management/users");
+          if (!editor.open || selectedDevice?.device_id !== deviceId) return;
+          replaceOptions(
+            ownerForm.elements.user_id,
+            users.filter((user) => user.account_class === "user"),
+            selectedDevice.owner_user_id,
+            "Unassigned",
+          );
+          ownerStatus.textContent = "";
+        } catch (error) {
+          if (!editor.open || selectedDevice?.device_id !== deviceId) return;
+          ownerStatus.textContent = error.message || "Users are unavailable.";
+        }
+      };
+      const revealCurrentToken = async () => {
+        if (!selectedDevice) return;
+        const deviceId = selectedDevice.device_id;
+        clearIssuedToken();
+        tokenStatus.textContent = "Loading active token...";
+        try {
+          const response = await ui.request(
+            `/api/management/devices/${encodeURIComponent(deviceId)}/token`,
+          );
+          if (!editor.open || selectedDevice?.device_id !== deviceId) return;
+          if (!response.token) throw new Error("The active token is unavailable. Create a new token.");
+          tokenValue.textContent = response.token;
+          tokenStatus.textContent = "";
+          copyToken.disabled = false;
+        } catch (error) {
+          if (!editor.open || selectedDevice?.device_id !== deviceId) return;
+          tokenStatus.textContent = error.message || "The active token is unavailable.";
+        }
+      };
       document.querySelectorAll("[data-dialog-close]").forEach((control) => {
         control.addEventListener("click", () => control.closest("dialog")?.close());
       });
@@ -220,7 +491,28 @@
           fields.is_gateway.checked = Boolean(selectedDevice.is_gateway);
           fields.gateway_device_id.disabled = fields.is_gateway.checked;
           fields.attributes.value = JSON.stringify(selectedDevice.attributes || {}, null, 2);
+          deviceRelationForm.elements.from_device_id.value = selectedDevice.device_id;
+          replaceOptions(
+            deviceRelationForm.elements.to_device_id,
+            devices.filter((device) => device.device_id !== selectedDevice.device_id),
+            "",
+            "Select a device",
+          );
+          assetRelationForm.elements.from_device_id.value = selectedDevice.device_id;
+          replaceOptions(
+            assetRelationForm.elements.to_asset_id,
+            assets,
+            "",
+            "Select an asset",
+          );
+          clearIssuedToken();
+          clearIssuedClaimCode();
+          clearTelemetry();
           editor.showModal();
+          void loadOwner();
+          void revealCurrentToken();
+          void loadTelemetry();
+          startTelemetryRefresh();
           fields.display_name.focus();
         } catch (error) {
           ui.announce(error.message, "error");
@@ -256,6 +548,70 @@
         if (gatewaySelect.disabled) gatewaySelect.value = "";
       });
 
+      telemetryRange.addEventListener("change", () => {
+        clearTelemetry();
+        void loadTelemetry();
+      });
+
+      ownerForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!selectedDevice) return;
+        const fields = ownerForm.elements;
+        const ownerUserId = fields.user_id.value || null;
+        if (ownerUserId === (selectedDevice.owner_user_id || null)) return;
+        if (!window.confirm("Changing the assigned user clears all existing shares for this device.")) return;
+        ui.setPending(ownerSubmit, true);
+        try {
+          await ui.request(`/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/owner`, {
+            method: "PUT",
+            body: { user_id: ownerUserId },
+          });
+          selectedDevice.owner_user_id = ownerUserId;
+          ownerStatus.textContent = "";
+          ui.announce(ownerUserId ? "Assigned user updated. Existing shares were cleared." : "User assignment removed. Existing shares were cleared.");
+          refreshDevices();
+        } catch (error) {
+          ownerStatus.textContent = error.message || "The assigned user could not be saved.";
+        } finally {
+          ui.setPending(ownerSubmit, false);
+        }
+      });
+
+      const bindRelationForm = (form, submit, targetField, targetLabel) => {
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          if (!selectedDevice) return;
+          ui.setPending(submit, true);
+          try {
+            const response = await fetch(form.action, {
+              method: "POST",
+              body: new URLSearchParams(new FormData(form)),
+              credentials: "same-origin",
+            });
+            if (response.status === 401) {
+              window.location.assign("/login");
+              return;
+            }
+            const redirect = new URL(response.url, window.location.origin);
+            if (!response.ok || redirect.searchParams.get("notice") !== "relation-created") {
+              throw new Error("The relation could not be created.");
+            }
+            form.elements[targetField].value = "";
+            ui.announce(`General ${targetLabel} relation created.`);
+          } catch (error) {
+            ui.announce(error.message || "The relation could not be created.", "error");
+          } finally {
+            ui.setPending(submit, false);
+          }
+        });
+      };
+      bindRelationForm(deviceRelationForm, deviceRelationSubmit, "to_device_id", "device");
+      bindRelationForm(assetRelationForm, assetRelationSubmit, "to_asset_id", "asset");
+
+      document.addEventListener("visibilitychange", () => {
+        if (editor.open && !document.hidden) void loadTelemetry();
+      });
+
       editorForm.addEventListener("submit", async (event) => {
         event.preventDefault();
         if (!selectedDevice) return;
@@ -284,6 +640,71 @@
           ui.announce(error.message, "error");
         } finally {
           ui.setPending(submit, false);
+        }
+      });
+
+      issueToken.addEventListener("click", async () => {
+        if (!selectedDevice) return;
+        ui.setPending(issueToken, true);
+        try {
+          const response = await ui.request(
+            `/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/tokens`,
+            { method: "POST" },
+          );
+          if (!response.token) throw new Error("The token was not returned. Try again.");
+          tokenValue.textContent = response.token;
+          tokenStatus.textContent = "";
+          copyToken.disabled = false;
+          ui.announce("New device token created. The previous token no longer works.");
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(issueToken, false);
+        }
+      });
+
+      issueClaimCode.addEventListener("click", async () => {
+        if (!selectedDevice) return;
+        if (!window.confirm("Generate a new pairing code? The active pairing code will stop working.")) return;
+        ui.setPending(issueClaimCode, true);
+        clearIssuedClaimCode();
+        claimCodeStatus.textContent = "Generating pairing code...";
+        try {
+          const response = await ui.request(
+            `/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/claim-code`,
+            { method: "POST" },
+          );
+          if (!response.code || !response.expires_at) throw new Error("The pairing code was not returned. Try again.");
+          claimCodeValue.textContent = response.code;
+          const expiresAt = new Date(response.expires_at);
+          claimCodeStatus.textContent = Number.isNaN(expiresAt.valueOf())
+            ? "Copy the pairing code now."
+            : `Expires ${expiresAt.toLocaleString()}. Copy the pairing code now.`;
+          copyClaimCode.disabled = false;
+          ui.announce("New pairing code created. The previous code no longer works.");
+          refreshDevices();
+        } catch (error) {
+          claimCodeStatus.textContent = error.message || "The pairing code could not be created.";
+        } finally {
+          ui.setPending(issueClaimCode, false);
+        }
+      });
+
+      copyToken.addEventListener("click", async () => {
+        try {
+          await ui.copyText(tokenValue.textContent || "");
+          tokenStatus.textContent = "Copied.";
+        } catch (_) {
+          tokenStatus.textContent = "Copy failed. Select and copy the token manually.";
+        }
+      });
+
+      copyClaimCode.addEventListener("click", async () => {
+        try {
+          await ui.copyText(claimCodeValue.textContent || "");
+          claimCodeStatus.textContent = "Copied.";
+        } catch (_) {
+          claimCodeStatus.textContent = "Copy failed. Select and copy the code manually.";
         }
       });
 
@@ -324,6 +745,13 @@
         credentialValue.textContent = "";
         credentialStatus.textContent = "";
         refreshDevices();
+      });
+
+      editor.addEventListener("close", () => {
+        stopTelemetryRefresh();
+        clearIssuedToken();
+        clearIssuedClaimCode();
+        clearTelemetry();
       });
     })();
   </script>

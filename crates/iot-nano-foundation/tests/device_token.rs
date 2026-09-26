@@ -4,17 +4,9 @@ use iot_nano_foundation::{
     generate_device_token,
 };
 use serde_json::json;
-use uuid::Uuid;
 
 fn payload() -> DeviceTelemetryPayload {
-    DeviceTelemetryPayload {
-        schema_version: 1,
-        device_id: None,
-        boot_id: Uuid::parse_str("c9c04d99-4e01-4f94-82a8-9e229e47c093").unwrap(),
-        sequence: 1842,
-        event_at: Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 0).unwrap(),
-        measurements: serde_json::Map::from_iter([("temperature_c".to_owned(), json!(26.4))]),
-    }
+    serde_json::from_str(r#"{"ts":1780000000123,"values":{"temperature_c":26.4}}"#).unwrap()
 }
 
 #[test]
@@ -29,27 +21,93 @@ fn generated_device_tokens_are_unique_and_identifiable_by_prefix() {
 }
 
 #[test]
+fn direct_payload_accepts_thingsboard_key_value_format() {
+    let parsed =
+        serde_json::from_str::<DeviceTelemetryPayload>(r#"{"temperature_c":26.4,"enabled":true}"#)
+            .unwrap();
+
+    assert_eq!(parsed.measurements["temperature_c"], json!(26.4));
+    assert_eq!(parsed.measurements["enabled"], json!(true));
+}
+
+#[test]
+fn direct_payload_accepts_thingsboard_timestamped_values_format() {
+    let parsed = serde_json::from_str::<DeviceTelemetryPayload>(
+        r#"{"ts":1780000000123,"values":{"temperature_c":26.4,"enabled":true}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(parsed.measurements["temperature_c"], json!(26.4));
+    assert_eq!(parsed.measurements["enabled"], json!(true));
+}
+
+#[test]
 fn token_payload_maps_to_the_resolved_device_and_validates_for_me_topic() {
-    let event = payload().into_event("esp-000123").unwrap();
+    let event = payload()
+        .into_event(
+            "esp-000123",
+            Utc.with_ymd_and_hms(2026, 9, 4, 10, 13, 0).unwrap(),
+        )
+        .unwrap();
 
     assert_eq!(event.device_id, "esp-000123");
     assert_eq!(event.validate_for_topic(DEVICE_TELEMETRY_TOPIC), Ok(()));
 }
 
 #[test]
+fn direct_payload_uses_receive_time_when_ts_is_absent() {
+    let received_at = Utc.with_ymd_and_hms(2026, 9, 4, 10, 13, 0).unwrap();
+    let parsed =
+        serde_json::from_str::<DeviceTelemetryPayload>(r#"{"temperature_c":26.4}"#).unwrap();
+
+    let event = parsed.into_event("esp-000123", received_at).unwrap();
+
+    assert_eq!(event.event_at, received_at);
+    assert_eq!(event.schema_version, 1);
+    assert_eq!(event.sequence, 0);
+    assert_ne!(event.boot_id, uuid::Uuid::nil());
+}
+
+#[test]
+fn direct_payload_uses_thingsboard_timestamp_when_supplied() {
+    let received_at = Utc.with_ymd_and_hms(2026, 9, 4, 10, 13, 0).unwrap();
+    let parsed = serde_json::from_str::<DeviceTelemetryPayload>(
+        r#"{"ts":1780000000123,"values":{"temperature_c":26.4}}"#,
+    )
+    .unwrap();
+
+    let event = parsed.into_event("esp-000123", received_at).unwrap();
+
+    assert_eq!(event.event_at.timestamp_millis(), 1_780_000_000_123);
+}
+
+#[test]
+fn direct_payload_allows_ts_without_a_values_wrapper() {
+    let received_at = Utc.with_ymd_and_hms(2026, 9, 4, 10, 13, 0).unwrap();
+    let parsed = serde_json::from_str::<DeviceTelemetryPayload>(
+        r#"{"ts":1780000000123,"temperature_c":26.4}"#,
+    )
+    .unwrap();
+
+    let event = parsed.into_event("esp-000123", received_at).unwrap();
+
+    assert_eq!(event.event_at.timestamp_millis(), 1_780_000_000_123);
+    assert_eq!(event.measurements["temperature_c"], json!(26.4));
+}
+
+#[test]
 fn token_payload_rejects_a_client_supplied_device_id() {
     let payload = r#"{
-        "schema_version": 1,
         "device_id": "esp-attacker",
-        "boot_id": "c9c04d99-4e01-4f94-82a8-9e229e47c093",
-        "sequence": 1842,
-        "event_at": "2026-09-04T10:12:00Z",
-        "measurements": {"temperature_c": 26.4}
+        "temperature_c": 26.4
     }"#;
     let parsed = serde_json::from_str::<DeviceTelemetryPayload>(payload).unwrap();
 
     assert_eq!(
-        parsed.into_event("esp-000123"),
+        parsed.into_event(
+            "esp-000123",
+            Utc.with_ymd_and_hms(2026, 9, 4, 10, 13, 0).unwrap(),
+        ),
         Err(TelemetryValidationError::DeviceIdNotAllowed)
     );
 }

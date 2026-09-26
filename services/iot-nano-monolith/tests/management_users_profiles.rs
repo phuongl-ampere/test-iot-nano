@@ -9,7 +9,7 @@ use axum::{
         header::{CONTENT_TYPE, COOKIE, SET_COOKIE},
     },
 };
-use iot_api::{TokenVault, hash_password, seed_tenant_test_users_sqlite};
+use iot_api::{TokenVault, hash_password};
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{ManagementSessionRouter, bootstrap_system};
 use iot_storage::{NewTenant, NewTenantAccount, PlatformStore, TenantIdentityRepository};
@@ -41,23 +41,25 @@ async fn management_router() -> (tempfile::TempDir, Arc<PlatformStore>, axum::Ro
     )
     .await
     .unwrap();
-    for app_id in ["fleet", "powermonitor"] {
+    for (username, password, role, account_class) in [
+        ("admin", "NanoAdmin@1234", "admin", "admin"),
+        ("viewer", "NanoView@1234", "viewer", "user"),
+    ] {
         sqlx::query(
-            "INSERT INTO applications (
-                app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
-             ) VALUES (?, ?, 'frontend', ?, ?, '[]', 1)",
+            "INSERT INTO users (
+                id, tenant_id, username, password_hash, role, account_class
+             ) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(app_id)
+        .bind(Uuid::now_v7().to_string())
         .bind(tenant.id.to_string())
-        .bind(format!("https://example.test/{app_id}"))
-        .bind(format!("management-{app_id}-client"))
+        .bind(username)
+        .bind(hash_password(password).unwrap())
+        .bind(role)
+        .bind(account_class)
         .execute(store.sqlite_pool().unwrap())
         .await
         .unwrap();
     }
-    seed_tenant_test_users_sqlite(store.sqlite_pool().unwrap(), tenant.id)
-        .await
-        .unwrap();
     let management = ManagementSessionRouter::new(Arc::clone(&store), test_token_vault());
     let router = management
         .router
@@ -141,16 +143,26 @@ async fn seed_audit_event(
     (event_id, actor_id)
 }
 
-async fn login_cookie(router: &axum::Router, username: &str, password: &str) -> String {
+async fn user_account_cookie(
+    router: &axum::Router,
+    tenant_slug: &str,
+    username: &str,
+    password: &str,
+) -> String {
     let response = router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/user/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({ "username": username, "password": password }).to_string(),
+                    json!({
+                        "tenant_slug": tenant_slug,
+                        "username": username,
+                        "password": password,
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
@@ -249,8 +261,8 @@ async fn json_request(
 #[tokio::test]
 async fn management_user_routes_authorize_before_json_and_support_crud() {
     let (_directory, _store, router) = management_router().await;
-    let viewer_cookie = login_cookie(&router, "viewer", "NanoView@1234").await;
-    let admin_cookie = login_cookie(&router, "admin", "NanoAdmin@1234").await;
+    let viewer_cookie = user_account_cookie(&router, "test", "viewer", "NanoView@1234").await;
+    let admin_cookie = user_account_cookie(&router, "test", "admin", "NanoAdmin@1234").await;
     let tenant_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
 
     for path in [
@@ -369,7 +381,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
                 .uri("/api/management/users")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
-                    r#"{"username":"content-type","password":"ContentType@123","default_app":"/apps/fleet","granted_apps":["fleet"]}"#,
+                    r#"{"username":"content-type","password":"ContentType@123"}"#,
                 ))
                 .unwrap(),
         )
@@ -424,8 +436,8 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     assert!(listed[0]["id"].is_string());
     assert_eq!(listed[0]["role"], "admin");
     assert_eq!(listed[0]["account_class"], "admin");
-    assert_eq!(listed[0]["default_app"], "/apps/powermonitor");
-    assert!(listed[0]["granted_apps"].is_array());
+    assert!(listed[0].get("default_app").is_none());
+    assert!(listed[0].get("granted_apps").is_none());
 
     let created = json_request(
         &router,
@@ -435,8 +447,6 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         json!({
             "username": "alice",
             "password": "AlicePassword@123",
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet", "powermonitor"],
         }),
         StatusCode::CREATED,
     )
@@ -445,8 +455,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     assert_eq!(created["username"], "alice");
     assert_eq!(created["role"], "viewer");
     assert_eq!(created["account_class"], "user");
-    assert_eq!(created["default_app"], "/apps/fleet");
-    assert_eq!(created["granted_apps"], json!(["fleet", "powermonitor"]));
+    assert!(created["capabilities"].is_array());
 
     json_request(
         &router,
@@ -456,8 +465,6 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         json!({
             "username": "alice",
             "password": "AlicePassword@123",
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet"],
         }),
         StatusCode::CONFLICT,
     )
@@ -470,36 +477,6 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         json!({
             "username": "not a valid username",
             "password": "InvalidUsername@123",
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet"],
-        }),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    json_request(
-        &router,
-        "POST",
-        "/api/management/users",
-        &tenant_cookie,
-        json!({
-            "username": "invalid-default-app",
-            "password": "InvalidDefaultApp@123",
-            "default_app": "/apps/not valid",
-            "granted_apps": ["fleet"],
-        }),
-        StatusCode::BAD_REQUEST,
-    )
-    .await;
-    json_request(
-        &router,
-        "POST",
-        "/api/management/users",
-        &tenant_cookie,
-        json!({
-            "username": "invalid-grants",
-            "password": "InvalidGrants@123",
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet", "fleet"],
         }),
         StatusCode::BAD_REQUEST,
     )
@@ -510,8 +487,6 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         "/api/management/users/missing",
         &tenant_cookie,
         json!({
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet"],
             "role": "admin",
         }),
         StatusCode::NOT_FOUND,
@@ -523,8 +498,6 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         "/api/management/users/alice",
         &tenant_cookie,
         json!({
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet"],
             "role": "admin",
         }),
         StatusCode::OK,
@@ -539,16 +512,16 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         "/api/management/users/alice",
         &tenant_cookie,
         json!({
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet"],
             "role": "operator",
         }),
         StatusCode::BAD_REQUEST,
     )
     .await;
 
-    let alice_first_session = login_cookie(&router, "alice", "AlicePassword@123").await;
-    let alice_second_session = login_cookie(&router, "alice", "AlicePassword@123").await;
+    let alice_first_session =
+        user_account_cookie(&router, "test", "alice", "AlicePassword@123").await;
+    let alice_second_session =
+        user_account_cookie(&router, "test", "alice", "AlicePassword@123").await;
     for cookie in [&alice_first_session, &alice_second_session] {
         let response = router
             .clone()
@@ -571,8 +544,6 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         "/api/management/users/alice",
         &tenant_cookie,
         json!({
-            "default_app": "/apps/fleet",
-            "granted_apps": ["fleet"],
             "role": "viewer",
         }),
         StatusCode::OK,
@@ -593,6 +564,41 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+}
+
+#[tokio::test]
+async fn management_user_routes_reject_removed_application_fields() {
+    let (_directory, _store, router) = management_router().await;
+    let tenant_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
+
+    json_request(
+        &router,
+        "POST",
+        "/api/management/users",
+        &tenant_cookie,
+        json!({
+            "username": "legacy-contract-user",
+            "password": "LegacyContract@123",
+            "default_app": "/apps/powermonitor",
+            "granted_apps": ["powermonitor"],
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    json_request(
+        &router,
+        "PUT",
+        "/api/management/users/admin",
+        &tenant_cookie,
+        json!({
+            "role": "admin",
+            "default_app": "/apps/powermonitor",
+            "granted_apps": ["powermonitor"],
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1177,7 +1183,7 @@ async fn management_alerts_are_guarded_and_scoped_to_the_authenticated_tenant() 
 
     let tenant_a_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
     let tenant_b_cookie = tenant_account_cookie(&router, "other-alerts", "OtherTenant@2026").await;
-    let viewer_cookie = login_cookie(&router, "viewer", "NanoView@1234").await;
+    let viewer_cookie = user_account_cookie(&router, "test", "viewer", "NanoView@1234").await;
 
     let anonymous = router
         .clone()
@@ -1267,7 +1273,7 @@ async fn tenant_alert_page_is_guarded_and_renders_only_the_session_tenant() {
     seed_alert(&store, tenant_b.id, "Tenant B page alert").await;
 
     let tenant_a_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
-    let viewer_cookie = login_cookie(&router, "viewer", "NanoView@1234").await;
+    let viewer_cookie = user_account_cookie(&router, "test", "viewer", "NanoView@1234").await;
 
     let anonymous = router
         .clone()
@@ -1315,10 +1321,14 @@ async fn tenant_alert_page_is_guarded_and_renders_only_the_session_tenant() {
             .to_vec(),
     )
     .unwrap();
-    assert!(page.contains("Tenant A page alert"));
+    assert!(page.contains("data-alert-rules-panel"));
+    assert!(page.contains("data-alert-incidents-panel"));
+    assert!(page.contains("data-alert-rule-form"));
+    assert!(!page.contains("Tenant A page alert"));
     assert!(!page.contains("Tenant B page alert"));
     assert!(page.contains("href=\"/tenant/alerts\" aria-current=\"page\""));
-    assert_read_only_tenant_alert_page_allows_only_logout_form(&page);
+    assert!(!page.contains("action=\"/system"));
+    assert!(!page.contains("href=\"/system"));
 }
 
 #[tokio::test]
@@ -1380,7 +1390,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
     let tenant_a_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
     let tenant_b_cookie = tenant_account_cookie(&router, "other-audit", "OtherTenant@2026").await;
     let system_cookie = system_account_cookie(&router).await;
-    let user_cookie = login_cookie(&router, "viewer", "NanoView@1234").await;
+    let user_cookie = user_account_cookie(&router, "test", "viewer", "NanoView@1234").await;
 
     for (cookie, expected_status) in [
         (None, StatusCode::UNAUTHORIZED),
@@ -1527,7 +1537,8 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
     assert!(page.contains("&#60;unsafe&#62;"));
     assert!(!page.contains("Tenant B audit"));
     assert!(page.contains("href=\"/tenant/audit\" aria-current=\"page\""));
-    assert!(!page.contains("<form"));
+    assert_eq!(page.matches("<form").count(), 1);
+    assert!(page.contains("<form class=\"logout-form\" action=\"/logout\" method=\"post\">"));
 }
 
 fn test_token_vault() -> TokenVault {

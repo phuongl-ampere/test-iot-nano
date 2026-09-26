@@ -1,5 +1,6 @@
 mod alerts;
 mod application;
+mod application_domain;
 mod authorization;
 mod commands;
 mod identity;

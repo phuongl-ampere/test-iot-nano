@@ -1,22 +1,17 @@
 use iot_nano_monolith::{
     PlatformLoginPage, PlatformUiIdentity, PlatformUiRenderer, SystemInfrastructurePage,
     SystemInfrastructureStatusRow, SystemPlatformPage, SystemTenantRow, TenantAlertRow,
-    TenantAlertsPage, TenantAuditPage, TenantAuditRow, TenantUserRow, TenantUsersPage,
-    UserDeviceDetailPage, UserDeviceListPage, UserDeviceRow,
+    TenantAlertsPage, TenantAuditPage, TenantAuditRow, TenantOverviewPage, TenantUserRow,
+    TenantUsersPage, UserAssetDetailPage, UserAssetListPage, UserAssetRow, UserDeviceDetailPage,
+    UserDeviceListPage, UserDeviceRow, UserInvitationPage, UserInvitationRow,
 };
 use std::fs;
 use std::path::Path;
 
-const TENANT_NAVIGATION: [(&str, &str, &str); 13] = [
+const TENANT_NAVIGATION: [(&str, &str, &str); 11] = [
     ("overview", "/tenant", "Overview"),
     ("devices", "/tenant/devices", "Devices"),
     ("assets", "/tenant/assets", "Assets"),
-    (
-        "device-profiles",
-        "/tenant/profiles/device",
-        "Device profiles",
-    ),
-    ("asset-profiles", "/tenant/profiles/asset", "Asset profiles"),
     ("alerts", "/tenant/alerts", "Alerts"),
     ("audit", "/tenant/audit", "Audit"),
     ("topology", "/tenant/topology", "Topology"),
@@ -27,12 +22,10 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 13] = [
     ("applications", "/tenant/applications", "Applications"),
 ];
 
-const TENANT_TEMPLATES: [(&str, &str); 15] = [
+const TENANT_TEMPLATES: [(&str, &str); 14] = [
     ("tenant.html", "overview"),
     ("tenant_devices.html", "devices"),
     ("tenant_assets.html", "assets"),
-    ("tenant_device_profiles.html", "device-profiles"),
-    ("tenant_asset_profiles.html", "asset-profiles"),
     ("tenant_alerts.html", "alerts"),
     ("tenant_audit.html", "audit"),
     ("tenant_topology.html", "topology"),
@@ -41,8 +34,9 @@ const TENANT_TEMPLATES: [(&str, &str); 15] = [
     ("tenant_groups.html", "groups"),
     ("tenant_permissions.html", "permissions"),
     ("tenant_applications.html", "applications"),
+    ("tenant_application_domain.html", "applications"),
     ("tenant_device_credential.html", "devices"),
-    ("tenant_device_tokens.html", "devices"),
+    ("tenant_device_claim_policy.html", "devices"),
 ];
 
 fn platform_template_source(name: &str) -> String {
@@ -299,7 +293,8 @@ fn system_layout_renders_only_system_navigation_and_escapes_identity() {
         PlatformUiRenderer::render_system(&identity, &SystemPlatformPage::new(Vec::new())).unwrap();
 
     assert!(rendered.contains("System Console"));
-    assert!(rendered.contains("href=\"/system\">Tenants</a>"));
+    assert!(rendered.contains("href=\"/system#tenants\">Tenants</a>"));
+    assert!(rendered.contains("id=\"tenants\""));
     assert!(rendered.contains("href=\"/system/infrastructure\""));
     assert!(rendered.contains("href=\"/system\" aria-current=\"page\""));
     assert_excludes_navigation_namespaces(&rendered, &["/tenant", "/app"]);
@@ -362,6 +357,7 @@ fn infrastructure_layout_renders_escaped_status_and_system_navigation_only() {
     let rendered = PlatformUiRenderer::render_system_infrastructure(&identity, &page).unwrap();
 
     assert!(rendered.contains("System infrastructure"));
+    assert!(rendered.contains("href=\"/system#tenants\">Tenants</a>"));
     assert!(rendered.contains("href=\"/system/infrastructure\" aria-current=\"page\""));
     assert!(rendered.contains("Runtime health"));
     assert!(rendered.contains("Ready"));
@@ -398,6 +394,7 @@ fn system_layout_renders_lifecycle_forms_without_tenant_secrets() {
         );
     }
     assert!(rendered.contains("method=\"post\""));
+    assert!(rendered.contains("name=\"tenant_account_username\""));
     assert!(rendered.contains("name=\"tenant_account_password\""));
     assert!(rendered.contains("name=\"password\""));
     assert!(rendered.contains("type=\"password\""));
@@ -409,8 +406,9 @@ fn system_layout_renders_lifecycle_forms_without_tenant_secrets() {
 #[test]
 fn tenant_layout_renders_only_tenant_navigation() {
     let identity = PlatformUiIdentity::new("Tenant Account");
+    let page = TenantOverviewPage::new(2, 3, 4, 1);
 
-    let rendered = PlatformUiRenderer::render_tenant(&identity).unwrap();
+    let rendered = PlatformUiRenderer::render_tenant(&identity, &page).unwrap();
 
     assert!(rendered.contains("Tenant Console"));
     assert!(rendered.contains("href=\"/tenant\" aria-current=\"page\""));
@@ -419,10 +417,30 @@ fn tenant_layout_renders_only_tenant_navigation() {
     assert!(rendered.contains("href=\"/tenant/permissions\""));
     assert!(rendered.contains("href=\"/tenant/alerts\""));
     assert!(rendered.contains("href=\"/tenant/audit\""));
-    assert!(rendered.contains("href=\"/tenant/profiles/device\""));
-    assert!(rendered.contains("href=\"/tenant/profiles/asset\""));
+    assert!(!rendered.contains("href=\"/tenant/profiles/device\""));
+    assert!(!rendered.contains("href=\"/tenant/profiles/asset\""));
     assert!(rendered.contains("href=\"/tenant/applications\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
+}
+
+#[test]
+fn owner_scoped_resource_sharing_uses_assignment_for_tenants_and_sharing_for_owners() {
+    let tenant_device = platform_template_source("tenant_devices.html");
+    let tenant_asset = platform_template_source("tenant_assets.html");
+    let user_device = platform_template_source("user_device.html");
+    let user_asset = platform_template_source("user_asset.html");
+
+    for template in [&tenant_device, &tenant_asset] {
+        assert!(template.contains("Assigned user"));
+        assert!(!template.contains("User access"));
+        assert!(!template.contains("permission: fields.permission.value"));
+    }
+    for template in [&user_device, &user_asset] {
+        assert!(template.contains("Invite user"));
+        assert!(template.contains("value=\"view\""));
+        assert!(template.contains("value=\"control\""));
+    }
+    assert!(!user_asset.contains("inherit_children"));
 }
 
 #[test]
@@ -568,7 +586,84 @@ fn tenant_users_layout_escapes_rows_and_contains_only_tenant_management_fields()
 }
 
 #[test]
-fn tenant_alerts_layout_is_read_only_and_escapes_server_rows() {
+fn tenant_users_layout_renders_a_capability_editor_only_for_user_accounts() {
+    let identity = PlatformUiIdentity::new("Tenant account");
+    let page = TenantUsersPage::new(
+        vec![
+            TenantUserRow::with_capabilities(
+                "user-id",
+                "operator",
+                "Active",
+                "User",
+                vec![
+                    "create_devices".to_owned(),
+                    "claim_devices".to_owned(),
+                    "control_devices".to_owned(),
+                ],
+            ),
+            TenantUserRow::with_capabilities(
+                "admin-id",
+                "tenant-admin",
+                "Active",
+                "Admin",
+                Vec::new(),
+            ),
+        ],
+        None,
+    );
+
+    let rendered = PlatformUiRenderer::render_tenant_users(&identity, &page).unwrap();
+
+    assert!(rendered.contains("data-user-capability-edit"));
+    assert!(rendered.contains("data-user-capability-form"));
+    assert!(rendered.contains("/api/management/users/"));
+    assert!(rendered.contains("/capabilities"));
+    assert!(rendered.contains("name=\"create_devices\""));
+    assert!(rendered.contains("name=\"claim_devices\""));
+    assert!(rendered.contains("name=\"control_devices\""));
+    assert!(
+        rendered.contains("data-capabilities=\"create_devices claim_devices control_devices\"")
+    );
+    assert!(rendered.contains("\"create_devices\", \"claim_devices\", \"edit_resources\""));
+    assert_eq!(rendered.matches("data-user-id=").count(), 1);
+}
+
+#[test]
+fn tenant_application_scopes_use_a_described_checklist_and_preserve_the_form_contract() {
+    let applications = platform_template_source("tenant_applications.html");
+    let stylesheet = platform_stylesheet_source();
+
+    assert!(applications.contains("class=\"scope-picker\""));
+    assert!(applications.contains("data-scope-checkbox"));
+    assert!(applications.contains("data-allowed-scopes-output"));
+    assert!(applications.contains("name=\"allowed_scopes\""));
+    assert!(applications.contains("devices:read"));
+    assert!(applications.contains("commands:write"));
+    assert!(applications.contains("authorization:write"));
+    assert!(applications.contains("Read device inventory and status."));
+    assert!(applications.contains("syncAllowedScopes"));
+    assert!(stylesheet.contains(".scope-picker"));
+}
+
+#[test]
+fn tenant_users_table_uses_the_shared_console_table_treatment() {
+    let users = platform_template_source("tenant_users.html");
+    let stylesheet = platform_stylesheet_source();
+
+    assert!(users.contains("class=\"table-scroll\""));
+    assert!(users.contains("class=\"data-table user-table\""));
+    assert!(users.contains("class=\"user-table__identity\""));
+    assert_eq!(
+        users
+            .matches("class=\"status-chip status-chip--neutral\"")
+            .count(),
+        2
+    );
+    assert!(stylesheet.contains(".user-table"));
+}
+
+#[test]
+fn tenant_alerts_layout_loads_dynamic_rows_without_rendering_server_data() {
     let identity = PlatformUiIdentity::new("Tenant <account>");
     let page = TenantAlertsPage::new(vec![TenantAlertRow::new(
         "device-<unsafe>",
@@ -583,14 +678,17 @@ fn tenant_alerts_layout_is_read_only_and_escapes_server_rows() {
 
     assert!(rendered.contains("href=\"/tenant/alerts\" aria-current=\"page\""));
     assert!(rendered.contains("Alerts"));
-    assert!(rendered.contains("Rule &#60;unsafe&#62;"));
+    assert!(!rendered.contains("Rule &#60;unsafe&#62;"));
     assert!(!rendered.contains("Rule <unsafe>"));
     assert!(rendered.contains("Device"));
     assert!(rendered.contains("Severity"));
     assert!(rendered.contains("Status"));
     assert!(rendered.contains("Last value"));
     assert!(rendered.contains("Updated"));
-    assert_read_only_page_allows_only_logout_form(&rendered);
+    assert!(rendered.contains("data-alert-rule-items"));
+    assert!(rendered.contains("data-alert-incident-items"));
+    assert!(rendered.contains("/api/management/alert-rules"));
+    assert!(rendered.contains("cell.textContent = value"));
     assert!(!rendered.contains("name=\"tenant_id\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
 }
@@ -637,8 +735,8 @@ fn user_layout_renders_only_workspace_navigation() {
         "device-<unsafe>",
         "Device <unsafe>",
         "Last seen 2026-09-18T10:20:30Z",
-        "Viewer",
-        "Direct user permission",
+        "View",
+        "Shared by owner",
     )]);
 
     let rendered = PlatformUiRenderer::render_user(&identity, &page).unwrap();
@@ -652,13 +750,156 @@ fn user_layout_renders_only_workspace_navigation() {
 }
 
 #[test]
+fn user_workspace_renders_recipient_specific_invitation_badge() {
+    let identity = PlatformUiIdentity::new("Nguyen").with_invitation_count(2);
+    let page = UserDeviceListPage::new(Vec::new());
+
+    let rendered = PlatformUiRenderer::render_user(&identity, &page).unwrap();
+
+    assert!(rendered.contains("href=\"/app/invitations\""));
+    assert!(rendered.contains("Invitations (2)"));
+}
+
+#[test]
+fn user_workspace_renders_a_secret_free_device_claim_form_only_with_capability() {
+    let identity = PlatformUiIdentity::new("Nguyen");
+    let without_claim_capability = UserDeviceListPage::new(Vec::new());
+    let with_claim_capability = UserDeviceListPage::new(Vec::new()).with_claim_devices();
+
+    let without_claim = PlatformUiRenderer::render_user(&identity, &without_claim_capability)
+        .expect("render workspace without device-claim capability");
+    let rendered = PlatformUiRenderer::render_user(&identity, &with_claim_capability)
+        .expect("render workspace with device-claim capability");
+
+    assert!(!without_claim.contains("action=\"/app/devices/claim\""));
+    assert!(rendered.contains("action=\"/app/devices/claim\" method=\"post\""));
+
+    let (_, claim_form) = rendered
+        .split_once("action=\"/app/devices/claim\"")
+        .expect("claim-enabled workspace contains the claim form");
+    let (claim_form, _) = claim_form
+        .split_once("</form>")
+        .expect("claim form is closed");
+
+    assert!(claim_form.contains("name=\"device_id\""));
+    assert!(claim_form.contains(
+        "name=\"code\" type=\"text\" autocomplete=\"one-time-code\" maxlength=\"40\" required"
+    ));
+    assert!(claim_form.contains("Add device"));
+    assert!(
+        !claim_form.contains("value="),
+        "the pairing code must be entered by the User and never rendered back into the form"
+    );
+    assert!(
+        !claim_form.contains("type=\"hidden\""),
+        "the claim form must not carry a raw pairing code in hidden markup"
+    );
+}
+
+#[test]
+fn shared_resource_template_has_no_owner_mutation_controls() {
+    let identity = PlatformUiIdentity::new("Nguyen");
+    let page = UserAssetDetailPage::new(UserAssetRow::new(
+        "asset-1",
+        "Shared asset",
+        "Root asset",
+        "View",
+        "Shared by owner",
+    ));
+
+    let rendered = PlatformUiRenderer::render_user_asset(&identity, &page).unwrap();
+
+    assert!(!rendered.contains("Invite user"));
+    assert!(!rendered.contains("Save asset"));
+    assert!(!rendered.contains("name=\"parent_asset_id\""));
+}
+
+#[test]
+fn owner_workspace_forms_render_only_with_owned_asset_options() {
+    let identity = PlatformUiIdentity::new("Owner");
+    let owned_asset = UserAssetRow::new(
+        "asset-1",
+        "Owned pump room",
+        "Root asset",
+        "Control",
+        "Owner",
+    );
+    let asset_page = UserAssetListPage::new(Vec::new()).with_management(vec![owned_asset.clone()]);
+    let device_page = UserDeviceDetailPage::new(UserDeviceRow::new(
+        "device-1",
+        "Pump 1",
+        "No activity reported",
+        "Control",
+        "Owner",
+    ))
+    .with_management(vec![owned_asset]);
+
+    let rendered_assets = PlatformUiRenderer::render_user_assets(&identity, &asset_page).unwrap();
+    let rendered_device = PlatformUiRenderer::render_user_device(&identity, &device_page).unwrap();
+
+    assert!(rendered_assets.contains("Create asset"));
+    assert!(rendered_assets.contains("action=\"/app/assets\""));
+    assert!(rendered_assets.contains("name=\"parent_asset_id\""));
+    assert!(rendered_device.contains("Save device"));
+    assert!(rendered_device.contains("name=\"asset_id\""));
+    assert!(rendered_device.contains("Owned pump room"));
+    assert!(rendered_device.contains("Invite user"));
+}
+
+#[test]
+fn owner_device_editor_preserves_the_current_asset_selection() {
+    let identity = PlatformUiIdentity::new("Owner");
+    let selected_asset = UserAssetRow::new(
+        "asset-1",
+        "Owned pump room",
+        "Root asset",
+        "Control",
+        "Owner",
+    )
+    .with_selected();
+    let page = UserDeviceDetailPage::new(UserDeviceRow::new(
+        "device-1",
+        "Pump 1",
+        "No activity reported",
+        "Control",
+        "Owner",
+    ))
+    .with_management(vec![selected_asset]);
+
+    let rendered = PlatformUiRenderer::render_user_device(&identity, &page).unwrap();
+
+    assert!(rendered.contains("<option value=\"asset-1\" selected>Owned pump room</option>"));
+}
+
+#[test]
+fn invitation_page_renders_incoming_pending_invitation_controls() {
+    let identity = PlatformUiIdentity::new("Nguyen").with_invitation_count(1);
+    let page = UserInvitationPage::new(vec![UserInvitationRow::new(
+        "invitation-1",
+        "Device",
+        "Pump <unsafe>",
+        "owner-a",
+        "Control",
+    )]);
+
+    let rendered = PlatformUiRenderer::render_user_invitations(&identity, &page).unwrap();
+
+    assert!(rendered.contains("Incoming invitations"));
+    assert!(rendered.contains("Pump &#60;unsafe&#62;"));
+    assert!(rendered.contains("action=\"/app/invitations/invitation-1/accept\""));
+    assert!(rendered.contains("action=\"/app/invitations/invitation-1/cancel\""));
+    assert!(rendered.contains("Accept"));
+    assert!(rendered.contains("Cancel"));
+}
+
+#[test]
 fn user_device_detail_renders_only_server_supplied_device_context() {
     let identity = PlatformUiIdentity::new("Nguyen");
     let page = UserDeviceDetailPage::new(UserDeviceRow::new(
         "device-1",
         "Device 1",
         "No activity reported",
-        "Viewer",
+        "View",
         "Group permission",
     ));
 
@@ -666,7 +907,7 @@ fn user_device_detail_renders_only_server_supplied_device_context() {
 
     assert!(rendered.contains("Device 1"));
     assert!(rendered.contains("No activity reported"));
-    assert!(rendered.contains("Viewer"));
+    assert!(rendered.contains("View"));
     assert!(rendered.contains("Group permission"));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/tenant"]);
     assert_read_only_page_allows_only_logout_form(&rendered);
@@ -704,16 +945,28 @@ fn system_and_user_templates_expose_only_supported_console_operations() {
     for template in [&user_devices, &user_assets, &user_device, &user_asset] {
         assert!(!template.contains("/tenant"));
         assert!(!template.contains("/system"));
-        assert!(!template.contains("<form"));
         assert!(!template.contains("/commands"));
     }
+    for template in [&user_devices, &user_assets] {
+        assert!(template.contains("{% if page.can_manage %}"));
+    }
+    assert!(user_device.contains(
+        "action=\"/app/devices/{{ page.device.device_id|urlencode_strict }}/permissions\""
+    ));
+    assert!(user_device.contains("Invite user"));
+    assert!(
+        user_asset.contains(
+            "action=\"/app/assets/{{ page.asset.asset_id|urlencode_strict }}/permissions\""
+        )
+    );
+    assert!(user_asset.contains("Invite user"));
+    assert!(!user_asset.contains("inherit_children"));
 }
 
 #[test]
 fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
     let devices = platform_template_source("tenant_devices.html");
     let credential = platform_template_source("tenant_device_credential.html");
-    let tokens = platform_template_source("tenant_device_tokens.html");
     let assets = platform_template_source("tenant_assets.html");
 
     for marker in [
@@ -726,7 +979,6 @@ fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
         "data-pause-when-hidden",
         "href=\"/tenant/devices\"",
         "id=\"device-{{ device.device_id|urlencode_strict }}\"",
-        "href=\"/tenant/devices/{{ device.device_id|urlencode_strict }}/tokens\"",
         "action=\"/tenant/devices\"",
     ] {
         assert!(
@@ -764,7 +1016,7 @@ fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
         "refresh status remains outside the HTMX-swapped table container"
     );
 
-    for template in [&credential, &tokens] {
+    for template in [&credential] {
         assert!(template.contains("data-copy-target"));
         assert!(template.contains("navigator.clipboard.writeText"));
         assert!(template.contains("Copy"));
@@ -778,16 +1030,185 @@ fn tenant_device_and_asset_templates_keep_progressive_existing_actions() {
     ] {
         assert!(assets.contains(marker), "assets template contains {marker}");
     }
+}
 
-    assert!(tokens.contains("<details class=\"confirmation\""));
-    assert!(tokens.contains(
-        "action=\"/tenant/devices/{{ page.device_id|urlencode_strict }}/tokens/revoke\""
+#[test]
+fn tenant_devices_editor_reveals_and_replaces_the_active_token_without_a_separate_page() {
+    let devices = platform_template_source("tenant_devices.html");
+    let token_page = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("templates/platform_ui/tenant_device_tokens.html");
+
+    assert!(devices.contains("data-device-token-issue"));
+    assert!(devices.contains(
+        "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/tokens"
     ));
-    // UI-only pages advertise only actions backed by the existing HTML forms.
-    for unsupported in ["/edit", "/delete", "/rotate"] {
-        assert!(!devices.contains(unsupported));
-        assert!(!assets.contains(unsupported));
-        assert!(!tokens.contains(unsupported));
+    assert!(
+        devices.contains(
+            "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/token"
+        )
+    );
+    assert!(devices.contains("Device token"));
+    assert!(devices.contains("data-device-token-copy"));
+    assert!(devices.contains("Only one token is active."));
+    assert!(
+        devices.contains("if (!editor.open || selectedDevice?.device_id !== deviceId) return;")
+    );
+    assert!(
+        !token_page.exists(),
+        "device token management belongs in the device editor, not a separate page"
+    );
+}
+
+#[test]
+fn tenant_pairing_policy_and_device_editor_keep_pairing_codes_out_of_server_rendered_markup() {
+    let policy = platform_template_source("tenant_device_claim_policy.html");
+    let devices = platform_template_source("tenant_devices.html");
+
+    assert!(policy.contains("<h1>Device pairing</h1>"));
+    assert!(policy.contains("href=\"/tenant/devices\">Back to devices</a>"));
+    assert!(policy.contains("action=\"/tenant/devices/claim-policy\" method=\"post\""));
+    for marker in [
+        "name=\"enabled\" type=\"checkbox\"",
+        "name=\"ttl_seconds\" type=\"number\" min=\"60\" max=\"86400\"",
+        "name=\"code_length\" type=\"number\" min=\"8\" max=\"32\"",
+        "name=\"max_failed_attempts\" type=\"number\" min=\"1\" max=\"20\"",
+        "name=\"request_cooldown_seconds\" type=\"number\" min=\"10\" max=\"3600\"",
+        "Save policy",
+    ] {
+        assert!(policy.contains(marker), "pairing policy contains {marker}");
+    }
+
+    for secret_marker in [
+        "name=\"device_id\"",
+        "name=\"code\"",
+        "{{ page.code }}",
+        "{{ page.claim_code",
+        "{{ page.pairing_code",
+    ] {
+        assert!(
+            !policy.contains(secret_marker),
+            "tenant policy never renders a raw pairing code: {secret_marker}"
+        );
+    }
+    assert!(devices.contains("{{ device.claim_status }}"));
+    assert!(devices.contains("/claim-code/revoke"));
+    assert!(devices.contains("data-device-claim-code-issue"));
+    assert!(devices.contains("data-device-claim-code-copy"));
+    assert!(devices.contains(
+        "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/claim-code"
+    ));
+    assert!(devices.contains("clearIssuedClaimCode();"));
+    assert!(!devices.contains("{{ device.claim_code"));
+    assert!(!devices.contains("{{ device.pairing_code"));
+}
+
+#[test]
+fn tenant_resource_editors_assign_one_owner_and_never_create_direct_grants() {
+    let devices = platform_template_source("tenant_devices.html");
+    let assets = platform_template_source("tenant_assets.html");
+
+    for (template, form, resource_id, owner_path) in [
+        (
+            &devices,
+            "data-device-owner-form",
+            "selectedDevice.device_id",
+            "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/owner",
+        ),
+        (
+            &assets,
+            "data-asset-owner-form",
+            "selectedAsset.id",
+            "/api/management/assets/${encodeURIComponent(selectedAsset.id)}/owner",
+        ),
+    ] {
+        assert!(template.contains(form), "resource editor contains {form}");
+        assert!(template.contains("Assigned user"));
+        assert!(template.contains("Transfer or unassigning clears existing shares."));
+        assert!(template.contains("user.account_class === \"user\""));
+        assert!(template.contains(resource_id));
+        assert!(template.contains(owner_path));
+        assert!(!template.contains("User access"));
+        assert!(!template.contains("/api/management/resource-access?scope="));
+        assert!(!template.contains("/tenant/permissions/revoke"));
+    }
+
+    for template in [&devices, &assets] {
+        assert!(!template.contains("inherit_children"));
+    }
+}
+
+#[test]
+fn tenant_devices_editor_separates_device_and_asset_relations() {
+    let devices = platform_template_source("tenant_devices.html");
+    let relations = platform_template_source("tenant_relations.html");
+
+    for (template, markers) in [
+        (
+            &devices,
+            &[
+                "data-device-device-relation-form",
+                "data-device-asset-relation-form",
+                "name=\"target_kind\" value=\"device\"",
+                "name=\"target_kind\" value=\"asset\"",
+                "Related device",
+                "Related asset",
+                "value=\"depends_on\"",
+                "value=\"installed_in\"",
+            ][..],
+        ),
+        (
+            &relations,
+            &[
+                "name=\"target_kind\" value=\"device\"",
+                "name=\"target_kind\" value=\"asset\"",
+                "name=\"to_device_id\"",
+                "name=\"to_asset_id\"",
+                "Create device relation",
+                "Create asset relation",
+            ][..],
+        ),
+    ] {
+        for marker in markers {
+            assert!(template.contains(marker), "template contains {marker}");
+        }
+    }
+}
+
+#[test]
+fn tenant_devices_editor_lists_recent_raw_telemetry_for_the_selected_range() {
+    let devices = platform_template_source("tenant_devices.html");
+
+    for marker in [
+        "data-device-telemetry-range",
+        "data-device-telemetry-items",
+        "data-device-telemetry-status",
+        "data-device-telemetry-scroll",
+        "<option value=\"1h\">Last hour</option>",
+        "<option value=\"1d\">Last day</option>",
+        "<option value=\"7d\">Last 7 days</option>",
+        "/api/management/devices/${encodeURIComponent(deviceId)}/telemetry?range=${encodeURIComponent(range)}",
+        "<th scope=\"col\">Value</th>",
+        "formatTelemetryValue(event.measurements)",
+        "const TELEMETRY_REFRESH_INTERVAL_MS = 2_000;",
+        "window.setInterval",
+        "document.hidden",
+        "startTelemetryRefresh();",
+    ] {
+        assert!(devices.contains(marker), "devices editor contains {marker}");
+    }
+
+    let stylesheet = platform_stylesheet_source();
+    for marker in [
+        ".device-telemetry-scroll",
+        "max-height: min(252px, 32vh)",
+        "overflow-y: auto",
+        ".device-telemetry-value",
+        "overflow-wrap: anywhere",
+    ] {
+        assert!(
+            stylesheet.contains(marker),
+            "telemetry stylesheet contains {marker}"
+        );
     }
 }
 
@@ -818,7 +1239,6 @@ fn tenant_operations_templates_make_supported_work_clear_without_inventing_backe
     for marker in [
         "Remove member",
         "Add member",
-        "Revoke permission",
         "Assign child to gateway",
         "Detach child from gateway",
         "Delete relation",
@@ -838,15 +1258,29 @@ fn tenant_operations_templates_make_supported_work_clear_without_inventing_backe
         );
     }
 
-    for template in [&groups, &permissions, &topology, &relations] {
+    for template in [&groups, &topology, &relations] {
         assert!(template.contains("<details class=\"confirmation\">"));
     }
+    assert!(!permissions.contains("<form"));
 
     for template in [&applications, &alerts, &audit] {
         assert!(template.contains("class=\"data-table\""));
     }
 
-    for template in [&alerts, &audit] {
+    for marker in [
+        "data-alert-rule-create",
+        "data-alert-rule-form",
+        "data-alert-rule-items",
+        "data-alert-incident-items",
+        "/api/management/alert-rules",
+        "/api/management/alert-incidents",
+        "/archive",
+        "Acknowledge",
+    ] {
+        assert!(alerts.contains(marker), "alerts template contains {marker}");
+    }
+
+    for template in [&audit] {
         assert!(template.contains("Read-only"));
         assert!(!template.contains("<form"));
         assert!(!template.contains("Acknowledge"));

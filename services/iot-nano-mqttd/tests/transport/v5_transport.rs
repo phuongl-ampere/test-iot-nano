@@ -1,10 +1,11 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use iot_nano_foundation::{RpcMode, RpcRequest};
 use iot_nano_mqttd::{
-    AuthenticatedDevice, DeviceAuthenticator, MqttdDeviceTransport, RpcResponseForwarder,
+    AuthenticatedDevice, DeviceAuthenticator, DeviceClaimCodeError, DeviceClaimCodeOutcome,
+    DeviceClaimCodePort, DeviceClaimCodeRequest, MqttdDeviceTransport, RpcResponseForwarder,
     TransportAuthRequest, TransportError, TransportRpcResponse, TransportUplink, UplinkForwarder,
 };
 use rumqttc::v5::mqttbytes::{
@@ -69,6 +70,32 @@ impl DeviceAuthenticator for StaticGatewayAuthenticator {
 #[derive(Clone, Default)]
 struct RecordedUplink {
     messages: Arc<Mutex<Vec<TransportUplink>>>,
+}
+
+#[derive(Clone, Default)]
+struct RecordedClaimCodes {
+    requests: Arc<Mutex<Vec<DeviceClaimCodeRequest>>>,
+}
+
+impl DeviceClaimCodePort for RecordedClaimCodes {
+    fn issue(
+        &self,
+        request: DeviceClaimCodeRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<DeviceClaimCodeOutcome, DeviceClaimCodeError>> + Send + '_>,
+    > {
+        let requests = Arc::clone(&self.requests);
+        Box::pin(async move {
+            requests.lock().await.push(request.clone());
+            Ok(DeviceClaimCodeOutcome::Issued {
+                device_id: request.device_id,
+                code: "V5-PAIRING-CODE".to_owned(),
+                expires_at: DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            })
+        })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -146,6 +173,101 @@ async fn token_authenticated_mqtt5_device_forwards_qos1_telemetry() {
         Packet::PubAck(PubAck { pkid: 7, .. })
     ));
     assert_eq!(uplink.messages.lock().await.len(), 1);
+
+    drop(client);
+    assert!(server_task.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn direct_mqtt5_device_receives_a_pairing_code_response_for_a_v7_request() {
+    let claim_codes = RecordedClaimCodes::default();
+    let transport = MqttdDeviceTransport::new(StaticAuthenticator, RecordedUplink::default())
+        .with_device_claim_code_port(Arc::new(claim_codes.clone()));
+    let (server, client) = duplex(8 * 1024);
+    let server_task = tokio::spawn(async move { transport.serve_v5_connection(server).await });
+    let mut client = Framed::new(
+        client,
+        Codec {
+            max_incoming_size: Some(1024 * 1024),
+            max_outgoing_size: Some(1024 * 1024),
+        },
+    );
+
+    client
+        .send(Packet::Connect(
+            Connect {
+                keep_alive: 60,
+                client_id: "v5-pairing-client".to_owned(),
+                clean_start: true,
+                properties: None,
+            },
+            None,
+            Some(Login::new("iotd_v5_device_token", "")),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success
+    ));
+
+    let mut subscribe = Subscribe::new(
+        Filter::new("v1/devices/me/pairing/response/+", QoS::AtLeastOnce),
+        None,
+    );
+    subscribe.pkid = 41;
+    client.send(Packet::Subscribe(subscribe)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::SubAck(ack)
+            if ack.pkid == 41
+                && matches!(
+                    ack.return_codes.as_slice(),
+                    [SubscribeReasonCode::Success(QoS::AtLeastOnce)]
+                )
+    ));
+
+    let request_id = Uuid::now_v7();
+    let mut request = Publish::new(
+        "v1/devices/me/pairing/request",
+        QoS::AtLeastOnce,
+        serde_json::to_vec(&serde_json::json!({"request_id": request_id})).unwrap(),
+        None,
+    );
+    request.pkid = 42;
+    client.send(Packet::Publish(request)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::PubAck(PubAck { pkid: 42, .. })
+    ));
+
+    let response = match client.next().await.unwrap().unwrap() {
+        Packet::Publish(response) => response,
+        packet => panic!("expected MQTT5 pairing response, got {packet:?}"),
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&response.topic),
+        format!("v1/devices/me/pairing/response/{request_id}")
+    );
+    assert_eq!(response.qos, QoS::AtLeastOnce);
+    assert!(!response.retain);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response.payload).unwrap(),
+        serde_json::json!({
+            "status": "issued",
+            "device_id": "v5-device",
+            "code": "V5-PAIRING-CODE",
+            "expires_at": "2030-01-01T00:00:00Z",
+        })
+    );
+    assert_eq!(
+        claim_codes.requests.lock().await.as_slice(),
+        &[DeviceClaimCodeRequest {
+            tenant_id: TEST_TENANT_ID,
+            device_id: "v5-device".to_owned(),
+            request_id,
+        }]
+    );
 
     drop(client);
     assert!(server_task.await.unwrap().is_ok());

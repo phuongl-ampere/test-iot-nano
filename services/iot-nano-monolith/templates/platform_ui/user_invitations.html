@@ -1,0 +1,54 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Invitations | IoT Nano{% endblock %}
+{% block account_kind %}User Account{% endblock %}
+{% block navigation_label %}Workspace navigation{% endblock %}
+{% block navigation %}
+  <a class="nav-link" href="/app">Devices</a>
+  <a class="nav-link" href="/app/assets">Assets</a>
+  <a class="nav-link active" href="/app/invitations" aria-current="page">Invitations</a>
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">User Account</p>
+    <h1>Incoming invitations</h1>
+    <p>Accept an invitation to add the shared resource to your workspace.</p>
+  </section>
+  <section class="workspace-panel">
+    <header class="panel-heading">
+      <div>
+        <h2>Pending invitations</h2>
+        <p class="panel-caption">No access is granted until you accept.</p>
+      </div>
+    </header>
+    {% if page.has_invitations %}
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th scope="col">Resource</th>
+              <th scope="col">From</th>
+              <th scope="col">Access</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for invitation in page.invitations %}
+              <tr>
+                <td><strong>{{ invitation.resource_kind }}</strong><span class="resource-id">{{ invitation.resource_name }}</span></td>
+                <td>{{ invitation.sender_username }}</td>
+                <td><span class="operation-note">{{ invitation.permission }}</span></td>
+                <td>
+                  <form class="inline-form inline-form--compact" action="/app/invitations/{{ invitation.id|urlencode_strict }}/accept" method="post"><button type="submit">Accept</button></form>
+                  <form class="inline-form inline-form--compact" action="/app/invitations/{{ invitation.id|urlencode_strict }}/cancel" method="post"><button class="danger-button" type="submit">Cancel</button></form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty-state">No pending invitations.</p>
+    {% endif %}
+  </section>
+{% endblock %}

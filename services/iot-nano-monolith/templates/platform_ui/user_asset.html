@@ -6,6 +6,7 @@
 {% block navigation %}
   <a class="nav-link" href="/app">Devices</a>
   <a class="nav-link active" href="/app/assets" aria-current="page">Assets</a>
+  <a class="nav-link" href="/app/invitations">Invitations</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
@@ -16,10 +17,23 @@
   <div class="page-actions">
     <a class="button-link button-link-secondary" href="/app/assets">Back to assets</a>
   </div>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  {% if page.can_edit %}
+  <section class="workspace-panel">
+    <header class="panel-heading"><h2>Asset settings</h2></header>
+    <form class="form-grid" action="/app/assets/{{ page.asset.asset_id|urlencode_strict }}" method="post">
+      <label class="field"><span>Name</span><input name="name" type="text" maxlength="128" value="{{ page.asset.name }}" required></label>
+      <label class="field"><span>Parent asset</span><select name="parent_asset_id"><option value="">No parent</option>{% for asset in page.owned_assets %}<option value="{{ asset.asset_id }}" {% if asset.selected %}selected{% endif %}>{{ asset.name }}</option>{% endfor %}</select></label>
+      <div class="form-actions"><button type="submit">Save asset</button></div>
+    </form>
+  </section>
+  {% endif %}
   <section class="workspace-panel">
     <header class="panel-heading">
       <h2>Access</h2>
-      <span class="operation-note">Read-only</span>
+      <span class="operation-note">{% if page.is_owner %}Owner{% else %}Read-only{% endif %}</span>
     </header>
     <dl class="resource-details">
       <div><dt>Containment</dt><dd>{{ page.asset.containment }}</dd></div>
@@ -27,4 +41,26 @@
       <div><dt>Access source</dt><dd>{{ page.asset.access_source }}</dd></div>
     </dl>
   </section>
+  {% if page.can_share %}
+  <section class="workspace-panel">
+    <header class="panel-heading">
+      <div><h2>Invite user</h2><p class="panel-caption">Send a pending invitation. Access begins only after the recipient accepts.</p></div>
+    </header>
+    <form class="form-grid" action="/app/assets/{{ page.asset.asset_id|urlencode_strict }}/permissions" method="post">
+      <label class="field"><span>Username</span><input name="username" type="text" maxlength="64" required></label>
+      <label class="field"><span>Access</span><select name="permission" required><option value="view">View</option><option value="control">Control</option></select></label>
+      <div class="form-actions"><button type="submit">Invite user</button></div>
+    </form>
+    {% if page.has_permissions %}
+      <h3>Accepted direct access</h3>
+      <div class="table-scroll">
+        <table class="data-table"><thead><tr><th scope="col">User</th><th scope="col">Access</th><th scope="col">Actions</th></tr></thead><tbody>
+        {% for permission in page.permissions %}
+          <tr><td>{{ permission.username }}</td><td><span class="status-chip">{{ permission.permission }}</span></td><td><form class="inline-form inline-form--compact" action="/app/assets/{{ page.asset.asset_id|urlencode_strict }}/permissions/revoke" method="post"><input name="permission_id" type="hidden" value="{{ permission.id }}"><button class="danger-button" type="submit">Revoke</button></form></td></tr>
+        {% endfor %}
+        </tbody></table>
+      </div>
+    {% endif %}
+  </section>
+  {% endif %}
 {% endblock %}

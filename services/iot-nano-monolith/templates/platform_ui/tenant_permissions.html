@@ -10,131 +10,31 @@
 {% block content %}
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
-    <h1>Resource Permissions</h1>
-    <p>Grant tenant users and groups the minimum access they need.</p>
+    <h1>Permissions</h1>
+    <p>Resource ownership and sharing are managed from the resource itself.</p>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
-    <header>
-      <div class="panel-heading"><h2>Grant asset permission</h2></div>
-      <p class="panel-caption">Asset permissions can optionally be inherited by child assets.</p>
+    <header class="panel-heading">
+      <div><h2>Assigned user</h2><p class="panel-caption">Assign or transfer the single owner from a Device or Asset editor. Changing the owner clears existing shares.</p></div>
     </header>
-    {% if page.subjects.is_empty() || page.assets.is_empty() %}
-      <p class="empty-state">Create a tenant user or group and an asset before granting asset access.</p>
-    {% else %}
-    <form class="form-grid" action="/tenant/permissions" method="post">
-      <input name="scope" type="hidden" value="asset">
-      <label class="field">
-        <span>Subject</span>
-        <select name="subject" required>
-          {% for subject in page.subjects %}
-            <option value="{{ subject.value }}">{{ subject.label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label class="field">
-        <span>Asset</span>
-        <select name="resource_id" required>
-          {% for asset in page.assets %}
-            <option value="{{ asset.value }}">{{ asset.label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label class="field">
-        <span>Permission</span>
-        <select name="permission" required>
-          <option value="viewer">Viewer</option>
-          <option value="manager">Manager</option>
-        </select>
-      </label>
-      <label class="field field--checkbox">
-        <input name="inherit_children" type="checkbox" value="true">
-        <span>Inherit to child assets</span>
-      </label>
-      <div class="form-actions"><button type="submit">Grant asset permission</button></div>
-    </form>
-    {% endif %}
+    <div class="page-actions">
+      <a class="button-link button-link-secondary" href="/tenant/devices">Devices</a>
+      <a class="button-link button-link-secondary" href="/tenant/assets">Assets</a>
+    </div>
   </section>
   <section class="workspace-panel">
-    <header>
-      <div class="panel-heading"><h2>Grant device permission</h2></div>
-      <p class="panel-caption">Device permissions apply to the selected device only.</p>
+    <header class="panel-heading">
+      <div><h2>Sharing</h2><p class="panel-caption">Only the assigned owner can share a resource directly with another regular user as View or Control.</p></div>
     </header>
-    {% if page.subjects.is_empty() || page.devices.is_empty() %}
-      <p class="empty-state">Create a tenant user or group and a device before granting device access.</p>
-    {% else %}
-    <form class="form-grid" action="/tenant/permissions" method="post">
-      <input name="scope" type="hidden" value="device">
-      <label class="field">
-        <span>Subject</span>
-        <select name="subject" required>
-          {% for subject in page.subjects %}
-            <option value="{{ subject.value }}">{{ subject.label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label class="field">
-        <span>Device</span>
-        <select name="resource_id" required>
-          {% for device in page.devices %}
-            <option value="{{ device.value }}">{{ device.label }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label class="field">
-        <span>Permission</span>
-        <select name="permission" required>
-          <option value="viewer">Viewer</option>
-          <option value="manager">Manager</option>
-        </select>
-      </label>
-      <div class="form-actions"><button type="submit">Grant device permission</button></div>
-    </form>
-    {% endif %}
+    <p class="empty-state">Open a resource from the User workspace to manage its direct shares.</p>
   </section>
   <section class="workspace-panel">
-    <header>
-      <div class="panel-heading"><h2>Active permissions</h2></div>
-      <p class="panel-caption">Revoking a permission immediately removes this direct grant.</p>
+    <header class="panel-heading">
+      <div><h2>Groups</h2><p class="panel-caption">Groups organize users. They do not grant access to Devices or Assets.</p></div>
     </header>
-    {% if page.permissions.is_empty() %}
-      <p class="empty-state">No direct permissions are active for this tenant.</p>
-    {% else %}
-      <div class="table-scroll">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th scope="col">Subject</th>
-              <th scope="col">Resource</th>
-              <th scope="col">Permission</th>
-              <th scope="col">Inheritance</th>
-              <th scope="col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for permission in page.permissions %}
-              <tr>
-                <td>{{ permission.subject }}</td>
-                <td>{{ permission.resource }}</td>
-                <td><span class="status-chip">{{ permission.permission }}</span></td>
-                <td><span class="status-chip status-chip--neutral">{{ permission.inheritance }}</span></td>
-                <td>
-                  <details class="confirmation">
-                    <summary>Revoke permission</summary>
-                    <p>This removes the direct grant for {{ permission.subject }}.</p>
-                    <form class="inline-form inline-form--compact" action="/tenant/permissions/revoke" method="post">
-                      <input name="permission_id" type="hidden" value="{{ permission.id }}">
-                      <button class="danger-button" type="submit">Revoke permission</button>
-                    </form>
-                  </details>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% endif %}
+    <a class="button-link button-link-secondary" href="/tenant/groups">Manage groups</a>
   </section>
 {% endblock %}

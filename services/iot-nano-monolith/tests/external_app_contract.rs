@@ -583,8 +583,6 @@ async fn create_user(
         .json(&json!({
             "username": USERNAME,
             "password": USER_PASSWORD,
-            "default_app": "/apps/powermonitor-external",
-            "granted_apps": ["powermonitor-external"],
         }))
         .send()
         .await?;
@@ -675,13 +673,12 @@ async fn prepare_powermonitor(
     npm: PathBuf,
 ) -> Result<PreparedPowerMonitor, Box<dyn Error>> {
     let source = powermonitor_directory();
-    assert!(
-        !source.join(".next").exists(),
-        "external app contract must not use artifacts in apps/powermonitor/.next"
-    );
-
     let directory = fixture.root.join("powermonitor");
     copy_powermonitor_source(&source, &directory)?;
+    assert!(
+        !directory.join(".next").exists(),
+        "external app fixture copied an artifact from apps/powermonitor/.next"
+    );
     let home = fixture.root.join("powermonitor-home");
     fs::create_dir(&home)?;
     let path = node_path()?;
@@ -695,8 +692,8 @@ async fn prepare_powermonitor(
     .await?;
     run_npm(&npm, &path, &home, &directory, &["run", "build"]).await?;
     assert!(
-        !source.join(".next").exists(),
-        "external app contract left a generated .next directory in apps/powermonitor"
+        directory.join(".next").is_dir(),
+        "external app contract did not build PowerMonitor in its isolated fixture"
     );
 
     let audit_path = fixture.root.join("powermonitor-start-environment.txt");

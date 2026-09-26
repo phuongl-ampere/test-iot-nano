@@ -8,9 +8,11 @@ use crate::{
     AuthorizationSubject, AuthorizedAssetListEntry, AuthorizedAssetSummary,
     AuthorizedDeviceListEntry, AuthorizedDeviceSummary, NewResourcePermission, NewUserGroup,
     OwnershipTransferTarget, PermissionCreator, PlatformStore, PlatformStoreError, ResourceAccess,
-    ResourceAccessSource, ResourcePermission, ResourcePermissionRecord, TenantAuthorizationError,
-    TenantAuthorizationRepository, TenantUserGroup, TenantUserGroupMember, UserGroup, audit,
-    authorization_account_class, parse_authorized_device_timestamp,
+    ResourceAccessSource, ResourceInvitation, ResourceInvitationRepository,
+    ResourceInvitationState, ResourcePermission, ResourcePermissionRecord,
+    TenantAuthorizationError, TenantAuthorizationRepository, TenantUserGroup,
+    TenantUserGroupMember, UserGroup, audit, authorization_account_class,
+    parse_authorized_device_timestamp,
 };
 
 impl PlatformStore {
@@ -1215,18 +1217,883 @@ impl PlatformStore {
         }
     }
 
+    pub async fn create_owner_resource_permission(
+        &self,
+        tenant_id: uuid::Uuid,
+        owner_user_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission: ResourcePermission,
+    ) -> Result<ResourcePermissionRecord, TenantAuthorizationError> {
+        if !matches!(
+            permission,
+            ResourcePermission::Viewer | ResourcePermission::Manager
+        ) {
+            return Err(TenantAuthorizationError::InvalidPermissionLevel { permission });
+        }
+        if owner_user_id == recipient_user_id {
+            return Err(TenantAuthorizationError::OwnerCannotShareWithSelf);
+        }
+
+        let id = uuid::Uuid::now_v7();
+        let (asset_id, device_id) = resource_permission_scope(&target);
+        let audit_event = audit::NewAuditEvent::new(
+            tenant_id,
+            AuditPrincipal::User(owner_user_id),
+            AuditAction::PermissionGranted,
+            AuditTargetType::ResourcePermission,
+            id.to_string(),
+            serde_json::json!({
+                "subject": {"kind": "user", "id": recipient_user_id.to_string()},
+                "resource": resource_permission_target_json(&target),
+                "permission": permission.as_str(),
+                "inherit_children": false,
+            }),
+        );
+
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, owner_user_id)
+                    .await?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, recipient_user_id)
+                    .await?;
+                sqlite_require_resource_owner(&mut transaction, tenant_id, &target, owner_user_id)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO resource_permissions (
+                        id, tenant_id, subject_user_id, asset_id, device_id,
+                        permission, inherit_children, created_by_user_id
+                     ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                )
+                .bind(id.to_string())
+                .bind(tenant_id.to_string())
+                .bind(recipient_user_id.to_string())
+                .bind(asset_id.map(|value| value.to_string()))
+                .bind(device_id.as_deref())
+                .bind(permission.as_str())
+                .bind(owner_user_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+                audit::insert_sqlite_audit_event(&mut transaction, &audit_event).await?;
+                transaction.commit().await?;
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_regular_tenant_user(&mut transaction, tenant_id, owner_user_id)
+                    .await?;
+                timescale_require_regular_tenant_user(
+                    &mut transaction,
+                    tenant_id,
+                    recipient_user_id,
+                )
+                .await?;
+                timescale_require_resource_owner(
+                    &mut transaction,
+                    tenant_id,
+                    &target,
+                    owner_user_id,
+                )
+                .await?;
+                sqlx::query(
+                    "INSERT INTO resource_permissions (
+                        id, tenant_id, subject_user_id, asset_id, device_id,
+                        permission, inherit_children, created_by_user_id
+                     ) VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)",
+                )
+                .bind(id)
+                .bind(tenant_id)
+                .bind(recipient_user_id)
+                .bind(asset_id)
+                .bind(device_id.as_deref())
+                .bind(permission.as_str())
+                .bind(owner_user_id)
+                .execute(&mut *transaction)
+                .await?;
+                audit::insert_timescale_audit_event(&mut transaction, &audit_event).await?;
+                transaction.commit().await?;
+            }
+        }
+
+        Ok(ResourcePermissionRecord {
+            id,
+            tenant_id,
+            subject_user_id: Some(recipient_user_id),
+            subject_group_id: None,
+            asset_id,
+            device_id,
+            permission,
+            inherit_children: false,
+            created_by: PermissionCreator::User(owner_user_id),
+        })
+    }
+
+    pub async fn create_owner_resource_invitation(
+        &self,
+        tenant_id: uuid::Uuid,
+        sender_user_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission: ResourcePermission,
+    ) -> Result<ResourceInvitation, TenantAuthorizationError> {
+        if !matches!(
+            permission,
+            ResourcePermission::Viewer | ResourcePermission::Manager
+        ) {
+            return Err(TenantAuthorizationError::InvalidPermissionLevel { permission });
+        }
+        if sender_user_id == recipient_user_id {
+            return Err(TenantAuthorizationError::OwnerCannotShareWithSelf);
+        }
+        let (asset_id, device_id) = resource_permission_scope(&target);
+        let invitation_id = uuid::Uuid::now_v7();
+
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
+                    .await?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, recipient_user_id)
+                    .await?;
+                sqlite_require_resource_owner(&mut transaction, tenant_id, &target, sender_user_id)
+                    .await?;
+                let existing_id = match asset_id {
+                    Some(asset_id) => {
+                        sqlx::query_scalar::<_, String>(
+                            "SELECT id FROM resource_invitations
+                         WHERE tenant_id = ? AND asset_id = ? AND recipient_user_id = ?
+                           AND state = 'pending'",
+                        )
+                        .bind(tenant_id.to_string())
+                        .bind(asset_id.to_string())
+                        .bind(recipient_user_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                    None => {
+                        sqlx::query_scalar::<_, String>(
+                            "SELECT id FROM resource_invitations
+                         WHERE tenant_id = ? AND device_id = ? AND recipient_user_id = ?
+                           AND state = 'pending'",
+                        )
+                        .bind(tenant_id.to_string())
+                        .bind(device_id.as_deref())
+                        .bind(recipient_user_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                };
+                let id = match existing_id {
+                    Some(existing_id) => {
+                        sqlx::query(
+                            "UPDATE resource_invitations
+                             SET permission = ?, sender_user_id = ?, updated_at = ?
+                             WHERE id = ? AND tenant_id = ?",
+                        )
+                        .bind(permission.as_str())
+                        .bind(sender_user_id.to_string())
+                        .bind(Utc::now().to_rfc3339())
+                        .bind(&existing_id)
+                        .bind(tenant_id.to_string())
+                        .execute(&mut *transaction)
+                        .await?;
+                        uuid::Uuid::parse_str(&existing_id)
+                            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?
+                    }
+                    None => {
+                        sqlx::query(
+                            "INSERT INTO resource_invitations (
+                                id, tenant_id, sender_user_id, recipient_user_id, asset_id,
+                                device_id, permission, state
+                             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+                        )
+                        .bind(invitation_id.to_string())
+                        .bind(tenant_id.to_string())
+                        .bind(sender_user_id.to_string())
+                        .bind(recipient_user_id.to_string())
+                        .bind(asset_id.map(|id| id.to_string()))
+                        .bind(device_id.as_deref())
+                        .bind(permission.as_str())
+                        .execute(&mut *transaction)
+                        .await?;
+                        invitation_id
+                    }
+                };
+                transaction.commit().await?;
+                Ok(ResourceInvitation {
+                    id,
+                    tenant_id,
+                    sender_user_id,
+                    recipient_user_id,
+                    asset_id,
+                    device_id,
+                    permission,
+                    state: ResourceInvitationState::Pending,
+                })
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
+                    .await?;
+                timescale_require_regular_tenant_user(
+                    &mut transaction,
+                    tenant_id,
+                    recipient_user_id,
+                )
+                .await?;
+                timescale_require_resource_owner(
+                    &mut transaction,
+                    tenant_id,
+                    &target,
+                    sender_user_id,
+                )
+                .await?;
+                let existing_id = match asset_id {
+                    Some(asset_id) => {
+                        sqlx::query_scalar::<_, uuid::Uuid>(
+                            "SELECT id FROM resource_invitations
+                         WHERE tenant_id = $1 AND asset_id = $2 AND recipient_user_id = $3
+                           AND state = 'pending'
+                         FOR UPDATE",
+                        )
+                        .bind(tenant_id)
+                        .bind(asset_id)
+                        .bind(recipient_user_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                    None => {
+                        sqlx::query_scalar::<_, uuid::Uuid>(
+                            "SELECT id FROM resource_invitations
+                         WHERE tenant_id = $1 AND device_id = $2 AND recipient_user_id = $3
+                           AND state = 'pending'
+                         FOR UPDATE",
+                        )
+                        .bind(tenant_id)
+                        .bind(device_id.as_deref())
+                        .bind(recipient_user_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                };
+                let id = match existing_id {
+                    Some(existing_id) => {
+                        sqlx::query(
+                            "UPDATE resource_invitations
+                             SET permission = $2, sender_user_id = $3, updated_at = now()
+                             WHERE id = $1 AND tenant_id = $4",
+                        )
+                        .bind(existing_id)
+                        .bind(permission.as_str())
+                        .bind(sender_user_id)
+                        .bind(tenant_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                        existing_id
+                    }
+                    None => {
+                        sqlx::query(
+                            "INSERT INTO resource_invitations (
+                                id, tenant_id, sender_user_id, recipient_user_id, asset_id,
+                                device_id, permission, state
+                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')",
+                        )
+                        .bind(invitation_id)
+                        .bind(tenant_id)
+                        .bind(sender_user_id)
+                        .bind(recipient_user_id)
+                        .bind(asset_id)
+                        .bind(device_id.as_deref())
+                        .bind(permission.as_str())
+                        .execute(&mut *transaction)
+                        .await?;
+                        invitation_id
+                    }
+                };
+                transaction.commit().await?;
+                Ok(ResourceInvitation {
+                    id,
+                    tenant_id,
+                    sender_user_id,
+                    recipient_user_id,
+                    asset_id,
+                    device_id,
+                    permission,
+                    state: ResourceInvitationState::Pending,
+                })
+            }
+        }
+    }
+
+    pub async fn accept_resource_invitation(
+        &self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        invitation_id: uuid::Uuid,
+    ) -> Result<ResourceInvitation, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, recipient_user_id)
+                    .await?;
+                let (sender, asset_id, device_id, permission, state) =
+                    sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String)>(
+                        "SELECT sender_user_id, asset_id, device_id, permission, state
+                     FROM resource_invitations
+                     WHERE id = ? AND tenant_id = ? AND recipient_user_id = ?",
+                    )
+                    .bind(invitation_id.to_string())
+                    .bind(tenant_id.to_string())
+                    .bind(recipient_user_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .ok_or(TenantAuthorizationError::InvitationNotFound {
+                        tenant_id,
+                        invitation_id,
+                    })?;
+                let state = ResourceInvitationState::parse(&state)
+                    .ok_or(TenantAuthorizationError::InvalidStoredRecord)?;
+                if state != ResourceInvitationState::Pending {
+                    return Err(TenantAuthorizationError::InvitationNotPending { invitation_id });
+                }
+                let sender_user_id = uuid::Uuid::parse_str(&sender)
+                    .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+                let target =
+                    invitation_target_from_sqlite(asset_id.as_deref(), device_id.as_deref())?;
+                let permission = invitation_permission(&permission)?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
+                    .await?;
+                sqlite_require_resource_owner(&mut transaction, tenant_id, &target, sender_user_id)
+                    .await?;
+                let (target_asset_id, target_device_id) = resource_permission_scope(&target);
+                let existing_permission = match target_asset_id {
+                    Some(asset_id) => {
+                        sqlx::query_as::<_, (String, String)>(
+                            "SELECT id, permission FROM resource_permissions
+                         WHERE tenant_id = ? AND subject_user_id = ? AND asset_id = ?
+                           AND revoked_at IS NULL",
+                        )
+                        .bind(tenant_id.to_string())
+                        .bind(recipient_user_id.to_string())
+                        .bind(asset_id.to_string())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                    None => {
+                        sqlx::query_as::<_, (String, String)>(
+                            "SELECT id, permission FROM resource_permissions
+                         WHERE tenant_id = ? AND subject_user_id = ? AND device_id = ?
+                           AND revoked_at IS NULL",
+                        )
+                        .bind(tenant_id.to_string())
+                        .bind(recipient_user_id.to_string())
+                        .bind(target_device_id.as_deref())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                };
+                match existing_permission {
+                    Some((permission_id, current_permission)) => {
+                        let current_permission = ResourcePermission::parse(&current_permission)
+                            .ok_or(TenantAuthorizationError::InvalidStoredRecord)?;
+                        if permission > current_permission {
+                            sqlx::query(
+                                "UPDATE resource_permissions
+                                 SET permission = ?
+                                 WHERE id = ? AND tenant_id = ? AND revoked_at IS NULL",
+                            )
+                            .bind(permission.as_str())
+                            .bind(permission_id)
+                            .bind(tenant_id.to_string())
+                            .execute(&mut *transaction)
+                            .await?;
+                        }
+                    }
+                    None => {
+                        let permission_id = uuid::Uuid::now_v7();
+                        sqlx::query(
+                            "INSERT INTO resource_permissions (
+                                id, tenant_id, subject_user_id, asset_id, device_id,
+                                permission, inherit_children, created_by_user_id
+                             ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                        )
+                        .bind(permission_id.to_string())
+                        .bind(tenant_id.to_string())
+                        .bind(recipient_user_id.to_string())
+                        .bind(target_asset_id.map(|id| id.to_string()))
+                        .bind(target_device_id.as_deref())
+                        .bind(permission.as_str())
+                        .bind(sender_user_id.to_string())
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                }
+                sqlx::query(
+                    "UPDATE resource_invitations
+                     SET state = 'accepted', updated_at = ?, accepted_at = ?, closed_at = ?
+                     WHERE id = ? AND tenant_id = ?",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(Utc::now().to_rfc3339())
+                .bind(Utc::now().to_rfc3339())
+                .bind(invitation_id.to_string())
+                .bind(tenant_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                Ok(ResourceInvitation {
+                    id: invitation_id,
+                    tenant_id,
+                    sender_user_id,
+                    recipient_user_id,
+                    asset_id: target_asset_id,
+                    device_id: target_device_id,
+                    permission,
+                    state: ResourceInvitationState::Accepted,
+                })
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_regular_tenant_user(
+                    &mut transaction,
+                    tenant_id,
+                    recipient_user_id,
+                )
+                .await?;
+                let (sender_user_id, asset_id, device_id, permission, state) = sqlx::query_as::<
+                    _,
+                    (
+                        uuid::Uuid,
+                        Option<uuid::Uuid>,
+                        Option<String>,
+                        String,
+                        String,
+                    ),
+                >(
+                    "SELECT sender_user_id, asset_id, device_id, permission, state
+                     FROM resource_invitations
+                     WHERE id = $1 AND tenant_id = $2 AND recipient_user_id = $3
+                     FOR UPDATE",
+                )
+                .bind(invitation_id)
+                .bind(tenant_id)
+                .bind(recipient_user_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(TenantAuthorizationError::InvitationNotFound {
+                    tenant_id,
+                    invitation_id,
+                })?;
+                let state = ResourceInvitationState::parse(&state)
+                    .ok_or(TenantAuthorizationError::InvalidStoredRecord)?;
+                if state != ResourceInvitationState::Pending {
+                    return Err(TenantAuthorizationError::InvitationNotPending { invitation_id });
+                }
+                let target = invitation_target_from_timescale(asset_id, device_id.as_deref())?;
+                let permission = invitation_permission(&permission)?;
+                timescale_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
+                    .await?;
+                timescale_require_resource_owner(
+                    &mut transaction,
+                    tenant_id,
+                    &target,
+                    sender_user_id,
+                )
+                .await?;
+                let (target_asset_id, target_device_id) = resource_permission_scope(&target);
+                let existing_permission = match target_asset_id {
+                    Some(asset_id) => {
+                        sqlx::query_as::<_, (uuid::Uuid, String)>(
+                            "SELECT id, permission FROM resource_permissions
+                         WHERE tenant_id = $1 AND subject_user_id = $2 AND asset_id = $3
+                           AND revoked_at IS NULL
+                         FOR UPDATE",
+                        )
+                        .bind(tenant_id)
+                        .bind(recipient_user_id)
+                        .bind(asset_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                    None => {
+                        sqlx::query_as::<_, (uuid::Uuid, String)>(
+                            "SELECT id, permission FROM resource_permissions
+                         WHERE tenant_id = $1 AND subject_user_id = $2 AND device_id = $3
+                           AND revoked_at IS NULL
+                         FOR UPDATE",
+                        )
+                        .bind(tenant_id)
+                        .bind(recipient_user_id)
+                        .bind(target_device_id.as_deref())
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                    }
+                };
+                match existing_permission {
+                    Some((permission_id, current_permission)) => {
+                        let current_permission = ResourcePermission::parse(&current_permission)
+                            .ok_or(TenantAuthorizationError::InvalidStoredRecord)?;
+                        if permission > current_permission {
+                            sqlx::query(
+                                "UPDATE resource_permissions
+                                 SET permission = $1
+                                 WHERE id = $2 AND tenant_id = $3 AND revoked_at IS NULL",
+                            )
+                            .bind(permission.as_str())
+                            .bind(permission_id)
+                            .bind(tenant_id)
+                            .execute(&mut *transaction)
+                            .await?;
+                        }
+                    }
+                    None => {
+                        sqlx::query(
+                            "INSERT INTO resource_permissions (
+                                id, tenant_id, subject_user_id, asset_id, device_id,
+                                permission, inherit_children, created_by_user_id
+                             ) VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)",
+                        )
+                        .bind(uuid::Uuid::now_v7())
+                        .bind(tenant_id)
+                        .bind(recipient_user_id)
+                        .bind(target_asset_id)
+                        .bind(target_device_id.as_deref())
+                        .bind(permission.as_str())
+                        .bind(sender_user_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                    }
+                }
+                sqlx::query(
+                    "UPDATE resource_invitations
+                     SET state = 'accepted', updated_at = now(), accepted_at = now(), closed_at = now()
+                     WHERE id = $1 AND tenant_id = $2",
+                )
+                .bind(invitation_id)
+                .bind(tenant_id)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                Ok(ResourceInvitation {
+                    id: invitation_id,
+                    tenant_id,
+                    sender_user_id,
+                    recipient_user_id,
+                    asset_id: target_asset_id,
+                    device_id: target_device_id,
+                    permission,
+                    state: ResourceInvitationState::Accepted,
+                })
+            }
+        }
+    }
+
+    pub async fn cancel_resource_invitation(
+        &self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        invitation_id: uuid::Uuid,
+    ) -> Result<bool, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, recipient_user_id)
+                    .await?;
+                let cancelled = sqlx::query(
+                    "UPDATE resource_invitations
+                     SET state = 'cancelled', updated_at = ?, closed_at = ?
+                     WHERE id = ? AND tenant_id = ? AND recipient_user_id = ? AND state = 'pending'",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(Utc::now().to_rfc3339())
+                .bind(invitation_id.to_string())
+                .bind(tenant_id.to_string())
+                .bind(recipient_user_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(cancelled)
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_regular_tenant_user(
+                    &mut transaction,
+                    tenant_id,
+                    recipient_user_id,
+                )
+                .await?;
+                let cancelled = sqlx::query(
+                    "UPDATE resource_invitations
+                     SET state = 'cancelled', updated_at = now(), closed_at = now()
+                     WHERE id = $1 AND tenant_id = $2 AND recipient_user_id = $3 AND state = 'pending'",
+                )
+                .bind(invitation_id)
+                .bind(tenant_id)
+                .bind(recipient_user_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                transaction.commit().await?;
+                Ok(cancelled)
+            }
+        }
+    }
+
+    pub async fn list_pending_resource_invitations(
+        &self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+    ) -> Result<Vec<ResourceInvitation>, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let rows = sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        String,
+                    ),
+                >(
+                    "SELECT id, sender_user_id, recipient_user_id, asset_id, device_id, permission
+                     FROM resource_invitations
+                     WHERE tenant_id = ? AND recipient_user_id = ? AND state = 'pending'
+                     ORDER BY created_at, id",
+                )
+                .bind(tenant_id.to_string())
+                .bind(recipient_user_id.to_string())
+                .fetch_all(store.pool())
+                .await?;
+                rows.into_iter()
+                    .map(|(id, sender, recipient, asset_id, device_id, permission)| {
+                        let id = uuid::Uuid::parse_str(&id)
+                            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+                        let sender_user_id = uuid::Uuid::parse_str(&sender)
+                            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+                        let recipient_user_id = uuid::Uuid::parse_str(&recipient)
+                            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+                        let target = invitation_target_from_sqlite(
+                            asset_id.as_deref(),
+                            device_id.as_deref(),
+                        )?;
+                        let (asset_id, device_id) = resource_permission_scope(&target);
+                        Ok(ResourceInvitation {
+                            id,
+                            tenant_id,
+                            sender_user_id,
+                            recipient_user_id,
+                            asset_id,
+                            device_id,
+                            permission: invitation_permission(&permission)?,
+                            state: ResourceInvitationState::Pending,
+                        })
+                    })
+                    .collect()
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query_as::<
+                    _,
+                    (
+                        uuid::Uuid,
+                        uuid::Uuid,
+                        uuid::Uuid,
+                        Option<uuid::Uuid>,
+                        Option<String>,
+                        String,
+                    ),
+                >(
+                    "SELECT id, sender_user_id, recipient_user_id, asset_id, device_id, permission
+                     FROM resource_invitations
+                     WHERE tenant_id = $1 AND recipient_user_id = $2 AND state = 'pending'
+                     ORDER BY created_at, id",
+                )
+                .bind(tenant_id)
+                .bind(recipient_user_id)
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter()
+                    .map(
+                        |(
+                            id,
+                            sender_user_id,
+                            recipient_user_id,
+                            asset_id,
+                            device_id,
+                            permission,
+                        )| {
+                            let target =
+                                invitation_target_from_timescale(asset_id, device_id.as_deref())?;
+                            let (asset_id, device_id) = resource_permission_scope(&target);
+                            Ok(ResourceInvitation {
+                                id,
+                                tenant_id,
+                                sender_user_id,
+                                recipient_user_id,
+                                asset_id,
+                                device_id,
+                                permission: invitation_permission(&permission)?,
+                                state: ResourceInvitationState::Pending,
+                            })
+                        },
+                    )
+                    .collect()
+            }
+        }
+    }
+
+    pub async fn revoke_owner_resource_permission(
+        &self,
+        tenant_id: uuid::Uuid,
+        owner_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission_id: uuid::Uuid,
+    ) -> Result<bool, TenantAuthorizationError> {
+        match self {
+            Self::Sqlite(store) => {
+                let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, owner_user_id)
+                    .await?;
+                sqlite_require_resource_owner(&mut transaction, tenant_id, &target, owner_user_id)
+                    .await?;
+                let (asset_id, device_id) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                    "SELECT asset_id, device_id FROM resource_permissions WHERE id = ? AND tenant_id = ?",
+                )
+                .bind(permission_id.to_string())
+                .bind(tenant_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(TenantAuthorizationError::PermissionNotFound {
+                    tenant_id,
+                    permission_id,
+                })?;
+                if !resource_permission_scope_matches(
+                    &target,
+                    asset_id.as_deref(),
+                    device_id.as_deref(),
+                ) {
+                    return Err(TenantAuthorizationError::PermissionNotFound {
+                        tenant_id,
+                        permission_id,
+                    });
+                }
+                let revoked = sqlx::query(
+                    "UPDATE resource_permissions
+                     SET revoked_at = ?
+                     WHERE id = ? AND tenant_id = ? AND revoked_at IS NULL",
+                )
+                .bind(Utc::now().to_rfc3339())
+                .bind(permission_id.to_string())
+                .bind(tenant_id.to_string())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                if revoked {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        AuditPrincipal::User(owner_user_id),
+                        AuditAction::PermissionRevoked,
+                        AuditTargetType::ResourcePermission,
+                        permission_id.to_string(),
+                        serde_json::json!({"revoked": true}),
+                    );
+                    audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
+                }
+                transaction.commit().await?;
+                Ok(revoked)
+            }
+            Self::Timescale(pool) => {
+                let mut transaction = pool.begin().await?;
+                timescale_require_regular_tenant_user(&mut transaction, tenant_id, owner_user_id)
+                    .await?;
+                timescale_require_resource_owner(
+                    &mut transaction,
+                    tenant_id,
+                    &target,
+                    owner_user_id,
+                )
+                .await?;
+                let (asset_id, device_id) = sqlx::query_as::<_, (Option<uuid::Uuid>, Option<String>)>(
+                    "SELECT asset_id, device_id FROM resource_permissions WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+                )
+                .bind(permission_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(TenantAuthorizationError::PermissionNotFound {
+                    tenant_id,
+                    permission_id,
+                })?;
+                if !resource_permission_scope_matches(
+                    &target,
+                    asset_id.as_ref().map(uuid::Uuid::to_string).as_deref(),
+                    device_id.as_deref(),
+                ) {
+                    return Err(TenantAuthorizationError::PermissionNotFound {
+                        tenant_id,
+                        permission_id,
+                    });
+                }
+                let revoked = sqlx::query(
+                    "UPDATE resource_permissions
+                     SET revoked_at = now()
+                     WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+                )
+                .bind(permission_id)
+                .bind(tenant_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    > 0;
+                if revoked {
+                    let event = audit::NewAuditEvent::new(
+                        tenant_id,
+                        AuditPrincipal::User(owner_user_id),
+                        AuditAction::PermissionRevoked,
+                        AuditTargetType::ResourcePermission,
+                        permission_id.to_string(),
+                        serde_json::json!({"revoked": true}),
+                    );
+                    audit::insert_timescale_audit_event(&mut transaction, &event).await?;
+                }
+                transaction.commit().await?;
+                Ok(revoked)
+            }
+        }
+    }
+
     pub async fn transfer_resource_ownership(
         &self,
         tenant_id: uuid::Uuid,
         actor: AuditPrincipal,
         target: OwnershipTransferTarget,
-        new_owner_user_id: uuid::Uuid,
+        new_owner_user_id: Option<uuid::Uuid>,
     ) -> Result<bool, TenantAuthorizationError> {
+        let tenant_account_id = match actor {
+            AuditPrincipal::TenantAccount(tenant_account_id) => tenant_account_id,
+            AuditPrincipal::SystemAccount(_) | AuditPrincipal::User(_) => {
+                return Err(TenantAuthorizationError::TenantAccountRequiredForOwnership);
+            }
+        };
+        let actor = AuditPrincipal::TenantAccount(tenant_account_id);
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
-                sqlite_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
-                sqlite_require_tenant_user(&mut transaction, tenant_id, new_owner_user_id).await?;
+                sqlite_require_tenant_account(&mut transaction, tenant_id, tenant_account_id)
+                    .await?;
+                if let Some(new_owner_user_id) = new_owner_user_id {
+                    sqlite_require_regular_tenant_user(
+                        &mut transaction,
+                        tenant_id,
+                        new_owner_user_id,
+                    )
+                    .await?;
+                }
                 let (target_type, target_id, previous_owner_user_id) = match &target {
                     OwnershipTransferTarget::Asset(asset_id) => {
                         let owner = sqlx::query_scalar::<_, Option<String>>(
@@ -1262,11 +2129,35 @@ impl PlatformStore {
                         (AuditTargetType::Device, device_id.clone(), owner)
                     }
                 };
-                let next_owner_user_id = new_owner_user_id.to_string();
-                if previous_owner_user_id.as_deref() == Some(next_owner_user_id.as_str()) {
+                let next_owner_user_id = new_owner_user_id.map(|user_id| user_id.to_string());
+                if previous_owner_user_id == next_owner_user_id {
                     transaction.commit().await?;
                     return Ok(false);
                 }
+                let revoked_permission_count = match &target {
+                    OwnershipTransferTarget::Asset(asset_id) => sqlx::query(
+                        "UPDATE resource_permissions
+                         SET revoked_at = ?
+                         WHERE tenant_id = ? AND asset_id = ? AND revoked_at IS NULL",
+                    )
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(tenant_id.to_string())
+                    .bind(asset_id.to_string())
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected(),
+                    OwnershipTransferTarget::Device(device_id) => sqlx::query(
+                        "UPDATE resource_permissions
+                         SET revoked_at = ?
+                         WHERE tenant_id = ? AND device_id = ? AND revoked_at IS NULL",
+                    )
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(tenant_id.to_string())
+                    .bind(device_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected(),
+                };
                 match target {
                     OwnershipTransferTarget::Asset(asset_id) => {
                         sqlx::query(
@@ -1301,7 +2192,8 @@ impl PlatformStore {
                         "owner_user_id": {
                             "before": previous_owner_user_id,
                             "after": next_owner_user_id,
-                        }
+                        },
+                        "revoked_permission_count": revoked_permission_count,
                     }),
                 );
                 audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
@@ -1310,9 +2202,16 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
-                timescale_require_tenant_audit_actor(&mut transaction, tenant_id, actor).await?;
-                timescale_require_tenant_user(&mut transaction, tenant_id, new_owner_user_id)
+                timescale_require_tenant_account(&mut transaction, tenant_id, tenant_account_id)
                     .await?;
+                if let Some(new_owner_user_id) = new_owner_user_id {
+                    timescale_require_regular_tenant_user(
+                        &mut transaction,
+                        tenant_id,
+                        new_owner_user_id,
+                    )
+                    .await?;
+                }
                 let (target_type, target_id, previous_owner_user_id) = match &target {
                     OwnershipTransferTarget::Asset(asset_id) => {
                         let owner = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
@@ -1359,11 +2258,33 @@ impl PlatformStore {
                         )
                     }
                 };
-                let next_owner_user_id = new_owner_user_id.to_string();
-                if previous_owner_user_id.as_deref() == Some(next_owner_user_id.as_str()) {
+                let next_owner_user_id = new_owner_user_id.map(|user_id| user_id.to_string());
+                if previous_owner_user_id == next_owner_user_id {
                     transaction.commit().await?;
                     return Ok(false);
                 }
+                let revoked_permission_count = match &target {
+                    OwnershipTransferTarget::Asset(asset_id) => sqlx::query(
+                        "UPDATE resource_permissions
+                         SET revoked_at = now()
+                         WHERE tenant_id = $1 AND asset_id = $2 AND revoked_at IS NULL",
+                    )
+                    .bind(tenant_id)
+                    .bind(*asset_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected(),
+                    OwnershipTransferTarget::Device(device_id) => sqlx::query(
+                        "UPDATE resource_permissions
+                         SET revoked_at = now()
+                         WHERE tenant_id = $1 AND device_id = $2 AND revoked_at IS NULL",
+                    )
+                    .bind(tenant_id)
+                    .bind(device_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected(),
+                };
                 match target {
                     OwnershipTransferTarget::Asset(asset_id) => {
                         sqlx::query(
@@ -1398,7 +2319,8 @@ impl PlatformStore {
                         "owner_user_id": {
                             "before": previous_owner_user_id,
                             "after": next_owner_user_id,
-                        }
+                        },
+                        "revoked_permission_count": revoked_permission_count,
                     }),
                 );
                 audit::insert_timescale_audit_event(&mut transaction, &event).await?;
@@ -1593,12 +2515,58 @@ impl TenantAuthorizationRepository for PlatformStore {
         })
     }
 
+    fn create_owner_resource_permission<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        owner_user_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission: ResourcePermission,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ResourcePermissionRecord, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::create_owner_resource_permission(
+                self,
+                tenant_id,
+                owner_user_id,
+                recipient_user_id,
+                target,
+                permission,
+            )
+            .await
+        })
+    }
+
+    fn revoke_owner_resource_permission<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        owner_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
+        Box::pin(async move {
+            PlatformStore::revoke_owner_resource_permission(
+                self,
+                tenant_id,
+                owner_user_id,
+                target,
+                permission_id,
+            )
+            .await
+        })
+    }
+
     fn transfer_resource_ownership<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
         actor: AuditPrincipal,
         target: OwnershipTransferTarget,
-        new_owner_user_id: uuid::Uuid,
+        new_owner_user_id: Option<uuid::Uuid>,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
         Box::pin(async move {
             PlatformStore::transfer_resource_ownership(
@@ -1609,6 +2577,84 @@ impl TenantAuthorizationRepository for PlatformStore {
                 new_owner_user_id,
             )
             .await
+        })
+    }
+}
+
+impl ResourceInvitationRepository for PlatformStore {
+    fn create_owner_resource_invitation<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        sender_user_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        target: OwnershipTransferTarget,
+        permission: ResourcePermission,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ResourceInvitation, TenantAuthorizationError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            PlatformStore::create_owner_resource_invitation(
+                self,
+                tenant_id,
+                sender_user_id,
+                recipient_user_id,
+                target,
+                permission,
+            )
+            .await
+        })
+    }
+
+    fn accept_resource_invitation<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        invitation_id: uuid::Uuid,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<ResourceInvitation, TenantAuthorizationError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            PlatformStore::accept_resource_invitation(
+                self,
+                tenant_id,
+                recipient_user_id,
+                invitation_id,
+            )
+            .await
+        })
+    }
+
+    fn cancel_resource_invitation<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+        invitation_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
+        Box::pin(async move {
+            PlatformStore::cancel_resource_invitation(
+                self,
+                tenant_id,
+                recipient_user_id,
+                invitation_id,
+            )
+            .await
+        })
+    }
+
+    fn list_pending_resource_invitations<'a>(
+        &'a self,
+        tenant_id: uuid::Uuid,
+        recipient_user_id: uuid::Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<ResourceInvitation>, TenantAuthorizationError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            PlatformStore::list_pending_resource_invitations(self, tenant_id, recipient_user_id)
+                .await
         })
     }
 }
@@ -1945,6 +2991,78 @@ async fn timescale_asset_resource_permission(
     Ok(strongest_resource_permission(rows))
 }
 
+fn invitation_permission(value: &str) -> Result<ResourcePermission, TenantAuthorizationError> {
+    match ResourcePermission::parse(value) {
+        Some(ResourcePermission::Viewer) => Ok(ResourcePermission::Viewer),
+        Some(ResourcePermission::Manager) => Ok(ResourcePermission::Manager),
+        _ => Err(TenantAuthorizationError::InvalidStoredRecord),
+    }
+}
+
+fn invitation_target_from_sqlite(
+    asset_id: Option<&str>,
+    device_id: Option<&str>,
+) -> Result<OwnershipTransferTarget, TenantAuthorizationError> {
+    match (asset_id, device_id) {
+        (Some(asset_id), None) => uuid::Uuid::parse_str(asset_id)
+            .map(OwnershipTransferTarget::Asset)
+            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord),
+        (None, Some(device_id)) if !device_id.is_empty() => {
+            Ok(OwnershipTransferTarget::Device(device_id.to_owned()))
+        }
+        _ => Err(TenantAuthorizationError::InvalidStoredRecord),
+    }
+}
+
+fn invitation_target_from_timescale(
+    asset_id: Option<uuid::Uuid>,
+    device_id: Option<&str>,
+) -> Result<OwnershipTransferTarget, TenantAuthorizationError> {
+    match (asset_id, device_id) {
+        (Some(asset_id), None) => Ok(OwnershipTransferTarget::Asset(asset_id)),
+        (None, Some(device_id)) if !device_id.is_empty() => {
+            Ok(OwnershipTransferTarget::Device(device_id.to_owned()))
+        }
+        _ => Err(TenantAuthorizationError::InvalidStoredRecord),
+    }
+}
+
+fn resource_permission_scope(
+    target: &OwnershipTransferTarget,
+) -> (Option<uuid::Uuid>, Option<String>) {
+    match target {
+        OwnershipTransferTarget::Asset(asset_id) => (Some(*asset_id), None),
+        OwnershipTransferTarget::Device(device_id) => (None, Some(device_id.clone())),
+    }
+}
+
+fn resource_permission_scope_matches(
+    target: &OwnershipTransferTarget,
+    asset_id: Option<&str>,
+    device_id: Option<&str>,
+) -> bool {
+    match target {
+        OwnershipTransferTarget::Asset(expected_asset_id) => {
+            asset_id.and_then(|value| value.parse::<uuid::Uuid>().ok()) == Some(*expected_asset_id)
+                && device_id.is_none()
+        }
+        OwnershipTransferTarget::Device(expected_device_id) => {
+            asset_id.is_none() && device_id == Some(expected_device_id)
+        }
+    }
+}
+
+fn resource_permission_target_json(target: &OwnershipTransferTarget) -> serde_json::Value {
+    match target {
+        OwnershipTransferTarget::Asset(asset_id) => {
+            serde_json::json!({"kind": "asset", "id": asset_id.to_string()})
+        }
+        OwnershipTransferTarget::Device(device_id) => {
+            serde_json::json!({"kind": "device", "id": device_id})
+        }
+    }
+}
+
 fn validate_new_resource_permission(
     permission: &NewResourcePermission,
 ) -> Result<(), TenantAuthorizationError> {
@@ -2082,6 +3200,63 @@ async fn sqlite_require_tenant_user(
         Ok(())
     } else {
         Err(TenantAuthorizationError::UserNotFound { tenant_id, user_id })
+    }
+}
+
+async fn sqlite_require_regular_tenant_user(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if sqlite_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM users WHERE id = ? AND tenant_id = ? AND account_class = 'user'",
+        tenant_id,
+        user_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::OwnerMustBeRegularUser { tenant_id, user_id })
+    }
+}
+
+async fn sqlite_require_resource_owner(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    target: &OwnershipTransferTarget,
+    user_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    let owner_user_id = match target {
+        OwnershipTransferTarget::Asset(asset_id) => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT owner_user_id FROM assets WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(asset_id.to_string())
+        .bind(tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(TenantAuthorizationError::AssetNotFound {
+            tenant_id,
+            asset_id: *asset_id,
+        })?,
+        OwnershipTransferTarget::Device(device_id) => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT owner_user_id FROM devices
+             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+        )
+        .bind(device_id)
+        .bind(tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| TenantAuthorizationError::DeviceNotFound {
+            tenant_id,
+            device_id: device_id.clone(),
+        })?,
+    };
+    if owner_user_id.as_deref() == Some(user_id.to_string().as_str()) {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::ResourceOwnerRequired { tenant_id, user_id })
     }
 }
 
@@ -2271,6 +3446,66 @@ async fn timescale_require_tenant_user(
         Ok(())
     } else {
         Err(TenantAuthorizationError::UserNotFound { tenant_id, user_id })
+    }
+}
+
+async fn timescale_require_regular_tenant_user(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    if timescale_tenant_uuid_record_exists(
+        transaction,
+        "SELECT 1 FROM users WHERE id = $1 AND tenant_id = $2 AND account_class = 'user'",
+        tenant_id,
+        user_id,
+    )
+    .await?
+    {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::OwnerMustBeRegularUser { tenant_id, user_id })
+    }
+}
+
+async fn timescale_require_resource_owner(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    target: &OwnershipTransferTarget,
+    user_id: uuid::Uuid,
+) -> Result<(), TenantAuthorizationError> {
+    let owner_user_id = match target {
+        OwnershipTransferTarget::Asset(asset_id) => sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+            "SELECT owner_user_id FROM assets
+             WHERE id = $1 AND tenant_id = $2
+             FOR UPDATE",
+        )
+        .bind(*asset_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(TenantAuthorizationError::AssetNotFound {
+            tenant_id,
+            asset_id: *asset_id,
+        })?,
+        OwnershipTransferTarget::Device(device_id) => sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+            "SELECT owner_user_id FROM devices
+             WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+             FOR UPDATE",
+        )
+        .bind(device_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| TenantAuthorizationError::DeviceNotFound {
+            tenant_id,
+            device_id: device_id.clone(),
+        })?,
+    };
+    if owner_user_id == Some(user_id) {
+        Ok(())
+    } else {
+        Err(TenantAuthorizationError::ResourceOwnerRequired { tenant_id, user_id })
     }
 }
 

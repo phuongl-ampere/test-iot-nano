@@ -8,8 +8,9 @@ use uuid::Uuid;
 
 use crate::token_vault::{TokenVault, TokenVaultError};
 use iot_storage::{
-    DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError, NewDeviceToken,
-    PlatformStore, ProvisionManagementDevice, ProvisionManagementDeviceError,
+    AuditPrincipal, DeviceTokenRecord, DeviceTokenRepository, DeviceTokenRepositoryError,
+    NewDeviceToken, NewOwnedDeviceToken, PlatformStore, ProvisionManagementDevice,
+    ProvisionManagementDeviceError,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +56,38 @@ pub async fn provision_platform_device_token(
             tenant_id,
             display_name,
             material,
+        )
+        .await
+        {
+            Ok(record) => return Ok(platform_token_response(record, token)),
+            Err(DeviceTokenRepositoryError::TokenPrefixConflict) => continue,
+            Err(error) => return Err(device_token_repository_error(error)),
+        }
+    }
+    Err(DeviceTokenStoreError::AllocationFailed)
+}
+
+pub async fn provision_owned_platform_device_token(
+    store: &PlatformStore,
+    vault: &TokenVault,
+    tenant_id: Uuid,
+    actor: AuditPrincipal,
+    display_name: &str,
+    owner_user_id: Uuid,
+    asset_id: Option<Uuid>,
+) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
+    for _ in 0..8 {
+        let (token, material) = new_platform_token(vault)?;
+        match DeviceTokenRepository::provision_owned_device_token(
+            store,
+            tenant_id,
+            actor,
+            NewOwnedDeviceToken {
+                display_name: display_name.to_owned(),
+                owner_user_id,
+                asset_id,
+                token: material,
+            },
         )
         .await
         {
@@ -117,6 +150,20 @@ pub async fn create_platform_device_token(
         }
     }
     Err(DeviceTokenStoreError::AllocationFailed)
+}
+
+pub async fn reveal_platform_device_token(
+    store: &PlatformStore,
+    vault: &TokenVault,
+    tenant_id: Uuid,
+    device_id: &str,
+) -> Result<DeviceTokenResponse, DeviceTokenStoreError> {
+    let secret = DeviceTokenRepository::active_device_token_secret(store, tenant_id, device_id)
+        .await
+        .map_err(device_token_repository_error)?
+        .ok_or(DeviceTokenStoreError::NotFound)?;
+    let token = vault.decrypt(&secret.token_ciphertext)?;
+    Ok(platform_token_response(secret.record, token))
 }
 
 pub async fn rotate_platform_device_token(

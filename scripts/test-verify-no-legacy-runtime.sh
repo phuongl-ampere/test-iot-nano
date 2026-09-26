@@ -23,7 +23,7 @@ expected_files=(
   services/iot-nano-monolith/src/config.rs
   services/iot-nano-monolith/src/lib.rs
   services/iot-nano-monolith/src/main.rs
-  services/iot-nano-monolith/src/management.rs
+  services/iot-nano-monolith/src/management/mod.rs
   services/iot-nano-monolith/src/readiness.rs
   services/iot-nano-monolith/src/runtime.rs
   services/iot-nano-api/Cargo.toml

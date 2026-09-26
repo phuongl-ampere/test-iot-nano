@@ -204,7 +204,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
-                    r#"{"username":"north-user","password":"NorthUser@2026","default_app":"/apps/powermonitor","granted_apps":["powermonitor"]}"#,
+                    r#"{"username":"north-user","password":"NorthUser@2026"}"#,
                 ))
                 .unwrap(),
         )
@@ -343,7 +343,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
-                    r#"{"username":"north-user","password":"NorthUser@2026","default_app":"/apps/powermonitor","granted_apps":["powermonitor"]}"#,
+                    r#"{"username":"north-user","password":"NorthUser@2026"}"#,
                 ))
                 .unwrap(),
         )

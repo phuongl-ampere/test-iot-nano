@@ -9,9 +9,11 @@ license.workspace = true
 test-support = []
 
 [dependencies]
+argon2.workspace = true
 base64.workspace = true
 chrono.workspace = true
 iot-nano-foundation = { path = "../iot-nano-foundation" }
+rand_core.workspace = true
 sqlx.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

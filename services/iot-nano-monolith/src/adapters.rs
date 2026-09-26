@@ -10,12 +10,15 @@ use iot_nano_core::{CommandTransport, CommandTransportError, TransportRpcPublish
 use iot_nano_foundation::RpcRequest;
 use iot_nano_mqttd::{
     AuthenticatedDevice, AuthorizationError, CommandResponseError, CommandResponsePort,
-    DeviceAuthorizationPort, GatewayAuthorization, GatewayAuthorizationRequest, RpcSessionRouter,
-    SessionError, TransportAuthRequest, TransportRpcResponse,
+    DeviceAuthorizationPort, DeviceClaimCodeError, DeviceClaimCodeOutcome, DeviceClaimCodePort,
+    DeviceClaimCodeRejection, DeviceClaimCodeRequest, GatewayAuthorization,
+    GatewayAuthorizationRequest, RpcSessionRouter, SessionError, TransportAuthRequest,
+    TransportRpcResponse,
 };
 use iot_storage::{
-    CommandOutboxRecord, CommandOutboxState, DeviceAuthorizationRepository, IdentityRepository,
-    NewCommandOutboxEntry, PlatformStore, PlatformStoreError,
+    CommandOutboxRecord, CommandOutboxState, DeviceAuthorizationRepository, DeviceClaimError,
+    DeviceClaimRepository, IdentityRepository, NewCommandOutboxEntry, PlatformStore,
+    PlatformStoreError,
 };
 use sqlx::Row;
 
@@ -673,6 +676,52 @@ fn map_authorization_error(error: AuthorizationError) -> CommandTransportError {
 
 pub struct PlatformCommandResponse {
     store: Arc<PlatformStore>,
+}
+
+pub struct PlatformDeviceClaimCode {
+    store: Arc<PlatformStore>,
+}
+
+impl PlatformDeviceClaimCode {
+    pub fn new(store: Arc<PlatformStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl DeviceClaimCodePort for PlatformDeviceClaimCode {
+    fn issue(
+        &self,
+        request: DeviceClaimCodeRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<DeviceClaimCodeOutcome, DeviceClaimCodeError>> + Send + '_>,
+    > {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            match DeviceClaimRepository::issue_device_claim_code(
+                store.as_ref(),
+                request.tenant_id,
+                &request.device_id,
+            )
+            .await
+            {
+                Ok(issued) => Ok(DeviceClaimCodeOutcome::Issued {
+                    device_id: request.device_id,
+                    code: issued.code,
+                    expires_at: issued.expires_at,
+                }),
+                Err(DeviceClaimError::PolicyDisabled) => Ok(DeviceClaimCodeOutcome::Rejected {
+                    reason: DeviceClaimCodeRejection::Disabled,
+                }),
+                Err(DeviceClaimError::RequestCoolingDown) => Ok(DeviceClaimCodeOutcome::Rejected {
+                    reason: DeviceClaimCodeRejection::CoolingDown,
+                }),
+                Err(DeviceClaimError::DeviceUnavailable) => Ok(DeviceClaimCodeOutcome::Rejected {
+                    reason: DeviceClaimCodeRejection::Unavailable,
+                }),
+                Err(_) => Err(DeviceClaimCodeError::Unavailable),
+            }
+        })
+    }
 }
 
 impl PlatformCommandResponse {

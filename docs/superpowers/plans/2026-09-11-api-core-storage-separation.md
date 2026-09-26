@@ -1,5 +1,10 @@
 # API Core Storage Separation Implementation Plan
 
+> **Status:** Superseded on 2026-09-25 by
+> [`2026-09-25-hard-cutover-legacy-removal.md`](2026-09-25-hard-cutover-legacy-removal.md).
+> The current architecture keeps one stable `iot-storage` facade and one
+> canonical schema source; this historical plan is retained for context only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `subagent-driven-development` or `executing-plans` task-by-task. Steps use
 > checkbox syntax for tracking.

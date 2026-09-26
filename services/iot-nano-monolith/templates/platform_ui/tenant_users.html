@@ -35,21 +35,41 @@
     {% if page.users.is_empty() %}
       <p class="empty-state">No Users have been created.</p>
     {% else %}
-      <div class="table-wrap">
-        <table>
+      <div class="table-scroll">
+        <table class="data-table user-table">
           <thead>
             <tr>
               <th scope="col">Username</th>
               <th scope="col">Status</th>
               <th scope="col">Account class</th>
+              <th scope="col"><span class="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
             {% for user in page.users %}
               <tr>
-                <td>{{ user.username }}</td>
-                <td>{{ user.status }}</td>
-                <td>{{ user.account_class }}</td>
+                <td>
+                  <div class="user-table__identity">
+                    <strong>{{ user.username }}</strong>
+                    <span>Tenant user</span>
+                  </div>
+                </td>
+                <td><span class="status-chip status-chip--neutral">{{ user.status }}</span></td>
+                <td><span class="status-chip status-chip--neutral">{{ user.account_class }}</span></td>
+                <td class="table-actions">
+                  {% if user.is_user_account %}
+                    <button
+                      type="button"
+                      class="button-link-secondary"
+                      data-user-capability-edit
+                      data-user-id="{{ user.id }}"
+                      data-username="{{ user.username }}"
+                      data-capabilities="{{ user.capabilities }}"
+                      aria-label="Edit capabilities for {{ user.username }}"
+                      title="Edit capabilities"
+                    >Capabilities</button>
+                  {% endif %}
+                </td>
               </tr>
             {% endfor %}
           </tbody>
@@ -57,4 +77,89 @@
       </div>
     {% endif %}
   </section>
+
+  <dialog id="user-capability-editor" class="dialog" aria-labelledby="user-capability-editor-title">
+    <header class="dialog-header">
+      <div>
+        <h2 id="user-capability-editor-title">User capabilities</h2>
+        <p class="panel-caption" data-user-capability-username></p>
+      </div>
+      <button type="button" class="dialog-close" data-user-capability-close aria-label="Close capability editor" title="Close">Close</button>
+    </header>
+    <form data-user-capability-form>
+      <fieldset class="capability-checkbox-grid">
+        <legend>Allow this User to</legend>
+        <label><input type="checkbox" name="create_assets"> <span>Create assets</span></label>
+        <label><input type="checkbox" name="create_devices"> <span>Create devices</span></label>
+        <label><input type="checkbox" name="claim_devices"> <span>Claim devices</span></label>
+        <label><input type="checkbox" name="edit_resources"> <span>Edit owned resources</span></label>
+        <label><input type="checkbox" name="control_devices"> <span>Control devices</span></label>
+        <label><input type="checkbox" name="share_owned_resources"> <span>Share owned resources</span></label>
+        <label><input type="checkbox" name="assign_application_profiles"> <span>Assign application profiles</span></label>
+        <label><input type="checkbox" name="manage_device_tokens"> <span>Manage device tokens</span></label>
+      </fieldset>
+      <p class="json-feedback" data-user-capability-status role="status"></p>
+      <div class="dialog-actions">
+        <button type="button" class="button-link-secondary" data-user-capability-close>Cancel</button>
+        <button type="submit">Save capabilities</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    (() => {
+      const ui = window.PlatformUi;
+      const editor = document.getElementById("user-capability-editor");
+      const form = document.querySelector("[data-user-capability-form]");
+      const username = document.querySelector("[data-user-capability-username]");
+      const status = document.querySelector("[data-user-capability-status]");
+      let selectedUsername = null;
+      if (!ui || !editor || !form || !username || !status) return;
+
+      const capabilityNames = [
+        "create_assets", "create_devices", "claim_devices", "edit_resources", "control_devices",
+        "share_owned_resources", "assign_application_profiles", "manage_device_tokens",
+      ];
+
+      document.querySelectorAll("[data-user-capability-close]").forEach((control) => {
+        control.addEventListener("click", () => editor.close());
+      });
+
+      document.querySelectorAll("[data-user-capability-edit]").forEach((control) => {
+        control.addEventListener("click", () => {
+          selectedUsername = control.dataset.username;
+          const capabilities = new Set((control.dataset.capabilities || "").split(" ").filter(Boolean));
+          username.textContent = selectedUsername;
+          status.textContent = "";
+          capabilityNames.forEach((capability) => {
+            form.elements[capability].checked = capabilities.has(capability);
+          });
+          editor.showModal();
+        });
+      });
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!selectedUsername) return;
+        const submit = event.submitter || form.querySelector("button[type=submit]");
+        const capabilities = capabilityNames.filter((capability) => form.elements[capability].checked);
+        ui.setPending(submit, true);
+        status.textContent = "";
+        try {
+          await ui.request(`/api/management/users/${encodeURIComponent(selectedUsername)}/capabilities`, {
+            method: "PUT",
+            body: { capabilities },
+          });
+          editor.close();
+          ui.announce("User capabilities saved.");
+          window.location.reload();
+        } catch (error) {
+          status.textContent = error.message;
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+    })();
+  </script>
 {% endblock %}

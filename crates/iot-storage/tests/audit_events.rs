@@ -60,8 +60,8 @@ async fn seed_tenant(store: &PlatformStore) {
     .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES (?, ?, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?1, ?2, ?1, 'unused', 'active', 1)",
     )
     .bind(TENANT_ACCOUNT_ID.to_string())
     .bind(TENANT_ID.to_string())
@@ -814,8 +814,8 @@ async fn sqlite_audited_mutation_rejects_an_actor_from_another_tenant() {
         .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES (?, ?, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?1, ?2, ?1, 'unused', 'active', 1)",
     )
     .bind(OTHER_TENANT_ACCOUNT_ID.to_string())
     .bind(OTHER_TENANT_ID.to_string())
@@ -907,7 +907,7 @@ async fn sqlite_ownership_transfer_is_audited_and_rejects_cross_tenant_owners() 
             TENANT_ID,
             AuditPrincipal::TenantAccount(TENANT_ACCOUNT_ID),
             OwnershipTransferTarget::Asset(OWNED_ASSET_ID),
-            OWNER_B,
+            Some(OWNER_B),
         )
         .await
         .unwrap()
@@ -918,7 +918,7 @@ async fn sqlite_ownership_transfer_is_audited_and_rejects_cross_tenant_owners() 
             TENANT_ID,
             AuditPrincipal::TenantAccount(TENANT_ACCOUNT_ID),
             OwnershipTransferTarget::Asset(OWNED_ASSET_ID),
-            OTHER_TENANT_USER_ID,
+            Some(OTHER_TENANT_USER_ID),
         )
         .await
         .is_err()
@@ -991,8 +991,8 @@ async fn timescale_audit_events_cover_permission_relation_and_containment_mutati
     .unwrap();
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES ($1, $2, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES ($1, $2, $1, 'unused', 'active', 1)",
     )
     .bind(tenant_account_id)
     .bind(tenant_id)

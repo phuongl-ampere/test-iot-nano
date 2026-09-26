@@ -11,50 +11,421 @@
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
     <h1>Alerts</h1>
-    <p>Review current alert activity for this tenant.</p>
+    <p>Configure alert rules and respond to incidents in this tenant.</p>
   </section>
-  <section class="workspace-panel">
-    <header>
-      <div class="panel-heading"><h2>Current alert activity</h2><span class="operation-note">Read-only</span></div>
-      <p class="panel-caption">Alert rule configuration, acknowledgement, and archiving are not available in this console yet.</p>
-    </header>
-    {% if page.alerts.is_empty() %}
-      <p class="empty-state">No alert activity has been recorded for this tenant.</p>
-    {% else %}
-      <div class="table-scroll">
-        <table class="data-table">
-          <thead>
-            <tr>
-              <th scope="col">Device</th>
-              <th scope="col">Rule</th>
-              <th scope="col">Severity</th>
-              <th scope="col">Status</th>
-              <th scope="col">Last value</th>
-              <th scope="col">Updated</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for alert in page.alerts %}
-              <tr>
-                <td><code>{{ alert.device_id }}</code></td>
-                <td><strong>{{ alert.rule_name }}</strong></td>
-                <td>
-                  {% if alert.severity == "Critical" %}
-                    <span class="status-chip status-chip--critical">{{ alert.severity }}</span>
-                  {% else if alert.severity == "Warning" %}
-                    <span class="status-chip status-chip--warning">{{ alert.severity }}</span>
-                  {% else %}
-                    <span class="status-chip status-chip--neutral">{{ alert.severity }}</span>
-                  {% endif %}
-                </td>
-                <td><span class="status-chip status-chip--neutral">{{ alert.status }}</span></td>
-                <td>{{ alert.last_value }}</td>
-                <td>{{ alert.updated_at }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+
+  <section class="workspace-panel" data-alert-rules-panel>
+    <header class="panel-heading">
+      <div>
+        <h2>Alert rules</h2>
+        <p class="panel-caption">Rules are evaluated against tenant device telemetry.</p>
       </div>
-    {% endif %}
+      <button type="button" data-alert-rule-create>Create alert rule</button>
+    </header>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            <th scope="col">Condition</th>
+            <th scope="col">Scope</th>
+            <th scope="col">Severity</th>
+            <th scope="col">Status</th>
+            <th scope="col">Last activity</th>
+            <th scope="col">Actions</th>
+          </tr>
+        </thead>
+        <tbody data-alert-rule-items></tbody>
+      </table>
+    </div>
   </section>
+
+  <section class="workspace-panel" data-alert-incidents-panel>
+    <header class="panel-heading">
+      <div>
+        <h2>Incidents</h2>
+        <p class="panel-caption"><output data-alert-open-count>0</output> open incidents.</p>
+      </div>
+    </header>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">Status</th>
+            <th scope="col">Rule</th>
+            <th scope="col">Device</th>
+            <th scope="col">Last value</th>
+            <th scope="col">Updated</th>
+            <th scope="col">Action</th>
+          </tr>
+        </thead>
+        <tbody data-alert-incident-items></tbody>
+      </table>
+    </div>
+  </section>
+
+  <dialog id="alert-rule-editor" class="dialog" aria-labelledby="alert-rule-editor-title">
+    <header class="dialog-header">
+      <div>
+        <h2 id="alert-rule-editor-title">Alert rule</h2>
+        <p class="panel-caption">Changes apply only to the current tenant.</p>
+      </div>
+      <button type="button" class="dialog-close" data-alert-rule-close aria-label="Close alert rule editor" title="Close">Close</button>
+    </header>
+    <form data-alert-rule-form>
+      <label class="field">
+        <span>Name</span>
+        <input name="name" type="text" maxlength="128" required>
+      </label>
+      <label class="field">
+        <span>Scope</span>
+        <select name="device_id" data-alert-device-scope>
+          <option value="">Tenant fleet</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Metric key</span>
+        <input name="metric_key" type="text" maxlength="128" required>
+      </label>
+      <div class="form-grid form-grid--profile">
+        <label class="field">
+          <span>Comparison</span>
+          <select name="comparison">
+            <option value="gt">Greater than</option>
+            <option value="gte">Greater than or equal</option>
+            <option value="lt">Less than</option>
+            <option value="lte">Less than or equal</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Threshold</span>
+          <input name="threshold" type="number" step="any" required>
+        </label>
+      </div>
+      <div class="form-grid form-grid--profile">
+        <label class="field">
+          <span>Evaluation</span>
+          <select name="rule_type" data-alert-rule-type>
+            <option value="event_threshold">Per event</option>
+            <option value="window_average">Window average</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Window seconds</span>
+          <input name="window_seconds" type="number" min="60" step="1" value="60" data-alert-window-seconds>
+        </label>
+      </div>
+      <label class="field">
+        <span>Severity</span>
+        <select name="severity">
+          <option value="info">Info</option>
+          <option value="warning">Warning</option>
+          <option value="critical">Critical</option>
+        </select>
+      </label>
+      <label class="field field--checkbox">
+        <input name="enabled" type="checkbox" checked>
+        <span>Rule enabled</span>
+      </label>
+      <div class="dialog-actions">
+        <button type="button" class="button-link-secondary" data-alert-rule-close>Cancel</button>
+        <button type="submit">Save rule</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    (() => {
+      const ui = window.PlatformUi;
+      const ruleItems = document.querySelector("[data-alert-rule-items]");
+      const incidentItems = document.querySelector("[data-alert-incident-items]");
+      const openCount = document.querySelector("[data-alert-open-count]");
+      const createRule = document.querySelector("[data-alert-rule-create]");
+      const editor = document.getElementById("alert-rule-editor");
+      const form = document.querySelector("[data-alert-rule-form]");
+      const deviceScope = form?.querySelector("[data-alert-device-scope]");
+      const ruleType = form?.querySelector("[data-alert-rule-type]");
+      const windowSeconds = form?.querySelector("[data-alert-window-seconds]");
+      let devices = [];
+      let rules = [];
+      let editingRule = null;
+
+      if (!ui || !ruleItems || !incidentItems || !openCount || !createRule || !editor || !form || !deviceScope || !ruleType || !windowSeconds) return;
+
+      const option = (value, label) => {
+        const node = document.createElement("option");
+        node.value = value || "";
+        node.textContent = label;
+        return node;
+      };
+      const addCell = (row, value) => {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        row.append(cell);
+      };
+      const emptyRow = (target, message, columns) => {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = columns;
+        cell.textContent = message;
+        row.append(cell);
+        target.append(row);
+      };
+      const timestamp = (value) => {
+        if (!value) return "-";
+        const date = new Date(value);
+        return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+      };
+      const deviceLabel = (deviceId) => {
+        const device = devices.find((candidate) => candidate.device_id === deviceId);
+        return device?.display_name || deviceId;
+      };
+      const condition = (rule) => {
+        const window = rule.rule_type === "window_average" ? ` average/${rule.window_seconds}s` : "";
+        return `${rule.metric_key}${window} ${rule.comparison} ${rule.threshold}`;
+      };
+      const closeEditor = () => editor.close();
+      const setWindowState = () => {
+        const isWindowAverage = ruleType.value === "window_average";
+        windowSeconds.disabled = !isWindowAverage;
+        windowSeconds.required = isWindowAverage;
+      };
+      const replaceDeviceOptions = (selected = "") => {
+        deviceScope.replaceChildren(option("", "Tenant fleet"));
+        devices.forEach((device) => {
+          const node = option(device.device_id, device.display_name || device.device_id);
+          node.selected = node.value === selected;
+          deviceScope.append(node);
+        });
+      };
+      const rulePayload = () => ({
+        name: form.elements.name.value.trim(),
+        enabled: form.elements.enabled.checked,
+        device_id: form.elements.device_id.value || null,
+        metric_key: form.elements.metric_key.value.trim(),
+        rule_type: form.elements.rule_type.value,
+        comparison: form.elements.comparison.value,
+        threshold: Number(form.elements.threshold.value),
+        window_seconds: form.elements.rule_type.value === "window_average"
+          ? Number(form.elements.window_seconds.value)
+          : null,
+        for_seconds: editingRule?.for_seconds || 0,
+        resolve_after_seconds: editingRule?.resolve_after_seconds || 300,
+        reopen_grace_seconds: editingRule?.reopen_grace_seconds || 3600,
+        hysteresis: editingRule?.hysteresis ?? null,
+        severity: form.elements.severity.value,
+        reminder_interval_seconds: editingRule?.reminder_interval_seconds || 86400,
+      });
+      const updatePayload = (rule, overrides = {}) => ({
+        name: rule.name,
+        enabled: rule.enabled,
+        device_id: rule.device_id,
+        metric_key: rule.metric_key,
+        rule_type: rule.rule_type,
+        comparison: rule.comparison,
+        threshold: rule.threshold,
+        window_seconds: rule.window_seconds,
+        for_seconds: rule.for_seconds,
+        resolve_after_seconds: rule.resolve_after_seconds,
+        reopen_grace_seconds: rule.reopen_grace_seconds,
+        hysteresis: rule.hysteresis,
+        severity: rule.severity,
+        reminder_interval_seconds: rule.reminder_interval_seconds,
+        ...overrides,
+      });
+      const renderRules = () => {
+        ruleItems.replaceChildren();
+        if (!rules.length) {
+          emptyRow(ruleItems, "No alert rules configured.", 7);
+          return;
+        }
+        rules.forEach((rule) => {
+          const row = document.createElement("tr");
+          addCell(row, rule.name);
+          addCell(row, condition(rule));
+          addCell(row, rule.device_id ? deviceLabel(rule.device_id) : "Tenant fleet");
+          addCell(row, rule.severity);
+          addCell(row, rule.archived_at ? "Archived" : rule.enabled ? "Enabled" : "Disabled");
+          addCell(row, timestamp(rule.updated_at));
+          const actions = document.createElement("td");
+          const edit = document.createElement("button");
+          edit.type = "button";
+          edit.className = "button-link-secondary";
+          edit.textContent = "Edit";
+          edit.title = "Edit alert rule";
+          edit.setAttribute("aria-label", `Edit alert rule ${rule.name}`);
+          edit.addEventListener("click", () => openEditor(rule));
+          actions.append(edit);
+          if (!rule.archived_at) {
+            const toggle = document.createElement("button");
+            toggle.type = "button";
+            toggle.className = "button-link-secondary";
+            toggle.textContent = rule.enabled ? "Disable" : "Enable";
+            toggle.title = `${toggle.textContent} alert rule`;
+            toggle.setAttribute("aria-label", `${toggle.textContent} alert rule ${rule.name}`);
+            toggle.addEventListener("click", () => toggleRule(rule, toggle));
+            const archive = document.createElement("button");
+            archive.type = "button";
+            archive.className = "button-danger";
+            archive.textContent = "Archive";
+            archive.title = "Archive alert rule";
+            archive.setAttribute("aria-label", `Archive alert rule ${rule.name}`);
+            archive.addEventListener("click", () => archiveRule(rule, archive));
+            actions.append(toggle, archive);
+          }
+          row.append(actions);
+          ruleItems.append(row);
+        });
+      };
+      const renderIncidents = (incidents) => {
+        incidentItems.replaceChildren();
+        if (!incidents.length) {
+          emptyRow(incidentItems, "No alert incidents recorded.", 6);
+          return;
+        }
+        incidents.forEach((incident) => {
+          const row = document.createElement("tr");
+          addCell(row, incident.status);
+          addCell(row, incident.rule_name);
+          addCell(row, deviceLabel(incident.device_id));
+          addCell(row, incident.last_value ?? "-");
+          addCell(row, timestamp(incident.updated_at));
+          const actions = document.createElement("td");
+          if (incident.acknowledged_at) {
+            actions.textContent = "Acknowledged";
+          } else {
+            const acknowledge = document.createElement("button");
+            acknowledge.type = "button";
+            acknowledge.className = "button-link-secondary";
+            acknowledge.textContent = "Acknowledge";
+            acknowledge.title = "Acknowledge incident";
+            acknowledge.setAttribute("aria-label", `Acknowledge incident for ${incident.rule_name}`);
+            acknowledge.addEventListener("click", () => acknowledgeIncident(incident, acknowledge));
+            actions.append(acknowledge);
+          }
+          row.append(actions);
+          incidentItems.append(row);
+        });
+      };
+      const loadConsole = async () => {
+        try {
+          const [nextRules, incidents, summary, nextDevices] = await Promise.all([
+            ui.request("/api/management/alert-rules"),
+            ui.request("/api/management/alert-incidents"),
+            ui.request("/api/management/alerts/summary"),
+            ui.request("/api/management/devices"),
+          ]);
+          rules = nextRules;
+          devices = nextDevices;
+          openCount.textContent = String(summary.open_incident_count || 0);
+          renderRules();
+          renderIncidents(incidents);
+        } catch (error) {
+          ui.announce(error.message, "error");
+        }
+      };
+      const openEditor = (rule = null) => {
+        editingRule = rule;
+        replaceDeviceOptions(rule?.device_id || "");
+        form.reset();
+        if (rule) {
+          form.elements.name.value = rule.name;
+          form.elements.enabled.checked = rule.enabled;
+          form.elements.metric_key.value = rule.metric_key;
+          form.elements.rule_type.value = rule.rule_type;
+          form.elements.comparison.value = rule.comparison;
+          form.elements.threshold.value = rule.threshold;
+          form.elements.window_seconds.value = rule.window_seconds || 60;
+          form.elements.severity.value = rule.severity;
+          deviceScope.value = rule.device_id || "";
+        } else {
+          form.elements.enabled.checked = true;
+          form.elements.rule_type.value = "event_threshold";
+          form.elements.comparison.value = "gt";
+          form.elements.severity.value = "warning";
+        }
+        setWindowState();
+        editor.showModal();
+        form.elements.name.focus();
+      };
+      const toggleRule = async (rule, control) => {
+        ui.setPending(control, true);
+        try {
+          await ui.request(`/api/management/alert-rules/${encodeURIComponent(rule.id)}`, {
+            method: "PUT",
+            body: updatePayload(rule, { enabled: !rule.enabled }),
+          });
+          ui.announce(`Alert rule ${rule.enabled ? "disabled" : "enabled"}.`);
+          await loadConsole();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(control, false);
+        }
+      };
+      const archiveRule = async (rule, control) => {
+        if (!window.confirm(`Archive alert rule ${rule.name}? Existing incidents remain available for review.`)) return;
+        ui.setPending(control, true);
+        try {
+          await ui.request(`/api/management/alert-rules/${encodeURIComponent(rule.id)}/archive`, { method: "POST" });
+          ui.announce("Alert rule archived.");
+          await loadConsole();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(control, false);
+        }
+      };
+      const acknowledgeIncident = async (incident, control) => {
+        ui.setPending(control, true);
+        try {
+          await ui.request(`/api/management/alert-incidents/${encodeURIComponent(incident.id)}/acknowledge`, { method: "POST" });
+          ui.announce("Incident acknowledged.");
+          await loadConsole();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(control, false);
+        }
+      };
+
+      createRule.addEventListener("click", () => openEditor());
+      document.querySelectorAll("[data-alert-rule-close]").forEach((control) => {
+        control.addEventListener("click", closeEditor);
+      });
+      ruleType.addEventListener("change", setWindowState);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const submit = event.submitter || form.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          const body = rulePayload();
+          if (!body.name || !body.metric_key || !Number.isFinite(body.threshold)) {
+            throw new Error("Enter a name, metric key, and numeric threshold.");
+          }
+          if (body.rule_type === "window_average" && (!Number.isInteger(body.window_seconds) || body.window_seconds < 60)) {
+            throw new Error("Window average requires at least 60 seconds.");
+          }
+          if (editingRule) {
+            await ui.request(`/api/management/alert-rules/${encodeURIComponent(editingRule.id)}`, { method: "PUT", body });
+            ui.announce("Alert rule updated.");
+          } else {
+            await ui.request("/api/management/alert-rules", { method: "POST", body });
+            ui.announce("Alert rule created.");
+          }
+          closeEditor();
+          await loadConsole();
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+      editor.addEventListener("close", () => {
+        editingRule = null;
+      });
+
+      void loadConsole();
+    })();
+  </script>
 {% endblock %}

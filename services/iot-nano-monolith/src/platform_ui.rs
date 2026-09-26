@@ -18,17 +18,32 @@ pub(crate) fn htmx() -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformUiIdentity {
     label: String,
+    invitation_count: Option<usize>,
 }
 
 impl PlatformUiIdentity {
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
+            invitation_count: None,
         }
     }
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    pub fn with_invitation_count(mut self, invitation_count: usize) -> Self {
+        self.invitation_count = Some(invitation_count);
+        self
+    }
+
+    pub(crate) fn has_invitation_count(&self) -> bool {
+        self.invitation_count.is_some()
+    }
+
+    pub(crate) fn invitation_count(&self) -> usize {
+        self.invitation_count.unwrap_or_default()
     }
 }
 
@@ -86,6 +101,30 @@ pub struct SystemInfrastructurePage {
     health: String,
     listeners: Vec<SystemInfrastructureStatusRow>,
     configuration: Vec<SystemInfrastructureStatusRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantOverviewPage {
+    user_count: usize,
+    asset_count: usize,
+    device_count: usize,
+    open_alert_count: u64,
+}
+
+impl TenantOverviewPage {
+    pub fn new(
+        user_count: usize,
+        asset_count: usize,
+        device_count: usize,
+        open_alert_count: u64,
+    ) -> Self {
+        Self {
+            user_count,
+            asset_count,
+            device_count,
+            open_alert_count,
+        }
+    }
 }
 
 impl SystemInfrastructurePage {
@@ -181,9 +220,20 @@ impl TenantGroupsPage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantUserRow {
+    id: String,
     username: String,
     status: String,
     account_class: String,
+    is_user_account: bool,
+    capabilities: String,
+    can_create_assets: bool,
+    can_create_devices: bool,
+    can_claim_devices: bool,
+    can_edit_resources: bool,
+    can_control_devices: bool,
+    can_share_owned_resources: bool,
+    can_assign_application_profiles: bool,
+    can_manage_device_tokens: bool,
 }
 
 impl TenantUserRow {
@@ -192,10 +242,37 @@ impl TenantUserRow {
         status: impl Into<String>,
         account_class: impl Into<String>,
     ) -> Self {
+        Self::with_capabilities("", username, status, account_class, Vec::new())
+    }
+
+    pub fn with_capabilities(
+        id: impl Into<String>,
+        username: impl Into<String>,
+        status: impl Into<String>,
+        account_class: impl Into<String>,
+        capabilities: Vec<String>,
+    ) -> Self {
+        let account_class = account_class.into();
+        let capabilities = capabilities
+            .into_iter()
+            .filter(|capability| !capability.is_empty())
+            .collect::<Vec<_>>();
+        let has_capability = |name| capabilities.iter().any(|capability| capability == name);
         Self {
+            id: id.into(),
             username: username.into(),
             status: status.into(),
-            account_class: account_class.into(),
+            is_user_account: account_class == "User",
+            account_class,
+            capabilities: capabilities.join(" "),
+            can_create_assets: has_capability("create_assets"),
+            can_create_devices: has_capability("create_devices"),
+            can_claim_devices: has_capability("claim_devices"),
+            can_edit_resources: has_capability("edit_resources"),
+            can_control_devices: has_capability("control_devices"),
+            can_share_owned_resources: has_capability("share_owned_resources"),
+            can_assign_application_profiles: has_capability("assign_application_profiles"),
+            can_manage_device_tokens: has_capability("manage_device_tokens"),
         }
     }
 }
@@ -326,6 +403,8 @@ pub struct TenantDeviceRow {
     display_name: String,
     status: String,
     asset: String,
+    claim_status: String,
+    has_active_claim_code: bool,
 }
 
 impl TenantDeviceRow {
@@ -340,7 +419,19 @@ impl TenantDeviceRow {
             display_name: display_name.into(),
             status: status.into(),
             asset: asset.into(),
+            claim_status: "No active pairing code".to_owned(),
+            has_active_claim_code: false,
         }
+    }
+
+    pub(crate) fn with_claim_status(
+        mut self,
+        status: impl Into<String>,
+        has_active_claim_code: bool,
+    ) -> Self {
+        self.claim_status = status.into();
+        self.has_active_claim_code = has_active_claim_code;
+        self
     }
 }
 
@@ -356,6 +447,38 @@ impl TenantDevicesPage {
         Self {
             devices,
             notice: notice.unwrap_or_default(),
+            has_notice: notice.is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantDeviceClaimPolicyPage {
+    enabled: bool,
+    ttl_seconds: u32,
+    code_length: u8,
+    max_failed_attempts: u8,
+    request_cooldown_seconds: u32,
+    notice: String,
+    has_notice: bool,
+}
+
+impl TenantDeviceClaimPolicyPage {
+    pub(crate) fn new(
+        enabled: bool,
+        ttl_seconds: u32,
+        code_length: u8,
+        max_failed_attempts: u8,
+        request_cooldown_seconds: u32,
+        notice: Option<&str>,
+    ) -> Self {
+        Self {
+            enabled,
+            ttl_seconds,
+            code_length,
+            max_failed_attempts,
+            request_cooldown_seconds,
+            notice: notice.unwrap_or_default().to_owned(),
             has_notice: notice.is_some(),
         }
     }
@@ -507,22 +630,25 @@ impl TenantTopologyPage {
 pub struct TenantRelationRow {
     id: String,
     from_device: String,
+    target_kind: String,
     relation_type: String,
-    to_device: String,
+    target: String,
 }
 
 impl TenantRelationRow {
     pub(crate) fn new(
         id: impl Into<String>,
         from_device: impl Into<String>,
+        target_kind: impl Into<String>,
         relation_type: impl Into<String>,
-        to_device: impl Into<String>,
+        target: impl Into<String>,
     ) -> Self {
         Self {
             id: id.into(),
             from_device: from_device.into(),
+            target_kind: target_kind.into(),
             relation_type: relation_type.into(),
-            to_device: to_device.into(),
+            target: target.into(),
         }
     }
 }
@@ -530,6 +656,7 @@ impl TenantRelationRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantRelationsPage {
     devices: Vec<TenantSelectOption>,
+    assets: Vec<TenantSelectOption>,
     relations: Vec<TenantRelationRow>,
     notice: &'static str,
     has_notice: bool,
@@ -538,11 +665,13 @@ pub struct TenantRelationsPage {
 impl TenantRelationsPage {
     pub(crate) fn new(
         devices: Vec<TenantSelectOption>,
+        assets: Vec<TenantSelectOption>,
         relations: Vec<TenantRelationRow>,
         notice: Option<&'static str>,
     ) -> Self {
         Self {
             devices,
+            assets,
             relations,
             notice: notice.unwrap_or_default(),
             has_notice: notice.is_some(),
@@ -588,6 +717,75 @@ pub struct TenantApplicationsPage {
     applications: Vec<TenantApplicationRow>,
     notice: &'static str,
     has_notice: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantApplicationDomainProfileRow {
+    id: String,
+    name: String,
+    resource_kind: String,
+}
+
+impl TenantApplicationDomainProfileRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        resource_kind: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            resource_kind: resource_kind.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantApplicationAssetProfileRelationRow {
+    id: String,
+    parent_name: String,
+    child_name: String,
+}
+
+impl TenantApplicationAssetProfileRelationRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        parent_name: impl Into<String>,
+        child_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            parent_name: parent_name.into(),
+            child_name: child_name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantApplicationDomainPage {
+    app_id: String,
+    application_name: String,
+    profiles: Vec<TenantApplicationDomainProfileRow>,
+    asset_profiles: Vec<TenantSelectOption>,
+    relations: Vec<TenantApplicationAssetProfileRelationRow>,
+}
+
+impl TenantApplicationDomainPage {
+    pub(crate) fn new(
+        app_id: impl Into<String>,
+        application_name: impl Into<String>,
+        profiles: Vec<TenantApplicationDomainProfileRow>,
+        asset_profiles: Vec<TenantSelectOption>,
+        relations: Vec<TenantApplicationAssetProfileRelationRow>,
+    ) -> Self {
+        Self {
+            app_id: app_id.into(),
+            application_name: application_name.into(),
+            profiles,
+            asset_profiles,
+            relations,
+        }
+    }
 }
 
 impl TenantApplicationsPage {
@@ -674,72 +872,6 @@ impl TenantAssetProfilesPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantDeviceTokenRow {
-    id: String,
-    prefix: String,
-    created_at: String,
-    last_used_at: String,
-    status: String,
-    revocable: bool,
-}
-
-impl TenantDeviceTokenRow {
-    pub(crate) fn new(
-        id: impl Into<String>,
-        prefix: impl Into<String>,
-        created_at: impl Into<String>,
-        last_used_at: impl Into<String>,
-        status: impl Into<String>,
-        revocable: bool,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            prefix: prefix.into(),
-            created_at: created_at.into(),
-            last_used_at: last_used_at.into(),
-            status: status.into(),
-            revocable,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantDeviceTokensPage {
-    device_id: String,
-    display_name: String,
-    tokens: Vec<TenantDeviceTokenRow>,
-    credential: String,
-    has_credential: bool,
-    notice: &'static str,
-    has_notice: bool,
-}
-
-impl TenantDeviceTokensPage {
-    pub(crate) fn new(
-        device_id: impl Into<String>,
-        display_name: impl Into<String>,
-        tokens: Vec<TenantDeviceTokenRow>,
-        notice: Option<&'static str>,
-    ) -> Self {
-        Self {
-            device_id: device_id.into(),
-            display_name: display_name.into(),
-            tokens,
-            credential: String::new(),
-            has_credential: false,
-            notice: notice.unwrap_or_default(),
-            has_notice: notice.is_some(),
-        }
-    }
-
-    pub(crate) fn with_credential(mut self, credential: impl Into<String>) -> Self {
-        self.credential = credential.into();
-        self.has_credential = true;
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDeviceRow {
     device_id: String,
     display_name: String,
@@ -769,11 +901,42 @@ impl UserDeviceRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserDeviceListPage {
     devices: Vec<UserDeviceRow>,
+    can_manage: bool,
+    can_claim_devices: bool,
+    owned_assets: Vec<UserAssetRow>,
+    notice: String,
+    has_notice: bool,
 }
 
 impl UserDeviceListPage {
     pub fn new(devices: Vec<UserDeviceRow>) -> Self {
-        Self { devices }
+        Self {
+            devices,
+            can_manage: false,
+            can_claim_devices: false,
+            owned_assets: Vec::new(),
+            notice: String::new(),
+            has_notice: false,
+        }
+    }
+
+    pub fn with_management(mut self, owned_assets: Vec<UserAssetRow>) -> Self {
+        self.can_manage = true;
+        self.owned_assets = owned_assets;
+        self
+    }
+
+    pub fn with_claim_devices(mut self) -> Self {
+        self.can_claim_devices = true;
+        self
+    }
+
+    pub fn with_notice(mut self, notice: Option<&str>) -> Self {
+        if let Some(notice) = notice {
+            self.notice = notice.to_owned();
+            self.has_notice = true;
+        }
+        self
     }
 }
 
@@ -782,8 +945,16 @@ pub struct UserDeviceDetailPage {
     device: UserDeviceRow,
     telemetry: Vec<UserDeviceTelemetryRow>,
     alerts: Vec<UserDeviceAlertRow>,
+    permissions: Vec<UserResourcePermissionRow>,
+    owned_assets: Vec<UserAssetRow>,
     has_telemetry: bool,
     has_alerts: bool,
+    is_owner: bool,
+    can_edit: bool,
+    can_share: bool,
+    has_permissions: bool,
+    notice: String,
+    has_notice: bool,
 }
 
 impl UserDeviceDetailPage {
@@ -792,8 +963,16 @@ impl UserDeviceDetailPage {
             device,
             telemetry: Vec::new(),
             alerts: Vec::new(),
+            permissions: Vec::new(),
+            owned_assets: Vec::new(),
             has_telemetry: false,
             has_alerts: false,
+            is_owner: false,
+            can_edit: false,
+            can_share: false,
+            has_permissions: false,
+            notice: String::new(),
+            has_notice: false,
         }
     }
 
@@ -806,6 +985,41 @@ impl UserDeviceDetailPage {
         self.has_alerts = !alerts.is_empty();
         self.telemetry = telemetry;
         self.alerts = alerts;
+        self
+    }
+
+    pub fn with_management(mut self, owned_assets: Vec<UserAssetRow>) -> Self {
+        self.is_owner = true;
+        self.can_edit = true;
+        self.can_share = true;
+        self.owned_assets = owned_assets;
+        self
+    }
+
+    pub(crate) fn with_capabilities(
+        mut self,
+        owned_assets: Vec<UserAssetRow>,
+        can_edit: bool,
+        can_share: bool,
+    ) -> Self {
+        self.is_owner = true;
+        self.can_edit = can_edit;
+        self.can_share = can_share;
+        self.owned_assets = owned_assets;
+        self
+    }
+
+    pub(crate) fn with_access_management(
+        mut self,
+        permissions: Vec<UserResourcePermissionRow>,
+        notice: Option<&str>,
+    ) -> Self {
+        self.has_permissions = !permissions.is_empty();
+        self.permissions = permissions;
+        if let Some(notice) = notice {
+            self.notice = notice.to_owned();
+            self.has_notice = true;
+        }
         self
     }
 }
@@ -856,6 +1070,7 @@ pub struct UserAssetRow {
     containment: String,
     permission: String,
     access_source: String,
+    selected: bool,
 }
 
 impl UserAssetRow {
@@ -872,29 +1087,166 @@ impl UserAssetRow {
             containment: containment.into(),
             permission: permission.into(),
             access_source: access_source.into(),
+            selected: false,
         }
+    }
+
+    pub fn with_selected(mut self) -> Self {
+        self.selected = true;
+        self
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserAssetListPage {
     assets: Vec<UserAssetRow>,
+    can_manage: bool,
+    owned_assets: Vec<UserAssetRow>,
 }
 
 impl UserAssetListPage {
     pub fn new(assets: Vec<UserAssetRow>) -> Self {
-        Self { assets }
+        Self {
+            assets,
+            can_manage: false,
+            owned_assets: Vec::new(),
+        }
+    }
+
+    pub fn with_management(mut self, owned_assets: Vec<UserAssetRow>) -> Self {
+        self.can_manage = true;
+        self.owned_assets = owned_assets;
+        self
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserAssetDetailPage {
     asset: UserAssetRow,
+    permissions: Vec<UserResourcePermissionRow>,
+    owned_assets: Vec<UserAssetRow>,
+    is_owner: bool,
+    can_edit: bool,
+    can_share: bool,
+    has_permissions: bool,
+    notice: String,
+    has_notice: bool,
 }
 
 impl UserAssetDetailPage {
     pub fn new(asset: UserAssetRow) -> Self {
-        Self { asset }
+        Self {
+            asset,
+            permissions: Vec::new(),
+            owned_assets: Vec::new(),
+            is_owner: false,
+            can_edit: false,
+            can_share: false,
+            has_permissions: false,
+            notice: String::new(),
+            has_notice: false,
+        }
+    }
+
+    pub fn with_management(mut self, owned_assets: Vec<UserAssetRow>) -> Self {
+        self.is_owner = true;
+        self.can_edit = true;
+        self.can_share = true;
+        self.owned_assets = owned_assets;
+        self
+    }
+
+    pub(crate) fn with_capabilities(
+        mut self,
+        owned_assets: Vec<UserAssetRow>,
+        can_edit: bool,
+        can_share: bool,
+    ) -> Self {
+        self.is_owner = true;
+        self.can_edit = can_edit;
+        self.can_share = can_share;
+        self.owned_assets = owned_assets;
+        self
+    }
+
+    pub(crate) fn with_access_management(
+        mut self,
+        permissions: Vec<UserResourcePermissionRow>,
+        notice: Option<&str>,
+    ) -> Self {
+        self.has_permissions = !permissions.is_empty();
+        self.permissions = permissions;
+        if let Some(notice) = notice {
+            self.notice = notice.to_owned();
+            self.has_notice = true;
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserResourcePermissionRow {
+    id: String,
+    username: String,
+    permission: String,
+    inheritance: String,
+}
+
+impl UserResourcePermissionRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        username: impl Into<String>,
+        permission: impl Into<String>,
+        inheritance: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            username: username.into(),
+            permission: permission.into(),
+            inheritance: inheritance.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInvitationRow {
+    id: String,
+    resource_kind: String,
+    resource_name: String,
+    sender_username: String,
+    permission: String,
+}
+
+impl UserInvitationRow {
+    pub fn new(
+        id: impl Into<String>,
+        resource_kind: impl Into<String>,
+        resource_name: impl Into<String>,
+        sender_username: impl Into<String>,
+        permission: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            resource_kind: resource_kind.into(),
+            resource_name: resource_name.into(),
+            sender_username: sender_username.into(),
+            permission: permission.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInvitationPage {
+    invitations: Vec<UserInvitationRow>,
+    has_invitations: bool,
+}
+
+impl UserInvitationPage {
+    pub fn new(invitations: Vec<UserInvitationRow>) -> Self {
+        Self {
+            has_invitations: !invitations.is_empty(),
+            invitations,
+        }
     }
 }
 
@@ -952,8 +1304,11 @@ impl PlatformUiRenderer {
         SystemInfrastructureStatusLayout::new(page).render()
     }
 
-    pub fn render_tenant(identity: &PlatformUiIdentity) -> Result<String, askama::Error> {
-        TenantLayout::new(identity).render()
+    pub fn render_tenant(
+        identity: &PlatformUiIdentity,
+        page: &TenantOverviewPage,
+    ) -> Result<String, askama::Error> {
+        TenantLayout::new(identity, page).render()
     }
 
     pub fn render_tenant_users(
@@ -991,6 +1346,13 @@ impl PlatformUiRenderer {
         TenantDevicesLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_device_claim_policy(
+        identity: &PlatformUiIdentity,
+        page: &TenantDeviceClaimPolicyPage,
+    ) -> Result<String, askama::Error> {
+        TenantDeviceClaimPolicyLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_alerts(
         identity: &PlatformUiIdentity,
         page: &TenantAlertsPage,
@@ -1026,6 +1388,13 @@ impl PlatformUiRenderer {
         TenantApplicationsLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_application_domain(
+        identity: &PlatformUiIdentity,
+        page: &TenantApplicationDomainPage,
+    ) -> Result<String, askama::Error> {
+        TenantApplicationDomainLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_device_credential(
         identity: &PlatformUiIdentity,
         page: &TenantDeviceCredentialPage,
@@ -1045,13 +1414,6 @@ impl PlatformUiRenderer {
         page: &TenantAssetProfilesPage,
     ) -> Result<String, askama::Error> {
         TenantAssetProfilesLayout::new(identity, page).render()
-    }
-
-    pub fn render_tenant_device_tokens(
-        identity: &PlatformUiIdentity,
-        page: &TenantDeviceTokensPage,
-    ) -> Result<String, askama::Error> {
-        TenantDeviceTokensLayout::new(identity, page).render()
     }
 
     pub fn render_user(
@@ -1079,6 +1441,13 @@ impl PlatformUiRenderer {
         page: &UserAssetListPage,
     ) -> Result<String, askama::Error> {
         UserAssetLayout::new(identity, page).render()
+    }
+
+    pub fn render_user_invitations(
+        identity: &PlatformUiIdentity,
+        page: &UserInvitationPage,
+    ) -> Result<String, askama::Error> {
+        UserInvitationsLayout::new(identity, page).render()
     }
 
     pub fn render_user_asset(
@@ -1150,11 +1519,12 @@ impl<'a> SystemInfrastructureStatusLayout<'a> {
 #[template(path = "platform_ui/tenant.html")]
 pub struct TenantLayout<'a> {
     identity: &'a PlatformUiIdentity,
+    page: &'a TenantOverviewPage,
 }
 
 impl<'a> TenantLayout<'a> {
-    pub fn new(identity: &'a PlatformUiIdentity) -> Self {
-        Self { identity }
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantOverviewPage) -> Self {
+        Self { identity, page }
     }
 }
 
@@ -1217,6 +1587,19 @@ pub struct TenantDevicesLayout<'a> {
     page: &'a TenantDevicesPage,
 }
 
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_device_claim_policy.html")]
+pub struct TenantDeviceClaimPolicyLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantDeviceClaimPolicyPage,
+}
+
+impl<'a> TenantDeviceClaimPolicyLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDeviceClaimPolicyPage) -> Self {
+        Self { identity, page }
+    }
+}
+
 impl<'a> TenantDevicesLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDevicesPage) -> Self {
         Self { identity, page }
@@ -1276,6 +1659,19 @@ pub struct TenantApplicationsLayout<'a> {
     page: &'a TenantApplicationsPage,
 }
 
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_application_domain.html")]
+pub struct TenantApplicationDomainLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantApplicationDomainPage,
+}
+
+impl<'a> TenantApplicationDomainLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantApplicationDomainPage) -> Self {
+        Self { identity, page }
+    }
+}
+
 impl<'a> TenantApplicationsLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantApplicationsPage) -> Self {
         Self { identity, page }
@@ -1328,19 +1724,6 @@ impl<'a> TenantAssetProfilesLayout<'a> {
 }
 
 #[derive(Template)]
-#[template(path = "platform_ui/tenant_device_tokens.html")]
-pub struct TenantDeviceTokensLayout<'a> {
-    identity: &'a PlatformUiIdentity,
-    page: &'a TenantDeviceTokensPage,
-}
-
-impl<'a> TenantDeviceTokensLayout<'a> {
-    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantDeviceTokensPage) -> Self {
-        Self { identity, page }
-    }
-}
-
-#[derive(Template)]
 #[template(path = "platform_ui/user.html")]
 pub struct UserLayout<'a> {
     identity: &'a PlatformUiIdentity,
@@ -1387,6 +1770,19 @@ pub struct UserAssetLayout<'a> {
 
 impl<'a> UserAssetLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a UserAssetListPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/user_invitations.html")]
+pub struct UserInvitationsLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a UserInvitationPage,
+}
+
+impl<'a> UserInvitationsLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a UserInvitationPage) -> Self {
         Self { identity, page }
     }
 }

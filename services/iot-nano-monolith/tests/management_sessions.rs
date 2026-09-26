@@ -13,8 +13,9 @@ use iot_api::{OAuthBrowserSessionVerifier, TokenVault, hash_password};
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{ManagementSessionRouter, bootstrap_system};
 use iot_storage::{
-    ApplicationKind, ApplicationRepository, NewApplication, NewOAuthClientSecret, NewTenant,
-    NewTenantAccount, OAuthRepository, PlatformStore, TenantIdentityRepository, TenantStatus,
+    ApplicationKind, ApplicationRepository, DeviceClaimError, DeviceClaimPolicy,
+    DeviceClaimRepository, NewApplication, NewOAuthClientSecret, NewTenant, NewTenantAccount,
+    OAuthRepository, PlatformStore, TenantIdentityRepository, TenantStatus,
 };
 use serde_json::json;
 use std::{
@@ -79,17 +80,22 @@ async fn seed_tenant_admin_users(store: &PlatformStore) {
     )
     .await
     .unwrap();
-    let pool = store.sqlite_pool().unwrap();
-    sqlx::query(
-        "INSERT INTO applications (
-            app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
-         ) VALUES ('powermonitor', ?, 'frontend', '/apps/powermonitor', ?, '[]', 1)",
+    ApplicationRepository::upsert_application(
+        store,
+        NewApplication {
+            app_id: "powermonitor".parse().unwrap(),
+            tenant_id: tenant.id,
+            kind: ApplicationKind::Frontend,
+            launch_url: "/apps/powermonitor".to_owned(),
+            client_id: format!("seed-{}-powermonitor", tenant.id).parse().unwrap(),
+            redirect_uris: Vec::new(),
+            allowed_scopes: Vec::new(),
+            enabled: true,
+        },
     )
-    .bind(tenant.id.to_string())
-    .bind(format!("seed-{}-powermonitor", tenant.id))
-    .execute(pool)
     .await
     .unwrap();
+    let pool = store.sqlite_pool().unwrap();
     for (username, password, role, account_class) in [
         ("admin", "NanoAdmin@1234", "admin", "admin"),
         ("viewer", "NanoView@1234", "viewer", "user"),
@@ -97,8 +103,8 @@ async fn seed_tenant_admin_users(store: &PlatformStore) {
         let user_id = uuid::Uuid::now_v7().to_string();
         sqlx::query(
             "INSERT INTO users (
-                id, tenant_id, username, password_hash, role, account_class, default_app
-             ) VALUES (?, ?, ?, ?, ?, ?, '/apps/powermonitor')",
+                id, tenant_id, username, password_hash, role, account_class
+             ) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&user_id)
         .bind(tenant.id.to_string())
@@ -106,15 +112,6 @@ async fn seed_tenant_admin_users(store: &PlatformStore) {
         .bind(hash_password(password).unwrap())
         .bind(role)
         .bind(account_class)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO user_app_grants (user_id, tenant_id, app_key)
-             VALUES (?, ?, 'powermonitor')",
-        )
-        .bind(user_id)
-        .bind(tenant.id.to_string())
         .execute(pool)
         .await
         .unwrap();
@@ -144,6 +141,301 @@ async fn tenant_account_cookie(router: &axum::Router) -> String {
         .next()
         .unwrap()
         .to_owned()
+}
+
+#[tokio::test]
+async fn tenant_account_replaces_a_users_elevated_capabilities() {
+    let (_directory, _store, management) = management_session_router_with_store().await;
+    let cookie = tenant_account_cookie(&management.router).await;
+
+    let response = management
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/management/users/viewer/capabilities")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, cookie)
+                .body(Body::from(
+                    json!({
+                        "capabilities": ["create_devices", "control_devices"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body["capabilities"],
+        json!(["control_devices", "create_devices"])
+    );
+}
+
+#[tokio::test]
+async fn user_workspace_creation_requires_the_tenant_enabled_capability() {
+    let (_directory, management) = management_session_router().await;
+    let cookie = user_account_cookie(&management.router).await;
+
+    let response = management
+        .router
+        .oneshot(system_lifecycle_form(
+            "/app/assets",
+            Some(&cookie),
+            "name=Denied+asset&parent_asset_id=",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn user_claims_a_device_through_a_secret_post_form() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let viewer_id: String =
+        sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'")
+            .bind(&tenant_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    grant_user_capabilities(pool, &tenant_id, &viewer_id, &["claim_devices"]).await;
+    let device_id = "session-claim-device";
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
+        .bind(device_id)
+        .bind(&tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let tenant_uuid = tenant_id.parse().unwrap();
+    DeviceClaimRepository::update_device_claim_policy(
+        store.as_ref(),
+        tenant_uuid,
+        DeviceClaimPolicy {
+            enabled: true,
+            ..DeviceClaimPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    let issued =
+        DeviceClaimRepository::issue_device_claim_code(store.as_ref(), tenant_uuid, device_id)
+            .await
+            .unwrap();
+    let cookie = user_account_cookie(&management.router).await;
+
+    let claimed = management
+        .router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/app/devices/claim",
+            Some(&cookie),
+            &format!("device_id={device_id}&code={}", issued.code),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::SEE_OTHER);
+    assert_eq!(claimed.headers()[LOCATION], "/app?notice=device-claimed");
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT owner_user_id FROM devices WHERE tenant_id = ? AND device_id = ?",
+    )
+    .bind(&tenant_id)
+    .bind(device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(owner.as_deref(), Some(viewer_id.as_str()));
+
+    let workspace = management
+        .router
+        .oneshot(platform_get("/app?notice=device-claimed", Some(&cookie)))
+        .await
+        .unwrap();
+    let body = String::from_utf8(
+        to_bytes(workspace.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Device added to your workspace."));
+    assert!(body.contains(device_id));
+    assert!(!body.contains(&issued.code));
+}
+
+#[tokio::test]
+async fn tenant_updates_the_pairing_policy_without_a_tenant_side_code() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let cookie = tenant_account_cookie(&management.router).await;
+    let page = management
+        .router
+        .clone()
+        .oneshot(platform_get("/tenant/devices/claim-policy", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Pairing policy"));
+    assert!(!page.contains("Pairing code"));
+
+    let saved = management
+        .router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/devices/claim-policy",
+            Some(&cookie),
+            "enabled=on&ttl_seconds=1200&code_length=16&max_failed_attempts=4&request_cooldown_seconds=45",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        saved.headers()[LOCATION],
+        "/tenant/devices/claim-policy?notice=claim-policy-saved"
+    );
+    let tenant_id: uuid::Uuid =
+        sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(
+        DeviceClaimRepository::get_device_claim_policy(store.as_ref(), tenant_id)
+            .await
+            .unwrap(),
+        DeviceClaimPolicy {
+            enabled: true,
+            ttl_seconds: 1200,
+            code_length: 16,
+            max_failed_attempts: 4,
+            request_cooldown_seconds: 45,
+        }
+    );
+}
+
+#[tokio::test]
+async fn tenant_account_can_issue_and_immediately_replace_a_manual_device_claim_code() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id: uuid::Uuid =
+        sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+    DeviceClaimRepository::update_device_claim_policy(
+        store.as_ref(),
+        tenant_id,
+        DeviceClaimPolicy {
+            enabled: true,
+            ..DeviceClaimPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    let device =
+        management_provision_device(&router, &tenant_cookie, "Manual Pairing Device").await;
+    let device_id = device["device_id"].as_str().unwrap();
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/management/devices/{device_id}/claim-code"))
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert_eq!(first.headers()[CACHE_CONTROL], "no-store");
+    let first: serde_json::Value =
+        serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_code = first["code"].as_str().unwrap().to_owned();
+    assert_eq!(first["device_id"], device_id);
+    assert!(first["expires_at"].is_string());
+
+    let replacement = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/management/devices/{device_id}/claim-code"))
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.status(), StatusCode::CREATED);
+    let replacement: serde_json::Value =
+        serde_json::from_slice(&to_bytes(replacement.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let replacement_code = replacement["code"].as_str().unwrap();
+    assert_ne!(replacement_code, first_code);
+
+    let viewer_id: uuid::Uuid = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(tenant_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .parse()
+    .unwrap();
+    grant_user_capabilities(
+        pool,
+        &tenant_id.to_string(),
+        &viewer_id.to_string(),
+        &["claim_devices"],
+    )
+    .await;
+    assert!(matches!(
+        DeviceClaimRepository::claim_device_with_code(
+            store.as_ref(),
+            tenant_id,
+            viewer_id,
+            device_id,
+            &first_code,
+        )
+        .await,
+        Err(DeviceClaimError::CodeUnavailable)
+    ));
+    assert_eq!(
+        DeviceClaimRepository::claim_device_with_code(
+            store.as_ref(),
+            tenant_id,
+            viewer_id,
+            device_id,
+            replacement_code,
+        )
+        .await
+        .unwrap()
+        .device_id,
+        device_id
+    );
 }
 
 async fn management_user_cookie(router: &axum::Router, username: &str, password: &str) -> String {
@@ -197,6 +489,10 @@ async fn system_account_cookie(router: &axum::Router) -> String {
 }
 
 async fn user_account_cookie(router: &axum::Router) -> String {
+    user_account_cookie_for(router, "viewer", "NanoView@1234").await
+}
+
+async fn user_account_cookie_for(router: &axum::Router, username: &str, password: &str) -> String {
     let login = router
         .clone()
         .oneshot(
@@ -205,7 +501,8 @@ async fn user_account_cookie(router: &axum::Router) -> String {
                 .uri("/api/user/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    r#"{"tenant_slug":"test","username":"viewer","password":"NanoView@1234"}"#,
+                    json!({ "tenant_slug": "test", "username": username, "password": password })
+                        .to_string(),
                 ))
                 .unwrap(),
         )
@@ -219,6 +516,25 @@ async fn user_account_cookie(router: &axum::Router) -> String {
         .next()
         .unwrap()
         .to_owned()
+}
+
+async fn grant_user_capabilities(
+    pool: &sqlx::SqlitePool,
+    tenant_id: &str,
+    user_id: &str,
+    capabilities: &[&str],
+) {
+    for capability in capabilities {
+        sqlx::query(
+            "INSERT INTO user_capabilities (user_id, tenant_id, capability) VALUES (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(capability)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
 }
 
 fn platform_get(path: &str, cookie: Option<&str>) -> Request<Body> {
@@ -701,7 +1017,7 @@ async fn platform_routes_deny_unauthenticated_and_cross_kind_sessions() {
 }
 
 #[tokio::test]
-async fn platform_login_renders_the_three_server_side_forms() {
+async fn platform_login_renders_one_server_side_form() {
     let (_directory, management) = management_session_router().await;
     let response = management
         .router
@@ -723,42 +1039,33 @@ async fn platform_login_renders_the_three_server_side_forms() {
             .to_vec(),
     )
     .unwrap();
-    for action in ["/login/system", "/login/tenant", "/login/user"] {
-        assert!(body.contains(&format!("action=\"{action}\"")), "{action}");
-    }
-    for field in [
-        "name=\"username\"",
-        "name=\"tenant_slug\"",
-        "name=\"password\"",
-    ] {
+    assert!(body.contains("action=\"/login\""));
+    for field in ["name=\"username\"", "name=\"password\""] {
         assert!(body.contains(field), "{field}");
     }
+    assert!(!body.contains("name=\"tenant_slug\""));
     assert!(!body.contains("<script"));
     assert!(!body.contains("<select"));
 }
 
 #[tokio::test]
-async fn platform_login_forms_issue_sessions_redirect_and_preserve_cross_kind_guards() {
+async fn platform_login_issues_the_matching_session_and_redirect() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
 
     let mut cookies = Vec::new();
     for (path, body, destination) in [
         (
-            "/login/system",
+            "/login",
             "username=system&password=SystemAccount@2026",
             "/system",
         ),
         (
-            "/login/tenant",
-            "tenant_slug=test&password=TenantAccount@2026",
+            "/login",
+            "username=test&password=TenantAccount@2026",
             "/tenant",
         ),
-        (
-            "/login/user",
-            "tenant_slug=test&username=viewer&password=NanoView@1234",
-            "/app",
-        ),
+        ("/login", "username=viewer&password=NanoView@1234", "/app"),
     ] {
         let response = router
             .clone()
@@ -786,9 +1093,9 @@ async fn platform_login_forms_issue_sessions_redirect_and_preserve_cross_kind_gu
     let invalid = router
         .clone()
         .oneshot(system_lifecycle_form(
-            "/login/user",
+            "/login",
             None,
-            "tenant_slug=test&username=viewer&password=not-the-password",
+            "username=viewer&password=not-the-password",
         ))
         .await
         .unwrap();
@@ -877,7 +1184,7 @@ async fn platform_routes_render_the_matching_server_layout_and_local_css() {
 }
 
 #[tokio::test]
-async fn system_tenants_navigation_resolves_to_the_system_overview_for_a_system_session() {
+async fn system_tenants_navigation_targets_the_tenant_lifecycle_section_for_a_system_session() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
     let system_cookie = system_account_cookie(&router).await;
@@ -895,7 +1202,7 @@ async fn system_tenants_navigation_resolves_to_the_system_overview_for_a_system_
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("href=\"/system\">Tenants</a>"));
+    assert!(body.contains("href=\"/system#tenants\">Tenants</a>"));
 }
 
 fn assert_read_only_user_workspace_page_allows_only_logout_form(body: &str) {
@@ -927,9 +1234,9 @@ async fn user_workspace_lists_only_authorized_devices_with_server_resolved_acces
 
     for (device_name, permission, access_source) in [
         ("Owned device", "Owner", "Owner"),
-        ("Direct device", "Viewer", "Direct user permission"),
-        ("Group device", "Manager", "Group permission"),
-        ("Inherited device", "Viewer", "Inherited user permission"),
+        ("Direct device", "View", "Shared by owner"),
+        ("Group device", "Control", "Group permission"),
+        ("Inherited device", "View", "Inherited user permission"),
     ] {
         assert!(body.contains(device_name), "missing {device_name}");
         assert!(body.contains(permission), "missing {permission}");
@@ -941,7 +1248,8 @@ async fn user_workspace_lists_only_authorized_devices_with_server_resolved_acces
     assert!(!body.contains("href=\"/system"));
     assert!(!body.contains("href=\"/tenant"));
     assert!(!body.contains("/commands"));
-    assert_read_only_user_workspace_page_allows_only_logout_form(&body);
+    assert!(!body.contains("Create device"));
+    assert!(!body.contains("action=\"/app/devices\" method=\"post\""));
 }
 
 #[tokio::test]
@@ -966,8 +1274,8 @@ async fn user_workspace_device_detail_masks_unavailable_devices_and_denies_other
     let authorized_body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
     let authorized_body = String::from_utf8(authorized_body.to_vec()).unwrap();
     assert!(authorized_body.contains("Direct device"));
-    assert!(authorized_body.contains("Viewer"));
-    assert!(authorized_body.contains("Direct user permission"));
+    assert!(authorized_body.contains("View"));
+    assert!(authorized_body.contains("Shared by owner"));
     assert!(authorized_body.contains("Recent telemetry"));
     assert!(authorized_body.contains("direct-device-telemetry-&#60;unsafe&#62;"));
     assert!(authorized_body.contains("Recent alerts"));
@@ -1026,9 +1334,9 @@ async fn user_workspace_asset_list_shows_only_authorized_assets_and_resolved_lin
     let body = String::from_utf8(body.to_vec()).unwrap();
     for (asset_name, permission, access_source) in [
         ("Owned asset", "Owner", "Owner"),
-        ("Direct asset", "Viewer", "Direct user permission"),
-        ("Group asset", "Manager", "Group permission"),
-        ("Inherited asset", "Viewer", "Inherited group permission"),
+        ("Direct asset", "View", "Shared by owner"),
+        ("Group asset", "Control", "Group permission"),
+        ("Inherited asset", "View", "Inherited group permission"),
     ] {
         assert!(body.contains(asset_name), "missing {asset_name}");
         assert!(body.contains(permission), "missing {permission}");
@@ -1038,7 +1346,8 @@ async fn user_workspace_asset_list_shows_only_authorized_assets_and_resolved_lin
     assert!(!body.contains("Cross tenant asset"));
     assert!(!body.contains("href=\"/system"));
     assert!(!body.contains("href=\"/tenant"));
-    assert_read_only_user_workspace_page_allows_only_logout_form(&body);
+    assert!(!body.contains("Create asset"));
+    assert!(!body.contains("action=\"/app/assets\" method=\"post\""));
 
     let direct_asset_route = format!("/app/assets/{}", assets.direct_asset_id);
     assert!(body.contains(&format!("href=\"{direct_asset_route}\"")));
@@ -1068,8 +1377,8 @@ async fn user_workspace_asset_detail_masks_unavailable_assets_and_requires_user_
     let authorized_body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
     let authorized_body = String::from_utf8(authorized_body.to_vec()).unwrap();
     assert!(authorized_body.contains("Direct asset"));
-    assert!(authorized_body.contains("Viewer"));
-    assert!(authorized_body.contains("Direct user permission"));
+    assert!(authorized_body.contains("View"));
+    assert!(authorized_body.contains("Shared by owner"));
     assert_read_only_user_workspace_page_allows_only_logout_form(&authorized_body);
 
     for asset_id in [
@@ -1110,6 +1419,751 @@ async fn user_workspace_asset_detail_masks_unavailable_assets_and_requires_user_
             response.status()
         );
     }
+}
+
+#[tokio::test]
+async fn resource_owner_invitation_requires_recipient_acceptance_before_resource_access() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let owner_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let recipient_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'recipient', ?, 'viewer', 'user')",
+    )
+    .bind(&recipient_id)
+    .bind(&tenant_id)
+    .bind(hash_password("Recipient@1234").unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
+    let observer_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'observer', ?, 'viewer', 'user')",
+    )
+    .bind(&observer_id)
+    .bind(&tenant_id)
+    .bind(hash_password("Observer@1234").unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
+    let asset_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, owner_user_id)
+         VALUES (?, ?, 'Owner farm', ?)",
+    )
+    .bind(asset_id.to_string())
+    .bind(&tenant_id)
+    .bind(&owner_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, owner_user_id, asset_id)
+         VALUES ('owner-device', ?, 'Owner device', ?, ?)",
+    )
+    .bind(&tenant_id)
+    .bind(&owner_id)
+    .bind(asset_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name, owner_user_id, asset_id)
+         VALUES ('farm-child-device', ?, 'Farm child device', ?, ?)",
+    )
+    .bind(&tenant_id)
+    .bind(&owner_id)
+    .bind(asset_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let router = management.router;
+    let owner_cookie = user_account_cookie(&router).await;
+    let unknown_user = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            &format!("/app/assets/{asset_id}/permissions"),
+            Some(&owner_cookie),
+            "username=unknown-user&permission=view",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_user.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        unknown_user.headers()[LOCATION],
+        format!("/app/assets/{asset_id}?notice=mutation-unavailable")
+    );
+    let asset_share = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            &format!("/app/assets/{asset_id}/permissions"),
+            Some(&owner_cookie),
+            "username=recipient&permission=control",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(asset_share.status(), StatusCode::SEE_OTHER);
+
+    let device_share = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/app/devices/owner-device/permissions",
+            Some(&owner_cookie),
+            "username=recipient&permission=control",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(device_share.status(), StatusCode::SEE_OTHER);
+
+    let invitations = sqlx::query_as::<_, (String, Option<String>, Option<String>, String)>(
+        "SELECT id, asset_id, device_id, state
+         FROM resource_invitations
+         WHERE tenant_id = ? AND recipient_user_id = ?
+         ORDER BY device_id",
+    )
+    .bind(&tenant_id)
+    .bind(&recipient_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        invitations,
+        vec![
+            (
+                invitations[0].0.clone(),
+                Some(asset_id.to_string()),
+                None,
+                "pending".to_owned(),
+            ),
+            (
+                invitations[1].0.clone(),
+                None,
+                Some("owner-device".to_owned()),
+                "pending".to_owned(),
+            ),
+        ]
+    );
+    let grants_before_accept = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM resource_permissions
+         WHERE tenant_id = ? AND subject_user_id = ? AND revoked_at IS NULL",
+    )
+    .bind(&tenant_id)
+    .bind(&recipient_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(grants_before_accept, 0);
+
+    let asset_detail = router
+        .clone()
+        .oneshot(platform_get(
+            &format!("/app/assets/{asset_id}"),
+            Some(&owner_cookie),
+        ))
+        .await
+        .unwrap();
+    let asset_body = String::from_utf8(
+        to_bytes(asset_detail.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(asset_body.contains("Invite user"));
+    assert!(!asset_body.contains("inherit_children"));
+
+    let recipient_cookie = user_account_cookie_for(&router, "recipient", "Recipient@1234").await;
+    let recipient_workspace = router
+        .clone()
+        .oneshot(platform_get("/app", Some(&recipient_cookie)))
+        .await
+        .unwrap();
+    let recipient_body = String::from_utf8(
+        to_bytes(recipient_workspace.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        !recipient_body.contains("Farm child device"),
+        "recipient workspace: {recipient_body}"
+    );
+    assert!(!recipient_body.contains("Owner device"));
+    assert!(recipient_body.contains("Invitations (2)"));
+
+    let invitation_page = router
+        .clone()
+        .oneshot(platform_get("/app/invitations", Some(&recipient_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(invitation_page.status(), StatusCode::OK);
+    let invitation_body = String::from_utf8(
+        to_bytes(invitation_page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(invitation_body.contains("Owner farm"));
+    assert!(invitation_body.contains("Owner device"));
+
+    let asset_accept = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            &format!("/app/invitations/{}/accept", invitations[0].0),
+            Some(&recipient_cookie),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(asset_accept.status(), StatusCode::SEE_OTHER);
+    let device_accept = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            &format!("/app/invitations/{}/accept", invitations[1].0),
+            Some(&recipient_cookie),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(device_accept.status(), StatusCode::SEE_OTHER);
+
+    let grants = sqlx::query_as::<_, (Option<String>, Option<String>, String, i64)>(
+        "SELECT asset_id, device_id, permission, inherit_children
+         FROM resource_permissions
+         WHERE tenant_id = ? AND subject_user_id = ? AND revoked_at IS NULL
+         ORDER BY device_id",
+    )
+    .bind(&tenant_id)
+    .bind(&recipient_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        grants,
+        vec![
+            (Some(asset_id.to_string()), None, "manager".to_owned(), 0),
+            (
+                None,
+                Some("owner-device".to_owned()),
+                "manager".to_owned(),
+                0
+            ),
+        ]
+    );
+    let recipient_workspace = router
+        .clone()
+        .oneshot(platform_get("/app", Some(&recipient_cookie)))
+        .await
+        .unwrap();
+    let recipient_body = String::from_utf8(
+        to_bytes(recipient_workspace.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(recipient_body.contains("Owner device"));
+
+    grant_user_capabilities(pool, &tenant_id, &recipient_id, &["share_owned_resources"]).await;
+    let recipient_cannot_share = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/app/devices/owner-device/permissions",
+            Some(&recipient_cookie),
+            "username=observer&permission=view",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(recipient_cannot_share.status(), StatusCode::FORBIDDEN);
+
+    let asset_permission_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM resource_permissions
+         WHERE asset_id = ? AND subject_user_id = ? AND revoked_at IS NULL",
+    )
+    .bind(asset_id.to_string())
+    .bind(&recipient_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let revoke = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            &format!("/app/assets/{asset_id}/permissions/revoke"),
+            Some(&owner_cookie),
+            &format!("permission_id={asset_permission_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::SEE_OTHER);
+    let recipient_after_revoke = router
+        .clone()
+        .oneshot(platform_get("/app", Some(&recipient_cookie)))
+        .await
+        .unwrap();
+    let recipient_after_revoke_body = String::from_utf8(
+        to_bytes(recipient_after_revoke.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!recipient_after_revoke_body.contains("Farm child device"));
+    assert!(recipient_after_revoke_body.contains("Owner device"));
+
+    let observer_cookie = user_account_cookie_for(&router, "observer", "Observer@1234").await;
+    let rejected = router
+        .oneshot(system_lifecycle_form(
+            "/app/devices/owner-device/permissions",
+            Some(&observer_cookie),
+            "username=recipient&permission=view",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn user_owner_can_create_and_update_an_owned_asset() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let owner_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    grant_user_capabilities(
+        pool,
+        &tenant_id,
+        &owner_id,
+        &["create_assets", "edit_resources"],
+    )
+    .await;
+    let router = management.router;
+    let owner_cookie = user_account_cookie(&router).await;
+
+    let created = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/app/assets",
+            Some(&owner_cookie),
+            "name=Owner+farm&parent_asset_id=",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+
+    let asset_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM assets WHERE tenant_id = ? AND name = 'Owner farm'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let owner = sqlx::query_scalar::<_, String>("SELECT owner_user_id FROM assets WHERE id = ?")
+        .bind(&asset_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, owner_id);
+
+    let updated = router
+        .oneshot(system_lifecycle_form(
+            &format!("/app/assets/{asset_id}"),
+            Some(&owner_cookie),
+            "name=Renamed+farm&parent_asset_id=",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::SEE_OTHER);
+    let name = sqlx::query_scalar::<_, String>("SELECT name FROM assets WHERE id = ?")
+        .bind(&asset_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(name, "Renamed farm");
+}
+
+#[tokio::test]
+async fn user_owner_can_create_and_update_an_owned_device() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let owner_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    grant_user_capabilities(
+        pool,
+        &tenant_id,
+        &owner_id,
+        &["create_devices", "edit_resources"],
+    )
+    .await;
+    let asset_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, owner_user_id)
+         VALUES (?, ?, 'Owner asset', ?)",
+    )
+    .bind(&asset_id)
+    .bind(&tenant_id)
+    .bind(&owner_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let router = management.router;
+    let owner_cookie = user_account_cookie(&router).await;
+
+    let created = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/app/devices",
+            Some(&owner_cookie),
+            &format!("display_name=Owner+device&asset_id={asset_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+
+    let device_id = sqlx::query_scalar::<_, String>(
+        "SELECT device_id FROM devices WHERE tenant_id = ? AND display_name = 'Owner device'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let ownership = sqlx::query_as::<_, (String, String)>(
+        "SELECT owner_user_id, asset_id FROM devices WHERE device_id = ?",
+    )
+    .bind(&device_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(ownership, (owner_id, asset_id));
+
+    let updated = router
+        .oneshot(system_lifecycle_form(
+            &format!("/app/devices/{device_id}"),
+            Some(&owner_cookie),
+            "display_name=Renamed+device&asset_id=",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::SEE_OTHER);
+    let name =
+        sqlx::query_scalar::<_, String>("SELECT display_name FROM devices WHERE device_id = ?")
+            .bind(&device_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(name, "Renamed device");
+}
+
+#[tokio::test]
+async fn tenant_account_assigns_and_unassigns_device_and_asset_owners_revoking_existing_shares() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let owner_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let recipient_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'assignment-recipient', ?, 'viewer', 'user')",
+    )
+    .bind(&recipient_id)
+    .bind(&tenant_id)
+    .bind(hash_password("AssignmentRecipient@1234").unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name)
+         VALUES ('tenant-assignment-device', ?, 'Tenant assignment device')",
+    )
+    .bind(&tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, device_id, permission, created_by_user_id
+         ) VALUES (?, ?, ?, 'tenant-assignment-device', 'viewer', ?)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&tenant_id)
+    .bind(&recipient_id)
+    .bind(&owner_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/management/devices/tenant-assignment-device/owner")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(json!({ "user_id": owner_id }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT owner_user_id FROM devices WHERE device_id = 'tenant-assignment-device'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        Some(owner_id.clone())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_permissions
+             WHERE tenant_id = ? AND device_id = 'tenant-assignment-device' AND revoked_at IS NULL",
+        )
+        .bind(&tenant_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    let asset_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name)
+         VALUES (?, ?, 'Tenant assignment asset')",
+    )
+    .bind(asset_id.to_string())
+    .bind(&tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, asset_id, permission, created_by_user_id
+         ) VALUES (?, ?, ?, ?, 'viewer', ?)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&tenant_id)
+    .bind(&recipient_id)
+    .bind(asset_id.to_string())
+    .bind(&owner_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let assign_asset = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/assets/{asset_id}/owner"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(json!({ "user_id": owner_id }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assign_asset.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>("SELECT owner_user_id FROM assets WHERE id = ?",)
+            .bind(asset_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        Some(owner_id.clone())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_permissions
+             WHERE tenant_id = ? AND asset_id = ? AND revoked_at IS NULL",
+        )
+        .bind(&tenant_id)
+        .bind(asset_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+            id, tenant_id, subject_user_id, asset_id, permission, created_by_user_id
+         ) VALUES (?, ?, ?, ?, 'viewer', ?)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&tenant_id)
+    .bind(&recipient_id)
+    .bind(asset_id.to_string())
+    .bind(&owner_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let unassign_asset = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/management/assets/{asset_id}/owner"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(json!({ "user_id": null }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unassign_asset.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>("SELECT owner_user_id FROM assets WHERE id = ?")
+            .bind(asset_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_permissions
+             WHERE tenant_id = ? AND asset_id = ? AND revoked_at IS NULL",
+        )
+        .bind(&tenant_id)
+        .bind(asset_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn tenant_account_cannot_create_or_revoke_direct_resource_permissions() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let viewer_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE tenant_id = ? AND username = 'viewer'",
+    )
+    .bind(&tenant_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let asset_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name)
+         VALUES (?, ?, 'Tenant shared asset')",
+    )
+    .bind(asset_id.to_string())
+    .bind(&tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name)
+         VALUES ('tenant-shared-device', ?, 'Tenant shared device')",
+    )
+    .bind(&tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    for body in [
+        format!(
+            "subject=user:{viewer_id}&scope=device&resource_id=tenant-shared-device&permission=control"
+        ),
+        format!("subject=user:{viewer_id}&scope=asset&resource_id={asset_id}&permission=view"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(system_lifecycle_form(
+                "/tenant/permissions",
+                Some(&tenant_cookie),
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    let permission_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO resource_permissions (
+             id, tenant_id, subject_user_id, device_id, permission, created_by_user_id
+         ) VALUES (?, ?, ?, 'tenant-shared-device', 'viewer', ?)",
+    )
+    .bind(&permission_id)
+    .bind(&tenant_id)
+    .bind(&viewer_id)
+    .bind(&viewer_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    let revoke = router
+        .oneshot(system_lifecycle_form(
+            "/tenant/permissions/revoke",
+            Some(&tenant_cookie),
+            &format!("permission_id={permission_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_permissions WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(&permission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1458,44 +2512,65 @@ async fn system_html_lifecycle_forms_deny_non_system_sessions_before_form_parsin
 }
 
 #[tokio::test]
-async fn system_html_lifecycle_forms_redirect_invalid_input_without_reflecting_passwords() {
+async fn system_html_lifecycle_forms_report_tenant_field_validation_without_reflecting_input() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
     let system_cookie = system_account_cookie(&router).await;
 
-    let response = router
-        .clone()
-        .oneshot(system_lifecycle_form(
-            "/system/tenants",
-            Some(&system_cookie),
-            "slug=invalid-tenant&tenant_account_password=too-short",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        response.headers()[LOCATION],
-        "/system?notice=invalid-request"
-    );
-
-    let page = router
-        .oneshot(platform_get(
-            "/system?notice=invalid-request",
-            Some(&system_cookie),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(page.status(), StatusCode::OK);
-    let page = String::from_utf8(
-        to_bytes(page.into_body(), usize::MAX)
+    for (form, notice, message, private_value) in [
+        (
+            "slug=InvalidTenant&tenant_account_username=valid-admin&tenant_account_password=TenantAccount%402026",
+            "invalid-tenant-slug",
+            "Tenant slug must use lowercase letters, digits, or hyphens.",
+            "InvalidTenant",
+        ),
+        (
+            "slug=valid-tenant&tenant_account_username=invalid+username&tenant_account_password=TenantAccount%402026",
+            "invalid-tenant-account-username",
+            "Tenant Account username must be 3 to 64 characters using letters, digits, hyphens, or underscores.",
+            "invalid username",
+        ),
+        (
+            "slug=valid-tenant&tenant_account_username=valid-admin&tenant_account_password=too-short",
+            "invalid-tenant-account-password",
+            "Tenant Account password must be at least 8 ASCII characters and include uppercase, lowercase, a number, and a symbol.",
+            "too-short",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(system_lifecycle_form(
+                "/system/tenants",
+                Some(&system_cookie),
+                form,
+            ))
             .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(page.contains("Request could not be processed."));
-    assert!(!page.contains("invalid-tenant"));
-    assert!(!page.contains("too-short"));
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[LOCATION],
+            format!("/system?notice={notice}")
+        );
+
+        let page = router
+            .clone()
+            .oneshot(platform_get(
+                &format!("/system?notice={notice}"),
+                Some(&system_cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let page = String::from_utf8(
+            to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(page.contains(message));
+        assert!(!page.contains(private_value));
+    }
 }
 
 #[tokio::test]
@@ -1661,14 +2736,20 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "/api/management/assets/{asset_id}",
         "/api/management/devices",
         "/api/management/devices/{device_id}",
+        "/api/management/devices/{device_id}/owner",
+        "/api/management/devices/{device_id}/claim-code",
         "/api/management/devices/{device_id}/tokens",
         "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
+        "/api/management/devices/{device_id}/token",
+        "/api/management/devices/{device_id}/telemetry",
+        "/api/management/assets/{asset_id}/owner",
         "/api/management/profiles/asset-profiles",
         "/api/management/profiles/asset-profiles/{profile_id}",
         "/api/management/profiles/device-profiles",
         "/api/management/profiles/device-profiles/{profile_id}",
         "/api/management/users",
         "/api/management/users/{username}",
+        "/api/management/users/{username}/capabilities",
     ]);
     assert_eq!(actual_paths, expected_paths);
 
@@ -1708,12 +2789,32 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
             BTreeSet::from(["delete", "put"]),
         ),
         (
+            "/api/management/devices/{device_id}/owner",
+            BTreeSet::from(["put"]),
+        ),
+        (
+            "/api/management/devices/{device_id}/telemetry",
+            BTreeSet::from(["get"]),
+        ),
+        (
+            "/api/management/devices/{device_id}/claim-code",
+            BTreeSet::from(["post"]),
+        ),
+        (
             "/api/management/devices/{device_id}/tokens",
             BTreeSet::from(["post"]),
         ),
         (
             "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
             BTreeSet::from(["post"]),
+        ),
+        (
+            "/api/management/devices/{device_id}/token",
+            BTreeSet::from(["get"]),
+        ),
+        (
+            "/api/management/assets/{asset_id}/owner",
+            BTreeSet::from(["put"]),
         ),
         (
             "/api/management/profiles/asset-profiles",
@@ -1733,6 +2834,10 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         ),
         ("/api/management/users", BTreeSet::from(["get", "post"])),
         ("/api/management/users/{username}", BTreeSet::from(["put"])),
+        (
+            "/api/management/users/{username}/capabilities",
+            BTreeSet::from(["put"]),
+        ),
     ]);
     for (path, expected_methods) in expected_methods {
         let actual_methods = paths[path]
@@ -1818,6 +2923,12 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
             "#/components/schemas/DeviceToken",
         ),
         (
+            "/api/management/devices/{device_id}/claim-code",
+            "post",
+            "201",
+            "#/components/schemas/ManagementDeviceClaimCode",
+        ),
+        (
             "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
             "post",
             "201",
@@ -1859,12 +2970,18 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "ManagementAssetList",
         "ManagementAssetRequest",
         "ManagementDevice",
+        "ManagementDeviceClaimCode",
         "ManagementDeviceList",
+        "ManagementDeviceTelemetry",
+        "ManagementDeviceTelemetryPage",
         "ManagementDeviceUpdateRequest",
+        "ManagementResourceOwnerRequest",
         "ManagementUser",
+        "ManagementUserCapabilitiesRequest",
         "ManagementUserCreateRequest",
         "ManagementUserList",
         "ManagementUserUpdateRequest",
+        "PlatformLoginResponse",
         "SessionResponse",
     ]);
     assert_eq!(actual_schemas, expected_schemas);
@@ -2381,7 +3498,7 @@ async fn tenant_account_provisions_tenant_bound_devices_and_denies_user_sessions
 }
 
 #[tokio::test]
-async fn tenant_account_can_rotate_an_existing_device_token() {
+async fn tenant_account_can_replace_a_device_token() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
     let cookie = tenant_account_cookie(&router).await;
@@ -2432,6 +3549,162 @@ async fn tenant_account_can_rotate_an_existing_device_token() {
             .as_str()
             .is_some_and(|token| token != first_token)
     );
+}
+
+#[tokio::test]
+async fn tenant_account_can_reveal_the_single_active_device_token() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let cookie = tenant_account_cookie(&router).await;
+    let provisioned = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"display_name":"Copyable Token Device"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::CREATED);
+    let provisioned: serde_json::Value =
+        serde_json::from_slice(&to_bytes(provisioned.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let device_id = provisioned["device_id"].as_str().unwrap();
+    let first_token = provisioned["token"].as_str().unwrap();
+
+    let revealed = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/management/devices/{device_id}/token"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revealed.status(), StatusCode::OK);
+    assert_eq!(revealed.headers()[CACHE_CONTROL], "no-store");
+    let revealed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(revealed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(revealed["device_id"], device_id);
+    assert_eq!(revealed["token"], first_token);
+
+    let replaced = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/management/devices/{device_id}/tokens"))
+                .header(COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::CREATED);
+    let replaced: serde_json::Value =
+        serde_json::from_slice(&to_bytes(replaced.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let replacement_token = replaced["token"].as_str().unwrap();
+    assert_ne!(replacement_token, first_token);
+
+    let revealed = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/management/devices/{device_id}/token"))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revealed.status(), StatusCode::OK);
+    let revealed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(revealed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(revealed["token"], replacement_token);
+
+    let active_tokens: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM device_tokens WHERE device_id = ? AND revoked_at IS NULL",
+    )
+    .bind(device_id)
+    .fetch_one(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    assert_eq!(active_tokens, 1);
+}
+
+#[tokio::test]
+async fn tenant_account_can_list_raw_device_telemetry_for_a_selected_range() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let cookie = tenant_account_cookie(&router).await;
+    let provisioned = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &cookie)
+                .body(Body::from(r#"{"display_name":"Telemetry Device"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provisioned.status(), StatusCode::CREATED);
+    let provisioned: serde_json::Value =
+        serde_json::from_slice(&to_bytes(provisioned.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let device_id = provisioned["device_id"].as_str().unwrap();
+    let tenant_id: String = sqlx::query_scalar("SELECT tenant_id FROM devices WHERE device_id = ?")
+        .bind(device_id)
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+    let observed_at = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO telemetry (
+            event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(observed_at.to_rfc3339())
+    .bind(observed_at.to_rfc3339())
+    .bind(tenant_id)
+    .bind(device_id)
+    .bind("telemetry-boot-1")
+    .bind(1_i64)
+    .bind(r#"{"temperature_c":22.5,"switch":"on"}"#)
+    .bind("v1/devices/me/telemetry")
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    let telemetry = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/management/devices/{device_id}/telemetry?range=1h"
+                ))
+                .header(COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(telemetry.status(), StatusCode::OK);
+    let telemetry: serde_json::Value =
+        serde_json::from_slice(&to_bytes(telemetry.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(telemetry["items"][0]["device_id"], device_id);
+    assert_eq!(telemetry["items"][0]["measurements"]["temperature_c"], 22.5);
+    assert_eq!(telemetry["items"][0]["measurements"]["switch"], "on");
 }
 
 #[tokio::test]
@@ -3690,6 +4963,64 @@ async fn tenant_asset_and_device_pages_only_render_the_authenticated_tenant_reso
 }
 
 #[tokio::test]
+async fn tenant_overview_displays_authenticated_tenant_resource_counts() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_id = sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO assets (id, tenant_id, name) VALUES (?, ?, 'Overview asset')")
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&tenant_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name)
+         VALUES ('overview-device', ?, 'Overview device')",
+    )
+    .bind(&tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let response = router
+        .oneshot(platform_get("/tenant", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(
+        body.contains(
+            r#"data-testid="tenant-overview-users"><span>Users</span><strong>2</strong>"#
+        )
+    );
+    assert!(
+        body.contains(
+            r#"data-testid="tenant-overview-assets"><span>Assets</span><strong>1</strong>"#
+        )
+    );
+    assert!(body.contains(
+        r#"data-testid="tenant-overview-devices"><span>Devices</span><strong>1</strong>"#
+    ));
+    assert!(body.contains(
+        r#"data-testid="tenant-overview-open-alerts"><span>Open alerts</span><strong>0</strong>"#
+    ));
+    assert!(!body.contains("Data will appear after the route contract is connected."));
+}
+
+#[tokio::test]
 async fn tenant_asset_and_device_forms_create_current_tenant_resources_without_list_token_leaks() {
     let (_directory, store, management) = management_session_router_with_store().await;
     let router = management.router;
@@ -3776,7 +5107,7 @@ async fn tenant_asset_and_device_forms_create_current_tenant_resources_without_l
 }
 
 #[tokio::test]
-async fn tenant_profile_forms_and_device_token_pages_are_scoped_and_do_not_list_secrets() {
+async fn tenant_profile_forms_are_scoped_to_the_current_tenant() {
     let (_directory, store, management) = management_session_router_with_store().await;
     let router = management.router;
     let tenant_cookie = tenant_account_cookie(&router).await;
@@ -3853,15 +5184,6 @@ async fn tenant_profile_forms_and_device_token_pages_are_scoped_and_do_not_list_
     .execute(pool)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO devices (device_id, tenant_id, display_name)
-         VALUES ('other-token-device', ?, 'Other token device')",
-    )
-    .bind(other_tenant.id.to_string())
-    .execute(pool)
-    .await
-    .unwrap();
-
     for (path, expected, excluded) in [
         (
             "/tenant/profiles/device",
@@ -3890,88 +5212,37 @@ async fn tenant_profile_forms_and_device_token_pages_are_scoped_and_do_not_list_
         assert!(body.contains(expected), "{path}");
         assert!(!body.contains(excluded), "{path}");
     }
-
-    let provisioned = management_provision_device(&router, &tenant_cookie, "Token device").await;
-    let device_id = provisioned["device_id"].as_str().unwrap();
-    let issued = router
-        .clone()
-        .oneshot(system_lifecycle_form(
-            &format!("/tenant/devices/{device_id}/tokens/issue"),
-            Some(&tenant_cookie),
-            "",
-        ))
-        .await
-        .unwrap();
-    assert_eq!(issued.status(), StatusCode::CREATED);
-    assert_eq!(issued.headers()[CACHE_CONTROL], "no-store");
-    let issued_body = String::from_utf8(
-        to_bytes(issued.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    let credential = issued_body
-        .split("<code id=\"device-token-credential\" class=\"credential\">")
-        .nth(1)
-        .and_then(|value| value.split("</code>").next())
-        .expect("issue response must contain the one-time device token")
-        .to_owned();
-    assert!(!credential.is_empty());
-
-    let token_page = router
-        .clone()
-        .oneshot(platform_get(
-            &format!("/tenant/devices/{device_id}/tokens"),
-            Some(&tenant_cookie),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(token_page.status(), StatusCode::OK);
-    let token_page = String::from_utf8(
-        to_bytes(token_page.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(token_page.contains("Device tokens"));
-    assert!(!token_page.contains(&credential));
-
-    let active_token_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM device_tokens WHERE device_id = ? AND revoked_at IS NULL",
-    )
-    .bind(device_id)
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    let revoked = router
-        .clone()
-        .oneshot(system_lifecycle_form(
-            &format!("/tenant/devices/{device_id}/tokens/revoke"),
-            Some(&tenant_cookie),
-            &format!("token_id={active_token_id}"),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(revoked.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        revoked.headers()[LOCATION],
-        format!("/tenant/devices/{device_id}/tokens?notice=token-revoked")
-    );
-
-    let other_tenant_page = router
-        .oneshot(platform_get(
-            "/tenant/devices/other-token-device/tokens",
-            Some(&tenant_cookie),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(other_tenant_page.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
-async fn tenant_profile_and_token_routes_deny_non_tenant_sessions_before_form_parsing() {
+async fn legacy_device_token_html_routes_are_not_exposed() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+
+    for (method, path) in [
+        ("GET", "/tenant/devices/device-1/tokens"),
+        ("POST", "/tenant/devices/device-1/tokens/issue"),
+        ("POST", "/tenant/devices/device-1/tokens/revoke"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(COOKIE, &tenant_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn tenant_profile_routes_deny_non_tenant_sessions_before_form_parsing() {
     let (_directory, management) = management_session_router().await;
     let router = management.router;
     let system_cookie = system_account_cookie(&router).await;
@@ -3980,14 +5251,6 @@ async fn tenant_profile_and_token_routes_deny_non_tenant_sessions_before_form_pa
     for (path, form_path) in [
         ("/tenant/profiles/device", "/tenant/profiles/device"),
         ("/tenant/profiles/asset", "/tenant/profiles/asset"),
-        (
-            "/tenant/devices/not-a-tenant-device/tokens",
-            "/tenant/devices/not-a-tenant-device/tokens/issue",
-        ),
-        (
-            "/tenant/devices/not-a-tenant-device/tokens",
-            "/tenant/devices/not-a-tenant-device/tokens/revoke",
-        ),
     ] {
         for (cookie, expected_status) in [
             (None, StatusCode::UNAUTHORIZED),
@@ -4226,29 +5489,18 @@ async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenan
         0
     );
 
-    for body in [
-        format!(
-            "subject=user%3A{viewer_id}&scope=asset&resource_id={asset_id}&permission=manager&inherit_children=on"
-        ),
-        format!(
-            "subject=group%3A{group_id}&scope=device&resource_id=tenant-device&permission=viewer"
-        ),
-    ] {
-        let response = router
-            .clone()
-            .oneshot(system_lifecycle_form(
-                "/tenant/permissions",
-                Some(&tenant_cookie),
-                &body,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            response.headers()[LOCATION],
-            "/tenant/permissions?notice=permission-created"
-        );
-    }
+    let permission_grant = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/permissions",
+            Some(&tenant_cookie),
+            &format!(
+                "subject=user%3A{viewer_id}&scope=asset&resource_id={asset_id}&permission=control"
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(permission_grant.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM resource_permissions
@@ -4260,7 +5512,7 @@ async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenan
         .fetch_one(pool)
         .await
         .unwrap(),
-        2
+        0
     );
     let permissions = router
         .clone()
@@ -4274,39 +5526,10 @@ async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenan
             .to_vec(),
     )
     .unwrap();
-    assert!(permissions_body.contains("Tenant asset"));
-    assert!(permissions_body.contains("Tenant device"));
-    assert!(permissions_body.contains("Manager"));
-    assert!(permissions_body.contains("Viewer"));
-
-    let permission_id = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM resource_permissions WHERE tenant_id = ? AND asset_id = ?",
-    )
-    .bind(&tenant_id)
-    .bind(&asset_id)
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    let revoke = router
-        .clone()
-        .oneshot(system_lifecycle_form(
-            "/tenant/permissions/revoke",
-            Some(&tenant_cookie),
-            &format!("permission_id={permission_id}"),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(revoke.status(), StatusCode::SEE_OTHER);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM resource_permissions WHERE id = ? AND revoked_at IS NOT NULL",
-        )
-        .bind(&permission_id)
-        .fetch_one(pool)
-        .await
-        .unwrap(),
-        1
-    );
+    assert!(permissions_body.contains("Assigned user"));
+    assert!(permissions_body.contains("Only the assigned owner"));
+    assert!(!permissions_body.contains("Grant asset permission"));
+    assert!(!permissions_body.contains("Revoke permission"));
 
     let (other_tenant, _) = TenantIdentityRepository::create_tenant_with_account(
         store.as_ref(),
@@ -4349,23 +5572,28 @@ async fn tenant_group_and_permission_forms_are_scoped_to_the_authenticated_tenan
         .await
         .unwrap();
 
-    for request in [
-        system_lifecycle_form(
+    let cross_tenant_group_member = router
+        .clone()
+        .oneshot(system_lifecycle_form(
             "/tenant/groups/members",
             Some(&tenant_cookie),
             &format!("group_id={other_group_id}&user_id={viewer_id}"),
-        ),
-        system_lifecycle_form(
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_group_member.status(), StatusCode::SEE_OTHER);
+    let cross_tenant_permission = router
+        .clone()
+        .oneshot(system_lifecycle_form(
             "/tenant/permissions",
             Some(&tenant_cookie),
             &format!(
-                "subject=user%3A{viewer_id}&scope=asset&resource_id={other_asset_id}&permission=viewer"
+                "subject=user%3A{viewer_id}&scope=asset&resource_id={other_asset_id}&permission=view"
             ),
-        ),
-    ] {
-        let response = router.clone().oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    }
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_permission.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_group_members WHERE group_id = ?",)
             .bind(&other_group_id)
@@ -4539,7 +5767,7 @@ async fn system_created_tenant_can_create_and_sign_in_a_user_from_the_platform_f
         .oneshot(system_lifecycle_form(
             "/system/tenants",
             Some(&system_cookie),
-            "slug=fresh-tenant&tenant_account_password=FreshTenant%402026",
+            "slug=fresh-tenant&tenant_account_username=fresh-admin&tenant_account_password=FreshTenant%402026",
         ))
         .await
         .unwrap();
@@ -4552,9 +5780,9 @@ async fn system_created_tenant_can_create_and_sign_in_a_user_from_the_platform_f
     let tenant_login = router
         .clone()
         .oneshot(system_lifecycle_form(
-            "/login/tenant",
+            "/login",
             None,
-            "tenant_slug=fresh-tenant&password=FreshTenant%402026",
+            "username=fresh-admin&password=FreshTenant%402026",
         ))
         .await
         .unwrap();
@@ -4585,7 +5813,7 @@ async fn system_created_tenant_can_create_and_sign_in_a_user_from_the_platform_f
 
     assert_eq!(
         sqlx::query_scalar::<_, String>(
-            "SELECT default_app
+            "SELECT account_class
              FROM users
              JOIN tenants ON tenants.id = users.tenant_id
              WHERE tenants.slug = 'fresh-tenant' AND users.username = 'fresh-user'",
@@ -4593,28 +5821,28 @@ async fn system_created_tenant_can_create_and_sign_in_a_user_from_the_platform_f
         .fetch_one(store.sqlite_pool().unwrap())
         .await
         .unwrap(),
-        "/app"
+        "user"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)
-             FROM user_app_grants
-             JOIN users ON users.id = user_app_grants.user_id
+             FROM user_capabilities
+             JOIN users ON users.id = user_capabilities.user_id
              JOIN tenants ON tenants.id = users.tenant_id
              WHERE tenants.slug = 'fresh-tenant' AND users.username = 'fresh-user'",
         )
         .fetch_one(store.sqlite_pool().unwrap())
         .await
         .unwrap(),
-        0
+        2
     );
 
     let user_login = router
         .clone()
         .oneshot(system_lifecycle_form(
-            "/login/user",
+            "/login",
             None,
-            "tenant_slug=fresh-tenant&username=fresh-user&password=FreshUser%402026",
+            "username=fresh-user&password=FreshUser%402026",
         ))
         .await
         .unwrap();
@@ -4954,6 +6182,20 @@ async fn tenant_relations_page_and_forms_use_the_authenticated_tenant() {
     let first_id = first["device_id"].as_str().unwrap().to_owned();
     let second = management_provision_device(&router, &tenant_cookie, "Relation second").await;
     let second_id = second["device_id"].as_str().unwrap().to_owned();
+    let tenant_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let asset_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name)
+         VALUES (?, ?, 'Relation asset')",
+    )
+    .bind(asset_id.to_string())
+    .bind(&tenant_id)
+    .execute(pool)
+    .await
+    .unwrap();
 
     let overview = router
         .clone()
@@ -4983,7 +6225,7 @@ async fn tenant_relations_page_and_forms_use_the_authenticated_tenant() {
             "/tenant/relations",
             Some(&tenant_cookie),
             &format!(
-                "from_device_id={first_id}&to_device_id={second_id}&relation_type=located_near&tenant_id=injected"
+                "from_device_id={first_id}&target_kind=device&to_device_id={second_id}&relation_type=located_near&tenant_id=injected"
             ),
         ))
         .await
@@ -5000,7 +6242,7 @@ async fn tenant_relations_page_and_forms_use_the_authenticated_tenant() {
             "/tenant/relations",
             Some(&tenant_cookie),
             &format!(
-                "from_device_id={first_id}&to_device_id={second_id}&relation_type=located_near"
+                "from_device_id={first_id}&target_kind=device&to_device_id={second_id}&relation_type=located_near"
             ),
         ))
         .await
@@ -5010,10 +6252,6 @@ async fn tenant_relations_page_and_forms_use_the_authenticated_tenant() {
         created.headers()[LOCATION],
         "/tenant/relations?notice=relation-created"
     );
-    let tenant_id: String = sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
-        .fetch_one(pool)
-        .await
-        .unwrap();
     let relation_id: String = sqlx::query_scalar(
         "SELECT id FROM device_relations
          WHERE tenant_id = ? AND from_device_id = ? AND to_device_id = ?",
@@ -5025,12 +6263,39 @@ async fn tenant_relations_page_and_forms_use_the_authenticated_tenant() {
     .await
     .unwrap();
 
+    let asset_relation = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/relations",
+            Some(&tenant_cookie),
+            &format!(
+                "from_device_id={first_id}&target_kind=asset&to_asset_id={asset_id}&relation_type=measures"
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(asset_relation.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        asset_relation.headers()[LOCATION],
+        "/tenant/relations?notice=relation-created"
+    );
+    let asset_relation_id: String = sqlx::query_scalar(
+        "SELECT id FROM device_asset_relations
+         WHERE tenant_id = ? AND from_device_id = ? AND to_asset_id = ?",
+    )
+    .bind(&tenant_id)
+    .bind(&first_id)
+    .bind(asset_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
     let deleted = router
         .clone()
         .oneshot(system_lifecycle_form(
             "/tenant/relations/delete",
             Some(&tenant_cookie),
-            &format!("relation_id={relation_id}"),
+            &format!("target_kind=device&relation_id={relation_id}"),
         ))
         .await
         .unwrap();
@@ -5041,10 +6306,34 @@ async fn tenant_relations_page_and_forms_use_the_authenticated_tenant() {
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_relations WHERE tenant_id = ?",)
-            .bind(tenant_id)
+            .bind(&tenant_id)
             .fetch_one(pool)
             .await
             .unwrap(),
+        0
+    );
+    let asset_deleted = router
+        .clone()
+        .oneshot(system_lifecycle_form(
+            "/tenant/relations/delete",
+            Some(&tenant_cookie),
+            &format!("target_kind=asset&relation_id={asset_relation_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(asset_deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        asset_deleted.headers()[LOCATION],
+        "/tenant/relations?notice=relation-deleted"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM device_asset_relations WHERE tenant_id = ?",
+        )
+        .bind(&tenant_id)
+        .fetch_one(pool)
+        .await
+        .unwrap(),
         0
     );
 }
@@ -5218,6 +6507,252 @@ async fn tenant_application_page_scopes_list_upserts_and_hides_client_secrets() 
         ]
     );
     assert_eq!(updated.allowed_scopes, ["assets:read", "devices:read"]);
+}
+
+#[tokio::test]
+async fn tenant_account_manages_domain_profiles_inside_its_application() {
+    let (_directory, _store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+
+    let page = router
+        .clone()
+        .oneshot(platform_get(
+            "/tenant/applications/powermonitor",
+            Some(&tenant_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("PowerMonitor domain profile"));
+    assert!(page.contains("Asset containment rules"));
+    assert!(page.contains("const profileEndpoint"));
+    assert!(page.contains("/domain-profiles"));
+
+    let missing = router
+        .oneshot(platform_get(
+            "/tenant/applications/not-registered",
+            Some(&tenant_cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn tenant_account_application_domain_api_saves_profiles_and_asset_containment() {
+    let (_directory, _store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+    let endpoint = "/api/management/applications/powermonitor/domain-profiles";
+
+    let create_profile = |name: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(endpoint)
+            .header(CONTENT_TYPE, "application/json")
+            .header(COOKIE, &tenant_cookie)
+            .body(Body::from(
+                json!({
+                    "resource_kind": "asset",
+                    "name": name,
+                    "definition": {"fields": {"location": {"type": "string"}}},
+                    "live_view": {"live_charts": []}
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+
+    let farm = router
+        .clone()
+        .oneshot(create_profile("Power Farm"))
+        .await
+        .unwrap();
+    assert_eq!(farm.status(), StatusCode::CREATED);
+    let farm: serde_json::Value =
+        serde_json::from_slice(&to_bytes(farm.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let updated_farm = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("{endpoint}/{}", farm["id"].as_str().unwrap()))
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    json!({
+                        "name": "Primary Power Farm",
+                        "definition": {"fields": {"location": {"type": "string"}}},
+                        "live_view": {"live_charts": []}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_farm.status(), StatusCode::OK);
+
+    let zone = router
+        .clone()
+        .oneshot(create_profile("Power Zone"))
+        .await
+        .unwrap();
+    assert_eq!(zone.status(), StatusCode::CREATED);
+    let zone: serde_json::Value =
+        serde_json::from_slice(&to_bytes(zone.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let meter = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    json!({
+                        "resource_kind": "device",
+                        "name": "Power Meter",
+                        "definition": {"telemetry_schema": {"power_w": {"type": "number"}}},
+                        "live_view": {"live_charts": []}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(meter.status(), StatusCode::CREATED);
+    let meter: serde_json::Value =
+        serde_json::from_slice(&to_bytes(meter.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let relation = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/applications/powermonitor/asset-profile-relations")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    json!({
+                        "parent_profile_id": farm["id"],
+                        "child_profile_id": zone["id"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(relation.status(), StatusCode::CREATED);
+
+    let profiles = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(endpoint)
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(profiles.status(), StatusCode::OK);
+    let profiles: serde_json::Value =
+        serde_json::from_slice(&to_bytes(profiles.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(profiles.as_array().unwrap().len(), 3);
+
+    let asset = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/assets")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    json!({
+                        "name": "Application Domain Asset",
+                        "asset_profile_id": null,
+                        "parent_asset_id": null,
+                        "metadata": {},
+                        "attributes": {}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::CREATED);
+    let asset: serde_json::Value =
+        serde_json::from_slice(&to_bytes(asset.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    let device = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/management/devices")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(
+                    json!({
+                        "display_name": "Application Domain Device",
+                        "asset_id": asset["id"],
+                        "device_profile_id": null,
+                        "attributes": {}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(device.status(), StatusCode::CREATED);
+    let device: serde_json::Value =
+        serde_json::from_slice(&to_bytes(device.into_body(), usize::MAX).await.unwrap()).unwrap();
+
+    for (resource_kind, resource_id, profile_id) in [
+        (
+            "assets",
+            asset["id"].as_str().unwrap(),
+            farm["id"].as_str().unwrap(),
+        ),
+        (
+            "devices",
+            device["device_id"].as_str().unwrap(),
+            meter["id"].as_str().unwrap(),
+        ),
+    ] {
+        let assignment = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/api/management/applications/powermonitor/{resource_kind}/{resource_id}/domain-profile"
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(COOKIE, &tenant_cookie)
+                    .body(Body::from(json!({ "profile_id": profile_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(assignment.status(), StatusCode::NO_CONTENT);
+    }
 }
 
 #[tokio::test]

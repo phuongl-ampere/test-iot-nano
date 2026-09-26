@@ -284,6 +284,7 @@ pub trait PublicApiRepository: Send + Sync {
         &'a self,
         principal: &'a PublicPrincipal,
         device_id: Option<&'a str>,
+        asset_id: Option<Uuid>,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         after: Option<&'a str>,
@@ -450,6 +451,7 @@ impl PublicApiRepository for PlatformStore {
         &'a self,
         principal: &'a PublicPrincipal,
         device_id: Option<&'a str>,
+        asset_id: Option<Uuid>,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         after: Option<&'a str>,
@@ -457,7 +459,8 @@ impl PublicApiRepository for PlatformStore {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<PublicTelemetry>, PlatformStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            list_public_telemetry(self, principal, device_id, from, to, after, limit).await
+            list_public_telemetry(self, principal, device_id, asset_id, from, to, after, limit)
+                .await
         })
     }
 
@@ -1811,6 +1814,7 @@ async fn list_public_telemetry(
     store: &PlatformStore,
     principal: &PublicPrincipal,
     device_id: Option<&str>,
+    asset_id: Option<Uuid>,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     after: Option<&str>,
@@ -1825,11 +1829,22 @@ async fn list_public_telemetry(
         PlatformStore::Sqlite(store) => {
             let tenant_id = subject.tenant_id.to_string();
             let user_id = subject.user_id.to_string();
+            let asset_id = asset_id.map(|asset_id| asset_id.to_string());
             let cursor_at = cursor.as_ref().map(|value| value.0.to_rfc3339());
             let cursor_device = cursor.as_ref().map(|value| value.1.clone());
             let cursor_sequence = cursor.as_ref().map(|value| value.2);
             let rows = sqlx::query(
-                "WITH RECURSIVE candidates(device_id, asset_id, owner_user_id) AS (
+                "WITH RECURSIVE asset_tree(id, depth) AS (
+                     SELECT id, 0
+                     FROM assets
+                     WHERE tenant_id = ? AND id = ?
+                     UNION ALL
+                     SELECT asset.id, asset_tree.depth + 1
+                     FROM assets AS asset
+                     JOIN asset_tree ON asset.parent_asset_id = asset_tree.id
+                     WHERE asset.tenant_id = ? AND asset_tree.depth < 64
+                 ),
+                 candidates(device_id, asset_id, owner_user_id) AS (
                      SELECT device_id, asset_id, owner_user_id
                      FROM devices
                      WHERE tenant_id = ? AND deleted_at IS NULL
@@ -1885,12 +1900,20 @@ async fn list_public_telemetry(
                  WHERE t.tenant_id = ?
                    AND t.event_at >= ? AND t.event_at <= ?
                    AND (? IS NULL OR t.device_id = ?)
+                   AND (? IS NULL OR t.device_id IN (
+                        SELECT device_id
+                        FROM candidates
+                        WHERE asset_id IN (SELECT id FROM asset_tree)
+                   ))
                    AND (? IS NULL OR t.event_at > ?
                         OR (t.event_at = ? AND (t.device_id > ?
                             OR (t.device_id = ? AND t.sequence > ?))))
                  ORDER BY t.event_at, t.device_id, t.sequence
                  LIMIT ?",
             )
+            .bind(&tenant_id)
+            .bind(&asset_id)
+            .bind(&tenant_id)
             .bind(&tenant_id)
             .bind(&tenant_id)
             .bind(&user_id)
@@ -1905,6 +1928,7 @@ async fn list_public_telemetry(
             .bind(to.to_rfc3339())
             .bind(device_id)
             .bind(device_id)
+            .bind(&asset_id)
             .bind(&cursor_at)
             .bind(&cursor_at)
             .bind(&cursor_at)
@@ -1918,7 +1942,17 @@ async fn list_public_telemetry(
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "WITH RECURSIVE candidates(device_id, asset_id, owner_user_id) AS (
+                "WITH RECURSIVE asset_tree(id, depth) AS (
+                     SELECT id, 0
+                     FROM assets
+                     WHERE tenant_id = $1 AND id = $2::uuid
+                     UNION ALL
+                     SELECT asset.id, asset_tree.depth + 1
+                     FROM assets AS asset
+                     JOIN asset_tree ON asset.parent_asset_id = asset_tree.id
+                     WHERE asset.tenant_id = $1 AND asset_tree.depth < 64
+                 ),
+                 candidates(device_id, asset_id, owner_user_id) AS (
                      SELECT device_id, asset_id, owner_user_id
                      FROM devices
                      WHERE tenant_id = $1 AND deleted_at IS NULL
@@ -1936,7 +1970,7 @@ async fn list_public_telemetry(
                  ),
                  authorized(device_id) AS (
                      SELECT device_id FROM candidates
-                     WHERE owner_user_id = $2
+                     WHERE owner_user_id = $3
                      UNION
                      SELECT candidate.device_id
                      FROM candidates AS candidate
@@ -1944,12 +1978,12 @@ async fn list_public_telemetry(
                        ON permission.tenant_id = $1
                       AND permission.device_id = candidate.device_id
                       AND permission.revoked_at IS NULL
-                     WHERE permission.subject_user_id = $2
+                     WHERE permission.subject_user_id = $3
                         OR EXISTS (
                             SELECT 1 FROM user_group_members AS membership
                             WHERE membership.tenant_id = permission.tenant_id
                               AND membership.group_id = permission.subject_group_id
-                              AND membership.user_id = $2
+                              AND membership.user_id = $3
                         )
                      UNION
                      SELECT ancestors.device_id
@@ -1959,12 +1993,12 @@ async fn list_public_telemetry(
                       AND permission.asset_id = ancestors.asset_id
                       AND permission.inherit_children = TRUE
                       AND permission.revoked_at IS NULL
-                     WHERE permission.subject_user_id = $2
+                     WHERE permission.subject_user_id = $3
                         OR EXISTS (
                             SELECT 1 FROM user_group_members AS membership
                             WHERE membership.tenant_id = permission.tenant_id
                               AND membership.group_id = permission.subject_group_id
-                              AND membership.user_id = $2
+                              AND membership.user_id = $3
                         )
                  )
                  SELECT t.event_at, t.received_at, t.device_id, t.boot_id,
@@ -1972,19 +2006,26 @@ async fn list_public_telemetry(
                  FROM telemetry AS t
                  JOIN authorized ON authorized.device_id = t.device_id
                  WHERE t.tenant_id = $1
-                   AND t.event_at >= $3 AND t.event_at <= $4
-                   AND ($5::text IS NULL OR t.device_id = $5)
-                   AND ($6::timestamptz IS NULL OR t.event_at > $6
-                        OR (t.event_at = $6 AND (t.device_id > $7
-                            OR (t.device_id = $7 AND t.sequence > $8))))
+                   AND t.event_at >= $4 AND t.event_at <= $5
+                   AND ($6::text IS NULL OR t.device_id = $6)
+                   AND ($7::uuid IS NULL OR t.device_id IN (
+                        SELECT device_id
+                        FROM candidates
+                        WHERE asset_id IN (SELECT id FROM asset_tree)
+                   ))
+                   AND ($8::timestamptz IS NULL OR t.event_at > $8
+                        OR (t.event_at = $8 AND (t.device_id > $9
+                            OR (t.device_id = $9 AND t.sequence > $10))))
                  ORDER BY t.event_at, t.device_id, t.sequence
-                 LIMIT $9",
+                 LIMIT $11",
             )
             .bind(subject.tenant_id)
+            .bind(asset_id)
             .bind(subject.user_id)
             .bind(from)
             .bind(to)
             .bind(device_id)
+            .bind(asset_id)
             .bind(cursor.as_ref().map(|value| value.0))
             .bind(cursor.as_ref().map(|value| value.1.clone()))
             .bind(cursor.as_ref().map(|value| value.2))

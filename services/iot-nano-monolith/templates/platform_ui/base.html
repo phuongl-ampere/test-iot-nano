@@ -132,6 +132,9 @@
         </div>
         <div class="topbar-actions">
           <div class="account-label">{{ identity.label }}</div>
+          {% if identity.has_invitation_count() %}
+            <a class="account-label" href="/app/invitations">Invitations ({{ identity.invitation_count() }})</a>
+          {% endif %}
           {% block account_actions %}
             <form class="logout-form" action="/logout" method="post">
               <button class="logout-button" type="submit">Sign out</button>

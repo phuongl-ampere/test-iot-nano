@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 import type { Asset, Device } from "../lib/browser-api";
 
 type PowerMonitorTreeProps = {
@@ -17,6 +19,17 @@ export function PowerMonitorTree({
   selectedAssetId,
   selectedDeviceId,
 }: PowerMonitorTreeProps) {
+  const [expandedAssetIds, setExpandedAssetIds] = useState<Set<string>>(() => new Set());
+  const [hasInitializedExpansion, setHasInitializedExpansion] = useState(false);
+  const [isUnassignedExpanded, setIsUnassignedExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!hasInitializedExpansion && assets.length > 0) {
+      setExpandedAssetIds(new Set(assets.map((asset) => asset.id)));
+      setHasInitializedExpansion(true);
+    }
+  }, [assets, hasInitializedExpansion]);
+
   const childrenByAsset = new Map<string, Asset[]>();
   const roots: Asset[] = [];
   for (const asset of assets) {
@@ -43,7 +56,7 @@ export function PowerMonitorTree({
   const renderDevice = (device: Device, depth: number) => {
     const name = device.name ?? device.id;
     return (
-      <li className="tree-device" key={device.id} style={{ paddingInlineStart: depth * 16 }}>
+      <li className="tree-device tree-node" key={device.id} style={{ paddingInlineStart: depth * 16 }}>
         <button
           aria-current={selectedDeviceId === device.id ? "true" : undefined}
           aria-label={"Select " + name}
@@ -52,7 +65,7 @@ export function PowerMonitorTree({
           type="button"
         >
           <span aria-hidden="true" className={device.online ? "status-dot online" : "status-dot"} />
-          <span>{name}</span>
+          <span className="tree-label">{name}</span>
         </button>
       </li>
     );
@@ -66,21 +79,48 @@ export function PowerMonitorTree({
     nextSeen.add(asset.id);
     const children = (childrenByAsset.get(asset.id) ?? []).sort(assetName);
     const assignedDevices = (devicesByAsset.get(asset.id) ?? []).sort(deviceName);
+    const hasChildren = children.length > 0 || assignedDevices.length > 0;
+    const isExpanded = expandedAssetIds.has(asset.id);
     return (
-      <li className="tree-asset" key={asset.id}>
-        <button
-          aria-current={selectedAssetId === asset.id ? "true" : undefined}
-          aria-label={"Select " + asset.name}
-          className="tree-row"
-          onClick={() => onSelectAsset(asset.id)}
-          style={{ paddingInlineStart: depth * 16 }}
-          type="button"
-        >
-          <span aria-hidden="true" className="asset-mark" />
-          <span>{asset.name}</span>
-        </button>
-        {(children.length > 0 || assignedDevices.length > 0) && (
-          <ul>
+      <li className="tree-asset tree-node" key={asset.id}>
+        <div className="tree-node-row" style={{ paddingInlineStart: depth * 16 }}>
+          {hasChildren ? (
+            <button
+              aria-expanded={isExpanded}
+              aria-label={(isExpanded ? "Collapse " : "Expand ") + asset.name}
+              className="tree-disclosure"
+              onClick={() => {
+                setExpandedAssetIds((current) => {
+                  const next = new Set(current);
+                  if (next.has(asset.id)) {
+                    next.delete(asset.id);
+                  } else {
+                    next.add(asset.id);
+                  }
+                  return next;
+                });
+              }}
+              type="button"
+            >
+              <span aria-hidden="true">{isExpanded ? "-" : "+"}</span>
+            </button>
+          ) : (
+            <span aria-hidden="true" className="tree-disclosure-spacer" />
+          )}
+          <button
+            aria-current={selectedAssetId === asset.id ? "true" : undefined}
+            aria-label={"Select " + asset.name}
+            className="tree-row"
+            onClick={() => onSelectAsset(asset.id)}
+            type="button"
+          >
+            <span aria-hidden="true" className="asset-mark" />
+            <span className="tree-label">{asset.name}</span>
+            {hasChildren && <span className="tree-count">{children.length + assignedDevices.length}</span>}
+          </button>
+        </div>
+        {hasChildren && isExpanded && (
+          <ul className="tree-children">
             {children.map((child) => renderAsset(child, depth + 1, nextSeen))}
             {assignedDevices.map((device) => renderDevice(device, depth + 1))}
           </ul>
@@ -90,12 +130,24 @@ export function PowerMonitorTree({
   };
 
   return (
-    <nav aria-label="Asset explorer" className="powermonitor-tree">
+    <nav aria-label="Resources" className="powermonitor-tree">
       <ul>{roots.sort(assetName).map((asset) => renderAsset(asset, 0, new Set()))}</ul>
       {unassigned.length > 0 && (
         <section className="tree-unassigned">
-          <h3>Unassigned devices</h3>
-          <ul>{unassigned.sort(deviceName).map((device) => renderDevice(device, 0))}</ul>
+          <button
+            aria-expanded={isUnassignedExpanded}
+            className="tree-unassigned-toggle"
+            onClick={() => setIsUnassignedExpanded((expanded) => !expanded)}
+            type="button"
+          >
+            <span>Unassigned</span>
+            <span className="tree-count">{unassigned.length}</span>
+          </button>
+          {isUnassignedExpanded && (
+            <ul className="tree-children">
+              {unassigned.sort(deviceName).map((device) => renderDevice(device, 0))}
+            </ul>
+          )}
         </section>
       )}
       {assets.length === 0 && devices.length === 0 && (

@@ -17,8 +17,9 @@ use iot_nano_core::{
 };
 use iot_nano_foundation::StorageConfiguration;
 use iot_nano_mqttd::{
-    BrokerStorage, CachePort, CommandResponsePort, DeviceAuthorizationPort, MqttListenerConfig,
-    MqttRuntime, MqttRuntimeConfig, RetentionPolicy, RpcSessionRouter, SqliteStorage,
+    BrokerStorage, CachePort, CommandResponsePort, DeviceAuthorizationPort, DeviceClaimCodePort,
+    MqttListenerConfig, MqttRuntime, MqttRuntimeConfig, RetentionPolicy, RpcSessionRouter,
+    SqliteStorage,
 };
 use iot_nano_stream::{LocalStream, StreamConfig, StreamPort};
 use iot_storage::{PlatformStore, PlatformStoreError};
@@ -30,7 +31,7 @@ use crate::management::SystemInfrastructureStatus;
 use crate::{
     BootstrapSystemError, CacheError, ManagementSessionRouter, MonolithConfig, PersistentCache,
     PlatformCommandResponse, PlatformCommandTransport, PlatformCoreFacade,
-    PlatformDeviceAuthorization, Readiness,
+    PlatformDeviceAuthorization, PlatformDeviceClaimCode, Readiness,
 };
 
 const INTERNAL_DIRECTORY_MARKER: &str = ".iot-nano-monolith-state";
@@ -66,9 +67,6 @@ impl MonolithRuntime {
         username: &str,
         password: &str,
     ) -> Result<(), BootstrapSystemError> {
-        PlatformStore::backup_sqlite_before_migration(storage)
-            .await
-            .map_err(BootstrapSystemError::PlatformMigration)?;
         let platform = PlatformStore::open(storage)
             .await
             .map_err(BootstrapSystemError::PlatformMigration)?;
@@ -80,9 +78,6 @@ impl MonolithRuntime {
     pub async fn migrate(config: &MonolithConfig) -> Result<(), StartupError> {
         let internal_directory = prepare_internal_directory(&config.internal_dir)?;
         let instance_lock = InstanceLock::acquire_blocking(&internal_directory)?;
-        PlatformStore::backup_sqlite_before_migration(&config.storage)
-            .await
-            .map_err(StartupError::PlatformMigration)?;
         let platform = PlatformStore::open(&config.storage)
             .await
             .map_err(StartupError::PlatformMigration)?;
@@ -98,9 +93,6 @@ impl MonolithRuntime {
         let cancellation = CancellationToken::new();
         let failure_cancellation = CancellationToken::new();
         let http_cancellation = CancellationToken::new();
-        PlatformStore::backup_sqlite_before_migration(&config.storage)
-            .await
-            .map_err(StartupError::PlatformMigration)?;
         let platform = Arc::new(
             PlatformStore::open(&config.storage)
                 .await
@@ -139,6 +131,8 @@ impl MonolithRuntime {
             Arc::new(PlatformDeviceAuthorization::new(Arc::clone(&platform)));
         let command_responses: Arc<dyn CommandResponsePort> =
             Arc::new(PlatformCommandResponse::new(Arc::clone(&platform)));
+        let device_claim_codes: Arc<dyn DeviceClaimCodePort> =
+            Arc::new(PlatformDeviceClaimCode::new(Arc::clone(&platform)));
         let mqtt_storage_port: Arc<dyn BrokerStorage> = mqtt_storage.clone();
         let stream_port: Arc<dyn StreamPort> = stream.clone();
         let cache_port: Arc<dyn CachePort> = cache.clone();
@@ -192,6 +186,7 @@ impl MonolithRuntime {
             authorization: device_authorization,
             stream: stream_port,
             command_responses,
+            device_claim_codes: Some(device_claim_codes),
             cache: cache_port,
             session_router,
             cancellation: mqtt_cancellation.clone(),
@@ -356,7 +351,7 @@ pub enum StartupError {
         #[source]
         source: io::Error,
     },
-    #[error("platform storage migration failed")]
+    #[error("platform storage migration failed: {0}")]
     PlatformMigration(#[source] PlatformStoreError),
     #[error("stream recovery failed")]
     StreamRecovery(#[source] iot_nano_stream::StreamError),

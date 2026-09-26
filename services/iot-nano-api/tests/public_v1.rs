@@ -13,10 +13,14 @@ use chrono::{Duration, Utc};
 use iot_api::{
     CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreCommandRecord,
     CoreCommandResponseRequest, CoreFacade, CoreFacadeError, CoreTelemetryPoint,
-    CoreTelemetryQuery, TokenVault, public_v1_router,
+    CoreTelemetryQuery, TokenVault, create_platform_device_token, public_v1_router,
 };
 use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration};
-use iot_storage::{ApplicationKind, ApplicationRepository, NewApplication, PlatformStore};
+use iot_storage::{
+    ApplicationDomainProfileRepository, ApplicationDomainResourceKind, ApplicationKind,
+    ApplicationRepository, CreateApplicationDomainProfile, DeviceClaimPolicy,
+    DeviceClaimRepository, NewApplication, PlatformStore,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
@@ -29,6 +33,7 @@ const APPLICATION_ONLY_ACCESS_TOKEN: &str = "task-8-router-export-application-to
 const SHARED_ACCESS_TOKEN: &str = "task-8-router-export-shared-token";
 const COMMAND_RACE_TOKEN: &str = "task-8-router-export-command-race-token";
 const DEVICE_ID: &str = "task-8-router-export-device";
+const INVITED_ACCESS_TOKEN: &str = "task-8-router-export-invited-token";
 
 fn tenant_id() -> Uuid {
     Uuid::from_u128(10_004)
@@ -36,6 +41,10 @@ fn tenant_id() -> Uuid {
 
 fn user_id() -> Uuid {
     Uuid::from_u128(10_005)
+}
+
+fn invited_user_id() -> Uuid {
+    Uuid::from_u128(10_006)
 }
 
 fn access_token_hash(access_token: &str) -> String {
@@ -212,6 +221,25 @@ async fn exported_router_with_store() -> (
     .execute(pool)
     .await
     .unwrap();
+    for capability in [
+        "create_assets",
+        "create_devices",
+        "edit_resources",
+        "control_devices",
+        "share_owned_resources",
+        "assign_application_profiles",
+        "manage_device_tokens",
+    ] {
+        sqlx::query(
+            "INSERT INTO user_capabilities (user_id, tenant_id, capability) VALUES (?, ?, ?)",
+        )
+        .bind(user_id().to_string())
+        .bind(tenant_id().to_string())
+        .bind(capability)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
     sqlx::query("INSERT INTO devices (device_id, tenant_id, owner_user_id) VALUES (?, ?, ?)")
         .bind(DEVICE_ID)
         .bind(tenant_id().to_string())
@@ -237,6 +265,7 @@ async fn exported_router_with_store() -> (
                 "devices:read".to_owned(),
                 "devices:write".to_owned(),
                 "authorization:read".to_owned(),
+                "authorization:write".to_owned(),
                 "telemetry:read".to_owned(),
             ],
             enabled: true,
@@ -255,6 +284,7 @@ async fn exported_router_with_store() -> (
         "devices:read",
         "devices:write",
         "authorization:read",
+        "authorization:write",
         "telemetry:read",
     ])
     .to_string();
@@ -296,6 +326,142 @@ async fn exported_router_with_store() -> (
         core.clone(),
     );
     (directory, app, core, store)
+}
+
+#[tokio::test]
+async fn exported_public_resource_invitation_requires_recipient_acceptance() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query(
+        "DELETE FROM user_capabilities
+         WHERE user_id = ? AND tenant_id = ? AND capability = 'share_owned_resources'",
+    )
+    .bind(user_id().to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::hours(1);
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'public-invited-user', 'unused', 'viewer', 'user')",
+    )
+    .bind(invited_user_id().to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO oauth_access_tokens (
+            token_hash, app_id, tenant_id, user_id, scopes_json, issued_at, expires_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(access_token_hash(INVITED_ACCESS_TOKEN))
+    .bind(APP_ID)
+    .bind(tenant_id().to_string())
+    .bind(invited_user_id().to_string())
+    .bind(json!(["authorization:read", "authorization:write", "devices:read"]).to_string())
+    .bind(issued_at.to_rfc3339())
+    .bind(expires_at.to_rfc3339())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let owner_authorization = format!("Bearer {ACCESS_TOKEN}");
+    let invitation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/resource-invitations"))
+                .header(header::AUTHORIZATION, owner_authorization)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"username": "public-invited-user", "permission": "viewer"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invitation.status(), StatusCode::CREATED);
+    let invitation: Value =
+        serde_json::from_slice(&to_bytes(invitation.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let invitation_id = invitation["id"].as_str().unwrap();
+
+    let invited_authorization = format!("Bearer {INVITED_ACCESS_TOKEN}");
+    let devices_before_accept = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header(header::AUTHORIZATION, &invited_authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(devices_before_accept.status(), StatusCode::OK);
+    let devices_before_accept: Value = serde_json::from_slice(
+        &to_bytes(devices_before_accept.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(devices_before_accept["items"], json!([]));
+
+    let pending = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/resource-invitations")
+                .header(header::AUTHORIZATION, &invited_authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::OK);
+    let pending: Value =
+        serde_json::from_slice(&to_bytes(pending.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(pending["items"][0]["resource_kind"], "device");
+    assert_eq!(pending["items"][0]["resource_id"], DEVICE_ID);
+
+    let accepted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/resource-invitations/{invitation_id}/accept"
+                ))
+                .header(header::AUTHORIZATION, &invited_authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+
+    let devices_after_accept = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header(header::AUTHORIZATION, invited_authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(devices_after_accept.status(), StatusCode::OK);
+    let devices_after_accept: Value = serde_json::from_slice(
+        &to_bytes(devices_after_accept.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(devices_after_accept["items"][0]["device_id"], DEVICE_ID);
 }
 
 #[tokio::test]
@@ -348,6 +514,154 @@ async fn exported_public_router_mounts_resources_and_delegates_supplied_ports() 
 }
 
 #[tokio::test]
+async fn exported_public_command_allows_the_device_owner_without_global_control_capability() {
+    let (_directory, app, core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    sqlx::query("DELETE FROM user_capabilities WHERE user_id = ? AND tenant_id = ?")
+        .bind(user_id().to_string())
+        .bind(tenant_id().to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/devices/{DEVICE_ID}/commands"))
+            .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", "capability-gated-command")
+            .body(Body::from(
+                json!({"method":"setRelay","params":{"enabled":true}}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    let allowed = app.oneshot(request()).await.unwrap();
+    assert_eq!(allowed.status(), StatusCode::ACCEPTED);
+    assert_eq!(core.created.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn exported_public_claim_consumes_a_code_without_returning_it() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let device_id = format!("claim-via-public-api-{}", Uuid::now_v7());
+    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
+        .bind(&device_id)
+        .bind(tenant_id().to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    DeviceClaimRepository::update_device_claim_policy(
+        store.as_ref(),
+        tenant_id(),
+        DeviceClaimPolicy {
+            enabled: true,
+            ..DeviceClaimPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    let issued =
+        DeviceClaimRepository::issue_device_claim_code(store.as_ref(), tenant_id(), &device_id)
+            .await
+            .unwrap();
+
+    let claim_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/devices/claim")
+            .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"device_id": device_id, "code": issued.code}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    let denied = app.clone().oneshot(claim_request()).await.unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    sqlx::query(
+        "INSERT INTO user_capabilities (user_id, tenant_id, capability) VALUES (?, ?, 'claim_devices')",
+    )
+    .bind(user_id().to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let claimed = app.clone().oneshot(claim_request()).await.unwrap();
+    assert_eq!(claimed.status(), StatusCode::OK);
+    let body = to_bytes(claimed.into_body(), usize::MAX).await.unwrap();
+    let response: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["device_id"], device_id);
+    assert!(response.get("code").is_none());
+    assert!(!String::from_utf8_lossy(&body).contains(&issued.code));
+
+    let consumed = app.oneshot(claim_request()).await.unwrap();
+    assert_eq!(consumed.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn exported_public_user_capabilities_only_returns_the_callers_capabilities() {
+    let (_directory, app, _core, _store) = exported_router_with_store().await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/user-capabilities")
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        response["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("create_assets"))
+    );
+    assert!(response.get("username").is_none());
+}
+
+#[tokio::test]
+async fn exported_public_devices_include_current_runtime_health() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let seen_at = Utc::now();
+    sqlx::query("UPDATE devices SET last_seen_at = ? WHERE device_id = ?")
+        .bind(seen_at.to_rfc3339())
+        .bind(DEVICE_ID)
+        .execute(store.sqlite_pool().unwrap())
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/devices")
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["items"][0]["online"], true);
+    assert_eq!(
+        payload["items"][0]["last_seen_at"],
+        seen_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    );
+}
+
+#[tokio::test]
 async fn exported_public_router_rejects_an_unavailable_device_profile() {
     let (_directory, app, _core) = exported_router().await;
     let response = app
@@ -371,6 +685,470 @@ async fn exported_public_router_rejects_an_unavailable_device_profile() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn exported_public_device_live_view_ignores_a_legacy_global_profile_without_an_application_assignment()
+ {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO device_profiles (
+            id, tenant_id, name, telemetry_schema, metric_mapping, reporting_settings
+         ) VALUES (?, ?, 'Power Meter v1', '{}', '{}', ?)",
+    )
+    .bind(profile_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(
+        json!({
+            "live_charts": [{
+                "metric": "power_w",
+                "label": "Active power",
+                "unit": "W",
+                "color": "#167b83",
+                "aggregation": "last"
+            }]
+        })
+        .to_string(),
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE devices SET device_profile_id = ? WHERE device_id = ?")
+        .bind(profile_id.to_string())
+        .bind(DEVICE_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/live-view"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["profile"], Value::Null);
+    assert_eq!(payload["charts"], json!([]));
+}
+
+#[tokio::test]
+async fn exported_public_application_domain_profile_routes_use_the_oauth_application() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let profile = ApplicationDomainProfileRepository::create_application_domain_profile(
+        store.as_ref(),
+        tenant_id(),
+        CreateApplicationDomainProfile {
+            app_id: APP_ID.parse().unwrap(),
+            resource_kind: ApplicationDomainResourceKind::Device,
+            name: "Power Meter".to_owned(),
+            definition: json!({"telemetry_schema": {"power_w": {"type": "number"}}}),
+            live_view: json!({
+                "live_charts": [{
+                    "metric": "power_w",
+                    "label": "Active power",
+                    "unit": "W",
+                    "color": "#167b83",
+                    "aggregation": "last"
+                }]
+            }),
+        },
+    )
+    .await
+    .unwrap();
+
+    let catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/application-domain/profiles?kind=device")
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog.status(), StatusCode::OK);
+    let catalog: Value =
+        serde_json::from_slice(&to_bytes(catalog.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        catalog,
+        json!([{ "id": profile.id, "name": "Power Meter" }])
+    );
+
+    let assignment = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/application-profile"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"profile_id": profile.id}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assignment.status(), StatusCode::OK);
+
+    let view = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/live-view"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view.status(), StatusCode::OK);
+    let view: Value =
+        serde_json::from_slice(&to_bytes(view.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        view["profile"],
+        json!({"id": profile.id, "name": "Power Meter"})
+    );
+    assert_eq!(view["charts"][0]["metric"], "power_w");
+}
+
+#[tokio::test]
+async fn exported_public_profile_catalogs_are_scoped_to_the_token_tenant() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let device_profile_id = Uuid::now_v7();
+    let asset_profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO device_profiles (
+            id, tenant_id, name, telemetry_schema, metric_mapping, reporting_settings
+         ) VALUES (?, ?, 'Power Meter v1', '{}', '{}', '{}')",
+    )
+    .bind(device_profile_id.to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_profiles (id, tenant_id, name, fields, dashboard_defaults)
+         VALUES (?, ?, 'Power Farm v1', '{}', '{}')",
+    )
+    .bind(asset_profile_id.to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let device_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/device-profiles")
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let asset_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/asset-profiles")
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(device_response.status(), StatusCode::OK);
+    assert_eq!(asset_response.status(), StatusCode::OK);
+    let devices: Value = serde_json::from_slice(
+        &to_bytes(device_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let assets: Value = serde_json::from_slice(
+        &to_bytes(asset_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        devices,
+        json!([{ "id": device_profile_id, "name": "Power Meter v1" }])
+    );
+    assert_eq!(
+        assets,
+        json!([{ "id": asset_profile_id, "name": "Power Farm v1" }])
+    );
+}
+
+#[tokio::test]
+async fn exported_public_manager_can_assign_and_clear_a_device_profile() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let profile_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO device_profiles (
+            id, tenant_id, name, telemetry_schema, metric_mapping, reporting_settings
+         ) VALUES (?, ?, 'Power Meter v1', '{}', '{}', '{}')",
+    )
+    .bind(profile_id.to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let assign_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "device_profile_id": profile_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assign_response.status(), StatusCode::OK);
+
+    let clear_response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "device_profile_id": null }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(clear_response.status(), StatusCode::OK);
+    let cleared: Value = serde_json::from_slice(
+        &to_bytes(clear_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cleared["device_profile_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn exported_public_asset_live_view_ignores_a_legacy_global_profile_without_an_application_assignment()
+ {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let profile_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO asset_profiles (id, tenant_id, name, fields, dashboard_defaults)
+         VALUES (?, ?, 'Power Farm v1', '{}', ?)",
+    )
+    .bind(profile_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(
+        json!({
+            "live_charts": [{
+                "metric": "power_w",
+                "label": "Farm demand",
+                "unit": "W",
+                "color": "#d69731",
+                "aggregation": "sum"
+            }]
+        })
+        .to_string(),
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, asset_profile_id, owner_user_id)
+         VALUES (?, ?, 'Demo farm', ?, ?)",
+    )
+    .bind(asset_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(profile_id.to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/assets/{asset_id}/live-view"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["profile"], Value::Null);
+    assert_eq!(payload["charts"], json!([]));
+}
+
+#[tokio::test]
+async fn exported_public_manager_can_assign_and_clear_an_asset_profile() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let profile_id = Uuid::now_v7();
+    let asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO asset_profiles (id, tenant_id, name, fields, dashboard_defaults)
+         VALUES (?, ?, 'Power Farm v1', '{}', '{}')",
+    )
+    .bind(profile_id.to_string())
+    .bind(tenant_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, owner_user_id)
+         VALUES (?, ?, 'Demo farm', ?)",
+    )
+    .bind(asset_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let assign_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "asset_profile_id": profile_id }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(assign_response.status(), StatusCode::OK);
+
+    let clear_response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/assets/{asset_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "asset_profile_id": null }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(clear_response.status(), StatusCode::OK);
+    let cleared: Value = serde_json::from_slice(
+        &to_bytes(clear_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cleared["asset_profile_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn exported_public_asset_telemetry_is_limited_to_the_selected_asset_tree() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let root_asset_id = Uuid::now_v7();
+    let child_asset_id = Uuid::now_v7();
+    let other_device_id = "task-8-router-other-asset-device";
+    let event_at = Utc::now();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, parent_asset_id, owner_user_id)
+         VALUES (?, ?, 'Telemetry farm', NULL, ?), (?, ?, 'Telemetry zone', ?, ?)",
+    )
+    .bind(root_asset_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(user_id().to_string())
+    .bind(child_asset_id.to_string())
+    .bind(tenant_id().to_string())
+    .bind(root_asset_id.to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE devices SET asset_id = ? WHERE device_id = ?")
+        .bind(child_asset_id.to_string())
+        .bind(DEVICE_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, owner_user_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(other_device_id)
+    .bind(tenant_id().to_string())
+    .bind(user_id().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+    for (device_id, sequence) in [(DEVICE_ID, 1), (other_device_id, 2)] {
+        sqlx::query(
+            "INSERT INTO telemetry (
+                event_at, received_at, tenant_id, device_id, boot_id, sequence, measurements, topic
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'public-live-view')",
+        )
+        .bind(event_at.to_rfc3339())
+        .bind(event_at.to_rfc3339())
+        .bind(tenant_id().to_string())
+        .bind(device_id)
+        .bind(Uuid::now_v7().to_string())
+        .bind(sequence)
+        .bind(json!({ "power_w": 42.0 }).to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/telemetry?asset_id={root_asset_id}&aggregate=asset&from={}&to={}",
+                    (event_at - Duration::minutes(1))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    (event_at + Duration::minutes(1))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(payload["items"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["items"][0]["device_id"], DEVICE_ID);
 }
 
 #[tokio::test]
@@ -843,4 +1621,95 @@ async fn exported_public_router_scopes_alerts_to_the_token_tenant() {
             .await
             .unwrap();
     assert!(tenant_a_acknowledged_at.is_some());
+}
+
+#[tokio::test]
+async fn exported_public_owner_can_manage_a_device_token_and_alert_rules() {
+    let (_directory, app, _core, store) = exported_router_with_store().await;
+    let vault = TokenVault::from_key_material("task-8-router-export-vault");
+    let issued = create_platform_device_token(store.as_ref(), &vault, tenant_id(), DEVICE_ID)
+        .await
+        .unwrap();
+    let authorization = format!("Bearer {ACCESS_TOKEN}");
+
+    let revealed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/token"))
+                .header(header::AUTHORIZATION, &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revealed.status(), StatusCode::OK);
+    let revealed: Value =
+        serde_json::from_slice(&to_bytes(revealed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(revealed["token"], json!(issued.token));
+
+    let rotated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/token"))
+                .header(header::AUTHORIZATION, &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let rotated: Value =
+        serde_json::from_slice(&to_bytes(rotated.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_ne!(rotated["token"], revealed["token"]);
+
+    let created_rule = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/alert-rules"))
+                .header(header::AUTHORIZATION, &authorization)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "High active power",
+                        "metric_key": "power_w",
+                        "rule_type": "event_threshold",
+                        "comparison": "gt",
+                        "threshold": 500.0,
+                        "severity": "warning"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_rule.status(), StatusCode::CREATED);
+    let created_rule: Value = serde_json::from_slice(
+        &to_bytes(created_rule.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(created_rule["device_id"], json!(DEVICE_ID));
+
+    let rules = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/devices/{DEVICE_ID}/alert-rules"))
+                .header(header::AUTHORIZATION, authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rules.status(), StatusCode::OK);
+    let rules: Value =
+        serde_json::from_slice(&to_bytes(rules.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(rules["items"].as_array().unwrap().len(), 1);
+    assert_eq!(rules["items"][0]["id"], created_rule["id"]);
 }

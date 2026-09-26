@@ -6,20 +6,35 @@
 {% block navigation %}
   <a class="nav-link" href="/app">Devices</a>
   <a class="nav-link active" href="/app/assets" aria-current="page">Assets</a>
+  <a class="nav-link" href="/app/invitations">Invitations</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
     <p class="eyebrow">User Account</p>
     <h1>My Assets</h1>
-    <p>Assets you own or are permitted to view. This workspace is read-only.</p>
+    {% if page.can_manage %}
+      <p>Create assets and open resources you can access.</p>
+    {% else %}
+      <p>Assets you own or can access.</p>
+    {% endif %}
   </section>
+  {% if page.can_manage %}
+  <section class="workspace-panel">
+    <header class="panel-heading"><h2>Create asset</h2></header>
+    <form class="form-grid" action="/app/assets" method="post">
+      <label class="field"><span>Name</span><input name="name" type="text" maxlength="128" required></label>
+      <label class="field"><span>Parent asset</span><select name="parent_asset_id"><option value="">No parent</option>{% for asset in page.owned_assets %}<option value="{{ asset.asset_id }}">{{ asset.name }}</option>{% endfor %}</select></label>
+      <div class="form-actions"><button type="submit">Create asset</button></div>
+    </form>
+  </section>
+  {% endif %}
   <section class="workspace-panel">
     <header class="panel-heading">
       <div>
         <h2>Authorized assets</h2>
         <p class="panel-caption">Open an asset to inspect its containment and access context.</p>
       </div>
-      <span class="operation-note">Read-only</span>
+      <span class="operation-note">Authorized</span>
     </header>
     {% if page.assets.is_empty() %}
       <p class="empty-state">No assets are available to this account.</p>

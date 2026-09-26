@@ -34,6 +34,9 @@ describe("PowerMonitor refresh ownership", () => {
         alertRead += 1;
         return alertRead === 2 ? staleAlerts.promise : json({ items: [] });
       }
+      if (path === "/api/v1/resource-invitations") {
+        return json({ items: [] });
+      }
       if (path.startsWith("/api/v1/telemetry/device-1?")) {
         return json({ items: [{ at: "2026-09-13T10:00:00Z", power_w: deviceRead > 1 ? 75 : 20 }] });
       }
@@ -78,6 +81,9 @@ describe("PowerMonitor refresh ownership", () => {
       if (path === "/api/v1/assets" || path === "/api/v1/alerts") {
         return json({ items: [] });
       }
+      if (path === "/api/v1/resource-invitations") {
+        return json({ items: [] });
+      }
       if (path.startsWith("/api/v1/telemetry/device-1?")) {
         telemetryPaths.push(path);
         return json({ items: [{ at: "2026-09-13T10:00:00Z", power_w: 42 }] });
@@ -110,6 +116,53 @@ describe("PowerMonitor refresh ownership", () => {
       expect(lastPath).toBeDefined();
       expect(telemetryDuration(lastPath as string)).toBe(24 * 60 * 60 * 1_000);
     });
+  });
+
+  it("polls visible telemetry every five seconds and refreshes when the tab becomes visible", async () => {
+    let telemetryReads = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const path = typeof input === "string" ? input : input.toString();
+      if (path === "/api/v1/devices") {
+        return json({ items: [device(false)] });
+      }
+      if (path === "/api/v1/assets" || path === "/api/v1/alerts") {
+        return json({ items: [] });
+      }
+      if (path === "/api/v1/resource-invitations") {
+        return json({ items: [] });
+      }
+      if (path.startsWith("/api/v1/telemetry/device-1?")) {
+        telemetryReads += 1;
+        return json({ items: [{ at: "2026-09-13T10:00:00Z", power_w: telemetryReads }] });
+      }
+      throw new Error("Unexpected BFF request: " + path);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+
+    vi.useFakeTimers();
+    render(<PowerMonitorDashboard initialDeviceId="device-1" />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(telemetryReads).toBe(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(telemetryReads).toBe(2);
+
+    hidden.mockReturnValue(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(telemetryReads).toBe(2);
+
+    hidden.mockReturnValue(false);
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(telemetryReads).toBe(3);
   });
 });
 

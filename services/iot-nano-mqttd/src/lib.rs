@@ -52,7 +52,8 @@ pub use management::{
 pub use policy::{PolicyAdapters, PolicyError, build_policy};
 pub use ports::{
     AuthorizationError, CacheEntry, CacheError, CachePort, CommandResponseError,
-    CommandResponsePort, DeviceAuthorizationPort, GatewayAuthorization,
+    CommandResponsePort, DeviceAuthorizationPort, DeviceClaimCodeError, DeviceClaimCodeOutcome,
+    DeviceClaimCodePort, DeviceClaimCodeRejection, DeviceClaimCodeRequest, GatewayAuthorization,
     GatewayAuthorizationRequest, LocalDeviceAuthenticator, LocalRpcResponseForwarder,
     LocalStreamUplinkForwarder, LocalUplinkForwarder,
 };

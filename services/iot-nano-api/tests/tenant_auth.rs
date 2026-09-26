@@ -113,8 +113,8 @@ async fn tenant_authenticates_user_only_with_the_matching_tenant_slug() {
     let user_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO users (
-            id, tenant_id, username, password_hash, role, account_class, default_app
-         ) VALUES (?, ?, 'north-user', ?, 'viewer', 'user', '/app')",
+            id, tenant_id, username, password_hash, role, account_class
+         ) VALUES (?, ?, 'north-user', ?, 'viewer', 'user')",
     )
     .bind(user_id.to_string())
     .bind(north.id.to_string())

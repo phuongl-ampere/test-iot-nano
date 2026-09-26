@@ -1,13 +1,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  acceptResourceInvitation,
+  archiveDeviceAlertRule,
+  assignAssetApplicationProfile,
+  assignDeviceApplicationProfile,
+  cancelResourceInvitation,
+  claimDevice,
+  createAsset,
+  createDeviceAlertRule,
+  createDeviceResourceInvitation,
+  getAssetLiveView,
   getAssetTelemetry,
+  getDeviceLiveView,
   getDeviceTelemetry,
+  listDeviceAlertRules,
+  listApplicationDomainProfiles,
   listAlerts,
   listAssets,
   listDevices,
+  listResourceInvitations,
+  regenerateDeviceToken,
+  revealDeviceToken,
   sendDeviceCommandAndWait,
   submitDeviceCommand,
+  updateAsset,
+  updateDevice,
+  updateDeviceAlertRule,
 } from "../lib/browser-api";
 
 afterEach(() => {
@@ -15,6 +34,85 @@ afterEach(() => {
 });
 
 describe("browser PowerMonitor API", () => {
+  it("creates an asset with an optional parent and object metadata", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        id: "field-1",
+        metadata: {},
+        name: "North field",
+        parent_asset_id: "farm-1",
+      }), { status: 201 }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(createAsset({ name: "North field", parent_asset_id: "farm-1" })).resolves.toMatchObject({
+      id: "field-1",
+      name: "North field",
+      parent_id: "farm-1",
+    });
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/assets",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(JSON.parse(fetcher.mock.calls[0][1].body as string)).toEqual({
+      metadata: {},
+      name: "North field",
+      parent_asset_id: "farm-1",
+    });
+  });
+
+  it("sends a device claim code only in the JSON request body", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ device_id: "pairing-device", display_name: "Pairing device" }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(claimDevice("pairing-device", "ABCD-2345-EFGH")).resolves.toMatchObject({
+      id: "pairing-device",
+      name: "Pairing device",
+    });
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/devices/claim",
+      expect.objectContaining({
+        body: JSON.stringify({ device_id: "pairing-device", code: "ABCD-2345-EFGH" }),
+        method: "POST",
+      }),
+    );
+    expect(String(fetcher.mock.calls[0][0])).not.toContain("ABCD-2345-EFGH");
+  });
+
+  it("normalizes authorized public device fields while preserving top-level device state", async () => {
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        items: [{
+          asset_id: "asset-1",
+          device_id: "meter-1",
+          display_name: "Main meter",
+          effective_permission: "viewer",
+          brightness_pct: 72,
+          capabilities: ["switch", "brightness"],
+          metadata: { capabilities: ["switch"], switch_state: true },
+          online: true,
+          switch_state: false,
+        }],
+      }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listDevices()).resolves.toEqual([{
+      asset_id: "asset-1",
+      brightness_pct: 72,
+      capabilities: ["switch", "brightness"],
+      id: "meter-1",
+      name: "Main meter",
+      online: true,
+      permission: "viewer",
+      switch_state: false,
+    }]);
+  });
+
   it("uses same-origin generic BFF resources without a bearer token", async () => {
     const fetcher = vi
       .fn()
@@ -54,6 +152,58 @@ describe("browser PowerMonitor API", () => {
     expect(new Headers(fetcher.mock.calls[1][1].headers).get("authorization")).toBeNull();
   });
 
+  it("sends resource invitation actions through the same-origin BFF", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [{
+        id: "invite-1",
+        permission: "viewer",
+        resource_id: "meter-1",
+        resource_kind: "device",
+        resource_name: "Main meter",
+        sender_username: "owner-a",
+      }] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: "invite-2",
+        permission: "manager",
+        resource_id: "meter-1",
+        resource_kind: "device",
+        resource_name: "Main meter",
+        sender_username: "owner-a",
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listResourceInvitations()).resolves.toHaveLength(1);
+    await expect(createDeviceResourceInvitation("meter-1", "user-b", "manager")).resolves.toMatchObject({
+      id: "invite-2",
+      permission: "manager",
+    });
+    await expect(acceptResourceInvitation("invite-1")).resolves.toBeUndefined();
+    await expect(cancelResourceInvitation("invite-2")).resolves.toBeUndefined();
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/v1/devices/meter-1/resource-invitations",
+      expect.objectContaining({
+        body: JSON.stringify({ username: "user-b", permission: "manager" }),
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      3,
+      "/api/v1/resource-invitations/invite-1/accept",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      4,
+      "/api/v1/resource-invitations/invite-2/cancel",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("requests selected asset aggregate telemetry through the generic telemetry collection", async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ items: [{ at: "2026-09-13T10:00:00Z", power_w: 42 }] }), {
@@ -69,6 +219,163 @@ describe("browser PowerMonitor API", () => {
     expect(fetcher).toHaveBeenCalledWith(
       "/api/v1/telemetry?asset_id=asset-1&aggregate=asset&from=2026-09-13T09%3A00%3A00.000Z&to=2026-09-13T10%3A00%3A00.000Z",
       expect.objectContaining({ credentials: "same-origin" }),
+    );
+  });
+
+  it("loads only the selected resource profile chart configuration", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        profile: { id: "profile-meter", name: "Power Meter v1" },
+        charts: [{
+          metric: "power_w",
+          label: "Active power",
+          unit: "W",
+          color: "#167b83",
+          aggregation: "last",
+        }],
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        profile: { id: "profile-farm", name: "Power Farm v1" },
+        charts: [{
+          metric: "power_w",
+          label: "Farm demand",
+          unit: "W",
+          aggregation: "sum",
+        }],
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(getDeviceLiveView("meter-1")).resolves.toEqual({
+      profile: { id: "profile-meter", name: "Power Meter v1" },
+      charts: [{
+        metric: "power_w",
+        label: "Active power",
+        unit: "W",
+        color: "#167b83",
+        aggregation: "last",
+      }],
+    });
+    await expect(getAssetLiveView("asset-1")).resolves.toEqual({
+      profile: { id: "profile-farm", name: "Power Farm v1" },
+      charts: [{
+        metric: "power_w",
+        label: "Farm demand",
+        unit: "W",
+        aggregation: "sum",
+      }],
+    });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/v1/devices/meter-1/live-view",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/v1/assets/asset-1/live-view",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+  });
+
+  it("loads application-scoped profile catalogs and saves assignments through dedicated routes", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify([
+        { id: "meter-v1", name: "Power Meter v1" },
+      ]), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify([
+        { id: "farm-v1", name: "Power Farm v1" },
+      ]), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ profile_id: "meter-v1" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ profile_id: null }), { status: 200 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(listApplicationDomainProfiles("device")).resolves.toEqual([{ id: "meter-v1", name: "Power Meter v1" }]);
+    await expect(listApplicationDomainProfiles("asset")).resolves.toEqual([{ id: "farm-v1", name: "Power Farm v1" }]);
+    await expect(assignDeviceApplicationProfile("meter-1", "meter-v1")).resolves.toEqual({ profile_id: "meter-v1" });
+    await expect(assignAssetApplicationProfile("farm-1", null)).resolves.toEqual({ profile_id: null });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/v1/application-domain/profiles?kind=device",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/v1/application-domain/profiles?kind=asset",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      3,
+      "/api/v1/devices/meter-1/application-profile",
+      expect.objectContaining({
+        body: JSON.stringify({ profile_id: "meter-v1" }),
+        method: "PUT",
+      }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      4,
+      "/api/v1/assets/farm-1/application-profile",
+      expect.objectContaining({
+        body: JSON.stringify({ profile_id: null }),
+        method: "PUT",
+      }),
+    );
+  });
+
+  it("uses owner-scoped resource configuration routes through the BFF", async () => {
+    const rule = {
+      comparison: "gt" as const,
+      enabled: true,
+      for_seconds: 0,
+      metric_key: "power_w",
+      name: "High active power",
+      reopen_grace_seconds: 3_600,
+      reminder_interval_seconds: 86_400,
+      resolve_after_seconds: 300,
+      rule_type: "event_threshold" as const,
+      severity: "warning" as const,
+      threshold: 500,
+      window_seconds: null,
+    };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ device_id: "meter-1", display_name: "Renamed meter" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "farm-1", name: "Renamed farm" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "token-1", token: "iotn_old" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "token-2", token: "iotn_new" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...rule, device_id: "meter-1", id: "rule-1" }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...rule, device_id: "meter-1", id: "rule-1", threshold: 600 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetcher);
+
+    await expect(updateDevice("meter-1", { asset_id: null, display_name: "Renamed meter" })).resolves.toMatchObject({ name: "Renamed meter" });
+    await expect(updateAsset("farm-1", { name: "Renamed farm", parent_asset_id: null })).resolves.toMatchObject({ name: "Renamed farm" });
+    await expect(revealDeviceToken("meter-1")).resolves.toMatchObject({ token: "iotn_old" });
+    await expect(regenerateDeviceToken("meter-1")).resolves.toMatchObject({ token: "iotn_new" });
+    await expect(listDeviceAlertRules("meter-1")).resolves.toEqual([]);
+    await expect(createDeviceAlertRule("meter-1", rule)).resolves.toMatchObject({ id: "rule-1" });
+    await expect(updateDeviceAlertRule("meter-1", "rule-1", { ...rule, threshold: 600 })).resolves.toMatchObject({ threshold: 600 });
+    await expect(archiveDeviceAlertRule("meter-1", "rule-1")).resolves.toBeUndefined();
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/v1/devices/meter-1",
+      expect.objectContaining({ body: JSON.stringify({ asset_id: null, display_name: "Renamed meter" }), method: "PATCH" }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      4,
+      "/api/v1/devices/meter-1/token",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      7,
+      "/api/v1/devices/meter-1/alert-rules/rule-1",
+      expect.objectContaining({ method: "PUT" }),
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      8,
+      "/api/v1/devices/meter-1/alert-rules/rule-1",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 

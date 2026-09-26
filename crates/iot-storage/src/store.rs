@@ -1,14 +1,10 @@
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
-use sqlx::{Executor, PgPool, SqlitePool, postgres::PgPoolOptions, sqlite::SqlitePoolOptions};
+use sqlx::{Executor, PgPool, SqlitePool, postgres::PgPoolOptions};
 use thiserror::Error;
 
-use crate::{
-    ApplicationId, GatewayIngestValidationError, SQLITE_PLATFORM_SCHEMA_VERSION, SqliteStoreError,
-    backup_sqlite_pool_with_prefix, existing_pre_migration_backup, migrate_platform_timescale,
-    sqlite_backup_connect_options,
-};
+use crate::{ApplicationId, GatewayIngestValidationError, SqliteStoreError, schema::postgres};
 
 #[derive(Clone)]
 pub struct SqliteStore {
@@ -27,7 +23,7 @@ pub enum PlatformStoreError {
     #[error("platform storage configuration is incomplete")]
     InvalidConfiguration,
     #[error(
-        "platform Timescale schema table {table:?} predates tenant scoping; reset the development database before starting iot-nano"
+        "platform Timescale schema is not the current canonical schema at {table:?}; reset the development database before starting iot-nano"
     )]
     ResetRequiredTimescaleSchema { table: String },
     #[error(transparent)]
@@ -181,7 +177,7 @@ impl PlatformStore {
                     .max_connections(1)
                     .connect(database_url)
                     .await?;
-                migrate_platform_timescale(&migration_pool).await?;
+                postgres::migrate(&migration_pool).await?;
                 migration_pool.close().await;
 
                 let pool = PgPoolOptions::new()
@@ -199,58 +195,6 @@ impl PlatformStore {
                 Ok(Self::Timescale(pool))
             }
         }
-    }
-
-    /// Creates a coherent backup before a monolith upgrades an existing SQLite schema.
-    pub async fn backup_sqlite_before_migration(
-        configuration: &StorageConfiguration,
-    ) -> Result<Option<PathBuf>, PlatformStoreError> {
-        if configuration.storage != DatabaseStorage::Sqlite {
-            return Ok(None);
-        }
-        let path = configuration
-            .sqlite_path
-            .as_ref()
-            .ok_or(PlatformStoreError::InvalidConfiguration)?;
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(SqliteStoreError::Filesystem(error).into()),
-        };
-        if !metadata.is_file() {
-            return Err(SqliteStoreError::InvalidConfiguration.into());
-        }
-        if metadata.len() == 0 {
-            return Ok(None);
-        }
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(sqlite_backup_connect_options(
-                path,
-                configuration.sqlite_busy_timeout_ms,
-            ))
-            .await?;
-        let schema_version = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-            .fetch_one(&pool)
-            .await?;
-        let backup = if schema_version < SQLITE_PLATFORM_SCHEMA_VERSION {
-            match existing_pre_migration_backup(path, schema_version)? {
-                Some(path) => Some(path),
-                None => Some(
-                    backup_sqlite_pool_with_prefix(
-                        &pool,
-                        path,
-                        &format!("backup-v{schema_version}"),
-                    )
-                    .await?,
-                ),
-            }
-        } else {
-            None
-        };
-        pool.close().await;
-        Ok(backup)
     }
 
     pub fn sqlite_pool(&self) -> Option<&SqlitePool> {

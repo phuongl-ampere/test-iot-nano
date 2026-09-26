@@ -10,7 +10,7 @@ mod runtime;
 
 pub use adapters::{
     PlatformCommandResponse, PlatformCommandTransport, PlatformCoreFacade,
-    PlatformDeviceAuthorization,
+    PlatformDeviceAuthorization, PlatformDeviceClaimCode,
 };
 pub use cache::{CacheEntry, CacheError, PersistentCache};
 pub use config::{
@@ -21,20 +21,23 @@ pub use platform_ui::{
     LoginLayout, PlatformLoginPage, PlatformUiIdentity, PlatformUiRenderer,
     SystemInfrastructureLayout, SystemInfrastructurePage, SystemInfrastructureStatusRow,
     SystemLayout, SystemPlatformPage, SystemTenantRow, TenantAlertRow, TenantAlertsLayout,
-    TenantAlertsPage, TenantApplicationRow, TenantApplicationsLayout, TenantApplicationsPage,
-    TenantAssetProfilesLayout, TenantAssetProfilesPage, TenantAssetRow, TenantAssetsLayout,
-    TenantAssetsPage, TenantAuditLayout, TenantAuditPage, TenantAuditRow,
-    TenantDeviceCredentialLayout, TenantDeviceCredentialPage, TenantDeviceProfilesLayout,
-    TenantDeviceProfilesPage, TenantDeviceRow, TenantDeviceTokenRow, TenantDeviceTokensLayout,
-    TenantDeviceTokensPage, TenantDevicesLayout, TenantDevicesPage, TenantGroupMemberRow,
-    TenantGroupRow, TenantGroupsLayout, TenantGroupsPage, TenantLayout, TenantPermissionRow,
-    TenantPermissionsLayout, TenantPermissionsPage, TenantProfileRow, TenantRelationRow,
-    TenantRelationsLayout, TenantRelationsPage, TenantSelectOption, TenantTopologyLayout,
-    TenantTopologyPage, TenantTopologyRow, TenantUserRow, TenantUsersLayout, TenantUsersPage,
-    UserAssetDetailLayout, UserAssetDetailPage, UserAssetLayout, UserAssetListPage, UserAssetRow,
+    TenantAlertsPage, TenantApplicationAssetProfileRelationRow, TenantApplicationDomainLayout,
+    TenantApplicationDomainPage, TenantApplicationDomainProfileRow, TenantApplicationRow,
+    TenantApplicationsLayout, TenantApplicationsPage, TenantAssetProfilesLayout,
+    TenantAssetProfilesPage, TenantAssetRow, TenantAssetsLayout, TenantAssetsPage,
+    TenantAuditLayout, TenantAuditPage, TenantAuditRow, TenantDeviceClaimPolicyLayout,
+    TenantDeviceClaimPolicyPage, TenantDeviceCredentialLayout, TenantDeviceCredentialPage,
+    TenantDeviceProfilesLayout, TenantDeviceProfilesPage, TenantDeviceRow, TenantDevicesLayout,
+    TenantDevicesPage, TenantGroupMemberRow, TenantGroupRow, TenantGroupsLayout, TenantGroupsPage,
+    TenantLayout, TenantOverviewPage, TenantPermissionRow, TenantPermissionsLayout,
+    TenantPermissionsPage, TenantProfileRow, TenantRelationRow, TenantRelationsLayout,
+    TenantRelationsPage, TenantSelectOption, TenantTopologyLayout, TenantTopologyPage,
+    TenantTopologyRow, TenantUserRow, TenantUsersLayout, TenantUsersPage, UserAssetDetailLayout,
+    UserAssetDetailPage, UserAssetLayout, UserAssetListPage, UserAssetRow,
     UserAssetUnavailableLayout, UserDeviceAlertRow, UserDeviceDetailPage, UserDeviceLayout,
     UserDeviceListPage, UserDeviceRow, UserDeviceTelemetryRow, UserDeviceUnavailableLayout,
-    UserLayout,
+    UserInvitationPage, UserInvitationRow, UserInvitationsLayout, UserLayout,
+    UserResourcePermissionRow,
 };
 pub use readiness::Readiness;
 pub use runtime::{MonolithRuntime, ShutdownError, StartupError};

@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use iot_api::{hash_password, seed_tenant_test_users_sqlite};
+use iot_api::hash_password;
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_nano_monolith::{MonolithConfig, MonolithRuntime, bootstrap_system};
 use iot_storage::{
@@ -381,9 +381,16 @@ async fn alpha_runtime_uses_a_management_session_to_issue_a_public_pkce_code() {
     )
     .await
     .unwrap();
-    seed_tenant_test_users_sqlite(store.sqlite_pool().unwrap(), tenant.id)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'admin', ?, 'admin', 'admin')",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(tenant.id.to_string())
+    .bind(hash_password("NanoAdmin@1234").unwrap())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
     ApplicationRepository::upsert_application(
         store,
         NewApplication {

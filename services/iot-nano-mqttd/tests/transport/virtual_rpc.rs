@@ -1,9 +1,10 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use iot_nano_mqttd::{
-    AuthenticatedDevice, DeviceAuthenticator, MqttdDeviceTransport, RpcResponseForwarder,
+    AuthenticatedDevice, DeviceAuthenticator, DeviceClaimCodeError, DeviceClaimCodeOutcome,
+    DeviceClaimCodePort, DeviceClaimCodeRequest, MqttdDeviceTransport, RpcResponseForwarder,
     TransportAuthRequest, TransportError, TransportRpcResponse, TransportUplink, UplinkForwarder,
 };
 use rumqttc::{
@@ -68,6 +69,32 @@ struct RecordedUplink {
 }
 
 #[derive(Clone, Default)]
+struct RecordedClaimCodes {
+    requests: Arc<Mutex<Vec<DeviceClaimCodeRequest>>>,
+}
+
+impl DeviceClaimCodePort for RecordedClaimCodes {
+    fn issue(
+        &self,
+        request: DeviceClaimCodeRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<DeviceClaimCodeOutcome, DeviceClaimCodeError>> + Send + '_>,
+    > {
+        let requests = Arc::clone(&self.requests);
+        Box::pin(async move {
+            requests.lock().await.push(request.clone());
+            Ok(DeviceClaimCodeOutcome::Issued {
+                device_id: request.device_id,
+                code: "ABCD-7KMP-2QXZ".to_owned(),
+                expires_at: DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            })
+        })
+    }
+}
+
+#[derive(Clone, Default)]
 struct RecordedRpcResponses {
     responses: Arc<Mutex<Vec<TransportRpcResponse>>>,
 }
@@ -95,6 +122,238 @@ impl UplinkForwarder for RecordedUplink {
             Ok(())
         })
     }
+}
+
+#[tokio::test]
+async fn direct_device_receives_a_non_retained_pairing_code_response_for_a_v7_request() {
+    let claim_codes = RecordedClaimCodes::default();
+    let transport = MqttdDeviceTransport::new(StaticAuthenticator, RecordedUplink::default())
+        .with_device_claim_code_port(Arc::new(claim_codes.clone()));
+    let (server, client) = duplex(8 * 1024);
+    let server_task = tokio::spawn(async move { transport.serve_connection(server).await });
+    let mut client = Framed::new(
+        client,
+        Codec {
+            max_incoming_size: 1024 * 1024,
+            max_outgoing_size: 1024 * 1024,
+        },
+    );
+    let mut connect = Connect::new("pairing-client-a");
+    connect.set_login("iotd_test_device_token", "");
+    client.send(Packet::Connect(connect)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success
+    ));
+    client
+        .send(Packet::Subscribe(Subscribe {
+            pkid: 41,
+            filters: vec![SubscribeFilter {
+                path: "v1/devices/me/pairing/response/+".to_owned(),
+                qos: QoS::AtLeastOnce,
+            }],
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::SubAck(ack) if ack.pkid == 41
+    ));
+    let request_id = Uuid::now_v7();
+    let mut request = Publish::new(
+        "v1/devices/me/pairing/request",
+        QoS::AtLeastOnce,
+        serde_json::to_vec(&serde_json::json!({"request_id": request_id})).unwrap(),
+    );
+    request.pkid = 42;
+    client.send(Packet::Publish(request)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::PubAck(ack) if ack.pkid == 42
+    ));
+    let response = match client.next().await.unwrap().unwrap() {
+        Packet::Publish(response) => response,
+        packet => panic!("expected pairing response, got {packet:?}"),
+    };
+    assert_eq!(
+        response.topic,
+        format!("v1/devices/me/pairing/response/{request_id}")
+    );
+    assert_eq!(response.qos, QoS::AtLeastOnce);
+    assert!(!response.retain);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response.payload).unwrap(),
+        serde_json::json!({
+            "status": "issued",
+            "device_id": "device-a",
+            "code": "ABCD-7KMP-2QXZ",
+            "expires_at": "2030-01-01T00:00:00Z",
+        })
+    );
+    assert_eq!(
+        claim_codes.requests.lock().await.as_slice(),
+        &[DeviceClaimCodeRequest {
+            tenant_id: TEST_TENANT_ID,
+            device_id: "device-a".to_owned(),
+            request_id,
+        }]
+    );
+    drop(client);
+    assert!(server_task.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn gateway_pairing_request_is_denied_without_issuing_a_claim_code() {
+    let claim_codes = RecordedClaimCodes::default();
+    let transport =
+        MqttdDeviceTransport::new(StaticGatewayAuthenticator, RecordedUplink::default())
+            .with_device_claim_code_port(Arc::new(claim_codes.clone()));
+    let (server, client) = duplex(8 * 1024);
+    let server_task = tokio::spawn(async move { transport.serve_connection(server).await });
+    let mut client = Framed::new(
+        client,
+        Codec {
+            max_incoming_size: 1024 * 1024,
+            max_outgoing_size: 1024 * 1024,
+        },
+    );
+
+    let mut connect = Connect::new("pairing-gateway-client");
+    connect.set_login("iotd_test_gateway_token", "");
+    client.send(Packet::Connect(connect)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success
+    ));
+
+    let mut request = Publish::new(
+        "v1/devices/me/pairing/request",
+        QoS::AtLeastOnce,
+        serde_json::to_vec(&serde_json::json!({"request_id": Uuid::now_v7()})).unwrap(),
+    );
+    request.pkid = 43;
+    client.send(Packet::Publish(request)).await.unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(TransportError::ForbiddenTopic)
+    ));
+    assert!(claim_codes.requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn qos_zero_pairing_request_is_denied_without_issuing_a_claim_code() {
+    let claim_codes = RecordedClaimCodes::default();
+    let transport = MqttdDeviceTransport::new(StaticAuthenticator, RecordedUplink::default())
+        .with_device_claim_code_port(Arc::new(claim_codes.clone()));
+    let (server, client) = duplex(8 * 1024);
+    let server_task = tokio::spawn(async move { transport.serve_connection(server).await });
+    let mut client = Framed::new(
+        client,
+        Codec {
+            max_incoming_size: 1024 * 1024,
+            max_outgoing_size: 1024 * 1024,
+        },
+    );
+
+    let mut connect = Connect::new("pairing-qos-zero-client");
+    connect.set_login("iotd_test_device_token", "");
+    client.send(Packet::Connect(connect)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success
+    ));
+
+    client
+        .send(Packet::Publish(Publish::new(
+            "v1/devices/me/pairing/request",
+            QoS::AtMostOnce,
+            serde_json::to_vec(&serde_json::json!({"request_id": Uuid::now_v7()})).unwrap(),
+        )))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(TransportError::ForbiddenTopic)
+    ));
+    assert!(claim_codes.requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn non_v7_pairing_request_id_is_rejected_without_issuing_a_claim_code() {
+    let claim_codes = RecordedClaimCodes::default();
+    let transport = MqttdDeviceTransport::new(StaticAuthenticator, RecordedUplink::default())
+        .with_device_claim_code_port(Arc::new(claim_codes.clone()));
+    let (server, client) = duplex(8 * 1024);
+    let server_task = tokio::spawn(async move { transport.serve_connection(server).await });
+    let mut client = Framed::new(
+        client,
+        Codec {
+            max_incoming_size: 1024 * 1024,
+            max_outgoing_size: 1024 * 1024,
+        },
+    );
+
+    let mut connect = Connect::new("pairing-non-v7-client");
+    connect.set_login("iotd_test_device_token", "");
+    client.send(Packet::Connect(connect)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success
+    ));
+
+    let mut request = Publish::new(
+        "v1/devices/me/pairing/request",
+        QoS::AtLeastOnce,
+        serde_json::to_vec(&serde_json::json!({"request_id": Uuid::nil()})).unwrap(),
+    );
+    request.pkid = 44;
+    client.send(Packet::Publish(request)).await.unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(TransportError::InvalidPairingRequest)
+    ));
+    assert!(claim_codes.requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_pairing_request_is_rejected_without_issuing_a_claim_code() {
+    let claim_codes = RecordedClaimCodes::default();
+    let transport = MqttdDeviceTransport::new(StaticAuthenticator, RecordedUplink::default())
+        .with_device_claim_code_port(Arc::new(claim_codes.clone()));
+    let (server, client) = duplex(8 * 1024);
+    let server_task = tokio::spawn(async move { transport.serve_connection(server).await });
+    let mut client = Framed::new(
+        client,
+        Codec {
+            max_incoming_size: 1024 * 1024,
+            max_outgoing_size: 1024 * 1024,
+        },
+    );
+
+    let mut connect = Connect::new("pairing-malformed-client");
+    connect.set_login("iotd_test_device_token", "");
+    client.send(Packet::Connect(connect)).await.unwrap();
+    assert!(matches!(
+        client.next().await.unwrap().unwrap(),
+        Packet::ConnAck(ack) if ack.code == ConnectReturnCode::Success
+    ));
+
+    let mut request = Publish::new(
+        "v1/devices/me/pairing/request",
+        QoS::AtLeastOnce,
+        br#"{"request_id": }"#,
+    );
+    request.pkid = 45;
+    client.send(Packet::Publish(request)).await.unwrap();
+
+    assert!(matches!(
+        server_task.await.unwrap(),
+        Err(TransportError::InvalidPairingRequest)
+    ));
+    assert!(claim_codes.requests.lock().await.is_empty());
 }
 
 #[derive(Clone)]
@@ -334,7 +593,8 @@ async fn gateway_session_receives_child_command_on_the_gateway_virtual_topic() {
 }
 
 #[tokio::test]
-async fn two_way_response_is_forwarded_only_after_the_matching_virtual_rpc_is_published() {
+async fn two_way_response_with_idempotency_uuid_is_forwarded_after_the_matching_virtual_rpc_is_published()
+ {
     let responses = RecordedRpcResponses::default();
     let transport = MqttdDeviceTransport::new(StaticAuthenticator, RecordedUplink::default())
         .with_rpc_response_forwarder(responses.clone());
@@ -373,7 +633,7 @@ async fn two_way_response_is_forwarded_only_after_the_matching_virtual_rpc_is_pu
 
     let issued_at = Utc::now();
     let request = iot_nano_foundation::RpcRequest::with_mode(
-        Uuid::now_v7(),
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, b"public-api-idempotency-command"),
         "sample_now",
         serde_json::json!({}),
         issued_at,

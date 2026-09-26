@@ -2,15 +2,25 @@
 
 import { useState } from "react";
 
+import type { CommandMode } from "../lib/browser-api";
+
 type CommandPanelProps = {
   busy: boolean;
   disabled?: boolean;
-  onSubmit(method: string, params: Record<string, unknown>): void;
+  onSubmit(method: string, params: Record<string, unknown>, mode: CommandMode): void;
+  response?: Record<string, unknown> | null;
   state?: string | null;
 };
 
-export function CommandPanel({ busy, disabled = false, onSubmit, state = null }: CommandPanelProps) {
+export function CommandPanel({
+  busy,
+  disabled = false,
+  onSubmit,
+  response = null,
+  state = null,
+}: CommandPanelProps) {
   const [method, setMethod] = useState("sample_now");
+  const [mode, setMode] = useState<CommandMode>("one_way");
 
   return (
     <section aria-label="Send command" className="command-panel">
@@ -28,11 +38,34 @@ export function CommandPanel({ busy, disabled = false, onSubmit, state = null }:
             <option value="switch_off">Switch off</option>
           </select>
         </label>
-        <button disabled={busy || disabled} onClick={() => onSubmit(method, {})} type="button">
+        <div aria-label="Command delivery mode" className="command-mode" role="group">
+          <button
+            aria-pressed={mode === "one_way"}
+            disabled={busy || disabled}
+            onClick={() => setMode("one_way")}
+            type="button"
+          >
+            One-way
+          </button>
+          <button
+            aria-pressed={mode === "two_way"}
+            disabled={busy || disabled}
+            onClick={() => setMode("two_way")}
+            type="button"
+          >
+            Two-way
+          </button>
+        </div>
+        <button disabled={busy || disabled} onClick={() => onSubmit(method, {}, mode)} type="button">
           {busy ? "Sending" : "Send command"}
         </button>
       </div>
       {state !== null && <p className="command-state">Command state: {state}</p>}
+      {response !== null && (
+        <pre aria-label="Command response" className="command-response">
+          {JSON.stringify(response, null, 2)}
+        </pre>
+      )}
     </section>
   );
 }

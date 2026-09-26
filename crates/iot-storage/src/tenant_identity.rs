@@ -62,6 +62,7 @@ pub struct TenantSummary {
 pub struct TenantAccount {
     pub id: Uuid,
     pub tenant_id: Uuid,
+    pub username: String,
     pub status: AccountStatus,
     pub credential_version: i32,
 }
@@ -84,6 +85,13 @@ pub struct TenantUserCredential {
     pub user_id: Uuid,
     pub tenant_id: Uuid,
     pub password_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlatformAccountCredential {
+    System(SystemAccountCredential),
+    Tenant(TenantAccountCredential),
+    User(TenantUserCredential),
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +117,8 @@ pub enum TenantIdentityError {
     EmptySystemUsername,
     #[error("tenant slug must contain lowercase letters, digits, or hyphens")]
     InvalidTenantSlug,
+    #[error("tenant account username is required")]
+    EmptyTenantAccountUsername,
     #[error("password hash is required")]
     EmptyPasswordHash,
     #[error("stored tenant identity is invalid")]
@@ -166,7 +176,18 @@ impl TenantIdentityRepository {
         tenant: NewTenant,
         account: NewTenantAccount,
     ) -> Result<(Tenant, TenantAccount), TenantIdentityError> {
+        let username = tenant.slug.clone();
+        Self::create_tenant_with_named_account(store, tenant, username, account).await
+    }
+
+    pub async fn create_tenant_with_named_account(
+        store: &PlatformStore,
+        tenant: NewTenant,
+        username: String,
+        account: NewTenantAccount,
+    ) -> Result<(Tenant, TenantAccount), TenantIdentityError> {
         validate_tenant(&tenant)?;
+        validate_tenant_account_username(&username)?;
         if account.password_hash.is_empty() {
             return Err(TenantIdentityError::EmptyPasswordHash);
         }
@@ -180,6 +201,7 @@ impl TenantIdentityRepository {
         let account = TenantAccount {
             id: Uuid::now_v7(),
             tenant_id: tenant.id,
+            username,
             status: AccountStatus::Active,
             credential_version: 1,
         };
@@ -237,6 +259,7 @@ impl TenantIdentityRepository {
                     "SELECT
                         tenant_accounts.id AS account_id,
                         tenant_accounts.tenant_id AS account_tenant_id,
+                        tenant_accounts.username AS account_username,
                         tenant_accounts.password_hash,
                         tenant_accounts.credential_version,
                         tenants.id AS tenant_id,
@@ -258,6 +281,7 @@ impl TenantIdentityRepository {
                     "SELECT
                         tenant_accounts.id AS account_id,
                         tenant_accounts.tenant_id AS account_tenant_id,
+                        tenant_accounts.username AS account_username,
                         tenant_accounts.password_hash,
                         tenant_accounts.credential_version,
                         tenants.id AS tenant_id,
@@ -270,6 +294,58 @@ impl TenantIdentityRepository {
                        AND tenant_accounts.status = 'active'",
                 )
                 .bind(tenant_slug)
+                .fetch_optional(pool)
+                .await?;
+                row.map(tenant_account_credential_from_postgres).transpose()
+            }
+        }
+    }
+
+    pub async fn tenant_account_credential_by_username(
+        store: &PlatformStore,
+        username: &str,
+    ) -> Result<Option<TenantAccountCredential>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let row = sqlx::query(
+                    "SELECT
+                        tenant_accounts.id AS account_id,
+                        tenant_accounts.tenant_id AS account_tenant_id,
+                        tenant_accounts.username AS account_username,
+                        tenant_accounts.password_hash,
+                        tenant_accounts.credential_version,
+                        tenants.id AS tenant_id,
+                        tenants.slug,
+                        tenants.metadata
+                     FROM tenant_accounts
+                     JOIN tenants ON tenants.id = tenant_accounts.tenant_id
+                     WHERE tenant_accounts.username = ?
+                       AND tenants.status = 'active'
+                       AND tenant_accounts.status = 'active'",
+                )
+                .bind(username)
+                .fetch_optional(&store.pool)
+                .await?;
+                row.map(tenant_account_credential_from_sqlite).transpose()
+            }
+            PlatformStore::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT
+                        tenant_accounts.id AS account_id,
+                        tenant_accounts.tenant_id AS account_tenant_id,
+                        tenant_accounts.username AS account_username,
+                        tenant_accounts.password_hash,
+                        tenant_accounts.credential_version,
+                        tenants.id AS tenant_id,
+                        tenants.slug,
+                        tenants.metadata
+                     FROM tenant_accounts
+                     JOIN tenants ON tenants.id = tenant_accounts.tenant_id
+                     WHERE tenant_accounts.username = $1
+                       AND tenants.status = 'active'
+                       AND tenant_accounts.status = 'active'",
+                )
+                .bind(username)
                 .fetch_optional(pool)
                 .await?;
                 row.map(tenant_account_credential_from_postgres).transpose()
@@ -314,6 +390,55 @@ impl TenantIdentityRepository {
                 row.map(tenant_user_credential_from_postgres).transpose()
             }
         }
+    }
+
+    pub async fn tenant_user_credential_by_username(
+        store: &PlatformStore,
+        username: &str,
+    ) -> Result<Option<TenantUserCredential>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => {
+                let row = sqlx::query(
+                    "SELECT users.id, users.tenant_id, users.password_hash
+                     FROM users
+                     JOIN tenants ON tenants.id = users.tenant_id
+                     WHERE users.username = ? AND tenants.status = 'active'",
+                )
+                .bind(username)
+                .fetch_optional(&store.pool)
+                .await?;
+                row.map(tenant_user_credential_from_sqlite).transpose()
+            }
+            PlatformStore::Timescale(pool) => {
+                let row = sqlx::query(
+                    "SELECT users.id, users.tenant_id, users.password_hash
+                     FROM users
+                     JOIN tenants ON tenants.id = users.tenant_id
+                     WHERE users.username = $1 AND tenants.status = 'active'",
+                )
+                .bind(username)
+                .fetch_optional(pool)
+                .await?;
+                row.map(tenant_user_credential_from_postgres).transpose()
+            }
+        }
+    }
+
+    pub async fn platform_account_credential(
+        store: &PlatformStore,
+        username: &str,
+    ) -> Result<Option<PlatformAccountCredential>, TenantIdentityError> {
+        if let Some(credential) = Self::system_account_credential(store, username).await? {
+            return Ok(Some(PlatformAccountCredential::System(credential)));
+        }
+        if let Some(credential) =
+            Self::tenant_account_credential_by_username(store, username).await?
+        {
+            return Ok(Some(PlatformAccountCredential::Tenant(credential)));
+        }
+        Self::tenant_user_credential_by_username(store, username)
+            .await
+            .map(|credential| credential.map(PlatformAccountCredential::User))
     }
 
     pub async fn list_tenants(store: &PlatformStore) -> Result<Vec<Tenant>, TenantIdentityError> {
@@ -433,7 +558,7 @@ impl TenantIdentityRepository {
                 let mut transaction = store.pool.begin().await?;
                 let row = sqlx::query(
                     "SELECT tenant_accounts.id, tenant_accounts.tenant_id, tenant_accounts.status,
-                            tenant_accounts.credential_version
+                            tenant_accounts.username, tenant_accounts.credential_version
                      FROM tenant_accounts
                      JOIN tenants ON tenants.id = tenant_accounts.tenant_id
                      WHERE tenants.slug = ? AND tenants.status <> 'deleted'",
@@ -463,7 +588,7 @@ impl TenantIdentityRepository {
                 let mut transaction = pool.begin().await?;
                 let row = sqlx::query(
                     "SELECT tenant_accounts.id, tenant_accounts.tenant_id, tenant_accounts.status,
-                            tenant_accounts.credential_version
+                            tenant_accounts.username, tenant_accounts.credential_version
                      FROM tenant_accounts
                      JOIN tenants ON tenants.id = tenant_accounts.tenant_id
                      WHERE tenants.slug = $1 AND tenants.status <> 'deleted'
@@ -508,7 +633,7 @@ impl TenantIdentityRepository {
                          WHERE slug = ? AND status <> 'deleted'
                      )
                        AND status = 'active'
-                     RETURNING id, tenant_id, status, credential_version",
+                     RETURNING id, tenant_id, username, status, credential_version",
                 )
                 .bind(tenant_slug)
                 .fetch_optional(&store.pool)
@@ -527,7 +652,8 @@ impl TenantIdentityRepository {
                        AND tenants.status <> 'deleted'
                        AND tenant_accounts.status = 'active'
                      RETURNING tenant_accounts.id, tenant_accounts.tenant_id,
-                               tenant_accounts.status, tenant_accounts.credential_version",
+                               tenant_accounts.username, tenant_accounts.status,
+                               tenant_accounts.credential_version",
                 )
                 .bind(tenant_slug)
                 .fetch_optional(pool)
@@ -618,6 +744,7 @@ fn tenant_account_credential_from_sqlite(
         account: TenantAccount {
             id: parse_uuid(row.try_get::<String, _>("account_id")?)?,
             tenant_id,
+            username: row.try_get("account_username")?,
             status: AccountStatus::Active,
             credential_version: row.try_get("credential_version")?,
         },
@@ -678,6 +805,7 @@ fn tenant_account_credential_from_postgres(
         account: TenantAccount {
             id: row.try_get("account_id")?,
             tenant_id,
+            username: row.try_get("account_username")?,
             status: AccountStatus::Active,
             credential_version: row.try_get("credential_version")?,
         },
@@ -715,6 +843,7 @@ fn tenant_account_from_sqlite(row: SqliteRow) -> Result<TenantAccount, TenantIde
     Ok(TenantAccount {
         id: parse_uuid(row.try_get::<String, _>("id")?)?,
         tenant_id: parse_uuid(row.try_get::<String, _>("tenant_id")?)?,
+        username: row.try_get("username")?,
         status: account_status_from_str(&row.try_get::<String, _>("status")?)?,
         credential_version: row.try_get("credential_version")?,
     })
@@ -724,6 +853,7 @@ fn tenant_account_from_postgres(row: PgRow) -> Result<TenantAccount, TenantIdent
     Ok(TenantAccount {
         id: row.try_get("id")?,
         tenant_id: row.try_get("tenant_id")?,
+        username: row.try_get("username")?,
         status: account_status_from_str(&row.try_get::<String, _>("status")?)?,
         credential_version: row.try_get("credential_version")?,
     })
@@ -765,11 +895,12 @@ async fn create_sqlite_tenant_with_account(
         .execute(&mut *transaction)
         .await?;
     sqlx::query(
-        "INSERT INTO tenant_accounts (id, tenant_id, password_hash, status, credential_version)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO tenant_accounts (id, tenant_id, username, password_hash, status, credential_version)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(account.id.to_string())
     .bind(account.tenant_id.to_string())
+    .bind(&account.username)
     .bind(password_hash)
     .bind(account.status.as_str())
     .bind(account.credential_version)
@@ -793,11 +924,12 @@ async fn create_timescale_tenant_with_account(
         .execute(&mut *transaction)
         .await?;
     sqlx::query(
-        "INSERT INTO tenant_accounts (id, tenant_id, password_hash, status, credential_version)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO tenant_accounts (id, tenant_id, username, password_hash, status, credential_version)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(account.id)
     .bind(account.tenant_id)
+    .bind(&account.username)
     .bind(password_hash)
     .bind(account.status.as_str())
     .bind(account.credential_version)
@@ -824,6 +956,13 @@ fn validate_tenant(tenant: &NewTenant) -> Result<(), TenantIdentityError> {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
         return Err(TenantIdentityError::InvalidTenantSlug);
+    }
+    Ok(())
+}
+
+fn validate_tenant_account_username(value: &str) -> Result<(), TenantIdentityError> {
+    if value.is_empty() {
+        return Err(TenantIdentityError::EmptyTenantAccountUsername);
     }
     Ok(())
 }

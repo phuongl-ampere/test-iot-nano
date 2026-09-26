@@ -29,6 +29,39 @@ pub enum CommandResponseError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DeviceClaimCodeError {
+    #[error("device claim service unavailable")]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceClaimCodeRequest {
+    pub tenant_id: Uuid,
+    pub device_id: String,
+    pub request_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceClaimCodeRejection {
+    Unavailable,
+    Disabled,
+    CoolingDown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceClaimCodeOutcome {
+    Issued {
+        device_id: String,
+        code: String,
+        expires_at: DateTime<Utc>,
+    },
+    Rejected {
+        reason: DeviceClaimCodeRejection,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CacheError {
     #[error("cache key cannot be empty")]
     EmptyKey,
@@ -118,6 +151,15 @@ pub trait CommandResponsePort: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), CommandResponseError>> + Send + '_>>;
 }
 
+pub trait DeviceClaimCodePort: Send + Sync {
+    fn issue(
+        &self,
+        request: DeviceClaimCodeRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<DeviceClaimCodeOutcome, DeviceClaimCodeError>> + Send + '_>,
+    >;
+}
+
 #[derive(Clone)]
 pub struct LocalDeviceAuthenticator {
     authorization: Arc<dyn DeviceAuthorizationPort>,
@@ -191,7 +233,7 @@ impl UplinkForwarder for LocalStreamUplinkForwarder {
                 let payload: DeviceTelemetryPayload = serde_json::from_slice(&message.payload)
                     .map_err(|_| TransportError::InvalidUplinkPayload)?;
                 let event = payload
-                    .into_event(message.device.device_id.clone())
+                    .into_event(message.device.device_id.clone(), message.received_at)
                     .map_err(|_| TransportError::InvalidUplinkPayload)?;
                 stream
                     .append(

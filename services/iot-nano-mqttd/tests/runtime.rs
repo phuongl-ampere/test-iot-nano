@@ -741,6 +741,7 @@ fn runtime_config(
         authorization,
         stream: Arc::new(TestStream),
         command_responses: Arc::new(TestResponses),
+        device_claim_codes: None,
         cache: Arc::new(TestCache),
         session_router: Default::default(),
         cancellation: CancellationToken::new(),

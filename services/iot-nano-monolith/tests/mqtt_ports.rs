@@ -74,6 +74,7 @@ impl MonolithMqttFixture {
             authorization: authorization.clone(),
             stream: stream.clone(),
             command_responses: responses.clone(),
+            device_claim_codes: None,
             cache,
             session_router: Default::default(),
             cancellation: Default::default(),

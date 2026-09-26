@@ -180,7 +180,7 @@ async fn migrate_only_waits_for_the_internal_instance_lock_before_migrating_or_b
 }
 
 #[tokio::test]
-async fn migrate_only_creates_a_sqlite_backup_before_upgrading_an_existing_platform() {
+async fn migrate_only_rejects_an_unmarked_sqlite_database_without_creating_a_backup() {
     let fixture = Fixture::new();
     let mut runtime = MonolithRuntime::start(fixture.config.clone())
         .await
@@ -190,20 +190,25 @@ async fn migrate_only_creates_a_sqlite_backup_before_upgrading_an_existing_platf
         .await
         .unwrap();
 
+    fixture.remove_platform_state();
     let platform_path = fixture.config.storage.sqlite_path.as_ref().unwrap();
     let connection = rusqlite::Connection::open(platform_path).unwrap();
     connection
         .execute_batch(
-            "INSERT INTO devices (device_id) VALUES ('backup-before-upgrade');
-             PRAGMA user_version = 0;",
+            "CREATE TABLE legacy_state (id INTEGER PRIMARY KEY);
+             INSERT INTO legacy_state (id) VALUES (1);",
         )
         .unwrap();
     drop(connection);
 
     let output = fixture.migration_command().output().unwrap();
     assert!(
-        output.status.success(),
-        "migrate-only failed instead of preserving a pre-upgrade SQLite backup: {output:?}"
+        !output.status.success(),
+        "migrate-only accepted an unmarked SQLite database: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("reset the development database"),
+        "migrate-only did not explain the required reset: {output:?}"
     );
 
     let file_name = platform_path.file_name().unwrap().to_str().unwrap();
@@ -216,17 +221,15 @@ async fn migrate_only_creates_a_sqlite_backup_before_upgrading_an_existing_platf
                 .is_some_and(|name| name.starts_with(&format!("{file_name}.backup-")))
         })
         .collect::<Vec<_>>();
-    assert_eq!(backups.len(), 1, "expected one pre-upgrade SQLite backup");
-    assert!(backups[0].metadata().unwrap().len() > 0);
-    let backup = rusqlite::Connection::open(&backups[0]).unwrap();
-    let device_id: String = backup
-        .query_row(
-            "SELECT device_id FROM devices WHERE device_id = 'backup-before-upgrade'",
-            [],
-            |row| row.get(0),
-        )
+    assert!(
+        backups.is_empty(),
+        "hard cutover must not create upgrade backups"
+    );
+    let connection = rusqlite::Connection::open(platform_path).unwrap();
+    let row_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM legacy_state", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(device_id, "backup-before-upgrade");
+    assert_eq!(row_count, 1, "migrate-only modified the rejected database");
 
     fixture.assert_configured_addresses_are_unbound();
 }

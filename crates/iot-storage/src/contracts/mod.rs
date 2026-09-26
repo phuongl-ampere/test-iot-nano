@@ -1,5 +1,6 @@
 mod alerts;
 mod application;
+mod application_domain;
 mod commands;
 mod identity;
 mod resources;
@@ -17,6 +18,12 @@ pub use application::{
     NewApplication, NewOAuthAuthorizationCode, NewOAuthClientSecret, OAuthAccessTokenRecord,
     OAuthAuthorizationCodeExchange, OAuthClientCredentialsToken, OAuthRepository, RedirectUri,
 };
+pub use application_domain::{
+    ApplicationAssetProfileRelation, ApplicationDomainProfile, ApplicationDomainProfileError,
+    ApplicationDomainProfileRepository, ApplicationDomainResourceKind,
+    CreateApplicationAssetProfileRelation, CreateApplicationDomainProfile,
+    UpdateApplicationDomainProfile,
+};
 pub use commands::{
     CommandLifecycleRepository, CommandOutboxRecord, CommandOutboxState, CommandRepository,
     NewCommandOutboxEntry, NotificationKind, NotificationOutboxRecord, NotificationOutboxState,
@@ -31,9 +38,10 @@ pub use resources::{
     AccountClass, AuthorizationRepository, AuthorizationSubject, AuthorizedAssetListEntry,
     AuthorizedAssetSummary, AuthorizedDeviceListEntry, AuthorizedDeviceSummary,
     NewResourcePermission, NewUserGroup, OwnershipTransferTarget, PermissionCreator,
-    ResourceAccess, ResourceAccessSource, ResourceKind, ResourcePermission,
-    ResourcePermissionRecord, TenantAuthorizationError, TenantAuthorizationRepository,
-    TenantUserGroup, TenantUserGroupMember, UserDeviceActivity, UserDeviceActivityRepository,
-    UserDeviceAlert, UserDeviceTelemetry, UserGroup,
+    ResourceAccess, ResourceAccessSource, ResourceInvitation, ResourceInvitationRepository,
+    ResourceInvitationState, ResourceKind, ResourcePermission, ResourcePermissionRecord,
+    TenantAuthorizationError, TenantAuthorizationRepository, TenantUserGroup,
+    TenantUserGroupMember, UserDeviceActivity, UserDeviceActivityRepository, UserDeviceAlert,
+    UserDeviceTelemetry, UserGroup,
 };
 pub use telemetry::{TelemetryAggregate, TelemetryAggregateRepository, TelemetryRepository};

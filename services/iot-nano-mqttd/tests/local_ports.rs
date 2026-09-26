@@ -900,11 +900,7 @@ fn direct_uplink() -> TransportUplink {
         device: device(),
         topic: "v1/devices/me/telemetry".to_owned(),
         payload: serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "boot_id": "c9c04d99-4e01-4f94-82a8-9e229e47c093",
-            "sequence": 1,
-            "event_at": "2026-09-10T08:00:00Z",
-            "measurements": {"temperature_c": 26.4},
+            "temperature_c": 26.4,
         }))
         .unwrap(),
         qos: QoS::AtLeastOnce,

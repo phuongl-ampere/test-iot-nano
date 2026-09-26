@@ -6,20 +6,48 @@
 {% block navigation %}
   <a class="nav-link active" href="/app" aria-current="page">Devices</a>
   <a class="nav-link" href="/app/assets">Assets</a>
+  <a class="nav-link" href="/app/invitations">Invitations</a>
 {% endblock %}
 {% block content %}
   <section class="page-heading">
     <p class="eyebrow">User Account</p>
     <h1>My Devices</h1>
-    <p>Devices you own or are permitted to view. This workspace is read-only.</p>
+    {% if page.can_manage %}
+      <p>Create devices and open resources you can access.</p>
+    {% else %}
+      <p>Devices you own or can access.</p>
+    {% endif %}
   </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  {% if page.can_manage %}
+  <section class="workspace-panel">
+    <header class="panel-heading"><h2>Create device</h2></header>
+    <form class="form-grid" action="/app/devices" method="post">
+      <label class="field"><span>Display name</span><input name="display_name" type="text" maxlength="128" required></label>
+      <label class="field"><span>Asset</span><select name="asset_id"><option value="">Unassigned</option>{% for asset in page.owned_assets %}<option value="{{ asset.asset_id }}">{{ asset.name }}</option>{% endfor %}</select></label>
+      <div class="form-actions"><button type="submit">Create device</button></div>
+    </form>
+  </section>
+  {% endif %}
+  {% if page.can_claim_devices %}
+  <section class="workspace-panel">
+    <header class="panel-heading"><h2>Add device</h2></header>
+    <form class="form-grid" action="/app/devices/claim" method="post">
+      <label class="field"><span>Device ID</span><input name="device_id" type="text" maxlength="128" required></label>
+      <label class="field"><span>Pairing code</span><input name="code" type="text" autocomplete="one-time-code" maxlength="40" required></label>
+      <div class="form-actions"><button type="submit">Add device</button></div>
+    </form>
+  </section>
+  {% endif %}
   <section class="workspace-panel">
     <header class="panel-heading">
       <div>
         <h2>Authorized devices</h2>
         <p class="panel-caption">Open a device to inspect its access, telemetry, and alerts.</p>
       </div>
-      <span class="operation-note">Read-only</span>
+      <span class="operation-note">Authorized</span>
     </header>
     {% if page.devices.is_empty() %}
       <p class="empty-state">No devices are available to this account.</p>

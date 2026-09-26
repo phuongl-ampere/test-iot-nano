@@ -59,25 +59,41 @@ async fn sqlite_schema_enforces_system_tenant_and_tenant_account_identity_roots(
     assert!(duplicate_slug.is_err());
 
     sqlx::query(
-        "INSERT INTO tenant_accounts (id, tenant_id, password_hash, status, credential_version)
-         VALUES (?, ?, ?, 'active', 1)",
+        "INSERT INTO tenant_accounts (
+             id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?, ?, ?, ?, 'active', 1)",
     )
     .bind("tenant-account-1")
     .bind("tenant-1")
+    .bind("north-admin")
     .bind("hash")
     .execute(pool)
     .await
     .unwrap();
     let duplicate_tenant_account = sqlx::query(
-        "INSERT INTO tenant_accounts (id, tenant_id, password_hash, status, credential_version)
-         VALUES (?, ?, ?, 'active', 1)",
+        "INSERT INTO tenant_accounts (
+             id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?, ?, ?, ?, 'active', 1)",
     )
     .bind("tenant-account-2")
     .bind("tenant-1")
+    .bind("north-admin-2")
     .bind("hash")
     .execute(pool)
     .await;
     assert!(duplicate_tenant_account.is_err());
+
+    let duplicate_platform_username = sqlx::query(
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, ?, ?, 'viewer', 'user')",
+    )
+    .bind("user-1")
+    .bind("tenant-1")
+    .bind("north-admin")
+    .bind("hash")
+    .execute(pool)
+    .await;
+    assert!(duplicate_platform_username.is_err());
 }
 
 #[tokio::test]
@@ -272,8 +288,8 @@ async fn sqlite_schema_requires_tenant_id_for_every_user() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
     let missing_tenant = sqlx::query(
-        "INSERT INTO users (id, username, password_hash, role, account_class, default_app)
-         VALUES (?, ?, ?, 'viewer', 'user', '/app')",
+        "INSERT INTO users (id, username, password_hash, role, account_class)
+         VALUES (?, ?, ?, 'viewer', 'user')",
     )
     .bind("user-without-tenant")
     .bind("without-tenant")
@@ -289,8 +305,8 @@ async fn sqlite_schema_requires_tenant_id_for_every_user() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class, default_app)
-         VALUES (?, ?, ?, ?, 'viewer', 'user', '/app')",
+        "INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, ?, ?, 'viewer', 'user')",
     )
     .bind("user-with-tenant")
     .bind("tenant-1")

@@ -1,5 +1,3 @@
-use std::str::FromStr;
-
 use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -7,64 +5,13 @@ use argon2::{
 use axum::http::{HeaderMap, header::AUTHORIZATION};
 use chrono::{DateTime, Utc};
 use iot_storage::{
-    OAuthRepository, PlatformStore, PlatformStoreError, TenantIdentityError,
-    TenantIdentityRepository,
+    OAuthRepository, PlatformAccountCredential, PlatformStore, PlatformStoreError,
+    TenantIdentityError, TenantIdentityRepository,
 };
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
-use sqlx::{PgPool, Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
-
-const ADMIN_USERNAME: &str = "admin";
-const VIEWER_USERNAME: &str = "viewer";
-const INITIAL_ADMIN_PASSWORD: &str = "NanoAdmin@1234";
-const INITIAL_VIEWER_PASSWORD: &str = "NanoView@1234";
-pub const DEFAULT_APP: &str = "/apps/powermonitor";
-pub const POWER_MONITOR_APP: &str = "powermonitor";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Admin,
-    Viewer,
-}
-
-impl Role {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Admin => "admin",
-            Self::Viewer => "viewer",
-        }
-    }
-
-    pub const fn username(self) -> &'static str {
-        match self {
-            Self::Admin => ADMIN_USERNAME,
-            Self::Viewer => VIEWER_USERNAME,
-        }
-    }
-}
-
-impl FromStr for Role {
-    type Err = AuthError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "admin" => Ok(Self::Admin),
-            "viewer" => Ok(Self::Viewer),
-            _ => Err(AuthError::InvalidRole),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AccountClass {
-    System,
-    Admin,
-    User,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -79,36 +26,6 @@ pub struct AuthenticatedPrincipal {
     pub kind: PrincipalKind,
     pub principal_id: Uuid,
     pub tenant_id: Option<Uuid>,
-}
-
-impl AccountClass {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Admin => "admin",
-            Self::User => "user",
-        }
-    }
-
-    pub const fn from_legacy_role(role: Role) -> Self {
-        match role {
-            Role::Admin => Self::Admin,
-            Role::Viewer => Self::User,
-        }
-    }
-}
-
-impl FromStr for AccountClass {
-    type Err = AuthError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "system" => Ok(Self::System),
-            "admin" => Ok(Self::Admin),
-            "user" => Ok(Self::User),
-            _ => Err(AuthError::InvalidAccountClass),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,28 +83,12 @@ pub async fn validate_bearer_access_token(
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct AuthenticatedUser {
-    pub user_id: Uuid,
-    pub role: Role,
-    pub account_class: AccountClass,
-    pub username: String,
-    pub default_app: String,
-    pub granted_apps: Vec<String>,
-}
-
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error(
         "password must use at least eight ASCII non-whitespace characters with uppercase, lowercase, digit, and special characters"
     )]
     InvalidPasswordFormat,
-    #[error("stored users are incomplete")]
-    IncompleteStoredUsers,
-    #[error("invalid user role")]
-    InvalidRole,
-    #[error("invalid account class")]
-    InvalidAccountClass,
     #[error("stored password hash is invalid")]
     InvalidStoredHash,
     #[error("authentication failed")]
@@ -250,6 +151,43 @@ pub async fn authenticate_system_account(
     })
 }
 
+pub async fn authenticate_platform_account(
+    store: &PlatformStore,
+    username: &str,
+    password: &str,
+) -> Result<AuthenticatedPrincipal, AuthError> {
+    let credential = TenantIdentityRepository::platform_account_credential(store, username)
+        .await
+        .map_err(AuthError::TenantIdentity)?
+        .ok_or(AuthError::AuthenticationFailed)?;
+    match credential {
+        PlatformAccountCredential::System(credential) => {
+            verify_password(password, &credential.password_hash)?;
+            Ok(AuthenticatedPrincipal {
+                kind: PrincipalKind::System,
+                principal_id: credential.account.id,
+                tenant_id: None,
+            })
+        }
+        PlatformAccountCredential::Tenant(credential) => {
+            verify_password(password, &credential.password_hash)?;
+            Ok(AuthenticatedPrincipal {
+                kind: PrincipalKind::Tenant,
+                principal_id: credential.account.id,
+                tenant_id: Some(credential.tenant.id),
+            })
+        }
+        PlatformAccountCredential::User(credential) => {
+            verify_password(password, &credential.password_hash)?;
+            Ok(AuthenticatedPrincipal {
+                kind: PrincipalKind::User,
+                principal_id: credential.user_id,
+                tenant_id: Some(credential.tenant_id),
+            })
+        }
+    }
+}
+
 pub async fn authenticate_tenant_account(
     store: &PlatformStore,
     tenant_slug: &str,
@@ -296,188 +234,4 @@ fn verify_password(password: &str, password_hash: &str) -> Result<(), AuthError>
     } else {
         Err(AuthError::AuthenticationFailed)
     }
-}
-
-pub async fn seed_tenant_test_users_sqlite(
-    pool: &SqlitePool,
-    tenant_id: Uuid,
-) -> Result<(), AuthError> {
-    let mut transaction = pool.begin().await?;
-    let rows = sqlx::query("SELECT role, username FROM users WHERE tenant_id = ?")
-        .bind(tenant_id.to_string())
-        .fetch_all(&mut *transaction)
-        .await?;
-    let bootstrap_defaults = rows.is_empty();
-    if bootstrap_defaults {
-        sqlx::query(
-            "INSERT OR IGNORE INTO applications (
-                app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
-             ) VALUES (?, ?, 'frontend', '/apps/powermonitor', ?, '[]', 1)",
-        )
-        .bind(POWER_MONITOR_APP)
-        .bind(tenant_id.to_string())
-        .bind(format!("seed-{tenant_id}-powermonitor"))
-        .execute(&mut *transaction)
-        .await?;
-        for (role, password) in [
-            (Role::Admin, INITIAL_ADMIN_PASSWORD),
-            (Role::Viewer, INITIAL_VIEWER_PASSWORD),
-        ] {
-            validate_password(password)?;
-            sqlx::query(
-                "INSERT INTO users (
-                    id, tenant_id, username, password_hash, role, account_class, default_app
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(tenant_id.to_string())
-            .bind(role.username())
-            .bind(hash_password(password)?)
-            .bind(role.as_str())
-            .bind(AccountClass::from_legacy_role(role).as_str())
-            .bind(DEFAULT_APP)
-            .execute(&mut *transaction)
-            .await?;
-        }
-        for username in [ADMIN_USERNAME, VIEWER_USERNAME] {
-            let user_id: String =
-                sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = ? AND username = ?")
-                    .bind(tenant_id.to_string())
-                    .bind(username)
-                    .fetch_one(&mut *transaction)
-                    .await?;
-            sqlx::query(
-                "INSERT OR IGNORE INTO user_app_grants (user_id, tenant_id, app_key)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(user_id)
-            .bind(tenant_id.to_string())
-            .bind(POWER_MONITOR_APP)
-            .execute(&mut *transaction)
-            .await?;
-        }
-    } else {
-        for row in rows {
-            row.try_get::<String, _>("role")?
-                .parse::<Role>()
-                .map_err(|_| AuthError::IncompleteStoredUsers)?;
-        }
-    }
-    transaction.commit().await?;
-    Ok(())
-}
-
-pub async fn authenticate_credentials(
-    pool: &PgPool,
-    username: &str,
-    password: &str,
-) -> Result<AuthenticatedUser, AuthError> {
-    let row = sqlx::query(
-        "SELECT id, tenant_id, role, account_class, password_hash, default_app
-         FROM users
-         WHERE username = $1",
-    )
-    .bind(username)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AuthError::AuthenticationFailed)?;
-    let stored_role = row
-        .try_get::<String, _>("role")?
-        .parse::<Role>()
-        .map_err(|_| AuthError::InvalidStoredHash)?;
-    let account_class = row
-        .try_get::<String, _>("account_class")?
-        .parse::<AccountClass>()
-        .map_err(|_| AuthError::InvalidStoredHash)?;
-    let password_hash = row.try_get::<String, _>("password_hash")?;
-    let password_hash =
-        PasswordHash::new(&password_hash).map_err(|_| AuthError::InvalidStoredHash)?;
-    if Argon2::default()
-        .verify_password(password.as_bytes(), &password_hash)
-        .is_ok()
-    {
-        let user_id = row.try_get::<Uuid, _>("id")?;
-        let tenant_id = row.try_get::<Uuid, _>("tenant_id")?;
-        let granted_apps = sqlx::query(
-            "SELECT app_key
-             FROM user_app_grants
-             WHERE user_id = $1 AND tenant_id = $2
-             ORDER BY app_key",
-        )
-        .bind(user_id)
-        .bind(tenant_id)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|grant| grant.try_get("app_key"))
-        .collect::<Result<Vec<String>, sqlx::Error>>()?;
-        Ok(AuthenticatedUser {
-            user_id,
-            role: stored_role,
-            account_class,
-            username: username.to_owned(),
-            default_app: row.try_get("default_app")?,
-            granted_apps,
-        })
-    } else {
-        Err(AuthError::AuthenticationFailed)
-    }
-}
-
-pub async fn authenticate_credentials_sqlite(
-    pool: &SqlitePool,
-    username: &str,
-    password: &str,
-) -> Result<AuthenticatedUser, AuthError> {
-    let row = sqlx::query(
-        "SELECT id, tenant_id, role, account_class, password_hash, default_app
-         FROM users
-         WHERE username = ?",
-    )
-    .bind(username)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AuthError::AuthenticationFailed)?;
-    let stored_role = row
-        .try_get::<String, _>("role")?
-        .parse::<Role>()
-        .map_err(|_| AuthError::InvalidStoredHash)?;
-    let account_class = row
-        .try_get::<String, _>("account_class")?
-        .parse::<AccountClass>()
-        .map_err(|_| AuthError::InvalidStoredHash)?;
-    let password_hash = row.try_get::<String, _>("password_hash")?;
-    let password_hash =
-        PasswordHash::new(&password_hash).map_err(|_| AuthError::InvalidStoredHash)?;
-    if !Argon2::default()
-        .verify_password(password.as_bytes(), &password_hash)
-        .is_ok()
-    {
-        return Err(AuthError::AuthenticationFailed);
-    }
-    let user_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
-        .map_err(|_| AuthError::InvalidStoredHash)?;
-    let tenant_id = Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
-        .map_err(|_| AuthError::InvalidStoredHash)?;
-    let granted_apps = sqlx::query(
-        "SELECT app_key
-         FROM user_app_grants
-         WHERE user_id = ? AND tenant_id = ?
-         ORDER BY app_key",
-    )
-    .bind(user_id.to_string())
-    .bind(tenant_id.to_string())
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|grant| grant.try_get("app_key"))
-    .collect::<Result<Vec<String>, sqlx::Error>>()?;
-    Ok(AuthenticatedUser {
-        user_id,
-        role: stored_role,
-        account_class,
-        username: username.to_owned(),
-        default_app: row.try_get("default_app")?,
-        granted_apps,
-    })
 }

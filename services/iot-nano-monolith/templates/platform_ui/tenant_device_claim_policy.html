@@ -1,0 +1,35 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Device Pairing | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  {% let active_nav = "devices" %}
+  {% include "platform_ui/tenant_navigation.html" %}
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Device pairing</h1>
+  </section>
+  {% if page.has_notice %}
+    <p class="notice" role="status">{{ page.notice }}</p>
+  {% endif %}
+  <section class="workspace-panel">
+    <header class="panel-heading">
+      <div>
+        <h2>Pairing policy</h2>
+        <p class="panel-caption">Devices request a short-lived code after a local pairing action.</p>
+      </div>
+      <a class="button-link button-link-secondary" href="/tenant/devices">Back to devices</a>
+    </header>
+    <form class="form-grid" action="/tenant/devices/claim-policy" method="post">
+      <label class="field field--checkbox"><input name="enabled" type="checkbox"{% if page.enabled %} checked{% endif %}><span>Enable pairing</span></label>
+      <label class="field"><span>Code lifetime (seconds)</span><input name="ttl_seconds" type="number" min="60" max="86400" value="{{ page.ttl_seconds }}" required></label>
+      <label class="field"><span>Code length</span><input name="code_length" type="number" min="8" max="32" value="{{ page.code_length }}" required></label>
+      <label class="field"><span>Maximum failed attempts</span><input name="max_failed_attempts" type="number" min="1" max="20" value="{{ page.max_failed_attempts }}" required></label>
+      <label class="field"><span>Request cooldown (seconds)</span><input name="request_cooldown_seconds" type="number" min="10" max="3600" value="{{ page.request_cooldown_seconds }}" required></label>
+      <div class="form-actions"><button type="submit">Save policy</button></div>
+    </form>
+  </section>
+{% endblock %}

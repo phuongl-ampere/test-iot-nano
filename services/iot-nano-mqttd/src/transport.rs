@@ -38,8 +38,9 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::ports::{
-    CommandResponsePort, DeviceAuthorizationPort, LocalDeviceAuthenticator,
-    LocalRpcResponseForwarder, LocalStreamUplinkForwarder,
+    CommandResponsePort, DeviceAuthorizationPort, DeviceClaimCodeError, DeviceClaimCodeOutcome,
+    DeviceClaimCodePort, DeviceClaimCodeRejection, DeviceClaimCodeRequest,
+    LocalDeviceAuthenticator, LocalRpcResponseForwarder, LocalStreamUplinkForwarder,
 };
 
 const MAX_PACKET_BYTES: usize = 1024 * 1024;
@@ -48,6 +49,9 @@ const COMMAND_PUBACK_TIMEOUT: Duration = Duration::from_secs(10);
 const DIRECT_RPC_FILTER: &str = "v1/devices/me/rpc/request/+";
 const GATEWAY_RPC_FILTER: &str = "v1/gateways/me/rpc/request/+";
 const DIRECT_RPC_RESPONSE_PREFIX: &str = "v1/devices/me/rpc/response/";
+const DIRECT_PAIRING_REQUEST_TOPIC: &str = "v1/devices/me/pairing/request";
+const DIRECT_PAIRING_RESPONSE_FILTER: &str = "v1/devices/me/pairing/response/+";
+const DIRECT_PAIRING_RESPONSE_PREFIX: &str = "v1/devices/me/pairing/response/";
 const GATEWAY_RPC_RESPONSE_PREFIX: &str = "v1/gateways/me/rpc/response/";
 pub(crate) const DIRECT_TELEMETRY_TOPIC: &str = "v1/devices/me/telemetry";
 pub(crate) const GATEWAY_TOPICS: [&str; 3] = [
@@ -520,6 +524,43 @@ impl RpcResponseForwarder for RejectingRpcResponseForwarder {
     }
 }
 
+#[derive(Clone)]
+struct RejectingDeviceClaimCodePort;
+
+impl DeviceClaimCodePort for RejectingDeviceClaimCodePort {
+    fn issue(
+        &self,
+        _request: DeviceClaimCodeRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<DeviceClaimCodeOutcome, DeviceClaimCodeError>> + Send + '_>,
+    > {
+        Box::pin(async {
+            Ok(DeviceClaimCodeOutcome::Rejected {
+                reason: DeviceClaimCodeRejection::Unavailable,
+            })
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairingRequest {
+    request_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum PairingResponse {
+    Issued {
+        device_id: String,
+        code: String,
+        expires_at: DateTime<Utc>,
+    },
+    Rejected {
+        reason: DeviceClaimCodeRejection,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("MQTT device authentication failed")]
@@ -542,6 +583,8 @@ pub enum TransportError {
     InvalidUplinkPayload,
     #[error("RPC response payload must be JSON")]
     InvalidRpcResponsePayload,
+    #[error("pairing request payload is invalid")]
+    InvalidPairingRequest,
     #[error("RPC response callback is not configured")]
     RpcResponseForwarderUnavailable,
     #[error("command response port is unavailable: {0}")]
@@ -556,6 +599,7 @@ pub struct MqttdDeviceTransport {
     authenticator: Arc<dyn DeviceAuthenticator>,
     uplink: Arc<dyn UplinkForwarder>,
     rpc_response_forwarder: Arc<dyn RpcResponseForwarder>,
+    device_claim_codes: Arc<dyn DeviceClaimCodePort>,
 }
 
 impl MqttdDeviceTransport {
@@ -596,6 +640,7 @@ impl MqttdDeviceTransport {
             authenticator: Arc::new(authenticator),
             uplink: Arc::new(uplink),
             rpc_response_forwarder: Arc::new(RejectingRpcResponseForwarder),
+            device_claim_codes: Arc::new(RejectingDeviceClaimCodePort),
         }
     }
 
@@ -607,8 +652,57 @@ impl MqttdDeviceTransport {
         self
     }
 
+    pub fn with_device_claim_code_port(
+        mut self,
+        device_claim_codes: Arc<dyn DeviceClaimCodePort>,
+    ) -> Self {
+        self.device_claim_codes = device_claim_codes;
+        self
+    }
+
     pub fn router(&self) -> RpcSessionRouter {
         self.router.clone()
+    }
+
+    async fn pairing_response(
+        &self,
+        device: &AuthenticatedDevice,
+        payload: &[u8],
+    ) -> Result<(Uuid, Vec<u8>), TransportError> {
+        if device.is_gateway {
+            return Err(TransportError::ForbiddenTopic);
+        }
+        let request: PairingRequest =
+            serde_json::from_slice(payload).map_err(|_| TransportError::InvalidPairingRequest)?;
+        if request.request_id.get_version_num() != 7 {
+            return Err(TransportError::InvalidPairingRequest);
+        }
+        let response = match self
+            .device_claim_codes
+            .issue(DeviceClaimCodeRequest {
+                tenant_id: device.tenant_id,
+                device_id: device.device_id.clone(),
+                request_id: request.request_id,
+            })
+            .await
+        {
+            Ok(DeviceClaimCodeOutcome::Issued {
+                device_id,
+                code,
+                expires_at,
+            }) => PairingResponse::Issued {
+                device_id,
+                code,
+                expires_at,
+            },
+            Ok(DeviceClaimCodeOutcome::Rejected { reason }) => PairingResponse::Rejected { reason },
+            Err(_) => PairingResponse::Rejected {
+                reason: DeviceClaimCodeRejection::Unavailable,
+            },
+        };
+        let payload =
+            serde_json::to_vec(&response).map_err(|_| TransportError::InvalidPairingRequest)?;
+        Ok((request.request_id, payload))
     }
 
     pub async fn serve_connection<S>(&self, stream: S) -> Result<(), TransportError>
@@ -788,23 +882,27 @@ impl MqttdDeviceTransport {
                     }
                     match packet {
                         Packet::Subscribe(subscribe) => {
-                            let expected_filter = if device.is_gateway {
+                            let rpc_filter = if device.is_gateway {
                                 GATEWAY_RPC_FILTER
                             } else {
                                 DIRECT_RPC_FILTER
                             };
                             let return_codes = subscribe.filters.iter().map(|filter| {
-                                if filter.path == expected_filter && filter.qos != QoS::ExactlyOnce {
+                                let allowed = (filter.path == rpc_filter
+                                    || (!device.is_gateway
+                                        && filter.path == DIRECT_PAIRING_RESPONSE_FILTER))
+                                    && filter.qos != QoS::ExactlyOnce;
+                                if allowed {
                                     SubscribeReasonCode::Success(filter.qos)
                                 } else {
                                     SubscribeReasonCode::Failure
                                 }
                             }).collect::<Vec<_>>();
-                            let accepted = return_codes.iter().any(|code| {
-                                matches!(code, SubscribeReasonCode::Success(_))
+                            let rpc_accepted = subscribe.filters.iter().any(|filter| {
+                                filter.path == rpc_filter && filter.qos != QoS::ExactlyOnce
                             });
                             framed.send(Packet::SubAck(SubAck::new(subscribe.pkid, return_codes))).await?;
-                            if accepted && commands.is_none() {
+                            if rpc_accepted && commands.is_none() {
                                 commands = Some(self.router.register(SessionRegistration {
                                     token_id: device.token_id,
                                     tenant_id: device.tenant_id,
@@ -817,6 +915,26 @@ impl MqttdDeviceTransport {
                             }
                         }
                         Packet::Publish(publish) => {
+                            if publish.topic == DIRECT_PAIRING_REQUEST_TOPIC {
+                                if device.is_gateway
+                                    || publish.qos != QoS::AtLeastOnce
+                                    || publish.retain
+                                {
+                                    return Err(TransportError::ForbiddenTopic);
+                                }
+                                let (request_id, payload) = self.pairing_response(device, &publish.payload).await?;
+                                framed.send(Packet::PubAck(PubAck::new(publish.pkid))).await?;
+                                let packet_id = next_packet_id;
+                                next_packet_id = next_packet_id.wrapping_add(1).max(1);
+                                let mut response = Publish::new(
+                                    format!("{DIRECT_PAIRING_RESPONSE_PREFIX}{request_id}"),
+                                    QoS::AtLeastOnce,
+                                    payload,
+                                );
+                                response.pkid = packet_id;
+                                framed.send(Packet::Publish(response)).await?;
+                                continue;
+                            }
                             if let Some(command_id) = rpc_response_command_id(device, &publish.topic) {
                                 if publish.qos != QoS::AtLeastOnce {
                                     return Err(TransportError::ForbiddenTopic);
@@ -935,7 +1053,7 @@ impl MqttdDeviceTransport {
                 }
                 match packet {
                 Ok(V5Packet::Subscribe(subscribe)) => {
-                    let expected_filter = if device.is_gateway {
+                    let rpc_filter = if device.is_gateway {
                         GATEWAY_RPC_FILTER
                     } else {
                         DIRECT_RPC_FILTER
@@ -944,16 +1062,20 @@ impl MqttdDeviceTransport {
                         .filters
                         .iter()
                         .map(|filter| {
-                            if filter.path == expected_filter && filter.qos != V5QoS::ExactlyOnce {
+                            let allowed = (filter.path == rpc_filter
+                                || (!device.is_gateway
+                                    && filter.path == DIRECT_PAIRING_RESPONSE_FILTER))
+                                && filter.qos != V5QoS::ExactlyOnce;
+                            if allowed {
                                 V5SubscribeReasonCode::Success(filter.qos)
                             } else {
                                 V5SubscribeReasonCode::Failure
                             }
                         })
                         .collect::<Vec<_>>();
-                    let accepted = return_codes
-                        .iter()
-                        .any(|code| matches!(code, V5SubscribeReasonCode::Success(_)));
+                    let rpc_accepted = subscribe.filters.iter().any(|filter| {
+                        filter.path == rpc_filter && filter.qos != V5QoS::ExactlyOnce
+                    });
                     framed
                         .send(V5Packet::SubAck(V5SubAck {
                             pkid: subscribe.pkid,
@@ -961,7 +1083,7 @@ impl MqttdDeviceTransport {
                             properties: None,
                         }))
                         .await?;
-                    if accepted && commands.is_none() {
+                    if rpc_accepted && commands.is_none() {
                         commands = Some(
                             self.router
                                 .register(SessionRegistration {
@@ -979,6 +1101,29 @@ impl MqttdDeviceTransport {
                 }
                 Ok(V5Packet::Publish(publish)) => {
                     let topic = String::from_utf8_lossy(&publish.topic).into_owned();
+                    if topic == DIRECT_PAIRING_REQUEST_TOPIC {
+                        if device.is_gateway
+                            || publish.qos != V5QoS::AtLeastOnce
+                            || publish.retain
+                        {
+                            return Err(TransportError::ForbiddenTopic);
+                        }
+                        let (request_id, payload) = self.pairing_response(device, &publish.payload).await?;
+                        framed
+                            .send(V5Packet::PubAck(V5PubAck::new(publish.pkid, None)))
+                            .await?;
+                        let packet_id = next_packet_id;
+                        next_packet_id = next_packet_id.wrapping_add(1).max(1);
+                        let mut response = rumqttc::v5::mqttbytes::v5::Publish::new(
+                            format!("{DIRECT_PAIRING_RESPONSE_PREFIX}{request_id}"),
+                            V5QoS::AtLeastOnce,
+                            payload,
+                            None,
+                        );
+                        response.pkid = packet_id;
+                        framed.send(V5Packet::Publish(response)).await?;
+                        continue;
+                    }
                     if let Some(command_id) = rpc_response_command_id(device, &topic) {
                         if publish.qos != V5QoS::AtLeastOnce {
                             return Err(TransportError::ForbiddenTopic);
@@ -1148,6 +1293,5 @@ fn rpc_response_command_id(device: &AuthenticatedDevice, topic: &str) -> Option<
     if command_id.is_empty() || command_id.contains('/') {
         return None;
     }
-    let command_id = Uuid::parse_str(command_id).ok()?;
-    (command_id.get_version_num() == 7).then_some(command_id)
+    Uuid::parse_str(command_id).ok()
 }

@@ -1864,22 +1864,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "iot-sqldb-common"
-version = "0.1.0"
-dependencies = [
- "sqlx",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
 name = "iot-storage"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "base64 0.22.1",
  "chrono",
  "iot-nano-foundation",
+ "rand_core 0.6.4",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",

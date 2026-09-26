@@ -4,9 +4,9 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rand_core::{OsRng, RngCore};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
@@ -16,32 +16,73 @@ use crate::{TelemetryEvent, TelemetryValidationError};
 pub const DEVICE_TELEMETRY_TOPIC: &str = "v1/devices/me/telemetry";
 pub const DEVICE_TOKEN_PREFIX_LENGTH: usize = 16;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceTelemetryPayload {
-    pub schema_version: u16,
-    #[serde(default)]
-    pub device_id: Option<String>,
-    pub boot_id: Uuid,
-    pub sequence: u64,
-    pub event_at: DateTime<Utc>,
+    pub event_at: Option<DateTime<Utc>>,
     pub measurements: Map<String, Value>,
+    device_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectTelemetryWirePayload {
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    values: Option<Map<String, Value>>,
+    #[serde(default)]
+    device_id: Option<String>,
+    #[serde(flatten)]
+    measurements: Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for DeviceTelemetryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = DirectTelemetryWirePayload::deserialize(deserializer)?;
+        let measurements = match wire.values {
+            Some(values) if wire.measurements.is_empty() => values,
+            Some(_) => {
+                return Err(D::Error::custom(
+                    "direct telemetry must use either top-level key-values or a values object",
+                ));
+            }
+            None => wire.measurements,
+        };
+        let event_at = wire
+            .ts
+            .map(|timestamp| {
+                Utc.timestamp_millis_opt(timestamp).single().ok_or_else(|| {
+                    D::Error::custom("ts must be a valid Unix timestamp in milliseconds")
+                })
+            })
+            .transpose()?;
+
+        Ok(Self {
+            event_at,
+            measurements,
+            device_id: wire.device_id,
+        })
+    }
 }
 
 impl DeviceTelemetryPayload {
     pub fn into_event(
         self,
         device_id: impl Into<String>,
+        received_at: DateTime<Utc>,
     ) -> Result<TelemetryEvent, TelemetryValidationError> {
         if self.device_id.is_some() {
             return Err(TelemetryValidationError::DeviceIdNotAllowed);
         }
 
         Ok(TelemetryEvent {
-            schema_version: self.schema_version,
+            schema_version: 1,
             device_id: device_id.into(),
-            boot_id: self.boot_id,
-            sequence: self.sequence,
-            event_at: self.event_at,
+            boot_id: Uuid::new_v4(),
+            sequence: 0,
+            event_at: self.event_at.unwrap_or(received_at),
             measurements: self.measurements,
             gateway_device_id: None,
         })

@@ -49,3 +49,21 @@ async fn heartbeat_renews_an_active_inflight_claim_before_acknowledgement() {
 
     consumer.acknowledge(&batch).await.unwrap();
 }
+
+#[tokio::test]
+async fn heartbeat_rejoins_after_the_consumer_lease_expires() {
+    let directory = tempfile::tempdir().unwrap();
+    let stream = LocalStream::open(
+        StreamConfig::sqlite(directory.path().join("stream.sqlite"))
+            .with_partitions(1)
+            .with_lease_duration(Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
+    let consumer = CoreStreamConsumer::new(Arc::new(stream), "writer", "monolith-writer");
+
+    consumer.claim(0).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    consumer.heartbeat().await.unwrap();
+}

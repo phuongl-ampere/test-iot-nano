@@ -7,12 +7,13 @@ import json
 import logging
 import math
 import os
+import random
+import sys
 from queue import Empty, Full, Queue
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
 
 import paho.mqtt.client as mqtt
@@ -22,12 +23,16 @@ RPC_REQUEST_PREFIX = "v1/devices/me/rpc/request/"
 RPC_REQUEST_FILTER = RPC_REQUEST_PREFIX + "+"
 RPC_RESPONSE_PREFIX = "v1/devices/me/rpc/response/"
 TELEMETRY_TOPIC = "v1/devices/me/telemetry"
+PAIRING_REQUEST_TOPIC = "v1/devices/me/pairing/request"
+PAIRING_RESPONSE_PREFIX = "v1/devices/me/pairing/response/"
+PAIRING_RESPONSE_FILTER = PAIRING_RESPONSE_PREFIX + "+"
 PUBLISH_ACK_TIMEOUT_SECONDS = 5.0
 REQUEST_QUEUE_MAXSIZE = 100
 LOGGER = logging.getLogger(__name__)
-DEVICE_TOKEN = "iotd_179c739a343806f8ebdb6bdccbb49ffac7e410b303d347e38880749b40ce4d3e"
+MQTT_DEVICE_TOKEN_USERNAME = "iotd_device_token"
+DEVELOPMENT_DEVICE_TOKEN = "iotd_d05e8bb703242c23876a70cfd528fb7db09f1ab59cdfc850ff095c2de3805188"
 MQTT_HOST = "127.0.0.1"
-MQTT_PORT = 1883
+MQTT_PORT = 18883
 PUBLISH_INTERVAL_SECONDS = 10.0
 
 
@@ -51,12 +56,16 @@ class MqttConfiguration:
     port: int
     ca_file: Optional[str]
     publish_interval_seconds: float
+    simulate_values: bool
+    simulation_random_seed: Optional[int]
 
 
 def configuration_from_environment() -> MqttConfiguration:
-    token = os.environ.get("DEVICE_TOKEN", DEVICE_TOKEN)
-    if not token:
-        raise ValueError("DEVICE_TOKEN is required")
+    token = os.environ.get("DEVICE_TOKEN") or DEVELOPMENT_DEVICE_TOKEN
+    seed = os.environ.get("SIMULATION_RANDOM_SEED")
+    simulate_values = os.environ.get("SIMULATE_VALUES", "true").lower()
+    if simulate_values not in {"true", "false"}:
+        raise ValueError("SIMULATE_VALUES must be true or false")
     publish_interval_seconds = float(
         os.environ.get("PUBLISH_INTERVAL_SECONDS", str(PUBLISH_INTERVAL_SECONDS))
     )
@@ -68,6 +77,8 @@ def configuration_from_environment() -> MqttConfiguration:
         port=int(os.environ.get("MQTT_PORT", str(MQTT_PORT))),
         ca_file=os.environ.get("MQTT_CA_FILE") or None,
         publish_interval_seconds=publish_interval_seconds,
+        simulate_values=simulate_values == "true",
+        simulation_random_seed=int(seed) if seed is not None else None,
     )
 
 
@@ -96,26 +107,19 @@ class TelemetryPublisher:
         self,
         client: mqtt.Client,
         state: LightingSwitcherState,
-        boot_id: str,
     ):
         self.client = client
         self.state = state
-        self.boot_id = boot_id
 
-    def publish(self, sequence: int, interval_seconds: float = 0) -> None:
-        telemetry = build_telemetry(
-            self.state,
-            self.boot_id,
-            sequence,
-            interval_seconds,
-        )
+    def publish(self, interval_seconds: float = 0) -> None:
+        telemetry = build_telemetry(self.state, interval_seconds)
         publish_qos1(
             self.client,
             TELEMETRY_TOPIC,
             json.dumps(telemetry),
             description="telemetry",
         )
-        LOGGER.info("telemetry sequence=%s", telemetry["sequence"])
+        LOGGER.info("telemetry published")
 
 
 def decode_rpc_request(topic: str, payload: bytes) -> Optional[dict]:
@@ -153,6 +157,7 @@ class LightingSwitcherState:
         self.switch_state = False
         self.brightness_pct = 0
         self.energy_kwh = 0.0
+        self.reboot_count = 0
         self._lock = threading.Lock()
 
     def handle_rpc(self, request: dict) -> CommandOutcome:
@@ -167,7 +172,11 @@ class LightingSwitcherState:
 
         with self._lock:
             method = request.get("method")
-            if method == "switch_on":
+            if method == "sample_now":
+                pass
+            elif method == "reboot":
+                self.reboot_count += 1
+            elif method == "switch_on":
                 self.switch_state = True
                 self.brightness_pct = self.brightness_pct or 100.0
             elif method == "switch_off":
@@ -197,6 +206,13 @@ class LightingSwitcherState:
             if self.switch_state:
                 self.energy_kwh += power_w * elapsed_seconds / 3_600_000
 
+    def simulate_load(self, generator: random.Random) -> None:
+        with self._lock:
+            self.switch_state = generator.random() >= 0.15
+            self.brightness_pct = (
+                round(generator.uniform(20.0, 100.0), 1) if self.switch_state else 0.0
+            )
+
     def measurements(self, interval_seconds: float) -> dict:
         self.advance_energy(interval_seconds)
         with self._lock:
@@ -210,6 +226,7 @@ class LightingSwitcherState:
                 "brightness_pct": self.brightness_pct,
                 "power_w": round(power_w, 3),
                 "energy_kwh": round(self.energy_kwh, 9),
+                "reboot_count": self.reboot_count,
             }
 
     @staticmethod
@@ -237,17 +254,9 @@ class LightingSwitcherState:
 
 def build_telemetry(
     state: LightingSwitcherState,
-    boot_id: str,
-    sequence: int,
     interval_seconds: float,
 ) -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "boot_id": boot_id,
-        "sequence": sequence,
-        "event_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "measurements": state.measurements(interval_seconds),
-    }
+    return state.measurements(interval_seconds)
 
 
 def is_rpc_request_topic(topic: str) -> bool:
@@ -274,11 +283,73 @@ def rpc_response_topic(request_id: str) -> str:
     return RPC_RESPONSE_PREFIX + request_id
 
 
+def pairing_response_topic(request_id: str) -> str:
+    if (
+        not isinstance(request_id, str)
+        or not request_id
+        or "/" in request_id
+        or "+" in request_id
+        or "#" in request_id
+    ):
+        raise ValueError("request_id must be one non-empty topic segment")
+    return PAIRING_RESPONSE_PREFIX + request_id
+
+
+def is_pairing_response_topic(topic: str) -> bool:
+    suffix = topic.removeprefix(PAIRING_RESPONSE_PREFIX)
+    return topic.startswith(PAIRING_RESPONSE_PREFIX) and bool(suffix) and "/" not in suffix
+
+
+def uuid7() -> str:
+    """Return a UUIDv7 without relying on the Python runtime version."""
+    timestamp_ms = int(time.time() * 1000)
+    random_bits = int.from_bytes(os.urandom(10), "big")
+    value = (
+        (timestamp_ms << 80)
+        | (0x7 << 76)
+        | (((random_bits >> 68) & 0xFFF) << 64)
+        | (0b10 << 62)
+        | (random_bits & ((1 << 62) - 1))
+    )
+    return str(uuid.UUID(int=value))
+
+
+def request_pairing_code(client: mqtt.Client) -> str:
+    request_id = uuid7()
+    publish_qos1(
+        client,
+        PAIRING_REQUEST_TOPIC,
+        json.dumps({"request_id": request_id}),
+        description="pairing request",
+    )
+    LOGGER.info("pairing requested id=%s", request_id)
+    return request_id
+
+
+def log_pairing_response(topic: str, payload: bytes) -> None:
+    if not is_pairing_response_topic(topic):
+        return
+    try:
+        response = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        LOGGER.warning("pairing response was invalid")
+        return
+    if not isinstance(response, dict):
+        LOGGER.warning("pairing response was invalid")
+        return
+    code = response.get("code")
+    expires_at = response.get("expires_at")
+    if isinstance(code, str) and isinstance(expires_at, str):
+        LOGGER.info("pairing code=%s expires_at=%s", code, expires_at)
+    else:
+        LOGGER.info("pairing request was rejected")
+
+
 def subscription_granted(granted_qos) -> bool:
     return isinstance(granted_qos, (list, tuple)) and granted_qos in ([0], [1])
 
 
-def main() -> None:
+def main(request_pairing: bool = False) -> None:
     try:
         configuration = configuration_from_environment()
     except (TypeError, ValueError, OverflowError) as exc:
@@ -286,13 +357,14 @@ def main() -> None:
         raise SystemExit("MQTT configuration failed.") from None
 
     state = LightingSwitcherState()
+    random_generator = random.Random(configuration.simulation_random_seed)
     client = None
     try:
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id=f"python-lighting-switcher-{uuid.uuid4()}",
         )
-        client.username_pw_set(configuration.token, password="")
+        client.username_pw_set(MQTT_DEVICE_TOKEN_USERNAME, password=configuration.token)
         if configuration.ca_file:
             client.tls_set(ca_certs=configuration.ca_file)
     except Exception as exc:
@@ -308,9 +380,7 @@ def main() -> None:
     readiness = threading.Event()
     stopping = threading.Event()
     request_queue = Queue(maxsize=REQUEST_QUEUE_MAXSIZE)
-    publisher = TelemetryPublisher(
-        client, state, str(uuid.uuid4())
-    )
+    publisher = TelemetryPublisher(client, state)
 
     def fail_startup(message: str) -> None:
         LOGGER.error("MQTT startup failed: %s", message)
@@ -372,6 +442,9 @@ def main() -> None:
             readiness.set()
 
     def on_message(_mqtt_client, _userdata, message):
+        if is_pairing_response_topic(message.topic):
+            log_pairing_response(message.topic, message.payload)
+            return
         enqueue_rpc_request(request_queue, message.topic, message.payload)
 
     def on_connect_fail(_mqtt_client, _userdata):
@@ -411,11 +484,21 @@ def main() -> None:
             configuration.port,
             RPC_REQUEST_FILTER,
         )
-        sequence = 0
+        if request_pairing:
+            subscribe_result = client.subscribe(PAIRING_RESPONSE_FILTER, qos=1)
+            subscribe_rc = (
+                subscribe_result[0]
+                if isinstance(subscribe_result, (tuple, list))
+                else subscribe_result
+            )
+            if subscribe_rc != 0:
+                raise RuntimeError("pairing response subscription failed")
+            request_pairing_code(client)
         last_energy_at = time.monotonic()
         next_periodic_at = last_energy_at + configuration.publish_interval_seconds
-        publisher.publish(sequence)
-        sequence += 1
+        if configuration.simulate_values:
+            state.simulate_load(random_generator)
+        publisher.publish()
         while True:
             if startup_failed.is_set():
                 raise SystemExit("MQTT connection or RPC subscription failed.")
@@ -423,8 +506,9 @@ def main() -> None:
             if now >= next_periodic_at:
                 state.advance_energy(max(0.0, now - last_energy_at))
                 last_energy_at = now
-                publisher.publish(sequence)
-                sequence += 1
+                if configuration.simulate_values:
+                    state.simulate_load(random_generator)
+                publisher.publish()
                 next_periodic_at = now + configuration.publish_interval_seconds
                 continue
 
@@ -437,9 +521,15 @@ def main() -> None:
             state.advance_energy(max(0.0, now - last_energy_at))
             last_energy_at = now
             outcome = state.handle_rpc(request)
+            LOGGER.info(
+                "command id=%s method=%s mode=%s applied=%s",
+                request.get("id"),
+                request.get("method"),
+                request.get("mode", "one_way"),
+                outcome.applied,
+            )
             if outcome.applied:
-                publisher.publish(sequence)
-                sequence += 1
+                publisher.publish()
             if outcome.response is not None:
                 publish_qos1(
                     client,
@@ -447,6 +537,7 @@ def main() -> None:
                     json.dumps(outcome.response),
                     description="RPC response",
                 )
+                LOGGER.info("command response id=%s published", request["id"])
     except KeyboardInterrupt:
         LOGGER.info("shutdown requested")
     except Exception as exc:
@@ -460,4 +551,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     configure_logging()
-    main()
+    main(request_pairing="--request-pairing" in sys.argv[1:])

@@ -335,6 +335,7 @@ async fn sqlite_public_legacy_admin_group_inherited_permission_controls_resource
         &store,
         &member,
         Some(&device_id),
+        None,
         event_at - ChronoDuration::minutes(1),
         event_at + ChronoDuration::minutes(1),
         None,
@@ -605,6 +606,7 @@ async fn sqlite_public_legacy_admin_is_denied_unshared_resources_and_mutations()
         PublicApiRepository::list_public_telemetry(
             &store,
             &legacy_admin,
+            None,
             None,
             event_at - ChronoDuration::minutes(1),
             event_at + ChronoDuration::minutes(1),
@@ -1094,6 +1096,7 @@ async fn sqlite_public_telemetry_requires_a_matching_telemetry_tenant() {
             &store,
             &principal,
             Some(&device_id),
+            None,
             event_at - ChronoDuration::minutes(1),
             event_at + ChronoDuration::minutes(1),
             None,

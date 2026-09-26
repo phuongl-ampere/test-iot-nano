@@ -1,30 +1,39 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   BffApiError,
-  acknowledgeAlert,
+  acceptResourceInvitation,
+  cancelResourceInvitation,
+  claimDevice,
+  createAsset,
+  getAssetLiveView,
   getAssetTelemetry,
+  getDeviceLiveView,
   getDeviceTelemetry,
   listAlerts,
   listAssets,
   listDevices,
+  listResourceInvitations,
+  listUserCapabilities,
   sendDeviceCommandAndWait,
   type Alert,
   type Asset,
   type CommandLifecycle,
   type CommandMode,
   type Device,
+  type LiveView,
+  type ResourceInvitation,
   type TelemetryPoint,
   type TimeRange,
 } from "../lib/browser-api";
-import { AlertPanel } from "./alert-panel";
 import { CommandPanel } from "./command-panel";
 import { DeviceControlPanel } from "./device-control-panel";
-import { PowerTelemetryChart } from "./power-telemetry-chart";
+import { LiveTelemetryCharts } from "./live-telemetry-charts";
 import { PowerTelemetryTable } from "./power-telemetry-table";
 import { PowerMonitorTree } from "./powermonitor-tree";
+import { ResourceEditDrawer } from "./resource-edit-drawer";
 import { TimeRangeControl } from "./time-range-control";
 
 type PowerMonitorDashboardProps = {
@@ -38,21 +47,43 @@ export function PowerMonitorDashboard({
 }: PowerMonitorDashboardProps) {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [assetBusy, setAssetBusy] = useState(false);
+  const [assetName, setAssetName] = useState("");
+  const [assetOpen, setAssetOpen] = useState(false);
+  const [assetParentId, setAssetParentId] = useState("");
   const [command, setCommand] = useState<CommandLifecycle | null>(null);
   const [commandBusy, setCommandBusy] = useState(false);
+  const [claimBusy, setClaimBusy] = useState(false);
+  const [claimCode, setClaimCode] = useState("");
+  const [claimDeviceId, setClaimDeviceId] = useState("");
+  const [claimOpen, setClaimOpen] = useState(false);
+  const [capabilities, setCapabilities] = useState<string[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [invitationBusyId, setInvitationBusyId] = useState<string | null>(null);
+  const [invitations, setInvitations] = useState<ResourceInvitation[]>([]);
+  const [invitationsOpen, setInvitationsOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [liveView, setLiveView] = useState<LiveView>({ charts: [], profile: null });
+  const [liveViewLoading, setLiveViewLoading] = useState(false);
+  const [editingResource, setEditingResource] = useState<{
+    asset_id?: string | null;
+    id: string;
+    kind: "asset" | "device";
+    name?: string;
+    parent_id?: string | null;
+    permission?: Device["permission"] | Asset["permission"];
+  } | null>(null);
   const [range, setRange] = useState<TimeRange>("1h");
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(initialAssetId ?? null);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(initialDeviceId ?? null);
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
   const [telemetryLoading, setTelemetryLoading] = useState(false);
-  const [workingAlertId, setWorkingAlertId] = useState<string | null>(null);
   const selectedAssetIdRef = useRef<string | null>(initialAssetId ?? null);
   const selectedDeviceIdRef = useRef<string | null>(initialDeviceId ?? null);
   const selectionGenerationRef = useRef(0);
   const telemetryRequestIdRef = useRef(0);
+  const liveViewRequestIdRef = useRef(0);
   const workspaceRequestIdRef = useRef(0);
   const rangeRef = useRef<TimeRange>("1h");
 
@@ -65,6 +96,31 @@ export function PowerMonitorDashboard({
     [assets, selectedAssetId],
   );
   const onlineCount = devices.filter((device) => device.online).length;
+  const selectedResource = selectedAsset !== null
+    ? {
+      id: selectedAsset.id,
+      kind: "asset" as const,
+      name: selectedAsset.name,
+      parent_id: selectedAsset.parent_id,
+      permission: selectedAsset.permission,
+    }
+    : selectedDevice !== null
+      ? {
+        asset_id: selectedDevice.asset_id,
+        id: selectedDevice.id,
+        kind: "device" as const,
+        name: selectedDevice.name,
+        permission: selectedDevice.permission,
+      }
+      : null;
+  const canManageSelectedResource = selectedResource?.permission === "manager"
+    || selectedResource?.permission === "owner";
+  const canCreateAssets = capabilities.includes("create_assets");
+  const canClaimDevices = capabilities.includes("claim_devices");
+  const resourcePath = useMemo(
+    () => getResourcePath(assets, selectedAsset, selectedDevice),
+    [assets, selectedAsset, selectedDevice],
+  );
 
   const refresh = useCallback(async (): Promise<boolean> => {
     const requestId = workspaceRequestIdRef.current + 1;
@@ -73,10 +129,10 @@ export function PowerMonitorDashboard({
     setLoading(true);
     setError(null);
     try {
-      const [nextDevices, nextAssets, nextAlerts] = await Promise.all([
-        listDevices(),
-        listAssets(),
-        listAlerts(),
+      const [[nextDevices, nextAssets, nextAlerts], invitationRead, nextCapabilities] = await Promise.all([
+        Promise.all([listDevices(), listAssets(), listAlerts()]),
+        readResourceInvitations(),
+        readUserCapabilities(),
       ]);
       if (
         workspaceRequestIdRef.current !== requestId
@@ -87,6 +143,11 @@ export function PowerMonitorDashboard({
       setDevices(nextDevices);
       setAssets(nextAssets);
       setAlerts(nextAlerts);
+      setCapabilities(nextCapabilities);
+      setInvitations(invitationRead.items);
+      if (invitationRead.warning !== null) {
+        setError(invitationRead.warning);
+      }
       const requestedAssetId = selectedAssetIdRef.current;
       const nextAssetId = requestedAssetId !== null && nextAssets.some((asset) => asset.id === requestedAssetId)
         ? requestedAssetId
@@ -154,11 +215,118 @@ export function PowerMonitorDashboard({
     void refreshTelemetry();
   }, [range, refreshTelemetry, selectedAssetId, selectedDeviceId]);
 
+  const refreshLiveView = useCallback(async (): Promise<void> => {
+    const assetId = selectedAssetIdRef.current;
+    const deviceId = selectedDeviceIdRef.current;
+    const target = assetId !== null
+      ? { id: assetId, type: "asset" as const }
+      : deviceId !== null
+        ? { id: deviceId, type: "device" as const }
+        : null;
+    const requestId = liveViewRequestIdRef.current + 1;
+    liveViewRequestIdRef.current = requestId;
+    if (target === null) {
+      setLiveView({ charts: [], profile: null });
+      setLiveViewLoading(false);
+      return;
+    }
+    setLiveViewLoading(true);
+    setLiveView({ charts: [], profile: null });
+    try {
+      const view = target.type === "asset"
+        ? await getAssetLiveView(target.id)
+        : await getDeviceLiveView(target.id);
+      if (liveViewRequestIdRef.current === requestId) {
+        setLiveView(view);
+      }
+    } catch (reason) {
+      if (liveViewRequestIdRef.current === requestId) {
+        setError(errorMessage(reason));
+      }
+    } finally {
+      if (liveViewRequestIdRef.current === requestId) {
+        setLiveViewLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshLiveView();
+  }, [refreshLiveView, selectedAssetId, selectedDeviceId]);
+
+  useEffect(() => {
+    const refreshVisibleTelemetry = () => {
+      if (!document.hidden) {
+        void refreshTelemetry();
+      }
+    };
+    const interval = window.setInterval(refreshVisibleTelemetry, 5_000);
+    document.addEventListener("visibilitychange", refreshVisibleTelemetry);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", refreshVisibleTelemetry);
+    };
+  }, [refreshTelemetry]);
+
   const refreshWorkspaceAndTelemetry = useCallback(async (): Promise<void> => {
     if (await refresh()) {
       await refreshTelemetry();
     }
   }, [refresh, refreshTelemetry]);
+
+  const submitAsset = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const name = assetName.trim();
+    if (name.length === 0) {
+      return;
+    }
+    setAssetBusy(true);
+    setError(null);
+    try {
+      const asset = await createAsset({
+        name,
+        parent_asset_id: assetParentId === "" ? null : assetParentId,
+      });
+      setAssetName("");
+      setAssetParentId("");
+      setAssetOpen(false);
+      selectedAssetIdRef.current = asset.id;
+      selectedDeviceIdRef.current = null;
+      setSelectedAssetId(asset.id);
+      setSelectedDeviceId(null);
+      await refreshWorkspaceAndTelemetry();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setAssetBusy(false);
+    }
+  };
+
+  const submitDeviceClaim = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const deviceId = claimDeviceId.trim();
+    const code = claimCode.trim();
+    if (deviceId.length === 0 || code.length === 0) {
+      return;
+    }
+    setClaimBusy(true);
+    setError(null);
+    try {
+      const device = await claimDevice(deviceId, code);
+      setClaimCode("");
+      setClaimDeviceId("");
+      setClaimOpen(false);
+      selectedAssetIdRef.current = null;
+      selectedDeviceIdRef.current = device.id;
+      setSelectedAssetId(null);
+      setSelectedDeviceId(device.id);
+      await refreshWorkspaceAndTelemetry();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setClaimBusy(false);
+    }
+  };
 
   const sendCommand = async (
     method: string,
@@ -187,18 +355,25 @@ export function PowerMonitorDashboard({
     }
   };
 
-  const acknowledge = async (alertId: string) => {
-    setWorkingAlertId(alertId);
+  const respondToInvitation = async (invitationId: string, action: "accept" | "cancel") => {
+    setInvitationBusyId(invitationId);
     setError(null);
     try {
-      await acknowledgeAlert(alertId);
-      setAlerts((current) => current.map((alert) => (
-        alert.id === alertId ? { ...alert, status: "acknowledged" } : alert
-      )));
+      if (action === "accept") {
+        await acceptResourceInvitation(invitationId);
+      } else {
+        await cancelResourceInvitation(invitationId);
+      }
+      setInvitations((current) => current.filter((invitation) => invitation.id !== invitationId));
+      if (action === "accept") {
+        await refreshWorkspaceAndTelemetry();
+      } else {
+        await refresh();
+      }
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
-      setWorkingAlertId(null);
+      setInvitationBusyId(null);
     }
   };
 
@@ -208,14 +383,11 @@ export function PowerMonitorDashboard({
       <aside className="explorer">
         <header className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">P</span>
-          <span>
-            <strong>Power Monitor</strong>
-            <small>Operational energy view</small>
-          </span>
+          <strong>Power Monitor</strong>
         </header>
         <div className="explorer-heading">
-          <span className="eyebrow">Asset explorer</span>
-          <strong>{loading ? "Loading" : devices.length + " devices"}</strong>
+          <strong>Assets</strong>
+          <span>{loading ? "Loading" : assets.length + " assets"}</span>
           <span>{onlineCount} online</span>
         </div>
         <PowerMonitorTree
@@ -223,6 +395,7 @@ export function PowerMonitorDashboard({
           devices={devices}
           onSelectAsset={(assetId) => {
             selectionGenerationRef.current += 1;
+            setEditingResource(null);
             selectedAssetIdRef.current = assetId;
             selectedDeviceIdRef.current = null;
             setSelectedAssetId(assetId);
@@ -230,6 +403,7 @@ export function PowerMonitorDashboard({
           }}
           onSelectDevice={(deviceId) => {
             selectionGenerationRef.current += 1;
+            setEditingResource(null);
             selectedAssetIdRef.current = null;
             selectedDeviceIdRef.current = deviceId;
             setSelectedDeviceId(deviceId);
@@ -243,11 +417,45 @@ export function PowerMonitorDashboard({
       <section className="workspace">
         <header className="workspace-header">
           <div>
-            <span className="eyebrow">Power Monitor</span>
+            <nav aria-label="Resource path" className="resource-path">
+              <ol>
+                {resourcePath.map((entry, index) => <li key={entry + index}>{entry}</li>)}
+              </ol>
+            </nav>
             <h1>{title}</h1>
-            <p>{selectedDevice?.id ?? selectedAsset?.id ?? "All accessible resources"}</p>
+            <div className="resource-meta">
+              {selectedDevice !== null && (
+                <span className={selectedDevice.online ? "resource-status online" : "resource-status"}>
+                  {selectedDevice.online ? "Online" : "Offline"}
+                </span>
+              )}
+              <span>{selectedDevice?.id ?? selectedAsset?.id ?? "All accessible resources"}</span>
+            </div>
           </div>
           <div className="workspace-actions">
+            <button
+              aria-controls="resource-invitations"
+              aria-expanded={invitationsOpen}
+              onClick={() => setInvitationsOpen((open) => !open)}
+              type="button"
+            >
+              {invitations.length === 0 ? "Invitations" : "Invitations (" + invitations.length + ")"}
+            </button>
+            {canClaimDevices && (
+              <button aria-expanded={claimOpen} onClick={() => setClaimOpen((open) => !open)} type="button">
+                Add device
+              </button>
+            )}
+            {canCreateAssets && (
+              <button aria-expanded={assetOpen} onClick={() => setAssetOpen((open) => !open)} type="button">
+                Add asset
+              </button>
+            )}
+            {selectedResource !== null && canManageSelectedResource && (
+              <button onClick={() => setEditingResource(selectedResource)} type="button">
+                Edit {selectedResource.kind}
+              </button>
+            )}
             <TimeRangeControl
               onChange={(nextRange) => {
                 rangeRef.current = nextRange;
@@ -258,13 +466,104 @@ export function PowerMonitorDashboard({
             <button aria-label="Refresh Power Monitor" disabled={loading} onClick={() => void refreshWorkspaceAndTelemetry()} type="button">
               Refresh
             </button>
+            <form action="/api/auth/logout" method="post">
+              <button type="submit">Sign out</button>
+            </form>
           </div>
         </header>
+
+        {invitationsOpen && (
+          <section aria-label="Pending invitations" className="invitation-panel" id="resource-invitations">
+            <header className="section-heading">
+              <div>
+                <span className="eyebrow">Resource access</span>
+                <h2>Invitations</h2>
+              </div>
+            </header>
+            {invitations.length === 0 ? (
+              <p className="empty-state">No pending invitations.</p>
+            ) : (
+              <ul className="invitation-list">
+                {invitations.map((invitation) => (
+                  <li key={invitation.id}>
+                    <div>
+                      <strong>{invitation.resource_name}</strong>
+                      <span>{invitation.sender_username} shared {invitation.permission} access to this {invitation.resource_kind}.</span>
+                    </div>
+                    <div className="invitation-actions">
+                      <button
+                        aria-label={"Accept invitation for " + invitation.resource_name}
+                        disabled={invitationBusyId === invitation.id}
+                        onClick={() => void respondToInvitation(invitation.id, "accept")}
+                        type="button"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        aria-label={"Decline invitation for " + invitation.resource_name}
+                        disabled={invitationBusyId === invitation.id}
+                        onClick={() => void respondToInvitation(invitation.id, "cancel")}
+                        type="button"
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        )}
+
+        {claimOpen && (
+          <section aria-label="Add device" className="claim-device-panel">
+            <header className="section-heading"><h2>Add device</h2></header>
+            <form onSubmit={(event) => void submitDeviceClaim(event)}>
+              <label>
+                <span>Device ID</span>
+                <input autoComplete="off" disabled={claimBusy} onChange={(event) => setClaimDeviceId(event.target.value)} value={claimDeviceId} />
+              </label>
+              <label>
+                <span>Pairing code</span>
+                <input autoComplete="one-time-code" disabled={claimBusy} onChange={(event) => setClaimCode(event.target.value)} value={claimCode} />
+              </label>
+              <div className="invitation-actions">
+                <button disabled={claimBusy || claimDeviceId.trim().length === 0 || claimCode.trim().length === 0} type="submit">Add device</button>
+                <button disabled={claimBusy} onClick={() => setClaimOpen(false)} type="button">Cancel</button>
+              </div>
+            </form>
+          </section>
+        )}
+
+        {assetOpen && (
+          <section aria-label="Add asset" className="claim-device-panel">
+            <header className="section-heading"><h2>Add asset</h2></header>
+            <form onSubmit={(event) => void submitAsset(event)}>
+              <label>
+                <span>Asset name</span>
+                <input autoComplete="off" disabled={assetBusy} onChange={(event) => setAssetName(event.target.value)} required value={assetName} />
+              </label>
+              <label>
+                <span>Parent asset</span>
+                <select aria-label="Parent asset" disabled={assetBusy} onChange={(event) => setAssetParentId(event.target.value)} value={assetParentId}>
+                  <option value="">No parent</option>
+                  {assets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+                </select>
+              </label>
+              <div className="invitation-actions">
+                <button disabled={assetBusy || assetName.trim().length === 0} type="submit">{assetBusy ? "Creating" : "Create asset"}</button>
+                <button disabled={assetBusy} onClick={() => setAssetOpen(false)} type="button">Cancel</button>
+              </div>
+            </form>
+          </section>
+        )}
 
         {error !== null && (
           <div className="error-banner" role="alert">
             <span>{error}</span>
-            {error === "Sign in is required." && <a href="/api/auth/login">Sign in</a>}
+            {(error === "Sign in is required." || error === invitationScopeMessage) && (
+              <a href="/api/auth/login">Sign in again</a>
+            )}
           </div>
         )}
 
@@ -290,8 +589,20 @@ export function PowerMonitorDashboard({
             </>
           ) : (
             <>
-              <PowerTelemetryChart points={telemetry} />
-              <PowerTelemetryTable points={telemetry} />
+              {liveViewLoading ? (
+                <p className="empty-state">Loading configured live view...</p>
+              ) : liveView.profile === null ? (
+                <PowerTelemetryTable points={telemetry} />
+              ) : liveView.charts.length === 0 ? (
+                <p className="empty-state">This profile has no live widgets configured.</p>
+              ) : (
+                <LiveTelemetryCharts
+                  charts={liveView.charts}
+                  isAsset={selectedAsset !== null}
+                  points={telemetry}
+                  range={range}
+                />
+              )}
               {selectedDevice !== null && (
                 <>
                   <DeviceControlPanel
@@ -303,29 +614,29 @@ export function PowerMonitorDashboard({
                     onCommand={(method, params, mode) => void sendCommand(method, params, mode)}
                     switchState={selectedDevice.switch_state}
                   />
-                  <CommandPanel busy={commandBusy} onSubmit={sendCommand} state={command?.state} />
-                  <a className="detail-link" href={"/devices/" + encodeURIComponent(selectedDevice.id)}>Open device details</a>
+                  <CommandPanel
+                    busy={commandBusy}
+                    onSubmit={sendCommand}
+                    response={command?.response}
+                    state={command?.state}
+                  />
                 </>
               )}
             </>
           )}
         </section>
-
-        {selectedAsset !== null && (
-          <section aria-label="Asset details" className="asset-details">
-            <header className="section-heading">
-              <div>
-                <span className="eyebrow">Asset details</span>
-                <h2>{selectedAsset.name}</h2>
-              </div>
-            </header>
-            <p>{devices.filter((device) => device.asset_id === selectedAsset.id).length} assigned devices</p>
-            <a className="detail-link" href={"/assets/" + encodeURIComponent(selectedAsset.id)}>Open asset details</a>
-          </section>
-        )}
-
-        <AlertPanel alerts={alerts} onAcknowledge={(alertId) => void acknowledge(alertId)} workingId={workingAlertId} />
       </section>
+      {editingResource !== null && (
+        <ResourceEditDrawer
+          assets={assets}
+          onClose={() => setEditingResource(null)}
+          onSaved={async () => {
+            await refreshWorkspaceAndTelemetry();
+            await refreshLiveView();
+          }}
+          resource={editingResource}
+        />
+      )}
     </main>
   );
 }
@@ -335,4 +646,57 @@ function errorMessage(reason: unknown): string {
     return "Sign in is required.";
   }
   return reason instanceof Error ? reason.message : "PowerMonitor request failed.";
+}
+
+const invitationScopeMessage = "Sign in again to use resource invitations.";
+
+type InvitationRead = {
+  items: ResourceInvitation[];
+  warning: string | null;
+};
+
+async function readResourceInvitations(): Promise<InvitationRead> {
+  try {
+    return { items: await listResourceInvitations(), warning: null };
+  } catch (reason) {
+    if (reason instanceof BffApiError && reason.status === 403) {
+      return { items: [], warning: invitationScopeMessage };
+    }
+    throw reason;
+  }
+}
+
+async function readUserCapabilities(): Promise<string[]> {
+  try {
+    return await listUserCapabilities();
+  } catch {
+    return [];
+  }
+}
+
+function getResourcePath(
+  assets: Asset[],
+  selectedAsset: Asset | null,
+  selectedDevice: Device | null,
+): string[] {
+  const assetsById = new Map(assets.map((asset) => [asset.id, asset]));
+  const path: string[] = [];
+  const visited = new Set<string>();
+  let assetId = selectedAsset?.id ?? selectedDevice?.asset_id ?? null;
+
+  while (assetId !== null && !visited.has(assetId)) {
+    visited.add(assetId);
+    const asset = assetsById.get(assetId);
+    if (asset === undefined) {
+      break;
+    }
+    path.unshift(asset.name);
+    assetId = asset.parent_id ?? null;
+  }
+
+  if (selectedDevice !== null) {
+    path.push(selectedDevice.name ?? selectedDevice.id);
+  }
+
+  return path.length > 0 ? path : ["All resources"];
 }

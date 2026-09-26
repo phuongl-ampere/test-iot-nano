@@ -58,8 +58,8 @@ async fn seed_tenant_scope(pool: &SqlitePool) {
     }
     for (id, tenant_id) in [(TENANT_ACCOUNT_A, TENANT_A), (TENANT_ACCOUNT_B, TENANT_B)] {
         sqlx::query(
-            "INSERT INTO tenant_accounts (id, tenant_id, password_hash, status, credential_version)
-             VALUES (?, ?, 'unused', 'active', 1)",
+            "INSERT INTO tenant_accounts (id, tenant_id, username, password_hash, status, credential_version)
+             VALUES (?1, ?2, ?1, 'unused', 'active', 1)",
         )
         .bind(id.to_string())
         .bind(tenant_id.to_string())

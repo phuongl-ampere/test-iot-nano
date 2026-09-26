@@ -10,6 +10,9 @@
 /.codebase-memory/
 /.worktrees/
 /.cargo-lane/
+apps/powermonitor/.key
+infra/monolith/local-platform-seed.env
+debug/__pycache__/
 
 # Environment files
 .env

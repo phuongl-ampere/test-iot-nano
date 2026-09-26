@@ -12,7 +12,6 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
 use reqwest::{
     Client, StatusCode,
     header::{COOKIE, LOCATION, SET_COOKIE},
@@ -120,6 +119,24 @@ async fn sqlite_monolith_process_runs_management_oauth_public_api_and_graceful_s
     let mut child = spawn_child(&mut command).unwrap();
     let result = run_e2e_flow(&fixture, &mut child).await;
     result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "release-only: starts a SQLite monolith process"]
+async fn sqlite_monolith_device_pairing_claim_and_share_require_recipient_acceptance() {
+    run_device_pairing_claim_and_share_e2e().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "release-only: starts a SQLite monolith process"]
+async fn sqlite_monolith_tenant_capabilities_gate_user_resource_creation() {
+    run_user_capability_e2e().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "release-only: starts a SQLite monolith process"]
+async fn sqlite_monolith_telemetry_opens_acknowledges_and_archives_alerts() {
+    run_alert_lifecycle_e2e().await.unwrap();
 }
 
 #[cfg(unix)]
@@ -268,13 +285,24 @@ async fn run_e2e_flow(
         .header(COOKIE, &tenant_cookie)
         .json(&json!({
             "username": "e2e-user",
-            "password": "E2eUserPassword@2026",
-            "default_app": "/apps/e2e-app",
-            "granted_apps": ["e2e-app"]
+            "password": "E2eUserPassword@2026"
         }))
         .send()
         .await?;
     assert_eq!(user.status(), StatusCode::CREATED);
+
+    let capabilities = client
+        .put(format!(
+            "http://{}/api/management/users/e2e-user/capabilities",
+            fixture.management_address
+        ))
+        .header(COOKIE, &tenant_cookie)
+        .json(&json!({
+            "capabilities": ["create_devices"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(capabilities.status(), StatusCode::OK);
 
     let user_login = client
         .post(format!(
@@ -450,6 +478,587 @@ async fn run_e2e_flow(
     Ok(())
 }
 
+struct E2eSession {
+    fixture: Fixture,
+    client: Client,
+    child: ManagedChild,
+    tenant_cookie: String,
+}
+
+impl E2eSession {
+    async fn start() -> Result<Self, Box<dyn std::error::Error>> {
+        let fixture = Fixture::new().await;
+        let binary = env!("CARGO_BIN_EXE_iot-nano-monolith");
+        let mut bootstrap = Command::new(binary);
+        fixture.configure(&mut bootstrap);
+        let output = bootstrap
+            .arg("--bootstrap-system")
+            .env("IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME", "e2e-system")
+            .env(
+                "IOT_NANO_BOOTSTRAP_SYSTEM_PASSWORD",
+                "E2eBootstrapSystem@2026",
+            )
+            .output()
+            .await?;
+        assert!(output.status.success(), "{output:?}");
+
+        let mut command = Command::new(binary);
+        fixture.configure(&mut command);
+        command.stderr(Stdio::inherit());
+        let child = spawn_child(&mut command)?;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        wait_ready(&client, fixture.public_address).await?;
+
+        let system_login = client
+            .post(format!(
+                "http://{}/api/system/auth/login",
+                fixture.management_address
+            ))
+            .json(&json!({
+                "username": "e2e-system",
+                "password": "E2eBootstrapSystem@2026"
+            }))
+            .send()
+            .await?;
+        assert_eq!(system_login.status(), StatusCode::OK);
+        let system_cookie = session_cookie(&system_login, "system login");
+
+        let tenant = client
+            .post(format!(
+                "http://{}/api/system/tenants",
+                fixture.management_address
+            ))
+            .header(COOKIE, system_cookie)
+            .json(&json!({
+                "slug": "e2e-tenant",
+                "metadata": { "source": "sqlite-e2e" },
+                "tenant_account_password": "E2eTenantAccount@2026"
+            }))
+            .send()
+            .await?;
+        assert_eq!(tenant.status(), StatusCode::CREATED);
+
+        let tenant_login = client
+            .post(format!(
+                "http://{}/api/tenant/auth/login",
+                fixture.management_address
+            ))
+            .json(&json!({
+                "tenant_slug": "e2e-tenant",
+                "password": "E2eTenantAccount@2026"
+            }))
+            .send()
+            .await?;
+        assert_eq!(tenant_login.status(), StatusCode::OK);
+
+        Ok(Self {
+            fixture,
+            client,
+            child,
+            tenant_cookie: session_cookie(&tenant_login, "tenant login"),
+        })
+    }
+
+    async fn stop(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.child.signal(rustix::process::Signal::TERM)?;
+        let exit = timeout(Duration::from_secs(15), self.child.wait()).await??;
+        if !exit.success() {
+            return Err(io::Error::other(format!("monolith exited with {exit}")).into());
+        }
+        for address in [
+            self.fixture.public_address,
+            self.fixture.management_address,
+            self.fixture.mqtt_tcp_address,
+            self.fixture.mqtt_tls_address,
+        ] {
+            let listener = TcpListener::bind(address).await?;
+            drop(listener);
+        }
+        Ok(())
+    }
+}
+
+async fn run_device_pairing_claim_and_share_e2e() -> Result<(), Box<dyn std::error::Error>> {
+    let session = E2eSession::start().await?;
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        create_management_user(&session, "owner", "OwnerPassword@2026").await?;
+        create_management_user(&session, "recipient", "RecipientPassword@2026").await?;
+        enable_claim_policy(&session).await?;
+
+        let device_id = provision_device(&session, "Pairing Device").await?;
+        let token = create_device_token(&session, &device_id).await?;
+        let code =
+            request_pairing_code(session.fixture.mqtt_tcp_address, &device_id, &token).await?;
+
+        let owner_cookie = user_cookie(&session, "owner", "OwnerPassword@2026").await?;
+        let claim = session
+            .client
+            .post(format!(
+                "http://{}/app/devices/claim",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &owner_cookie)
+            .form(&[("device_id", device_id.as_str()), ("code", code.as_str())])
+            .send()
+            .await?;
+        assert_eq!(claim.status(), StatusCode::SEE_OTHER);
+        assert_eq!(claim.headers()[LOCATION], "/app?notice=device-claimed");
+
+        let invite = session
+            .client
+            .post(format!(
+                "http://{}/app/devices/{device_id}/permissions",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &owner_cookie)
+            .form(&[("username", "recipient"), ("permission", "view")])
+            .send()
+            .await?;
+        assert_eq!(invite.status(), StatusCode::SEE_OTHER);
+
+        let recipient_cookie = user_cookie(&session, "recipient", "RecipientPassword@2026").await?;
+        let workspace_before = session
+            .client
+            .get(format!("http://{}/app", session.fixture.management_address))
+            .header(COOKIE, &recipient_cookie)
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(!workspace_before.contains("Pairing Device"));
+        assert!(workspace_before.contains("Invitations (1)"));
+
+        let invitation_page = session
+            .client
+            .get(format!(
+                "http://{}/app/invitations",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &recipient_cookie)
+            .send()
+            .await?
+            .text()
+            .await?;
+        let invitation_id = invitation_page
+            .split("/app/invitations/")
+            .nth(1)
+            .and_then(|value| value.split('/').next())
+            .expect("invitation page omitted the accept route");
+
+        let accepted = session
+            .client
+            .post(format!(
+                "http://{}/app/invitations/{invitation_id}/accept",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &recipient_cookie)
+            .send()
+            .await?;
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+
+        let workspace_after = session
+            .client
+            .get(format!("http://{}/app", session.fixture.management_address))
+            .header(COOKIE, &recipient_cookie)
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(workspace_after.contains("Pairing Device"));
+        Ok(())
+    }
+    .await;
+    let shutdown = session.stop().await;
+    result?;
+    shutdown
+}
+
+async fn run_user_capability_e2e() -> Result<(), Box<dyn std::error::Error>> {
+    let session = E2eSession::start().await?;
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        create_management_user(&session, "contributor", "ContributorPassword@2026").await?;
+        let contributor_cookie =
+            user_cookie(&session, "contributor", "ContributorPassword@2026").await?;
+
+        let denied_device = session
+            .client
+            .post(format!(
+                "http://{}/app/devices",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &contributor_cookie)
+            .form(&[("display_name", "Denied Device")])
+            .send()
+            .await?;
+        assert_eq!(denied_device.status(), StatusCode::FORBIDDEN);
+
+        let default_asset = session
+            .client
+            .post(format!(
+                "http://{}/app/assets",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &contributor_cookie)
+            .form(&[("name", "Default Asset")])
+            .send()
+            .await?;
+        assert_eq!(default_asset.status(), StatusCode::SEE_OTHER);
+
+        let capabilities = session
+            .client
+            .put(format!(
+                "http://{}/api/management/users/contributor/capabilities",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &session.tenant_cookie)
+            .json(&json!({
+                "capabilities": [
+                    "claim_devices",
+                    "create_assets",
+                    "create_devices",
+                    "control_devices",
+                    "edit_resources",
+                    "share_owned_resources"
+                ]
+            }))
+            .send()
+            .await?;
+        assert_eq!(capabilities.status(), StatusCode::OK);
+
+        let created_device = session
+            .client
+            .post(format!(
+                "http://{}/app/devices",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &contributor_cookie)
+            .form(&[("display_name", "Allowed Device")])
+            .send()
+            .await?;
+        assert_eq!(created_device.status(), StatusCode::SEE_OTHER);
+        let detail = created_device
+            .headers()
+            .get(LOCATION)
+            .expect("created device response omitted its detail URL")
+            .to_str()?;
+        let device_detail = session
+            .client
+            .get(format!(
+                "http://{}{}",
+                session.fixture.management_address, detail
+            ))
+            .header(COOKIE, &contributor_cookie)
+            .send()
+            .await?
+            .text()
+            .await?;
+        assert!(device_detail.contains("Allowed Device"));
+        Ok(())
+    }
+    .await;
+    let shutdown = session.stop().await;
+    result?;
+    shutdown
+}
+
+async fn run_alert_lifecycle_e2e() -> Result<(), Box<dyn std::error::Error>> {
+    let session = E2eSession::start().await?;
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        let device_id = provision_device(&session, "Alert Device").await?;
+        let token = create_device_token(&session, &device_id).await?;
+        let rule = session
+            .client
+            .post(format!(
+                "http://{}/api/management/alert-rules",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &session.tenant_cookie)
+            .json(&json!({
+                "name": "High Power",
+                "enabled": true,
+                "device_id": device_id,
+                "metric_key": "power_w",
+                "rule_type": "event_threshold",
+                "comparison": "gt",
+                "threshold": 500.0,
+                "severity": "warning"
+            }))
+            .send()
+            .await?;
+        assert_eq!(rule.status(), StatusCode::CREATED);
+        let rule: serde_json::Value = rule.json().await?;
+        let rule_id = rule["id"].as_str().expect("alert rule omitted its ID");
+
+        publish_device_measurements(
+            session.fixture.mqtt_tcp_address,
+            &device_id,
+            &token,
+            json!({ "power_w": 750.0 }),
+        )
+        .await?;
+        let incident = wait_for_alert_incident(&session, rule_id).await?;
+        let incident_id = incident["id"]
+            .as_str()
+            .expect("alert incident omitted its ID");
+        assert_eq!(incident["status"], "open");
+        assert_eq!(incident["last_value"], 750.0);
+
+        let acknowledged = session
+            .client
+            .post(format!(
+                "http://{}/api/management/alert-incidents/{incident_id}/acknowledge",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &session.tenant_cookie)
+            .send()
+            .await?;
+        assert_eq!(acknowledged.status(), StatusCode::OK);
+        let acknowledged: serde_json::Value = acknowledged.json().await?;
+        assert!(acknowledged["acknowledged_at"].is_string());
+
+        let archived = session
+            .client
+            .post(format!(
+                "http://{}/api/management/alert-rules/{rule_id}/archive",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &session.tenant_cookie)
+            .send()
+            .await?;
+        assert_eq!(archived.status(), StatusCode::NO_CONTENT);
+        Ok(())
+    }
+    .await;
+    let shutdown = session.stop().await;
+    result?;
+    shutdown
+}
+
+fn session_cookie(response: &reqwest::Response, context: &str) -> String {
+    response
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap_or_else(|| panic!("{context} did not issue a session cookie"))
+        .to_str()
+        .expect("session cookie was not valid ASCII")
+        .split(';')
+        .next()
+        .expect("session cookie was empty")
+        .to_owned()
+}
+
+async fn create_management_user(
+    session: &E2eSession,
+    username: &str,
+    password: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = session
+        .client
+        .post(format!(
+            "http://{}/api/management/users",
+            session.fixture.management_address
+        ))
+        .header(COOKIE, &session.tenant_cookie)
+        .json(&json!({ "username": username, "password": password }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    Ok(())
+}
+
+async fn user_cookie(
+    session: &E2eSession,
+    username: &str,
+    password: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = session
+        .client
+        .post(format!(
+            "http://{}/api/user/auth/login",
+            session.fixture.management_address
+        ))
+        .json(&json!({
+            "tenant_slug": "e2e-tenant",
+            "username": username,
+            "password": password
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(session_cookie(&response, "user login"))
+}
+
+async fn enable_claim_policy(session: &E2eSession) -> Result<(), Box<dyn std::error::Error>> {
+    let response = session
+        .client
+        .post(format!(
+            "http://{}/tenant/devices/claim-policy",
+            session.fixture.management_address
+        ))
+        .header(COOKIE, &session.tenant_cookie)
+        .form(&[
+            ("enabled", "on"),
+            ("ttl_seconds", "900"),
+            ("code_length", "12"),
+            ("max_failed_attempts", "5"),
+            ("request_cooldown_seconds", "10"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    Ok(())
+}
+
+async fn provision_device(
+    session: &E2eSession,
+    display_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = session
+        .client
+        .post(format!(
+            "http://{}/api/management/devices",
+            session.fixture.management_address
+        ))
+        .header(COOKIE, &session.tenant_cookie)
+        .json(&json!({ "display_name": display_name }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let device: serde_json::Value = response.json().await?;
+    Ok(device["device_id"]
+        .as_str()
+        .expect("provisioned device omitted its ID")
+        .to_owned())
+}
+
+async fn create_device_token(
+    session: &E2eSession,
+    device_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = session
+        .client
+        .post(format!(
+            "http://{}/api/management/devices/{device_id}/tokens",
+            session.fixture.management_address
+        ))
+        .header(COOKIE, &session.tenant_cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let token: serde_json::Value = response.json().await?;
+    Ok(token["token"]
+        .as_str()
+        .expect("device-token response omitted plaintext token")
+        .to_owned())
+}
+
+async fn request_pairing_code(
+    address: SocketAddr,
+    device_id: &str,
+    token: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut device = TcpStream::connect(address).await?;
+    device
+        .write_all(&v311_connect(device_id, "iotd_device_token", token))
+        .await?;
+    assert_eq!(
+        read_mqtt_packet(&mut device).await?,
+        vec![0x20, 0x02, 0x00, 0x00]
+    );
+    device
+        .write_all(&v311_subscribe("v1/devices/me/pairing/response/+", 11))
+        .await?;
+    assert_eq!(
+        read_mqtt_packet(&mut device).await?,
+        vec![0x90, 0x03, 0x00, 0x0b, 0x01]
+    );
+
+    let request_id = uuid::Uuid::now_v7();
+    device
+        .write_all(&v311_qos_one_publish(
+            "v1/devices/me/pairing/request",
+            json!({ "request_id": request_id }).to_string().as_bytes(),
+            12,
+        ))
+        .await?;
+    assert_eq!(
+        read_mqtt_packet(&mut device).await?,
+        vec![0x40, 0x02, 0x00, 0x0c]
+    );
+    let response = read_mqtt_packet(&mut device).await?;
+    assert_eq!(
+        mqtt_publish_topic(&response),
+        format!("v1/devices/me/pairing/response/{request_id}")
+    );
+    device
+        .write_all(&v311_puback(mqtt_publish_packet_id(&response)))
+        .await?;
+    let response: serde_json::Value = serde_json::from_slice(&mqtt_publish_payload(&response))?;
+    assert_eq!(response["status"], "issued");
+    assert_eq!(response["device_id"], device_id);
+    Ok(response["code"]
+        .as_str()
+        .expect("pairing response omitted the raw claim code")
+        .to_owned())
+}
+
+async fn publish_device_measurements(
+    address: SocketAddr,
+    device_id: &str,
+    token: &str,
+    measurements: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut device = TcpStream::connect(address).await?;
+    device
+        .write_all(&v311_connect(device_id, "iotd_device_token", token))
+        .await?;
+    assert_eq!(
+        read_mqtt_packet(&mut device).await?,
+        vec![0x20, 0x02, 0x00, 0x00]
+    );
+    device
+        .write_all(&v311_qos_one_publish(
+            "v1/devices/me/telemetry",
+            measurements.to_string().as_bytes(),
+            13,
+        ))
+        .await?;
+    assert_eq!(
+        read_mqtt_packet(&mut device).await?,
+        vec![0x40, 0x02, 0x00, 0x0d]
+    );
+    Ok(())
+}
+
+async fn wait_for_alert_incident(
+    session: &E2eSession,
+    rule_id: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    for _ in 0..120 {
+        let response = session
+            .client
+            .get(format!(
+                "http://{}/api/management/alert-incidents",
+                session.fixture.management_address
+            ))
+            .header(COOKIE, &session.tenant_cookie)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let incidents: Vec<serde_json::Value> = response.json().await?;
+        if let Some(incident) = incidents
+            .into_iter()
+            .find(|incident| incident["rule_id"].as_str() == Some(rule_id))
+        {
+            return Ok(incident);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    Err("alert worker did not create an incident".into())
+}
+
 async fn wait_ready(
     client: &Client,
     address: SocketAddr,
@@ -522,11 +1131,7 @@ async fn wait_for_telemetry(
 
 fn telemetry_payload() -> Vec<u8> {
     json!({
-        "schema_version": 1,
-        "boot_id": "c9c04d99-4e01-4f94-82a8-9e229e47c093",
-        "sequence": 1,
-        "event_at": Utc::now(),
-        "measurements": { "temperature_c": 22.5 }
+        "temperature_c": 22.5
     })
     .to_string()
     .into_bytes()
@@ -570,6 +1175,50 @@ fn v311_qos_one_publish(topic: &str, payload: &[u8], packet_id: u16) -> Vec<u8> 
     packet.extend_from_slice(&packet_id.to_be_bytes());
     packet.extend_from_slice(payload);
     packet
+}
+
+fn v311_subscribe(topic: &str, packet_id: u16) -> Vec<u8> {
+    let remaining = 2 + 2 + topic.len() + 1;
+    let mut packet = vec![0x82];
+    encode_remaining_length(remaining, &mut packet);
+    packet.extend_from_slice(&packet_id.to_be_bytes());
+    packet.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+    packet.extend_from_slice(topic.as_bytes());
+    packet.push(1);
+    packet
+}
+
+fn v311_puback(packet_id: u16) -> Vec<u8> {
+    vec![0x40, 0x02, (packet_id >> 8) as u8, packet_id as u8]
+}
+
+fn mqtt_publish_topic(packet: &[u8]) -> String {
+    let body = mqtt_packet_body_offset(packet);
+    let topic_length = usize::from(u16::from_be_bytes([packet[body], packet[body + 1]]));
+    String::from_utf8(packet[body + 2..body + 2 + topic_length].to_vec())
+        .expect("MQTT publish topic was not valid UTF-8")
+}
+
+fn mqtt_publish_packet_id(packet: &[u8]) -> u16 {
+    let body = mqtt_packet_body_offset(packet);
+    let topic_length = usize::from(u16::from_be_bytes([packet[body], packet[body + 1]]));
+    let packet_id_start = body + 2 + topic_length;
+    u16::from_be_bytes([packet[packet_id_start], packet[packet_id_start + 1]])
+}
+
+fn mqtt_publish_payload(packet: &[u8]) -> Vec<u8> {
+    let body = mqtt_packet_body_offset(packet);
+    let topic_length = usize::from(u16::from_be_bytes([packet[body], packet[body + 1]]));
+    let packet_id_length = if packet[0] & 0x06 == 0 { 0 } else { 2 };
+    packet[body + 2 + topic_length + packet_id_length..].to_vec()
+}
+
+fn mqtt_packet_body_offset(packet: &[u8]) -> usize {
+    let mut index = 1;
+    while packet[index] & 0x80 != 0 {
+        index += 1;
+    }
+    index + 1
 }
 
 fn encode_remaining_length(mut value: usize, packet: &mut Vec<u8>) {
@@ -618,7 +1267,7 @@ fn spawn_child(command: &mut Command) -> io::Result<ManagedChild> {
     command.process_group(0);
     let mut child = command
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .as_std_mut()
         .spawn()?;
     let Some(process_group) = rustix::process::Pid::from_raw(child.id() as i32) else {

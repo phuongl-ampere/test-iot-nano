@@ -63,8 +63,8 @@ async fn seed_tenants(pool: &SqlitePool) {
     insert_user(pool, USER_B, TENANT_B, "user-b").await;
     sqlx::query(
         "INSERT INTO tenant_accounts (
-            id, tenant_id, password_hash, status, credential_version
-         ) VALUES (?, ?, 'unused', 'active', 1), (?, ?, 'unused', 'active', 1)",
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?1, ?2, ?1, 'unused', 'active', 1), (?3, ?4, ?3, 'unused', 'active', 1)",
     )
     .bind(TENANT_ACCOUNT_A.to_string())
     .bind(TENANT_A.to_string())
