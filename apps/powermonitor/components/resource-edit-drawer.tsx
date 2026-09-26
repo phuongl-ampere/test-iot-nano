@@ -73,6 +73,7 @@ export function ResourceEditDrawer({
     isDevice ? resource.device_profile_id ?? "" : resource.asset_profile_id ?? "",
   );
   const [profilesLoading, setProfilesLoading] = useState(canManage);
+  const [profilesUnavailable, setProfilesUnavailable] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -107,7 +108,10 @@ export function ResourceEditDrawer({
         setProfiles(items);
       })
       .catch((reason) => {
-        if (active) setError(messageFor(reason));
+        if (active) {
+          setError(messageFor(reason));
+          setProfilesUnavailable(true);
+        }
       })
       .finally(() => {
         if (active) setProfilesLoading(false);
@@ -352,7 +356,7 @@ export function ResourceEditDrawer({
                 <span>{isDevice ? "Device profile" : "Asset profile"}</span>
                 <select
                   aria-label={isDevice ? "Device profile" : "Asset profile"}
-                  disabled={saving}
+                  disabled={saving || profilesUnavailable}
                   onChange={(event) => setProfileId(event.target.value)}
                   value={profileId}
                 >
@@ -362,7 +366,7 @@ export function ResourceEditDrawer({
               </label>
             )}
           </section>
-          <button disabled={saving || profilesLoading} type="submit">{saving ? "Saving" : "Save configuration"}</button>
+          <button disabled={saving || profilesLoading || profilesUnavailable} type="submit">{saving ? "Saving" : "Save configuration"}</button>
         </form>
       ) : (
         <p className="empty-state">You can view this resource but cannot change its configuration.</p>
