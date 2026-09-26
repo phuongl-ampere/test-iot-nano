@@ -45,9 +45,8 @@ database is recreated.
    credentials while no monolith owns the SQLite database.
 6. It starts the current workspace's monolith binary with the local runtime
    configuration, records its PID, and waits for `/healthz` and `/readyz`.
-7. It creates the tenant, PowerMonitor application, domain profiles, resource
-   hierarchy, devices, ownership, and permissions through existing management
-   APIs.
+7. It creates the tenant, PowerMonitor application, resource hierarchy,
+   devices, ownership, and permissions through existing management APIs.
 8. It verifies the fixture and prints the four user cases. The monolith
    remains running when the command exits.
 
@@ -57,9 +56,10 @@ environment directly.
 
 ## Demo Fixture
 
-The recreated tenant contains the `powermonitor` application, the `Power
-Farm`, `Power Zone`, and `Power Meter` domain profiles, two farms, two zones
-per farm, and two devices per zone.
+The recreated tenant contains the `powermonitor` application, two farms, two
+zones per farm, and two devices per zone. The seed deliberately does not
+write the retired application-scoped profile endpoints; tenant profile
+configuration is managed independently.
 
 | User case | Expected access |
 | --- | --- |

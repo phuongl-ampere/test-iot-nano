@@ -14,6 +14,8 @@ fi
 # shellcheck disable=SC1090
 source "$runtime_helper"
 local_platform_require_reset "$@"
+local_platform_configure
+management_url="$IOT_NANO_MANAGEMENT_URL"
 
 if [[ "${IOT_NANO_ALLOW_LOCAL_SEED:-}" != "1" ]]; then
   printf '%s\n' 'Set IOT_NANO_ALLOW_LOCAL_SEED=1 to run the fixed local seed.' >&2
@@ -108,10 +110,13 @@ esac
 tenant_login_body="$state_dir/tenant-login.json"
 tenant_login_status="$(request_status "$tenant_login_body" \
   --cookie-jar "$tenant_cookie" \
-  --data-urlencode "username=$IOT_NANO_SEED_TENANT_USERNAME" \
-  --data-urlencode "password=$IOT_NANO_SEED_TENANT_PASSWORD" \
-  "$management_url/login")"
-require_status "$tenant_login_status" 303 'Tenant Account login'
+  --header 'Content-Type: application/json' \
+  --data "$(jq -nc \
+    --arg tenant_slug "$IOT_NANO_SEED_TENANT_SLUG" \
+    --arg password "$IOT_NANO_SEED_TENANT_PASSWORD" \
+    '{tenant_slug: $tenant_slug, password: $password}')" \
+  "$management_url/api/tenant/auth/login")"
+require_status "$tenant_login_status" 200 'Tenant Account login'
 
 list_users() {
   curl --fail --silent --show-error --cookie "$tenant_cookie" \
@@ -186,104 +191,6 @@ ensure_powermonitor_application() {
     --data "$application_payload" \
     "$management_url/api/management/applications")"
   require_status "$application_status" 201 'PowerMonitor application seed'
-}
-
-list_application_domain_profiles() {
-  curl --fail --silent --show-error --cookie "$tenant_cookie" \
-    "$management_url/api/management/applications/$powermonitor_app_id/domain-profiles"
-}
-
-ensure_application_domain_profile() {
-  local resource_kind="$1"
-  local name="$2"
-  local definition="$3"
-  local live_view="$4"
-  local profiles_body="$state_dir/application-domain-profiles.json"
-  local profile_id
-  local match_count
-  local profile_payload
-  local profile_status
-
-  list_application_domain_profiles >"$profiles_body"
-  match_count="$(jq --arg resource_kind "$resource_kind" --arg name "$name" \
-    '[.[] | select(.resource_kind == $resource_kind and .name == $name)] | length' "$profiles_body")"
-  profile_payload="$(jq -nc \
-    --arg resource_kind "$resource_kind" \
-    --arg name "$name" \
-    --argjson definition "$definition" \
-    --argjson live_view "$live_view" \
-    '{resource_kind: $resource_kind, name: $name, definition: $definition, live_view: $live_view}')"
-  case "$match_count" in
-    0)
-      profile_status="$(request_status "$state_dir/application-domain-profile-create.json" \
-        --cookie "$tenant_cookie" \
-        --header 'Content-Type: application/json' \
-        --data "$profile_payload" \
-        "$management_url/api/management/applications/$powermonitor_app_id/domain-profiles")"
-      require_status "$profile_status" 201 "Application profile seed ($name)"
-      jq -r '.id' "$state_dir/application-domain-profile-create.json"
-      ;;
-    1)
-      profile_id="$(jq -r --arg resource_kind "$resource_kind" --arg name "$name" \
-        '.[] | select(.resource_kind == $resource_kind and .name == $name) | .id' "$profiles_body")"
-      profile_status="$(request_status "$state_dir/application-domain-profile-update.json" \
-        --cookie "$tenant_cookie" \
-        --request PUT \
-        --header 'Content-Type: application/json' \
-        --data "$profile_payload" \
-        "$management_url/api/management/applications/$powermonitor_app_id/domain-profiles/$profile_id")"
-      require_status "$profile_status" 200 "Application profile seed update ($name)"
-      printf '%s' "$profile_id"
-      ;;
-    *)
-      printf 'Application profile %s (%s) is ambiguous.\n' "$name" "$resource_kind" >&2
-      return 1
-      ;;
-  esac
-}
-
-ensure_application_asset_containment() {
-  local parent_profile_id="$1"
-  local child_profile_id="$2"
-  local relations_body="$state_dir/application-asset-profile-relations.json"
-  local match_count
-  local relation_status
-
-  curl --fail --silent --show-error --cookie "$tenant_cookie" \
-    "$management_url/api/management/applications/$powermonitor_app_id/asset-profile-relations" >"$relations_body"
-  match_count="$(jq --arg parent_profile_id "$parent_profile_id" --arg child_profile_id "$child_profile_id" \
-    '[.[] | select(.parent_profile_id == $parent_profile_id and .child_profile_id == $child_profile_id)] | length' "$relations_body")"
-  case "$match_count" in
-    0)
-      relation_status="$(request_status "$state_dir/application-asset-profile-relation-create.json" \
-        --cookie "$tenant_cookie" \
-        --header 'Content-Type: application/json' \
-        --data "$(jq -nc --arg parent_profile_id "$parent_profile_id" --arg child_profile_id "$child_profile_id" \
-          '{parent_profile_id: $parent_profile_id, child_profile_id: $child_profile_id}')" \
-        "$management_url/api/management/applications/$powermonitor_app_id/asset-profile-relations")"
-      require_status "$relation_status" 201 'Power Farm contains Power Zone seed'
-      ;;
-    1) ;;
-    *)
-      printf '%s\n' 'Power Farm contains Power Zone relation is ambiguous.' >&2
-      return 1
-      ;;
-  esac
-}
-
-assign_application_domain_profile() {
-  local resource_kind="$1"
-  local resource_id="$2"
-  local profile_id="$3"
-  local assignment_status
-
-  assignment_status="$(request_status "$state_dir/application-domain-profile-assignment.json" \
-    --cookie "$tenant_cookie" \
-    --request PUT \
-    --header 'Content-Type: application/json' \
-    --data "$(jq -nc --arg profile_id "$profile_id" '{profile_id: $profile_id}')" \
-    "$management_url/api/management/applications/$powermonitor_app_id/$resource_kind/$resource_id/domain-profile")"
-  require_status "$assignment_status" 204 "Application profile assignment ($resource_kind $resource_id)"
 }
 
 ensure_asset() {
@@ -475,23 +382,6 @@ ensure_user "$IOT_NANO_SEED_CONTROLLER_USERNAME" "$IOT_NANO_SEED_CONTROLLER_PASS
 ensure_user "$IOT_NANO_SEED_VIEWER_USERNAME" "$IOT_NANO_SEED_VIEWER_PASSWORD" >/dev/null
 ensure_user "$IOT_NANO_SEED_UNASSIGNED_USERNAME" "$IOT_NANO_SEED_UNASSIGNED_PASSWORD" >/dev/null
 
-power_meter_profile_id="$(ensure_application_domain_profile \
-  device \
-  'Power Meter' \
-  '{"telemetry_schema":{"power_w":{"type":"number","unit":"W"},"voltage_v":{"type":"number","unit":"V"},"current_a":{"type":"number","unit":"A"},"energy_kwh":{"type":"number","unit":"kWh"}},"metric_mapping":{"power_w":{"label":"Active power","unit":"W"},"voltage_v":{"label":"Voltage","unit":"V"},"current_a":{"label":"Current","unit":"A"},"energy_kwh":{"label":"Energy","unit":"kWh"}}}' \
-  '{"live_charts":[{"metric":"power_w","label":"Active power","unit":"W","color":"#167b83","aggregation":"last"}]}')"
-power_farm_profile_id="$(ensure_application_domain_profile \
-  asset \
-  'Power Farm' \
-  '{"fields":{"location":{"type":"string"},"capacity_kw":{"type":"number"}}}' \
-  '{"live_charts":[{"metric":"power_w","label":"Farm demand","unit":"W","color":"#d69731","aggregation":"sum"}]}')"
-power_zone_profile_id="$(ensure_application_domain_profile \
-  asset \
-  'Power Zone' \
-  '{"fields":{"location":{"type":"string"}}}' \
-  '{"live_charts":[{"metric":"power_w","label":"Zone demand","unit":"W","color":"#167b83","aggregation":"sum"}]}')"
-ensure_application_asset_containment "$power_farm_profile_id" "$power_zone_profile_id"
-
 farm_1_id="$(ensure_asset 'Power Farm 1' '')"
 farm_1_zone_1_id="$(ensure_asset 'Farm 1 / Zone 1' "$farm_1_id")"
 farm_1_zone_2_id="$(ensure_asset 'Farm 1 / Zone 2' "$farm_1_id")"
@@ -507,22 +397,6 @@ farm_2_zone_1_device_1_id="$(ensure_device 'Farm 2 / Zone 1 / Device 1' "$farm_2
 farm_2_zone_1_device_2_id="$(ensure_device 'Farm 2 / Zone 1 / Device 2' "$farm_2_zone_1_id")"
 farm_2_zone_2_device_1_id="$(ensure_device 'Farm 2 / Zone 2 / Device 1' "$farm_2_zone_2_id")"
 farm_2_zone_2_device_2_id="$(ensure_device 'Farm 2 / Zone 2 / Device 2' "$farm_2_zone_2_id")"
-
-for asset_id in "$farm_1_id" "$farm_2_id"; do
-  assign_application_domain_profile assets "$asset_id" "$power_farm_profile_id"
-done
-for asset_id in \
-  "$farm_1_zone_1_id" "$farm_1_zone_2_id" \
-  "$farm_2_zone_1_id" "$farm_2_zone_2_id"; do
-  assign_application_domain_profile assets "$asset_id" "$power_zone_profile_id"
-done
-for device_id in \
-  "$farm_1_zone_1_device_1_id" "$farm_1_zone_1_device_2_id" \
-  "$farm_1_zone_2_device_1_id" "$farm_1_zone_2_device_2_id" \
-  "$farm_2_zone_1_device_1_id" "$farm_2_zone_1_device_2_id" \
-  "$farm_2_zone_2_device_1_id" "$farm_2_zone_2_device_2_id"; do
-  assign_application_domain_profile devices "$device_id" "$power_meter_profile_id"
-done
 
 for asset_id in \
   "$farm_1_id" "$farm_1_zone_1_id" "$farm_1_zone_2_id" \
@@ -550,4 +424,3 @@ printf 'Controller: %s; control shares: Farm 1 / Zone 2 asset and Device 1.\n' \
 printf 'Viewer: %s; view shares: Farm 1 / Zone 1 asset and Farm 2 / Zone 2 / Device 2.\n' \
   "$IOT_NANO_SEED_VIEWER_USERNAME"
 printf 'Unassigned: %s; no seeded resources.\n' "$IOT_NANO_SEED_UNASSIGNED_USERNAME"
-printf '%s\n' 'PowerMonitor profiles: Power Meter, Power Farm, and Power Zone with live power charts.'

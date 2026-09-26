@@ -6,6 +6,7 @@ local_platform_helper_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 local_platform_configure() {
   local root
+  local cargo_bin
 
   root="${IOT_NANO_LOCAL_PLATFORM_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/rush-iot-nano/local-platform}"
   IOT_NANO_LOCAL_PLATFORM_ROOT="$root"
@@ -16,13 +17,19 @@ local_platform_configure() {
   IOT_NANO_LOCAL_TLS_KEY_PATH="$root/mqtt-key.pem"
   IOT_NANO_LOCAL_PID_FILE="${IOT_NANO_LOCAL_PID_FILE:-$root/monolith.pid}"
   IOT_NANO_LOCAL_LOG_FILE="${IOT_NANO_LOCAL_LOG_FILE:-$root/monolith.log}"
+  IOT_NANO_LOCAL_RUNNER_FILE="${IOT_NANO_LOCAL_RUNNER_FILE:-$root/monolith-runner.sh}"
+  IOT_NANO_LOCAL_STARTUP_ATTEMPTS="${IOT_NANO_LOCAL_STARTUP_ATTEMPTS:-300}"
   IOT_NANO_PUBLIC_HTTP_ADDRESS="${IOT_NANO_PUBLIC_HTTP_ADDRESS:-127.0.0.1:18080}"
   IOT_NANO_MANAGEMENT_ADDRESS="${IOT_NANO_MANAGEMENT_ADDRESS:-127.0.0.1:18081}"
   IOT_NANO_MQTT_TCP_ADDRESS="${IOT_NANO_MQTT_TCP_ADDRESS:-127.0.0.1:18883}"
   IOT_NANO_MQTT_TLS_ADDRESS="${IOT_NANO_MQTT_TLS_ADDRESS:-127.0.0.1:18884}"
   IOT_NANO_MANAGEMENT_URL="${IOT_NANO_MANAGEMENT_URL:-http://$IOT_NANO_MANAGEMENT_ADDRESS}"
   IOT_NANO_LOCAL_CARGO_LANE="${IOT_NANO_LOCAL_CARGO_LANE:-$local_platform_helper_root/scripts/dev/cargo-lane.sh}"
+  cargo_bin="${IOT_NANO_LOCAL_CARGO_BIN:-$(command -v cargo || true)}"
+  IOT_NANO_LOCAL_CARGO_BIN_DIR="${IOT_NANO_LOCAL_CARGO_BIN_DIR:-$(dirname "$cargo_bin")}"
   IOT_NANO_LOCAL_KILL_BIN="${IOT_NANO_LOCAL_KILL_BIN:-/bin/kill}"
+  IOT_NANO_LOCAL_LAUNCHCTL_BIN="${IOT_NANO_LOCAL_LAUNCHCTL_BIN:-/bin/launchctl}"
+  IOT_NANO_LOCAL_SERVICE_LABEL="${IOT_NANO_LOCAL_SERVICE_LABEL:-io.rush-iot-nano.local-platform.$(id -u)}"
 }
 
 local_platform_fail() {
@@ -87,6 +94,7 @@ local_platform_stop() {
 
   "$IOT_NANO_LOCAL_KILL_BIN" -TERM "$pid"
   local_platform_wait_for_listener_exit
+  local_platform_remove_launch_agent
   rm -f "$IOT_NANO_LOCAL_PID_FILE"
 }
 
@@ -109,6 +117,16 @@ local_platform_require_material() {
       return 1
     }
   done
+  [[ -x "$IOT_NANO_LOCAL_CARGO_BIN_DIR/cargo" ]] || {
+    local_platform_fail "cargo is unavailable from $IOT_NANO_LOCAL_CARGO_BIN_DIR"
+    return 1
+  }
+}
+
+local_platform_remove_launch_agent() {
+  if [[ "$(uname -s)" == Darwin && -x "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" ]]; then
+    "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" remove "$IOT_NANO_LOCAL_SERVICE_LABEL" 2>/dev/null || true
+  fi
 }
 
 local_platform_export_environment() {
@@ -146,7 +164,7 @@ local_platform_wait_for_http() {
   while ! curl --fail --silent --show-error --max-time 2 \
     "http://$IOT_NANO_PUBLIC_HTTP_ADDRESS$path" >/dev/null; do
     attempts=$((attempts + 1))
-    if [[ "$attempts" -gt 50 ]]; then
+    if [[ "$attempts" -gt "$IOT_NANO_LOCAL_STARTUP_ATTEMPTS" ]]; then
       local_platform_fail "timed out waiting for $path"
       return 1
     fi
@@ -154,16 +172,64 @@ local_platform_wait_for_http() {
   done
 }
 
+local_platform_wait_for_management() {
+  local attempts=0
+
+  while ! curl --silent --show-error --output /dev/null --max-time 2 \
+    "http://$IOT_NANO_MANAGEMENT_ADDRESS/api/system/auth/login"; do
+    attempts=$((attempts + 1))
+    if [[ "$attempts" -gt "$IOT_NANO_LOCAL_STARTUP_ATTEMPTS" ]]; then
+      local_platform_fail 'timed out waiting for the management listener'
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
+local_platform_write_runner() {
+  mkdir -p "$IOT_NANO_LOCAL_PLATFORM_ROOT"
+  chmod 700 "$IOT_NANO_LOCAL_PLATFORM_ROOT"
+  umask 077
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'export IOT_NANO_STORAGE=%q\n' "$IOT_NANO_STORAGE"
+    printf 'export IOT_NANO_SQLITE_PATH=%q\n' "$IOT_NANO_SQLITE_PATH"
+    printf 'export IOT_NANO_INTERNAL_DIR=%q\n' "$IOT_NANO_INTERNAL_DIR"
+    printf 'export IOT_NANO_TLS_CERT_PATH=%q\n' "$IOT_NANO_TLS_CERT_PATH"
+    printf 'export IOT_NANO_TLS_KEY_PATH=%q\n' "$IOT_NANO_TLS_KEY_PATH"
+    printf 'export IOT_NANO_PUBLIC_HTTP_ADDRESS=%q\n' "$IOT_NANO_PUBLIC_HTTP_ADDRESS"
+    printf 'export IOT_NANO_MANAGEMENT_ADDRESS=%q\n' "$IOT_NANO_MANAGEMENT_ADDRESS"
+    printf 'export IOT_NANO_MQTT_TCP_ADDRESS=%q\n' "$IOT_NANO_MQTT_TCP_ADDRESS"
+    printf 'export IOT_NANO_MQTT_TLS_ADDRESS=%q\n' "$IOT_NANO_MQTT_TLS_ADDRESS"
+    printf 'export IOT_DEVICE_TOKEN_VAULT_KEY=%q\n' "$IOT_DEVICE_TOKEN_VAULT_KEY"
+    printf 'export PATH=%q\n' "$IOT_NANO_LOCAL_CARGO_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
+    printf 'cd %q\n' "$local_platform_helper_root"
+    printf 'exec %q local-platform -- run -p iot-nano-monolith\n' "$IOT_NANO_LOCAL_CARGO_LANE"
+  } >"$IOT_NANO_LOCAL_RUNNER_FILE"
+  chmod 700 "$IOT_NANO_LOCAL_RUNNER_FILE"
+}
+
 local_platform_start() {
   local pid
 
   local_platform_export_environment
-  mkdir -p "$IOT_NANO_LOCAL_PLATFORM_ROOT"
-  nohup "$IOT_NANO_LOCAL_CARGO_LANE" local-platform -- \
-    run -p iot-nano-monolith >"$IOT_NANO_LOCAL_LOG_FILE" 2>&1 < /dev/null &
+  local_platform_write_runner
+  if [[ "$(uname -s)" == Darwin && -x "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" ]]; then
+    local_platform_remove_launch_agent
+    "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" submit \
+      -l "$IOT_NANO_LOCAL_SERVICE_LABEL" \
+      -o "$IOT_NANO_LOCAL_LOG_FILE" \
+      -e "$IOT_NANO_LOCAL_LOG_FILE" \
+      -- "$IOT_NANO_LOCAL_RUNNER_FILE"
+  else
+    nohup "$IOT_NANO_LOCAL_RUNNER_FILE" >"$IOT_NANO_LOCAL_LOG_FILE" 2>&1 < /dev/null &
+  fi
 
-  local_platform_wait_for_http /healthz
-  local_platform_wait_for_http /readyz
+  if ! local_platform_wait_for_http /healthz || ! local_platform_wait_for_http /readyz || \
+    ! local_platform_wait_for_management; then
+    local_platform_remove_launch_agent
+    return 1
+  fi
   pid="$(local_platform_listener_pid)"
   if [[ -z "$pid" ]] || ! local_platform_pid_is_expected "$pid"; then
     local_platform_fail 'started process could not be verified as the local monolith'

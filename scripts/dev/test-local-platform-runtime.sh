@@ -24,7 +24,16 @@ assert_file_contains() {
   local file="$1"
   local expected="$2"
 
-  grep -Fq "$expected" "$file" || fail "expected $file to contain $expected"
+  grep -Fq -- "$expected" "$file" || fail "expected $file to contain $expected"
+}
+
+assert_file_not_contains() {
+  local file="$1"
+  local unexpected="$2"
+
+  if grep -Fq -- "$unexpected" "$file"; then
+    fail "expected $file not to contain $unexpected"
+  fi
 }
 
 seed_output=''
@@ -83,6 +92,14 @@ rm -f "$IOT_NANO_TEST_LISTENER"
 EOF
 chmod +x "$fixture/bin/kill"
 
+cat >"$fixture/bin/launchctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >>"$IOT_NANO_TEST_LAUNCHCTL_LOG"
+EOF
+chmod +x "$fixture/bin/launchctl"
+
 export PATH="$fixture/bin:$PATH"
 export IOT_NANO_LOCAL_PLATFORM_ROOT="$platform_root"
 export IOT_NANO_PUBLIC_HTTP_ADDRESS='127.0.0.1:18080'
@@ -90,18 +107,20 @@ export IOT_NANO_TEST_LISTENER="$fixture/listener"
 export IOT_NANO_TEST_PLATFORM_PATH="$platform_root/platform.sqlite"
 export IOT_NANO_TEST_KILL_LOG="$fixture/kill.log"
 export IOT_NANO_LOCAL_KILL_BIN="$fixture/bin/kill"
+export IOT_NANO_TEST_LAUNCHCTL_LOG="$fixture/launchctl.log"
+export IOT_NANO_LOCAL_LAUNCHCTL_BIN="$fixture/bin/launchctl"
 touch "$IOT_NANO_TEST_LISTENER"
 
 # shellcheck disable=SC1090
 source "$helper"
 
-if local_platform_require_reset; then
+if local_platform_require_reset 2>"$fixture/usage.err"; then
   fail 'reset acknowledgement must require --reset'
 fi
 local_platform_require_reset --reset
 
 export IOT_NANO_TEST_LSOF_MODE=unverified
-if local_platform_stop; then
+if local_platform_stop 2>"$fixture/unverified.err"; then
   fail 'unverified listener must not be stopped'
 fi
 assert_missing "$IOT_NANO_TEST_KILL_LOG"
@@ -124,5 +143,17 @@ assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME'
 assert_file_contains "$seed" 'IOT_NANO_SEED_UNASSIGNED_USERNAME'
 assert_file_contains "$seed" "ensure_direct_share \"\$IOT_NANO_SEED_CONTROLLER_USERNAME\" control"
 assert_file_contains "$seed" "ensure_direct_share \"\$IOT_NANO_SEED_VIEWER_USERNAME\" view"
+assert_file_contains "$seed" '"$management_url/api/tenant/auth/login"'
+assert_file_contains "$seed" "require_status \"\$tenant_login_status\" 200 'Tenant Account login'"
+assert_file_contains "$seed" "--arg tenant_slug \"\$IOT_NANO_SEED_TENANT_SLUG\""
+assert_file_contains "$seed" "'{tenant_slug: \$tenant_slug, password: \$password}'"
+assert_file_contains "$helper" '"$IOT_NANO_LOCAL_LAUNCHCTL_BIN" submit'
+assert_file_contains "$helper" 'IOT_NANO_LOCAL_SERVICE_LABEL'
+assert_file_contains "$helper" 'IOT_NANO_LOCAL_CARGO_BIN_DIR'
+assert_file_contains "$helper" "cd %q\\n' \"\$local_platform_helper_root\""
+assert_file_contains "$helper" 'IOT_NANO_LOCAL_STARTUP_ATTEMPTS'
+assert_file_contains "$helper" 'local_platform_wait_for_management'
+assert_file_contains "$seed" 'management_url="$IOT_NANO_MANAGEMENT_URL"'
+assert_file_not_contains "$seed" '/domain-profiles'
 
 printf 'test-local-platform-runtime: ok\n'
