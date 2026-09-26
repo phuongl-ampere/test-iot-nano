@@ -32,7 +32,7 @@
 - Consumes: `infra/monolith/local-platform-seed.env.example`, `apps/powermonitor/.env.example`, `scripts/dev/seed-local-platform.sh --reset`, and `npm run dev -- --port 3002`.
 - Produces: one ordered, safe setup guide that a developer can follow without reading scripts.
 
-- [ ] **Step 1: Record exact local inputs and commands**
+- [x] **Step 1: Record exact local inputs and commands**
 
 Read the listed templates and scripts. Capture only documented placeholders and defaults:
 
@@ -46,7 +46,7 @@ curl --fail http://localhost:3002/
 
 Confirm that the reset command starts the local monolith and does not start the PowerMonitor development server.
 
-- [ ] **Step 2: Write the guide**
+- [x] **Step 2: Write the guide**
 
 Create `docs/local-development.md` with these sections in order:
 
@@ -67,7 +67,7 @@ Create `docs/local-development.md` with these sections in order:
 
 Use generated placeholder-only vault and self-signed TLS commands. Explain that the developer must replace the seed credentials and local platform URLs in the two ignored environment files, delete `OAUTH_CLIENT_SECRET` because the seeded client is public, and generate `SESSION_SECRET`. Include the four seeded access cases, health commands, UI URL, listener addresses, preserved files, and session invalidation behavior.
 
-- [ ] **Step 3: Check Markdown links and command references**
+- [x] **Step 3: Check Markdown links and command references**
 
 Run:
 
@@ -81,7 +81,7 @@ test -f docs/operations-monolith.md
 
 Expected: every referenced repository path exists and all expected guide references are found.
 
-- [ ] **Step 4: Commit the guide**
+- [x] **Step 4: Commit the guide**
 
 ```bash
 git add docs/local-development.md
@@ -98,7 +98,7 @@ git commit -m "docs: add local development guide"
 - Consumes: the guide created in Task 1.
 - Produces: concise links from the repository homepage to local and production procedures.
 
-- [ ] **Step 1: Replace the detailed local-seed subsection with an entry point**
+- [x] **Step 1: Replace the detailed local-seed subsection with an entry point**
 
 Keep the `### Fresh local PowerMonitor seed` heading, but replace its body with a short summary and a relative link:
 
@@ -116,11 +116,11 @@ IOT_NANO_ALLOW_LOCAL_SEED=1 ./scripts/dev/seed-local-platform.sh --reset
 
 Keep the existing explanation that the reset is disposable and requires a new browser sign-in. Do not duplicate setup details now owned by the local guide.
 
-- [ ] **Step 2: Make the production link explicit**
+- [x] **Step 2: Make the production link explicit**
 
 In the Runtime section, retain the link to `docs/operations-monolith.md` and name it the production deployment and rollback runbook.
 
-- [ ] **Step 3: Verify local and production entry points**
+- [x] **Step 3: Verify local and production entry points**
 
 Run:
 
@@ -130,7 +130,7 @@ rg -n 'local-development\.md|operations-monolith\.md|seed-local-platform\.sh --r
 
 Expected: the README links to both the local guide and production monolith runbook, and shows the guarded reset command once.
 
-- [ ] **Step 4: Commit the entry-point update**
+- [x] **Step 4: Commit the entry-point update**
 
 ```bash
 git add README.md
@@ -148,7 +148,7 @@ git commit -m "docs: link local development workflow"
 - Consumes: the current monolith topology stated by README and the production runbook.
 - Produces: a historical architecture reference that cannot be mistaken for a current startup guide.
 
-- [ ] **Step 1: Add a historical-status notice at the top**
+- [x] **Step 1: Add a historical-status notice at the top**
 
 Put this notice immediately below the title:
 
@@ -164,7 +164,7 @@ Put this notice immediately below the title:
 
 Retain the former content only as historical context. Do not remove it or change architectural history.
 
-- [ ] **Step 2: Verify that the redirect is unambiguous**
+- [x] **Step 2: Verify that the redirect is unambiguous**
 
 Run:
 
@@ -175,7 +175,7 @@ rg -n 'Historical architecture reference|local-development\.md|operations-monoli
 
 Expected: the notice precedes all four-service startup text and names both current replacement documents.
 
-- [ ] **Step 3: Commit the historical notice**
+- [x] **Step 3: Commit the historical notice**
 
 ```bash
 git add docs/operations.md
@@ -194,7 +194,7 @@ git commit -m "docs: retire four-service operations guide"
 - Consumes: all documentation changes from Tasks 1–3.
 - Produces: evidence that a reader finds one current local path and one current production path.
 
-- [ ] **Step 1: Verify repository paths and documentation hygiene**
+- [x] **Step 1: Verify repository paths and documentation hygiene**
 
 Run:
 
@@ -205,7 +205,7 @@ rg -n -i 'tbd|todo|replace-with-system-password|replace-with-owner-password' REA
 
 Expected: no whitespace errors, no unfinished placeholders, and template-only placeholder values appear only where the guide explicitly tells the reader to replace them.
 
-- [ ] **Step 2: Syntax-check the documented runtime and seed scripts**
+- [x] **Step 2: Syntax-check the documented runtime and seed scripts**
 
 Run:
 
@@ -215,7 +215,7 @@ bash -n scripts/dev/local-platform-runtime.sh scripts/dev/seed-local-platform.sh
 
 Expected: exit status `0`.
 
-- [ ] **Step 3: Check the guidance path manually**
+- [x] **Step 3: Check the guidance path manually**
 
 Confirm the following reading order is true:
 
@@ -227,7 +227,7 @@ docs/operations.md
   -> historical notice + both current documents
 ```
 
-- [ ] **Step 4: Commit any validation-driven wording fixes**
+- [x] **Step 4: Commit any validation-driven wording fixes**
 
 ```bash
 git add README.md docs/local-development.md docs/operations.md
