@@ -427,12 +427,21 @@ login_owner() {
   require_status "$owner_login_status" 303 'Seed owner login'
 }
 
-ensure_direct_view_share() {
-  local resource_kind="$1"
-  local resource_id="$2"
+ensure_direct_share() {
+  local username="$1"
+  local permission="$2"
+  local resource_kind="$3"
+  local resource_id="$4"
   local detail_path
   local page_body
+  local permission_label
   local share_status
+
+  case "$permission" in
+    view) permission_label='View' ;;
+    control) permission_label='Control' ;;
+    *) printf 'Unknown seed share permission: %s\n' "$permission" >&2; return 1 ;;
+  esac
 
   case "$resource_kind" in
     asset) detail_path="/app/assets/$resource_id" ;;
@@ -443,26 +452,28 @@ ensure_direct_view_share() {
   page_body="$state_dir/${resource_kind}-share-page.html"
   curl --fail --silent --show-error --cookie "$owner_cookie" \
     "$management_url$detail_path" >"$page_body"
-  if grep -Fq "<td>${IOT_NANO_SEED_RECIPIENT_USERNAME}</td><td><span class=\"status-chip\">View</span>" "$page_body"; then
+  if grep -Fq "<td>${username}</td><td><span class=\"status-chip\">${permission_label}</span>" "$page_body"; then
     return
   fi
-  if grep -Fq "<td>${IOT_NANO_SEED_RECIPIENT_USERNAME}</td>" "$page_body"; then
-    printf 'Seed recipient %s already has a non-View share on %s %s.\n' \
-      "$IOT_NANO_SEED_RECIPIENT_USERNAME" "$resource_kind" "$resource_id" >&2
+  if grep -Fq "<td>${username}</td>" "$page_body"; then
+    printf 'Seed user %s already has a different share on %s %s.\n' \
+      "$username" "$resource_kind" "$resource_id" >&2
     return 1
   fi
   share_status="$(request_status "$state_dir/${resource_kind}-share-result.html" \
     --cookie "$owner_cookie" \
     --request POST \
-    --data-urlencode "username=$IOT_NANO_SEED_RECIPIENT_USERNAME" \
-    --data-urlencode 'permission=view' \
+    --data-urlencode "username=$username" \
+    --data-urlencode "permission=$permission" \
     "$management_url$detail_path/permissions")"
-  require_status "$share_status" 303 "Direct View share ($resource_kind $resource_id)"
+  require_status "$share_status" 303 "Direct $permission share ($resource_kind $resource_id)"
 }
 
 ensure_powermonitor_application
 owner_user_id="$(ensure_user "$IOT_NANO_SEED_OWNER_USERNAME" "$IOT_NANO_SEED_OWNER_PASSWORD")"
-recipient_user_id="$(ensure_user "$IOT_NANO_SEED_RECIPIENT_USERNAME" "$IOT_NANO_SEED_RECIPIENT_PASSWORD")"
+ensure_user "$IOT_NANO_SEED_CONTROLLER_USERNAME" "$IOT_NANO_SEED_CONTROLLER_PASSWORD" >/dev/null
+ensure_user "$IOT_NANO_SEED_VIEWER_USERNAME" "$IOT_NANO_SEED_VIEWER_PASSWORD" >/dev/null
+ensure_user "$IOT_NANO_SEED_UNASSIGNED_USERNAME" "$IOT_NANO_SEED_UNASSIGNED_PASSWORD" >/dev/null
 
 power_meter_profile_id="$(ensure_application_domain_profile \
   device \
@@ -527,10 +538,16 @@ for device_id in \
 done
 
 login_owner
-ensure_direct_view_share asset "$farm_1_zone_1_id"
-ensure_direct_view_share device "$farm_2_zone_2_device_2_id"
+ensure_direct_share "$IOT_NANO_SEED_CONTROLLER_USERNAME" control asset "$farm_1_zone_2_id"
+ensure_direct_share "$IOT_NANO_SEED_CONTROLLER_USERNAME" control device "$farm_1_zone_2_device_1_id"
+ensure_direct_share "$IOT_NANO_SEED_VIEWER_USERNAME" view asset "$farm_1_zone_1_id"
+ensure_direct_share "$IOT_NANO_SEED_VIEWER_USERNAME" view device "$farm_2_zone_2_device_2_id"
 
-printf '%s\n' 'Local platform owner-sharing seed is ready.'
-printf 'Owner: %s; recipient: %s\n' "$IOT_NANO_SEED_OWNER_USERNAME" "$IOT_NANO_SEED_RECIPIENT_USERNAME"
-printf '%s\n' 'View shares: Farm 1 / Zone 1 asset and Farm 2 / Zone 2 / Device 2.'
+printf '%s\n' 'Local platform PowerMonitor seed is ready.'
+printf 'Owner: %s\n' "$IOT_NANO_SEED_OWNER_USERNAME"
+printf 'Controller: %s; control shares: Farm 1 / Zone 2 asset and Device 1.\n' \
+  "$IOT_NANO_SEED_CONTROLLER_USERNAME"
+printf 'Viewer: %s; view shares: Farm 1 / Zone 1 asset and Farm 2 / Zone 2 / Device 2.\n' \
+  "$IOT_NANO_SEED_VIEWER_USERNAME"
+printf 'Unassigned: %s; no seeded resources.\n' "$IOT_NANO_SEED_UNASSIGNED_USERNAME"
 printf '%s\n' 'PowerMonitor profiles: Power Meter, Power Farm, and Power Zone with live power charts.'

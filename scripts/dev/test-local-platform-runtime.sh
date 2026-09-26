@@ -20,6 +20,13 @@ assert_missing() {
   [[ ! -e "$1" ]] || fail "expected $1 to be absent"
 }
 
+assert_file_contains() {
+  local file="$1"
+  local expected="$2"
+
+  grep -Fq "$expected" "$file" || fail "expected $file to contain $expected"
+}
+
 seed_output=''
 seed_status=0
 if seed_output="$(IOT_NANO_ALLOW_LOCAL_SEED=1 \
@@ -111,5 +118,11 @@ assert_missing "$platform_root/internal"
 assert_present "$platform_root/vault.key"
 assert_present "$platform_root/mqtt-cert.pem"
 assert_present "$platform_root/mqtt-key.pem"
+
+assert_file_contains "$seed" 'IOT_NANO_SEED_CONTROLLER_USERNAME'
+assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME'
+assert_file_contains "$seed" 'IOT_NANO_SEED_UNASSIGNED_USERNAME'
+assert_file_contains "$seed" "ensure_direct_share \"\$IOT_NANO_SEED_CONTROLLER_USERNAME\" control"
+assert_file_contains "$seed" "ensure_direct_share \"\$IOT_NANO_SEED_VIEWER_USERNAME\" view"
 
 printf 'test-local-platform-runtime: ok\n'

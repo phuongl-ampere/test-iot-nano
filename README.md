@@ -99,6 +99,12 @@ starts a new monolith, and seeds the PowerMonitor fixture. It retains local
 TLS material and the device-token vault key. Existing PowerMonitor browser
 sessions are invalid after the reset and require a new sign-in.
 
+Copy `infra/monolith/local-platform-seed.env.example` to the ignored local
+seed file and set its credentials. The seed creates four PowerMonitor user
+cases: an owner of every seeded resource, a controller with two `control`
+shares, a viewer with two disjoint `view` shares, and an unassigned user with
+no seeded resource access.
+
 Run broad checks only in the release lane:
 
 ```bash
