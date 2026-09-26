@@ -75,6 +75,7 @@ fi
 
 if [[ " $* " == *' -p 4242 '* ]]; then
   if [[ "${IOT_NANO_TEST_LSOF_MODE:-verified}" == verified ]]; then
+    printf 'iot-nano-monolith 4242 test txt REG 1,1 0 1 %s\n' "$IOT_NANO_TEST_BINARY_PATH"
     printf 'iot-nano-monolith 4242 test 11u REG 1,1 0 1 %s\n' "$IOT_NANO_TEST_PLATFORM_PATH"
   else
     printf 'other-process 4242 test 11u REG 1,1 0 1 /tmp/other.sqlite\n'
@@ -87,6 +88,10 @@ cat >"$fixture/bin/kill" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$1" == -0 ]]; then
+  [[ -f "$IOT_NANO_TEST_LISTENER" ]]
+  exit
+fi
 printf '%s\n' "$*" >>"$IOT_NANO_TEST_KILL_LOG"
 rm -f "$IOT_NANO_TEST_LISTENER"
 EOF
@@ -113,6 +118,8 @@ touch "$IOT_NANO_TEST_LISTENER"
 
 # shellcheck disable=SC1090
 source "$helper"
+local_platform_configure
+export IOT_NANO_TEST_BINARY_PATH="$IOT_NANO_LOCAL_BINARY_PATH"
 
 if local_platform_require_reset 2>"$fixture/usage.err"; then
   fail 'reset acknowledgement must require --reset'
@@ -128,6 +135,8 @@ assert_missing "$IOT_NANO_TEST_KILL_LOG"
 export IOT_NANO_TEST_LSOF_MODE=verified
 local_platform_stop
 assert_present "$IOT_NANO_TEST_KILL_LOG"
+assert_present "$IOT_NANO_LOCAL_OWNER_FILE"
+assert_file_contains "$IOT_NANO_LOCAL_OWNER_FILE" "$root"
 
 local_platform_clear_state
 assert_missing "$platform_root/platform.sqlite"
@@ -137,6 +146,12 @@ assert_missing "$platform_root/internal"
 assert_present "$platform_root/vault.key"
 assert_present "$platform_root/mqtt-cert.pem"
 assert_present "$platform_root/mqtt-key.pem"
+
+IOT_NANO_PUBLIC_HTTP_ADDRESS='0.0.0.0:18080'
+if local_platform_preflight 2>"$fixture/non-loopback.err"; then
+  fail 'non-loopback runtime bindings must be rejected before reset'
+fi
+IOT_NANO_PUBLIC_HTTP_ADDRESS='127.0.0.1:18080'
 
 assert_file_contains "$seed" 'IOT_NANO_SEED_CONTROLLER_USERNAME'
 assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME'
@@ -150,10 +165,16 @@ assert_file_contains "$seed" "'{tenant_slug: \$tenant_slug, password: \$password
 assert_file_contains "$helper" '"$IOT_NANO_LOCAL_LAUNCHCTL_BIN" submit'
 assert_file_contains "$helper" 'IOT_NANO_LOCAL_SERVICE_LABEL'
 assert_file_contains "$helper" 'IOT_NANO_LOCAL_CARGO_BIN_DIR'
+assert_file_contains "$helper" 'IOT_NANO_LOCAL_LEGACY_SERVICE_LABEL'
 assert_file_contains "$helper" "cd %q\\n' \"\$local_platform_helper_root\""
 assert_file_contains "$helper" 'IOT_NANO_LOCAL_STARTUP_ATTEMPTS'
 assert_file_contains "$helper" 'local_platform_wait_for_management'
 assert_file_contains "$seed" 'management_url="$IOT_NANO_MANAGEMENT_URL"'
 assert_file_not_contains "$seed" '/domain-profiles'
+assert_file_contains "$seed" 'IOT_NANO_SEED_CONTROLLER_USERNAME:=seed-controller'
+assert_file_contains "$seed" 'IOT_NANO_SEED_UNASSIGNED_USERNAME:=seed-unassigned'
+assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME:=${IOT_NANO_SEED_RECIPIENT_USERNAME:-seed-viewer}'
+assert_file_contains "$seed" 'require_seed_variables'
+assert_file_contains "$seed" 'local_platform_preflight'
 
 printf 'test-local-platform-runtime: ok\n'

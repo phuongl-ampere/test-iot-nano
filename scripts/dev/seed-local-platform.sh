@@ -46,18 +46,43 @@ fi
 
 # shellcheck disable=SC1090
 source "$seed_file"
+: "${IOT_NANO_SEED_CONTROLLER_USERNAME:=seed-controller}"
+: "${IOT_NANO_SEED_CONTROLLER_PASSWORD:=SeedControllerOnly2026!}"
+: "${IOT_NANO_SEED_VIEWER_USERNAME:=${IOT_NANO_SEED_RECIPIENT_USERNAME:-seed-viewer}}"
+: "${IOT_NANO_SEED_VIEWER_PASSWORD:=${IOT_NANO_SEED_RECIPIENT_PASSWORD:-SeedViewerOnly2026!}}"
+: "${IOT_NANO_SEED_UNASSIGNED_USERNAME:=seed-unassigned}"
+: "${IOT_NANO_SEED_UNASSIGNED_PASSWORD:=SeedUnassignedOnly2026!}"
 
+require_seed_variables() {
+  local variable
+
+  for variable in \
+    IOT_NANO_SEED_SYSTEM_USERNAME \
+    IOT_NANO_SEED_SYSTEM_PASSWORD \
+    IOT_NANO_SEED_TENANT_SLUG \
+    IOT_NANO_SEED_TENANT_USERNAME \
+    IOT_NANO_SEED_TENANT_PASSWORD \
+    IOT_NANO_SEED_OWNER_USERNAME \
+    IOT_NANO_SEED_OWNER_PASSWORD \
+    IOT_NANO_SEED_CONTROLLER_USERNAME \
+    IOT_NANO_SEED_CONTROLLER_PASSWORD \
+    IOT_NANO_SEED_VIEWER_USERNAME \
+    IOT_NANO_SEED_VIEWER_PASSWORD \
+    IOT_NANO_SEED_UNASSIGNED_USERNAME \
+    IOT_NANO_SEED_UNASSIGNED_PASSWORD; do
+    [[ -n "${!variable:-}" ]] || {
+      printf 'Seed variable is required: %s\n' "$variable" >&2
+      return 1
+    }
+  done
+}
+
+require_seed_variables
+local_platform_preflight
 local_platform_stop
 local_platform_clear_state
 local_platform_bootstrap "$IOT_NANO_SEED_SYSTEM_USERNAME" "$IOT_NANO_SEED_SYSTEM_PASSWORD"
 local_platform_start
-
-for command in curl jq grep mktemp; do
-  command -v "$command" >/dev/null || {
-    printf 'Required command is unavailable: %s\n' "$command" >&2
-    exit 2
-  }
-done
 
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/iot-nano-local-seed.XXXXXX")"
 trap 'rm -rf "$state_dir"' EXIT
