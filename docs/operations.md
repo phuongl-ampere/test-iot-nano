@@ -1,5 +1,13 @@
 # Operations
 
+> **Historical architecture reference — not an operational runbook.**
+> The four-service topology documented below has been superseded by the single
+> `iot-nano-monolith` runtime. Do not start `iot-nano-stream`,
+> `iot-nano-core`, `iot-nano-api`, or `iot-nano-mqttd` as separate deployment
+> services. For local development, use [Local Development](local-development.md).
+> For production deployment, storage, and rollback, use
+> [Monolith Operations](operations-monolith.md).
+
 ## Runtime
 
 The development target runs only these services:
