@@ -22,7 +22,8 @@ pub use application_domain::{
     ApplicationAssetProfileRelation, ApplicationDomainProfile, ApplicationDomainProfileError,
     ApplicationDomainProfileRepository, ApplicationDomainResourceKind,
     CreateApplicationAssetProfileRelation, CreateApplicationDomainProfile,
-    UpdateApplicationDomainProfile,
+    TenantProfileConfiguration, TenantProfileContainmentRule, TenantProfileDefinition,
+    TenantProfileRepository, UpdateApplicationDomainProfile,
 };
 pub use commands::{
     CommandLifecycleRepository, CommandOutboxRecord, CommandOutboxState, CommandRepository,

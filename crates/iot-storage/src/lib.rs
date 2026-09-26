@@ -57,9 +57,11 @@ pub use contracts::{
     ResourceAccessSource, ResourceInvitation, ResourceInvitationRepository,
     ResourceInvitationState, ResourceKind, ResourcePermission, ResourcePermissionRecord,
     TelemetryAggregate, TelemetryAggregateRepository, TelemetryRepository,
-    TenantAuthorizationError, TenantAuthorizationRepository, TenantUserGroup,
-    TenantUserGroupMember, TopologyRepository, UpdateApplicationDomainProfile, UserDeviceActivity,
-    UserDeviceActivityRepository, UserDeviceAlert, UserDeviceTelemetry, UserGroup,
+    TenantAuthorizationError, TenantAuthorizationRepository, TenantProfileConfiguration,
+    TenantProfileContainmentRule, TenantProfileDefinition, TenantProfileRepository,
+    TenantUserGroup, TenantUserGroupMember, TopologyRepository, UpdateApplicationDomainProfile,
+    UserDeviceActivity, UserDeviceActivityRepository, UserDeviceAlert, UserDeviceTelemetry,
+    UserGroup,
 };
 pub use domain::RetentionResult;
 pub use store::{PlatformStore, PlatformStoreError, SqliteStore};

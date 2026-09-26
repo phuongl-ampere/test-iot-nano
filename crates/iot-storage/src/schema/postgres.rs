@@ -22,6 +22,8 @@ const CANONICAL_TABLES: &[&str] = &[
     "application_domain_profiles",
     "application_asset_profile_relations",
     "resource_application_profile_assignments",
+    "tenant_profile_configurations",
+    "resource_tenant_profile_assignments",
     "assets",
     "devices",
     "tenant_device_claim_policies",

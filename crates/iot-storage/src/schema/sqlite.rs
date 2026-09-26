@@ -21,6 +21,8 @@ pub(crate) const CANONICAL_TABLES: &[&str] = &[
     "application_domain_profiles",
     "application_asset_profile_relations",
     "resource_application_profile_assignments",
+    "tenant_profile_configurations",
+    "resource_tenant_profile_assignments",
     "assets",
     "device_relations",
     "device_asset_relations",
@@ -429,6 +431,24 @@ CREATE TABLE IF NOT EXISTS resource_application_profile_assignments (
 );
 CREATE INDEX IF NOT EXISTS resource_application_profile_assignments_profile_index
     ON resource_application_profile_assignments (tenant_id, profile_id);
+CREATE TABLE IF NOT EXISTS tenant_profile_configurations (
+    tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE RESTRICT,
+    version INTEGER NOT NULL,
+    configuration TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS resource_tenant_profile_assignments (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('asset', 'device')),
+    resource_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (tenant_id, resource_kind, resource_id)
+);
+CREATE INDEX IF NOT EXISTS resource_tenant_profile_assignments_profile_index
+    ON resource_tenant_profile_assignments (tenant_id, profile_id);
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,

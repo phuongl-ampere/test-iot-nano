@@ -1,14 +1,50 @@
 use std::{future::Future, pin::Pin};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{ApplicationId, PlatformStoreError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ApplicationDomainResourceKind {
     Asset,
     Device,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TenantProfileDefinition {
+    pub id: Uuid,
+    pub resource_kind: ApplicationDomainResourceKind,
+    pub name: String,
+    pub definition: serde_json::Value,
+    pub live_view: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantProfileContainmentRule {
+    pub parent_profile_id: Uuid,
+    pub child_profile_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TenantProfileConfiguration {
+    pub version: u16,
+    pub profiles: Vec<TenantProfileDefinition>,
+    pub containment_rules: Vec<TenantProfileContainmentRule>,
+    pub permission_definitions: serde_json::Value,
+}
+
+impl TenantProfileConfiguration {
+    pub fn empty() -> Self {
+        Self {
+            version: 1,
+            profiles: Vec::new(),
+            containment_rules: Vec::new(),
+            permission_definitions: serde_json::json!({}),
+        }
+    }
 }
 
 impl ApplicationDomainResourceKind {
@@ -71,6 +107,12 @@ pub struct CreateApplicationAssetProfileRelation {
 
 #[derive(Debug, Error)]
 pub enum ApplicationDomainProfileError {
+    #[error("tenant profile configuration version is not supported")]
+    UnsupportedConfigurationVersion,
+    #[error("tenant profile permission definitions must be an object")]
+    PermissionDefinitionsMustBeObject,
+    #[error("tenant profile containment rule references an unknown profile")]
+    UnknownContainedProfile,
     #[error("application domain application was not found")]
     ApplicationNotFound,
     #[error("application domain profile was not found")]
@@ -102,6 +144,24 @@ pub enum ApplicationDomainProfileError {
         #[source]
         source: PlatformStoreError,
     },
+}
+
+pub trait TenantProfileRepository: Send + Sync {
+    fn export_tenant_profile_configuration<'a>(
+        &'a self,
+        tenant_id: Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<TenantProfileConfiguration, ApplicationDomainProfileError>>
+                + Send
+                + 'a,
+        >,
+    >;
+    fn replace_tenant_profile_configuration<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        configuration: TenantProfileConfiguration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationDomainProfileError>> + Send + 'a>>;
 }
 
 impl From<PlatformStoreError> for ApplicationDomainProfileError {

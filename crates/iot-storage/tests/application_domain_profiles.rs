@@ -3,6 +3,8 @@ use iot_storage::{
     ApplicationDomainProfileRepository, ApplicationDomainResourceKind, ApplicationKind,
     ApplicationRepository, ClientId, CreateApplicationAssetProfileRelation,
     CreateApplicationDomainProfile, NewApplication, PlatformStore, RedirectUri,
+    TenantProfileConfiguration, TenantProfileContainmentRule, TenantProfileDefinition,
+    TenantProfileRepository,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -311,4 +313,68 @@ async fn sqlite_application_domain_allows_only_asset_contains_relations() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("asset profiles"), "{error}");
+}
+
+#[tokio::test]
+async fn sqlite_tenant_profile_configuration_replaces_atomically() {
+    let (_directory, store, tenant_id) = sqlite_store().await;
+    let farm_id = Uuid::now_v7();
+    let zone_id = Uuid::now_v7();
+    let configuration = TenantProfileConfiguration {
+        version: 1,
+        profiles: vec![
+            TenantProfileDefinition {
+                id: farm_id,
+                resource_kind: ApplicationDomainResourceKind::Asset,
+                name: "Power Farm".to_owned(),
+                definition: json!({"level": "farm", "inherits": []}),
+                live_view: json!({}),
+            },
+            TenantProfileDefinition {
+                id: zone_id,
+                resource_kind: ApplicationDomainResourceKind::Asset,
+                name: "Power Zone".to_owned(),
+                definition: json!({"level": "zone", "inherits": ["Power Farm"]}),
+                live_view: json!({}),
+            },
+        ],
+        containment_rules: vec![TenantProfileContainmentRule {
+            parent_profile_id: farm_id,
+            child_profile_id: zone_id,
+        }],
+        permission_definitions: json!({"roles": ["operator"]}),
+    };
+
+    TenantProfileRepository::replace_tenant_profile_configuration(
+        &store,
+        tenant_id,
+        configuration.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        TenantProfileRepository::export_tenant_profile_configuration(&store, tenant_id)
+            .await
+            .unwrap(),
+        configuration
+    );
+
+    let invalid = TenantProfileConfiguration {
+        containment_rules: vec![TenantProfileContainmentRule {
+            parent_profile_id: farm_id,
+            child_profile_id: Uuid::now_v7(),
+        }],
+        ..configuration.clone()
+    };
+    assert!(
+        TenantProfileRepository::replace_tenant_profile_configuration(&store, tenant_id, invalid)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        TenantProfileRepository::export_tenant_profile_configuration(&store, tenant_id)
+            .await
+            .unwrap(),
+        configuration
+    );
 }

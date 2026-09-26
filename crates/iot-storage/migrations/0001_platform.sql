@@ -249,6 +249,24 @@ CREATE TABLE IF NOT EXISTS resource_application_profile_assignments (
 );
 CREATE INDEX IF NOT EXISTS resource_application_profile_assignments_profile_index
     ON resource_application_profile_assignments (tenant_id, profile_id);
+CREATE TABLE IF NOT EXISTS tenant_profile_configurations (
+    tenant_id UUID PRIMARY KEY REFERENCES tenants(id) ON DELETE RESTRICT,
+    version INTEGER NOT NULL,
+    configuration JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS resource_tenant_profile_assignments (
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('asset', 'device')),
+    resource_id TEXT NOT NULL,
+    profile_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, resource_kind, resource_id)
+);
+CREATE INDEX IF NOT EXISTS resource_tenant_profile_assignments_profile_index
+    ON resource_tenant_profile_assignments (tenant_id, profile_id);
 CREATE TABLE IF NOT EXISTS assets (
     id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,

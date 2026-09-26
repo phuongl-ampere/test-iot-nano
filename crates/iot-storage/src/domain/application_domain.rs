@@ -1,4 +1,8 @@
-use std::{future::Future, pin::Pin};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+};
 
 use chrono::Utc;
 use sqlx::{Row, postgres::PgRow, sqlite::SqliteRow, types::Json};
@@ -8,8 +12,33 @@ use crate::{
     ApplicationAssetProfileRelation, ApplicationDomainProfile, ApplicationDomainProfileError,
     ApplicationDomainProfileRepository, ApplicationDomainResourceKind, ApplicationId,
     CreateApplicationAssetProfileRelation, CreateApplicationDomainProfile, PlatformStore,
-    UpdateApplicationDomainProfile,
+    TenantProfileConfiguration, TenantProfileRepository, UpdateApplicationDomainProfile,
 };
+
+impl TenantProfileRepository for PlatformStore {
+    fn export_tenant_profile_configuration<'a>(
+        &'a self,
+        tenant_id: Uuid,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<TenantProfileConfiguration, ApplicationDomainProfileError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { export_tenant_profile_configuration(self, tenant_id).await })
+    }
+
+    fn replace_tenant_profile_configuration<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        configuration: TenantProfileConfiguration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationDomainProfileError>> + Send + 'a>> {
+        Box::pin(async move {
+            replace_tenant_profile_configuration(self, tenant_id, configuration).await
+        })
+    }
+}
 
 impl ApplicationDomainProfileRepository for PlatformStore {
     fn list_application_domain_profiles<'a>(
@@ -949,4 +978,148 @@ fn profile_create_error(error: sqlx::Error, name: &str) -> ApplicationDomainProf
     } else {
         ApplicationDomainProfileError::from(error)
     }
+}
+
+async fn export_tenant_profile_configuration(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+) -> Result<TenantProfileConfiguration, ApplicationDomainProfileError> {
+    let stored = match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT configuration FROM tenant_profile_configurations WHERE tenant_id = ?",
+            )
+            .bind(tenant_id.to_string())
+            .fetch_optional(store.pool())
+            .await?
+        }
+        PlatformStore::Timescale(pool) => sqlx::query_scalar::<_, String>(
+            "SELECT configuration::text FROM tenant_profile_configurations WHERE tenant_id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?,
+    };
+    let Some(stored) = stored else {
+        return Ok(TenantProfileConfiguration::empty());
+    };
+    let configuration = serde_json::from_str::<TenantProfileConfiguration>(&stored)
+        .map_err(|_| ApplicationDomainProfileError::InvalidStoredProfile)?;
+    validate_tenant_profile_configuration(&configuration)
+        .map_err(|_| ApplicationDomainProfileError::InvalidStoredProfile)?;
+    Ok(configuration)
+}
+
+async fn replace_tenant_profile_configuration(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    configuration: TenantProfileConfiguration,
+) -> Result<(), ApplicationDomainProfileError> {
+    validate_tenant_profile_configuration(&configuration)?;
+    let serialized = serde_json::to_string(&configuration)
+        .map_err(|_| ApplicationDomainProfileError::InvalidStoredProfile)?;
+    match store {
+        PlatformStore::Sqlite(store) => {
+            let mut transaction = store.pool().begin().await?;
+            sqlx::query("DELETE FROM resource_tenant_profile_assignments WHERE tenant_id = ?")
+                .bind(tenant_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "INSERT INTO tenant_profile_configurations (tenant_id, version, configuration, updated_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(tenant_id) DO UPDATE SET
+                    version = excluded.version,
+                    configuration = excluded.configuration,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(tenant_id.to_string())
+            .bind(i64::from(configuration.version))
+            .bind(&serialized)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        }
+        PlatformStore::Timescale(pool) => {
+            let mut transaction = pool.begin().await?;
+            sqlx::query("DELETE FROM resource_tenant_profile_assignments WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "INSERT INTO tenant_profile_configurations (tenant_id, version, configuration)
+                 VALUES ($1, $2, $3::jsonb)
+                 ON CONFLICT(tenant_id) DO UPDATE SET
+                    version = EXCLUDED.version,
+                    configuration = EXCLUDED.configuration,
+                    updated_at = now()",
+            )
+            .bind(tenant_id)
+            .bind(i32::from(configuration.version))
+            .bind(&serialized)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_tenant_profile_configuration(
+    configuration: &TenantProfileConfiguration,
+) -> Result<(), ApplicationDomainProfileError> {
+    if configuration.version != 1 {
+        return Err(ApplicationDomainProfileError::UnsupportedConfigurationVersion);
+    }
+    if !configuration.permission_definitions.is_object() {
+        return Err(ApplicationDomainProfileError::PermissionDefinitionsMustBeObject);
+    }
+    let mut profile_ids = HashSet::new();
+    let mut names = HashSet::new();
+    let mut kinds = HashMap::new();
+    for profile in &configuration.profiles {
+        if !profile_ids.insert(profile.id) {
+            return Err(ApplicationDomainProfileError::InvalidStoredProfile);
+        }
+        if !names.insert((profile.resource_kind, profile.name.trim().to_owned())) {
+            return Err(ApplicationDomainProfileError::NameConflict(
+                profile.name.clone(),
+            ));
+        }
+        validate_tenant_profile_definition(profile)?;
+        kinds.insert(profile.id, profile.resource_kind);
+    }
+    for relation in &configuration.containment_rules {
+        if relation.parent_profile_id == relation.child_profile_id {
+            return Err(ApplicationDomainProfileError::AssetProfilesOnly);
+        }
+        let Some(parent_kind) = kinds.get(&relation.parent_profile_id) else {
+            return Err(ApplicationDomainProfileError::UnknownContainedProfile);
+        };
+        let Some(child_kind) = kinds.get(&relation.child_profile_id) else {
+            return Err(ApplicationDomainProfileError::UnknownContainedProfile);
+        };
+        if *parent_kind != ApplicationDomainResourceKind::Asset
+            || *child_kind != ApplicationDomainResourceKind::Asset
+        {
+            return Err(ApplicationDomainProfileError::AssetProfilesOnly);
+        }
+    }
+    Ok(())
+}
+
+fn validate_tenant_profile_definition(
+    profile: &crate::TenantProfileDefinition,
+) -> Result<(), ApplicationDomainProfileError> {
+    if profile.name.trim().is_empty() || profile.name.chars().count() > 128 {
+        return Err(ApplicationDomainProfileError::InvalidName);
+    }
+    if !profile.definition.is_object() {
+        return Err(ApplicationDomainProfileError::DefinitionMustBeObject);
+    }
+    if !profile.live_view.is_object() {
+        return Err(ApplicationDomainProfileError::LiveViewMustBeObject);
+    }
+    Ok(())
 }
