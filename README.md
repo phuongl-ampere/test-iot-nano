@@ -23,8 +23,8 @@ browser -> iot-nano-monolith -> platform storage
 The monolith deployment is for a fresh environment. It must not be pointed at,
 or used to directly convert or reuse, state owned by the former API, Core,
 Stream, or MQTTD services. See
-[docs/operations-monolith.md](docs/operations-monolith.md) for storage,
-secrets, startup, and rollback procedures.
+[docs/operations-monolith.md](docs/operations-monolith.md), the production
+deployment, storage, secrets, and rollback runbook.
 
 ## Device MQTT
 
@@ -85,25 +85,18 @@ callers opt into `sccache` and retain all Rust/Cargo wrapper settings.
 
 ### Fresh local PowerMonitor seed
 
-Use the local seed configuration at
-`infra/monolith/local-platform-seed.env` and reset the complete disposable
-local platform with:
+For the complete local workflow—creating local TLS and vault material,
+configuring PowerMonitor, resetting the monolith, loading demo data, and
+verifying the UI—follow [docs/local-development.md](docs/local-development.md).
+
+The guarded reset command is:
 
 ```bash
 IOT_NANO_ALLOW_LOCAL_SEED=1 ./scripts/dev/seed-local-platform.sh --reset
 ```
 
-The command stops only a verified local monolith, clears its platform SQLite
-database plus stream, MQTTD, and cache state, bootstraps the system account,
-starts a new monolith, and seeds the PowerMonitor fixture. It retains local
-TLS material and the device-token vault key. Existing PowerMonitor browser
-sessions are invalid after the reset and require a new sign-in.
-
-Copy `infra/monolith/local-platform-seed.env.example` to the ignored local
-seed file and set its credentials. The seed creates four PowerMonitor user
-cases: an owner of every seeded resource, a controller with two `control`
-shares, a viewer with two disjoint `view` shares, and an unassigned user with
-no seeded resource access.
+The reset recreates only disposable local platform state and requires a new
+PowerMonitor sign-in afterward. It preserves local TLS and vault material.
 
 Run broad checks only in the release lane:
 
