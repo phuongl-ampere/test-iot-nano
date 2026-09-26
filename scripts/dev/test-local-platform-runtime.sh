@@ -176,5 +176,12 @@ assert_file_contains "$seed" 'IOT_NANO_SEED_UNASSIGNED_USERNAME:=seed-unassigned
 assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME:=${IOT_NANO_SEED_RECIPIENT_USERNAME:-seed-viewer}'
 assert_file_contains "$seed" 'require_seed_variables'
 assert_file_contains "$seed" 'local_platform_preflight'
+assert_file_contains "$seed" '/api/management/profiles/device-profiles'
+assert_file_contains "$seed" '/api/management/profiles/asset-profiles'
+assert_file_contains "$seed" "'Power Meter'"
+assert_file_contains "$seed" "'Power Farm'"
+assert_file_contains "$seed" "'Power Zone'"
+assert_file_contains "$seed" 'asset_profile_id: $asset_profile_id'
+assert_file_contains "$seed" 'device_profile_id: $device_profile_id'
 
 printf 'test-local-platform-runtime: ok\n'

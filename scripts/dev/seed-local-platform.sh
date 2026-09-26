@@ -218,9 +218,52 @@ ensure_powermonitor_application() {
   require_status "$application_status" 201 'PowerMonitor application seed'
 }
 
+create_device_profile() {
+  local name="$1"
+  local telemetry_schema="$2"
+  local metric_mapping="$3"
+  local reporting_settings="$4"
+  local profile_status
+  local profile_body="$state_dir/device-profile-${name// /-}.json"
+
+  profile_status="$(request_status "$profile_body" \
+    --cookie "$tenant_cookie" \
+    --header 'Content-Type: application/json' \
+    --data "$(jq -nc \
+      --arg name "$name" \
+      --argjson telemetry_schema "$telemetry_schema" \
+      --argjson metric_mapping "$metric_mapping" \
+      --argjson reporting_settings "$reporting_settings" \
+      '{name: $name, telemetry_schema: $telemetry_schema, metric_mapping: $metric_mapping, reporting_settings: $reporting_settings}')" \
+    "$management_url/api/management/profiles/device-profiles")"
+  require_status "$profile_status" 201 "Device profile seed ($name)"
+  jq -r '.id' "$profile_body"
+}
+
+create_asset_profile() {
+  local name="$1"
+  local fields="$2"
+  local dashboard_defaults="$3"
+  local profile_status
+  local profile_body="$state_dir/asset-profile-${name// /-}.json"
+
+  profile_status="$(request_status "$profile_body" \
+    --cookie "$tenant_cookie" \
+    --header 'Content-Type: application/json' \
+    --data "$(jq -nc \
+      --arg name "$name" \
+      --argjson fields "$fields" \
+      --argjson dashboard_defaults "$dashboard_defaults" \
+      '{name: $name, fields: $fields, dashboard_defaults: $dashboard_defaults}')" \
+    "$management_url/api/management/profiles/asset-profiles")"
+  require_status "$profile_status" 201 "Asset profile seed ($name)"
+  jq -r '.id' "$profile_body"
+}
+
 ensure_asset() {
   local name="$1"
   local parent_asset_id="$2"
+  local asset_profile_id="$3"
   local assets_body="$state_dir/assets.json"
   local match_count
   local asset_id
@@ -249,8 +292,8 @@ ensure_asset() {
   create_status="$(request_status "$state_dir/asset-create.json" \
     --cookie "$tenant_cookie" \
     --header 'Content-Type: application/json' \
-    --data "$(jq -nc --arg name "$name" --arg parent_asset_id "$parent_asset_id" \
-      '{name: $name, asset_profile_id: null, parent_asset_id: (if $parent_asset_id == "" then null else $parent_asset_id end), metadata: {local_seed: "owner-sharing-demo"}, attributes: null}')" \
+    --data "$(jq -nc --arg name "$name" --arg parent_asset_id "$parent_asset_id" --arg asset_profile_id "$asset_profile_id" \
+      '{name: $name, asset_profile_id: $asset_profile_id, parent_asset_id: (if $parent_asset_id == "" then null else $parent_asset_id end), metadata: {local_seed: "owner-sharing-demo"}, attributes: null}')" \
     "$management_url/api/management/assets")"
   require_status "$create_status" 201 "Asset seed ($name)"
   asset_id="$(jq -r '.id' "$state_dir/asset-create.json")"
@@ -269,6 +312,7 @@ list_devices() {
 ensure_device() {
   local name="$1"
   local asset_id="$2"
+  local device_profile_id="$3"
   local devices_body="$state_dir/devices.json"
   local match_count
   local device_id
@@ -295,8 +339,8 @@ ensure_device() {
   create_status="$(request_status "$state_dir/device-create.json" \
     --cookie "$tenant_cookie" \
     --header 'Content-Type: application/json' \
-    --data "$(jq -nc --arg name "$name" --arg asset_id "$asset_id" \
-      '{display_name: $name, asset_id: $asset_id, device_profile_id: null, attributes: {local_seed: "owner-sharing-demo"}}')" \
+    --data "$(jq -nc --arg name "$name" --arg asset_id "$asset_id" --arg device_profile_id "$device_profile_id" \
+      '{display_name: $name, asset_id: $asset_id, device_profile_id: $device_profile_id, attributes: {local_seed: "owner-sharing-demo"}}')" \
     "$management_url/api/management/devices")"
   require_status "$create_status" 201 "Device seed ($name)"
   device_id="$(jq -r '.device_id' "$state_dir/device-create.json")"
@@ -407,21 +451,35 @@ ensure_user "$IOT_NANO_SEED_CONTROLLER_USERNAME" "$IOT_NANO_SEED_CONTROLLER_PASS
 ensure_user "$IOT_NANO_SEED_VIEWER_USERNAME" "$IOT_NANO_SEED_VIEWER_PASSWORD" >/dev/null
 ensure_user "$IOT_NANO_SEED_UNASSIGNED_USERNAME" "$IOT_NANO_SEED_UNASSIGNED_PASSWORD" >/dev/null
 
-farm_1_id="$(ensure_asset 'Power Farm 1' '')"
-farm_1_zone_1_id="$(ensure_asset 'Farm 1 / Zone 1' "$farm_1_id")"
-farm_1_zone_2_id="$(ensure_asset 'Farm 1 / Zone 2' "$farm_1_id")"
-farm_2_id="$(ensure_asset 'Power Farm 2' '')"
-farm_2_zone_1_id="$(ensure_asset 'Farm 2 / Zone 1' "$farm_2_id")"
-farm_2_zone_2_id="$(ensure_asset 'Farm 2 / Zone 2' "$farm_2_id")"
+power_meter_profile_id="$(create_device_profile \
+  'Power Meter' \
+  '{"power_w":{"type":"number","unit":"W"},"voltage_v":{"type":"number","unit":"V"},"current_a":{"type":"number","unit":"A"},"energy_kwh":{"type":"number","unit":"kWh"}}' \
+  '{"power_w":"Active power","voltage_v":"Voltage","current_a":"Current","energy_kwh":"Energy"}' \
+  '{"interval_seconds":60}')"
+power_farm_profile_id="$(create_asset_profile \
+  'Power Farm' \
+  '{"location":{"type":"string"},"capacity_kw":{"type":"number"}}' \
+  '{"primary_metric":"power_w","aggregation":"sum"}')"
+power_zone_profile_id="$(create_asset_profile \
+  'Power Zone' \
+  '{"location":{"type":"string"}}' \
+  '{"primary_metric":"power_w","aggregation":"sum"}')"
 
-farm_1_zone_1_device_1_id="$(ensure_device 'Farm 1 / Zone 1 / Device 1' "$farm_1_zone_1_id")"
-farm_1_zone_1_device_2_id="$(ensure_device 'Farm 1 / Zone 1 / Device 2' "$farm_1_zone_1_id")"
-farm_1_zone_2_device_1_id="$(ensure_device 'Farm 1 / Zone 2 / Device 1' "$farm_1_zone_2_id")"
-farm_1_zone_2_device_2_id="$(ensure_device 'Farm 1 / Zone 2 / Device 2' "$farm_1_zone_2_id")"
-farm_2_zone_1_device_1_id="$(ensure_device 'Farm 2 / Zone 1 / Device 1' "$farm_2_zone_1_id")"
-farm_2_zone_1_device_2_id="$(ensure_device 'Farm 2 / Zone 1 / Device 2' "$farm_2_zone_1_id")"
-farm_2_zone_2_device_1_id="$(ensure_device 'Farm 2 / Zone 2 / Device 1' "$farm_2_zone_2_id")"
-farm_2_zone_2_device_2_id="$(ensure_device 'Farm 2 / Zone 2 / Device 2' "$farm_2_zone_2_id")"
+farm_1_id="$(ensure_asset 'Power Farm 1' '' "$power_farm_profile_id")"
+farm_1_zone_1_id="$(ensure_asset 'Farm 1 / Zone 1' "$farm_1_id" "$power_zone_profile_id")"
+farm_1_zone_2_id="$(ensure_asset 'Farm 1 / Zone 2' "$farm_1_id" "$power_zone_profile_id")"
+farm_2_id="$(ensure_asset 'Power Farm 2' '' "$power_farm_profile_id")"
+farm_2_zone_1_id="$(ensure_asset 'Farm 2 / Zone 1' "$farm_2_id" "$power_zone_profile_id")"
+farm_2_zone_2_id="$(ensure_asset 'Farm 2 / Zone 2' "$farm_2_id" "$power_zone_profile_id")"
+
+farm_1_zone_1_device_1_id="$(ensure_device 'Farm 1 / Zone 1 / Device 1' "$farm_1_zone_1_id" "$power_meter_profile_id")"
+farm_1_zone_1_device_2_id="$(ensure_device 'Farm 1 / Zone 1 / Device 2' "$farm_1_zone_1_id" "$power_meter_profile_id")"
+farm_1_zone_2_device_1_id="$(ensure_device 'Farm 1 / Zone 2 / Device 1' "$farm_1_zone_2_id" "$power_meter_profile_id")"
+farm_1_zone_2_device_2_id="$(ensure_device 'Farm 1 / Zone 2 / Device 2' "$farm_1_zone_2_id" "$power_meter_profile_id")"
+farm_2_zone_1_device_1_id="$(ensure_device 'Farm 2 / Zone 1 / Device 1' "$farm_2_zone_1_id" "$power_meter_profile_id")"
+farm_2_zone_1_device_2_id="$(ensure_device 'Farm 2 / Zone 1 / Device 2' "$farm_2_zone_1_id" "$power_meter_profile_id")"
+farm_2_zone_2_device_1_id="$(ensure_device 'Farm 2 / Zone 2 / Device 1' "$farm_2_zone_2_id" "$power_meter_profile_id")"
+farm_2_zone_2_device_2_id="$(ensure_device 'Farm 2 / Zone 2 / Device 2' "$farm_2_zone_2_id" "$power_meter_profile_id")"
 
 for asset_id in \
   "$farm_1_id" "$farm_1_zone_1_id" "$farm_1_zone_2_id" \
@@ -449,3 +507,4 @@ printf 'Controller: %s; control shares: Farm 1 / Zone 2 asset and Device 1.\n' \
 printf 'Viewer: %s; view shares: Farm 1 / Zone 1 asset and Farm 2 / Zone 2 / Device 2.\n' \
   "$IOT_NANO_SEED_VIEWER_USERNAME"
 printf 'Unassigned: %s; no seeded resources.\n' "$IOT_NANO_SEED_UNASSIGNED_USERNAME"
+printf '%s\n' 'Profiles: Power Farm, Power Zone, and Power Meter.'
