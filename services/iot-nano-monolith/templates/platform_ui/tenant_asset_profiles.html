@@ -4,7 +4,7 @@
 {% block account_kind %}Tenant Account{% endblock %}
 {% block navigation_label %}Tenant navigation{% endblock %}
 {% block navigation %}
-  {% let active_nav = "asset-profiles" %}
+  {% let active_nav = "profile" %}
   {% include "platform_ui/tenant_navigation.html" %}
 {% endblock %}
 {% block content %}
@@ -13,6 +13,8 @@
     <h1>Asset Profiles</h1>
     <p>Define reusable fields and dashboard defaults for tenant assets.</p>
   </section>
+  {% let active_profile_tab = "asset" %}
+  {% include "platform_ui/tenant_profile_tabs.html" %}
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}

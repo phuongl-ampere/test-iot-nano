@@ -23,7 +23,7 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 12] = [
     ("profile", "/tenant/profile", "Profile"),
 ];
 
-const TENANT_TEMPLATES: [(&str, &str); 14] = [
+const TENANT_TEMPLATES: [(&str, &str); 16] = [
     ("tenant.html", "overview"),
     ("tenant_devices.html", "devices"),
     ("tenant_assets.html", "assets"),
@@ -36,6 +36,8 @@ const TENANT_TEMPLATES: [(&str, &str); 14] = [
     ("tenant_permissions.html", "permissions"),
     ("tenant_applications.html", "applications"),
     ("tenant_profile.html", "profile"),
+    ("tenant_asset_profiles.html", "profile"),
+    ("tenant_device_profiles.html", "profile"),
     ("tenant_device_credential.html", "devices"),
     ("tenant_device_claim_policy.html", "devices"),
 ];
@@ -430,11 +432,22 @@ fn tenant_profile_template_keeps_json_import_export_separate_from_profile_tabs()
     let template = platform_template_source("tenant_profile.html");
     let asset_profiles = platform_template_source("tenant_asset_profiles.html");
     let device_profiles = platform_template_source("tenant_device_profiles.html");
+    let tabs = platform_template_source("tenant_profile_tabs.html");
 
     assert!(template.contains("data-tenant-profile-json"));
     assert!(template.contains("/api/management/profile/export"));
     assert!(template.contains("/api/management/profile/import"));
     assert!(template.contains("type=\"file\""));
+    assert!(tabs.contains("href=\"/tenant/profile\""));
+    assert!(tabs.contains("href=\"/tenant/profiles/asset\""));
+    assert!(tabs.contains("href=\"/tenant/profiles/device\""));
+    assert_eq!(tabs.matches("aria-current=\"page\"").count(), 3);
+    assert!(template.contains("{% include \"platform_ui/tenant_profile_tabs.html\" %}"));
+    assert!(asset_profiles.contains("{% include \"platform_ui/tenant_profile_tabs.html\" %}"));
+    assert!(device_profiles.contains("{% include \"platform_ui/tenant_profile_tabs.html\" %}"));
+    assert!(template.contains("{% let active_profile_tab = \"configuration\" %}"));
+    assert!(asset_profiles.contains("{% let active_profile_tab = \"asset\" %}"));
+    assert!(device_profiles.contains("{% let active_profile_tab = \"device\" %}"));
     assert!(asset_profiles.contains("action=\"/tenant/profiles/asset\""));
     assert!(device_profiles.contains("action=\"/tenant/profiles/device\""));
 }

@@ -1,0 +1,5 @@
+<nav class="profile-tabs" aria-label="Profile catalog">
+  <a class="profile-tab{% if active_profile_tab == "configuration" %} active{% endif %}" href="/tenant/profile"{% if active_profile_tab == "configuration" %} aria-current="page"{% endif %}>Profile configuration</a>
+  <a class="profile-tab{% if active_profile_tab == "asset" %} active{% endif %}" href="/tenant/profiles/asset"{% if active_profile_tab == "asset" %} aria-current="page"{% endif %}>Asset Profiles</a>
+  <a class="profile-tab{% if active_profile_tab == "device" %} active{% endif %}" href="/tenant/profiles/device"{% if active_profile_tab == "device" %} aria-current="page"{% endif %}>Device Profiles</a>
+</nav>
