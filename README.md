@@ -83,6 +83,22 @@ Set `IOT_NANO_LANE_TARGET_ROOT` or `IOT_NANO_LANE_LOG` to override the local
 cache or timing-log locations. It never configures Rust compiler wrappers;
 callers opt into `sccache` and retain all Rust/Cargo wrapper settings.
 
+### Fresh local PowerMonitor seed
+
+Use the local seed configuration at
+`infra/monolith/local-platform-seed.env` and reset the complete disposable
+local platform with:
+
+```bash
+IOT_NANO_ALLOW_LOCAL_SEED=1 ./scripts/dev/seed-local-platform.sh --reset
+```
+
+The command stops only a verified local monolith, clears its platform SQLite
+database plus stream, MQTTD, and cache state, bootstraps the system account,
+starts a new monolith, and seeds the PowerMonitor fixture. It retains local
+TLS material and the device-token vault key. Existing PowerMonitor browser
+sessions are invalid after the reset and require a new sign-in.
+
 Run broad checks only in the release lane:
 
 ```bash

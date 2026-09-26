@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 helper="$root/scripts/dev/local-platform-runtime.sh"
+seed="$root/scripts/dev/seed-local-platform.sh"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
 
@@ -18,6 +19,19 @@ assert_present() {
 assert_missing() {
   [[ ! -e "$1" ]] || fail "expected $1 to be absent"
 }
+
+seed_output=''
+seed_status=0
+if seed_output="$(IOT_NANO_ALLOW_LOCAL_SEED=1 \
+  IOT_NANO_LOCAL_SEED_FILE="$fixture/missing-seed.env" \
+  "$seed" 2>&1)"; then
+  seed_status=0
+else
+  seed_status=$?
+fi
+[[ "$seed_status" == 2 ]] || fail 'seed without --reset must exit 2'
+[[ "$seed_output" == *"usage: seed-local-platform.sh --reset"* ]] || \
+  fail 'seed without --reset must print reset usage before reading configuration'
 
 platform_root="$fixture/local-platform"
 mkdir -p "$platform_root/internal" "$fixture/bin"

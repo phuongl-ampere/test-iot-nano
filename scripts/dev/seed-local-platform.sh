@@ -2,9 +2,18 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+runtime_helper="${IOT_NANO_LOCAL_RUNTIME_HELPER:-$root/scripts/dev/local-platform-runtime.sh}"
 seed_file="${IOT_NANO_LOCAL_SEED_FILE:-$root/infra/monolith/local-platform-seed.env}"
 management_url="${IOT_NANO_MANAGEMENT_URL:-http://127.0.0.1:8081}"
 powermonitor_url="${IOT_NANO_POWERMONITOR_URL:-http://localhost:3002}"
+
+if [[ ! -f "$runtime_helper" ]]; then
+  printf 'Local runtime helper does not exist: %s\n' "$runtime_helper" >&2
+  exit 2
+fi
+# shellcheck disable=SC1090
+source "$runtime_helper"
+local_platform_require_reset "$@"
 
 if [[ "${IOT_NANO_ALLOW_LOCAL_SEED:-}" != "1" ]]; then
   printf '%s\n' 'Set IOT_NANO_ALLOW_LOCAL_SEED=1 to run the fixed local seed.' >&2
@@ -35,6 +44,11 @@ fi
 
 # shellcheck disable=SC1090
 source "$seed_file"
+
+local_platform_stop
+local_platform_clear_state
+local_platform_bootstrap "$IOT_NANO_SEED_SYSTEM_USERNAME" "$IOT_NANO_SEED_SYSTEM_PASSWORD"
+local_platform_start
 
 for command in curl jq grep mktemp; do
   command -v "$command" >/dev/null || {
