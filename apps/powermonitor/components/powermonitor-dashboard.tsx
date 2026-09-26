@@ -153,8 +153,9 @@ export function PowerMonitorDashboard({
     setLoading(true);
     setError(null);
     try {
-      const [[nextDevices, nextAssets, nextAlerts], invitationRead, nextCapabilities] = await Promise.all([
+      const [[nextDevices, nextAssets, nextAlerts], [nextDeviceProfiles, nextAssetProfiles], invitationRead, nextCapabilities] = await Promise.all([
         Promise.all([listDevices(), listAssets(), listAlerts()]),
+        Promise.all([listResourceProfiles("device").catch(() => []), listResourceProfiles("asset").catch(() => [])]),
         readResourceInvitations(),
         readUserCapabilities(),
       ]);
@@ -166,6 +167,8 @@ export function PowerMonitorDashboard({
       }
       setDevices(nextDevices);
       setAssets(nextAssets);
+      setDeviceProfileNames(Object.fromEntries(nextDeviceProfiles.map((profile) => [profile.id, profile.name])));
+      setAssetProfileNames(Object.fromEntries(nextAssetProfiles.map((profile) => [profile.id, profile.name])));
       setAlerts(nextAlerts);
       setCapabilities(nextCapabilities);
       setInvitations(invitationRead.items);
