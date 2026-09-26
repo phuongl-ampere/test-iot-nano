@@ -120,6 +120,14 @@ pub(in crate::management) async fn platform_tenant_asset_profiles(
     .await
 }
 
+pub(in crate::management) async fn platform_tenant_profile(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_profile_page(&state, tenant).await
+}
+
 pub(in crate::management) async fn platform_tenant_topology(
     State(state): State<ManagementState>,
     request: Request,
@@ -480,6 +488,27 @@ pub(in crate::management) async fn tenant_asset_profiles_page(
         notice,
     );
     let rendered = crate::PlatformUiRenderer::render_tenant_asset_profiles(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
+pub(in crate::management) async fn tenant_profile_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+) -> Result<Html<String>, ManagementSessionError> {
+    let configuration = TenantProfileRepository::export_tenant_profile_configuration(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(application_domain_profile_error)?;
+    let configuration_json = serde_json::to_string_pretty(&configuration)
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let page = crate::TenantProfilePage::new(configuration_json);
+    let rendered = crate::PlatformUiRenderer::render_tenant_profile(
         &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
         &page,
     )

@@ -50,7 +50,8 @@ use iot_storage::{
     NewUserGroup, OAuthRepository, OwnershipTransferTarget, PlatformStore, PlatformStoreError,
     ProvisionManagementDeviceError, RedirectUri, ResourceAccess, ResourceAccessSource,
     ResourceInvitationRepository, ResourcePermission, SystemAccount, TenantAuthorizationError,
-    TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository, TenantStatus,
+    TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository,
+    TenantProfileConfiguration, TenantProfileRepository, TenantStatus,
     UpdateApplicationDomainProfile, UpdateManagementAlertRule, UpdateManagementAsset,
     UpdateManagementAssetProfile, UpdateManagementDevice, UpdateManagementDeviceProfile,
     UpdateManagementUser, UserCapability, UserDeviceActivityRepository,
@@ -248,6 +249,7 @@ impl ManagementSessionRouter {
                 "/tenant/profiles/asset",
                 get(platform_tenant_asset_profiles).post(create_tenant_asset_profile_form),
             )
+            .route("/tenant/profile", get(platform_tenant_profile))
             .route("/tenant/topology", get(platform_tenant_topology))
             .route(
                 "/tenant/topology/assign",
@@ -345,6 +347,19 @@ impl ManagementSessionRouter {
             .route("/api/user/auth/login", post(user_login))
             .route("/api/user/auth/me", get(current_user_session))
             .route("/api/management/applications", post(create_application))
+            .route(
+                "/api/management/profile",
+                get(get_management_tenant_profile_configuration)
+                    .put(replace_management_tenant_profile_configuration),
+            )
+            .route(
+                "/api/management/profile/export",
+                get(get_management_tenant_profile_configuration),
+            )
+            .route(
+                "/api/management/profile/import",
+                put(replace_management_tenant_profile_configuration),
+            )
             .route(
                 "/api/management/applications/{app_id}/domain-profiles",
                 get(list_management_application_domain_profiles)

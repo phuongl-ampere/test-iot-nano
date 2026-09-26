@@ -1,0 +1,85 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Profile configuration | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  {% let active_nav = "profile" %}
+  {% include "platform_ui/tenant_navigation.html" %}
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Profile configuration</h1>
+    <p>Manage the versioned JSON catalog for asset and device definitions, containment, hierarchy, inheritance, and permissions.</p>
+  </section>
+  <section class="workspace-panel">
+    <header class="panel-heading">
+      <div>
+        <h2>Tenant profile JSON</h2>
+        <p class="panel-caption">Import replaces this tenant’s complete profile catalog. Operational data is never included.</p>
+      </div>
+      <a class="button-link button-link-secondary" href="/api/management/profile/export" download="tenant-profile.json">Export JSON</a>
+    </header>
+    <form id="tenant-profile-form" class="form-grid" novalidate>
+      <label class="field">
+        <span>Profile configuration</span>
+        <textarea id="tenant-profile-json" name="configuration" rows="24" spellcheck="false" data-tenant-profile-json aria-describedby="tenant-profile-feedback">{{ page.configuration_json }}</textarea>
+      </label>
+      <label class="field">
+        <span>Import configuration file</span>
+        <input id="tenant-profile-file" type="file" accept="application/json,.json">
+      </label>
+      <p id="tenant-profile-feedback" class="json-feedback" role="status"></p>
+      <div class="form-actions">
+        <button id="tenant-profile-import" type="button">Import selected JSON</button>
+        <button type="submit" class="button-link-secondary">Save JSON changes</button>
+      </div>
+    </form>
+  </section>
+  <script>
+    (() => {
+      const form = document.getElementById('tenant-profile-form');
+      const editor = document.getElementById('tenant-profile-json');
+      const fileInput = document.getElementById('tenant-profile-file');
+      const importButton = document.getElementById('tenant-profile-import');
+      const feedback = document.getElementById('tenant-profile-feedback');
+      const endpoint = '/api/management/profile/import';
+
+      const parseConfiguration = (text) => JSON.parse(text);
+      const show = (message) => { feedback.textContent = message; };
+      const replace = async (configuration) => {
+        const response = await fetch(endpoint, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(configuration),
+        });
+        if (!response.ok) throw new Error(`Import failed (${response.status})`);
+        editor.value = JSON.stringify(configuration, null, 2);
+        show('Profile configuration saved.');
+      };
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        try {
+          await replace(parseConfiguration(editor.value));
+        } catch (error) {
+          show(error instanceof Error ? error.message : 'Profile JSON is invalid.');
+        }
+      });
+
+      importButton.addEventListener('click', async () => {
+        const file = fileInput.files[0];
+        if (!file) {
+          show('Choose a JSON file to import.');
+          return;
+        }
+        try {
+          await replace(parseConfiguration(await file.text()));
+        } catch (error) {
+          show(error instanceof Error ? error.message : 'Profile JSON is invalid.');
+        }
+      });
+    })();
+  </script>
+{% endblock %}

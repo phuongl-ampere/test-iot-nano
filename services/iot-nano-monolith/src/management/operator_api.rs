@@ -655,6 +655,39 @@ pub(super) async fn delete_management_asset_profile(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(super) async fn get_management_tenant_profile_configuration(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<TenantProfileConfiguration>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    TenantProfileRepository::export_tenant_profile_configuration(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map(Json)
+    .map_err(application_domain_profile_error)
+}
+
+pub(super) async fn replace_management_tenant_profile_configuration(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<StatusCode, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let configuration: TenantProfileConfiguration =
+        management_request_json(&state, request).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    TenantProfileRepository::replace_tenant_profile_configuration(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        configuration,
+    )
+    .await
+    .map_err(tenant_profile_import_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub(super) async fn list_management_application_domain_profiles(
     State(state): State<ManagementState>,
     Path(app_id): Path<String>,

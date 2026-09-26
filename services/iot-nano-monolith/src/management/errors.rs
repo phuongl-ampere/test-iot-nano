@@ -117,7 +117,10 @@ pub(super) fn application_domain_profile_error(
     error: ApplicationDomainProfileError,
 ) -> ManagementSessionError {
     match error {
-        ApplicationDomainProfileError::InvalidName
+        ApplicationDomainProfileError::UnsupportedConfigurationVersion
+        | ApplicationDomainProfileError::PermissionDefinitionsMustBeObject
+        | ApplicationDomainProfileError::UnknownContainedProfile
+        | ApplicationDomainProfileError::InvalidName
         | ApplicationDomainProfileError::DefinitionMustBeObject
         | ApplicationDomainProfileError::LiveViewMustBeObject
         | ApplicationDomainProfileError::AssetProfilesOnly => ManagementSessionError::BadRequest,
@@ -131,6 +134,15 @@ pub(super) fn application_domain_profile_error(
         | ApplicationDomainProfileError::RelationConflict => ManagementSessionError::Conflict,
         ApplicationDomainProfileError::InvalidStoredProfile
         | ApplicationDomainProfileError::Storage { .. } => ManagementSessionError::Unavailable,
+    }
+}
+
+pub(super) fn tenant_profile_import_error(
+    error: ApplicationDomainProfileError,
+) -> ManagementSessionError {
+    match error {
+        ApplicationDomainProfileError::Storage { .. } => ManagementSessionError::Unavailable,
+        _ => ManagementSessionError::BadRequest,
     }
 }
 

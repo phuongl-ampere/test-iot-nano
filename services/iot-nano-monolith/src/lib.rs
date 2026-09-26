@@ -30,14 +30,14 @@ pub use platform_ui::{
     TenantDeviceProfilesLayout, TenantDeviceProfilesPage, TenantDeviceRow, TenantDevicesLayout,
     TenantDevicesPage, TenantGroupMemberRow, TenantGroupRow, TenantGroupsLayout, TenantGroupsPage,
     TenantLayout, TenantOverviewPage, TenantPermissionRow, TenantPermissionsLayout,
-    TenantPermissionsPage, TenantProfileRow, TenantRelationRow, TenantRelationsLayout,
-    TenantRelationsPage, TenantSelectOption, TenantTopologyLayout, TenantTopologyPage,
-    TenantTopologyRow, TenantUserRow, TenantUsersLayout, TenantUsersPage, UserAssetDetailLayout,
-    UserAssetDetailPage, UserAssetLayout, UserAssetListPage, UserAssetRow,
-    UserAssetUnavailableLayout, UserDeviceAlertRow, UserDeviceDetailPage, UserDeviceLayout,
-    UserDeviceListPage, UserDeviceRow, UserDeviceTelemetryRow, UserDeviceUnavailableLayout,
-    UserInvitationPage, UserInvitationRow, UserInvitationsLayout, UserLayout,
-    UserResourcePermissionRow,
+    TenantPermissionsPage, TenantProfileLayout, TenantProfilePage, TenantProfileRow,
+    TenantRelationRow, TenantRelationsLayout, TenantRelationsPage, TenantSelectOption,
+    TenantTopologyLayout, TenantTopologyPage, TenantTopologyRow, TenantUserRow, TenantUsersLayout,
+    TenantUsersPage, UserAssetDetailLayout, UserAssetDetailPage, UserAssetLayout,
+    UserAssetListPage, UserAssetRow, UserAssetUnavailableLayout, UserDeviceAlertRow,
+    UserDeviceDetailPage, UserDeviceLayout, UserDeviceListPage, UserDeviceRow,
+    UserDeviceTelemetryRow, UserDeviceUnavailableLayout, UserInvitationPage, UserInvitationRow,
+    UserInvitationsLayout, UserLayout, UserResourcePermissionRow,
 };
 pub use readiness::Readiness;
 pub use runtime::{MonolithRuntime, ShutdownError, StartupError};

@@ -788,6 +788,19 @@ impl TenantApplicationDomainPage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantProfilePage {
+    configuration_json: String,
+}
+
+impl TenantProfilePage {
+    pub(crate) fn new(configuration_json: impl Into<String>) -> Self {
+        Self {
+            configuration_json: configuration_json.into(),
+        }
+    }
+}
+
 impl TenantApplicationsPage {
     pub(crate) fn new(
         applications: Vec<TenantApplicationRow>,
@@ -1395,6 +1408,13 @@ impl PlatformUiRenderer {
         TenantApplicationDomainLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_profile(
+        identity: &PlatformUiIdentity,
+        page: &TenantProfilePage,
+    ) -> Result<String, askama::Error> {
+        TenantProfileLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_device_credential(
         identity: &PlatformUiIdentity,
         page: &TenantDeviceCredentialPage,
@@ -1668,6 +1688,19 @@ pub struct TenantApplicationDomainLayout<'a> {
 
 impl<'a> TenantApplicationDomainLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantApplicationDomainPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_profile.html")]
+pub struct TenantProfileLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantProfilePage,
+}
+
+impl<'a> TenantProfileLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantProfilePage) -> Self {
         Self { identity, page }
     }
 }

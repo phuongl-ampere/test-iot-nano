@@ -6547,6 +6547,213 @@ async fn tenant_account_manages_domain_profiles_inside_its_application() {
 }
 
 #[tokio::test]
+async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
+    let (_directory, store, management) = management_session_router_with_store().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+
+    let page = router
+        .clone()
+        .oneshot(platform_get("/tenant/profile", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("data-tenant-profile-json"));
+
+    let initial = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/management/profile/export")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial: serde_json::Value =
+        serde_json::from_slice(&to_bytes(initial.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        initial,
+        json!({
+            "version": 1,
+            "profiles": [],
+            "containment_rules": [],
+            "permission_definitions": {}
+        })
+    );
+
+    let farm_id = uuid::Uuid::now_v7();
+    let zone_id = uuid::Uuid::now_v7();
+    let meter_id = uuid::Uuid::now_v7();
+    let configuration = json!({
+        "version": 1,
+        "profiles": [
+            {
+                "id": farm_id,
+                "resource_kind": "asset",
+                "name": "Farm",
+                "definition": {"hierarchy": {"level": "site"}},
+                "live_view": {"widgets": []}
+            },
+            {
+                "id": zone_id,
+                "resource_kind": "asset",
+                "name": "Zone",
+                "definition": {"hierarchy": {"level": "zone", "inherits": "Farm"}},
+                "live_view": {"widgets": []}
+            },
+            {
+                "id": meter_id,
+                "resource_kind": "device",
+                "name": "Meter",
+                "definition": {"telemetry_schema": {"power_w": {"type": "number"}}},
+                "live_view": {"charts": []}
+            }
+        ],
+        "containment_rules": [{
+            "parent_profile_id": farm_id,
+            "child_profile_id": zone_id
+        }],
+        "permission_definitions": {
+            "roles": {"operator": {"permissions": ["assets:read"]}}
+        }
+    });
+    let imported = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/management/profile/import")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(configuration.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.status(), StatusCode::NO_CONTENT);
+
+    let exported = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/management/profile")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exported.status(), StatusCode::OK);
+    let exported: serde_json::Value =
+        serde_json::from_slice(&to_bytes(exported.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(exported, configuration);
+
+    let mut invalid = configuration.clone();
+    invalid["permission_definitions"] = json!([]);
+    let rejected = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/management/profile/import")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(invalid.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let after_rejection = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/management/profile/export")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_rejection.status(), StatusCode::OK);
+    let after_rejection: serde_json::Value = serde_json::from_slice(
+        &to_bytes(after_rejection.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(after_rejection, configuration);
+
+    TenantIdentityRepository::create_tenant_with_account(
+        store.as_ref(),
+        NewTenant {
+            slug: "profile-other".to_owned(),
+            metadata: json!({}),
+        },
+        NewTenantAccount {
+            password_hash: hash_password("OtherTenant@2026").unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let other_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tenant_slug": "profile-other",
+                        "password": "OtherTenant@2026"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_login.status(), StatusCode::OK);
+    let other_cookie = other_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let other_export = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/management/profile/export")
+                .header(COOKIE, other_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_export.status(), StatusCode::OK);
+    let other_export: serde_json::Value = serde_json::from_slice(
+        &to_bytes(other_export.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(other_export, initial);
+}
+
+#[tokio::test]
 async fn tenant_account_application_domain_api_saves_profiles_and_asset_containment() {
     let (_directory, _store, management) = management_session_router_with_store().await;
     let router = management.router;

@@ -8,7 +8,7 @@ use iot_nano_monolith::{
 use std::fs;
 use std::path::Path;
 
-const TENANT_NAVIGATION: [(&str, &str, &str); 11] = [
+const TENANT_NAVIGATION: [(&str, &str, &str); 12] = [
     ("overview", "/tenant", "Overview"),
     ("devices", "/tenant/devices", "Devices"),
     ("assets", "/tenant/assets", "Assets"),
@@ -20,9 +20,10 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 11] = [
     ("groups", "/tenant/groups", "Groups"),
     ("permissions", "/tenant/permissions", "Permissions"),
     ("applications", "/tenant/applications", "Applications"),
+    ("profile", "/tenant/profile", "Profile"),
 ];
 
-const TENANT_TEMPLATES: [(&str, &str); 14] = [
+const TENANT_TEMPLATES: [(&str, &str); 15] = [
     ("tenant.html", "overview"),
     ("tenant_devices.html", "devices"),
     ("tenant_assets.html", "assets"),
@@ -35,6 +36,7 @@ const TENANT_TEMPLATES: [(&str, &str); 14] = [
     ("tenant_permissions.html", "permissions"),
     ("tenant_applications.html", "applications"),
     ("tenant_application_domain.html", "applications"),
+    ("tenant_profile.html", "profile"),
     ("tenant_device_credential.html", "devices"),
     ("tenant_device_claim_policy.html", "devices"),
 ];
@@ -420,7 +422,22 @@ fn tenant_layout_renders_only_tenant_navigation() {
     assert!(!rendered.contains("href=\"/tenant/profiles/device\""));
     assert!(!rendered.contains("href=\"/tenant/profiles/asset\""));
     assert!(rendered.contains("href=\"/tenant/applications\""));
+    assert!(rendered.contains("href=\"/tenant/profile\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
+}
+
+#[test]
+fn tenant_profile_template_keeps_json_import_export_separate_from_profile_tabs() {
+    let template = platform_template_source("tenant_profile.html");
+    let asset_profiles = platform_template_source("tenant_asset_profiles.html");
+    let device_profiles = platform_template_source("tenant_device_profiles.html");
+
+    assert!(template.contains("data-tenant-profile-json"));
+    assert!(template.contains("/api/management/profile/export"));
+    assert!(template.contains("/api/management/profile/import"));
+    assert!(template.contains("type=\"file\""));
+    assert!(asset_profiles.contains("action=\"/tenant/profiles/asset\""));
+    assert!(device_profiles.contains("action=\"/tenant/profiles/device\""));
 }
 
 #[test]
