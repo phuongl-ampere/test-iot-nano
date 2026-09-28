@@ -3,16 +3,16 @@
 ## Goal
 
 An unassigned, MQTT-authenticated device can request a short-lived pairing
-code after a physical pairing action. A regular User enters the device ID and
-that code in `/app` or PowerMonitor to become the device owner.
+code after a physical pairing action. A regular User enters the device serial
+number and that code in `/app` or PowerMonitor to become the device owner.
 
 ## Policy and Credentials
 
 Each tenant has one claim policy:
 
-- `enabled`, default `false`;
+- `enabled`, default `true`;
 - `ttl_seconds`, default `900`, range `60..=86_400`;
-- `code_length`, default `12`, range `8..=32`;
+- `code_length`, fixed at `6` numeric digits;
 - `max_failed_attempts`, default `5`, range `1..=20`;
 - `request_cooldown_seconds`, default `30`, range `10..=3_600`.
 
@@ -45,13 +45,14 @@ countdown.
 ## Claim and Authorization
 
 `claim_devices` is a User capability. New regular Users receive
-`claim_devices` and `create_assets`; they do not receive `create_devices` or
-other elevated capabilities by default. Existing User capability rows are
-unchanged.
+`claim_devices`, `create_assets`, `control_devices`, and
+`share_owned_resources`; they do not receive `create_devices` or other
+elevated capabilities by default.
 
 Claim is a user-session mutation, available via the monolith `/app` form and
-the PowerMonitor public API/BFF. It atomically verifies the caller tenant,
-device ownership state, code hash/expiry/attempt budget, and then sets
+the PowerMonitor public API/BFF. It resolves the serial number within the
+caller tenant, then atomically verifies device ownership state,
+code hash/expiry/attempt budget, and then sets
 `owner_user_id` and `claimed_at`, consumes the code, clears obsolete resource
 shares, and records an audit event. The new owner may view, control, and share
 that claimed device as resource-scoped owner rights. Claim does not grant
@@ -61,9 +62,10 @@ not reveal or rotate the MQTT device token.
 ## Tenant UI
 
 `/tenant/devices/claim-policy` remains under the Devices navigation active
-state. It lets a Tenant Account save the five policy parameters. Device edit
-shows claim state and lets the Tenant revoke an active code, but never reveal
-it. There is no Tenant-side raw-code generation path.
+state. It lets a Tenant Account configure pairing lifetime, failed attempts,
+and cooldown; code length is fixed at six digits. Device edit shows claim state,
+generates or revokes an active code, and returns a short-lived QR payload for
+the serial-plus-code claim flow.
 
 ## Verification
 

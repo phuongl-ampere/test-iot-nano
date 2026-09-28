@@ -35,7 +35,8 @@ API contracts, OpenAPI, tests, seed data, and current operational docs:
 
 A regular User has a tenant-scoped username/password, account class, ownership
 and resource permissions, and an explicit capability set. New Users receive
-`create_assets` and `claim_devices`; a Tenant Account may change capabilities.
+`create_assets`, `claim_devices`, `control_devices`, and
+`share_owned_resources`; a Tenant Account may change capabilities.
 
 Applications remain tenant OAuth/application registrations and application
 domain profiles. They do not select a user's landing application and do not

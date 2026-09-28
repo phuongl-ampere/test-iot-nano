@@ -1,5 +1,8 @@
 # Owner-Scoped Resource Sharing Design
 
+> Current implemented behavior is maintained in
+> [Platform current behavior](../../platform-current-behavior.md).
+
 ## Goal
 
 Make Device and Asset access explicit: a Tenant Account assigns one regular-user owner, and only that owner can share `view` or `control` access with other regular users.
@@ -15,7 +18,7 @@ Make Device and Asset access explicit: a Tenant Account assigns one regular-user
 ## Sharing
 
 - The owner has implicit `owner` access and may create or revoke direct grants to another regular user.
-- Direct grants expose `view` and `control` in the UI. They map to the existing storage permissions `viewer` and `manager` respectively; this preserves authorization compatibility while removing management terminology from the user experience.
+- Device grants expose `view` and `control`; Asset grants expose `view` and `manager`. A shared recipient never becomes the owner and cannot delete an Asset.
 - A recipient can view or control the granted resource but cannot share, revoke grants, transfer ownership, modify the resource, or manage access.
 - Tenant Accounts no longer create resource grants through Device, Asset, or generic tenant permission forms. They assign ownership instead.
 - The resource record does not duplicate recipient lists. The user workspace derives “Shared by <owner>” from the owner/grant data; the owner detail derives “Shared with” rows from the same grants.
