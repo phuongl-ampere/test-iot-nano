@@ -21,8 +21,8 @@ use iot_api::{
     PrincipalKind, TokenVault, authenticate_platform_account, authenticate_system_account,
     authenticate_tenant_account, authenticate_user_account, create_platform_device_token,
     generate_session_id, hash_password, provision_management_device_token,
-    provision_owned_platform_device_token, provision_platform_device_token,
-    reveal_platform_device_token, rotate_platform_device_token, validate_password,
+    provision_owned_platform_device_token, reveal_platform_device_token,
+    rotate_platform_device_token, validate_password,
 };
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
@@ -184,6 +184,14 @@ impl ManagementSessionRouter {
                 get(platform_system_infrastructure_status),
             )
             .route("/system/tenants", post(create_system_tenant_form))
+            .route(
+                "/system/settings/serial-number-length",
+                post(update_system_serial_number_length_form),
+            )
+            .route(
+                "/tenant/devices/serial-generation",
+                post(update_tenant_serial_generation_form),
+            )
             .route("/system/tenants/suspend", post(suspend_system_tenant_form))
             .route(
                 "/system/tenants/reactivate",
@@ -692,6 +700,59 @@ struct SystemTenantLifecycleForm {
 }
 
 #[derive(Deserialize)]
+struct SystemSerialNumberLengthForm {
+    serial_number_length: u8,
+}
+
+#[derive(Deserialize)]
+struct TenantSerialGenerationForm {
+    #[serde(default)]
+    enabled: Option<String>,
+}
+
+pub(in crate::management) async fn tenant_serial_generation_settings(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+) -> Result<(u8, bool), ManagementSessionError> {
+    let length: i64 =
+        match store {
+            PlatformStore::Sqlite(store) => sqlx::query_scalar(
+                "SELECT serial_number_length FROM system_accounts WHERE status = 'active' LIMIT 1",
+            )
+            .fetch_one(store.pool())
+            .await,
+            PlatformStore::Timescale(pool) => sqlx::query_scalar(
+                "SELECT serial_number_length FROM system_accounts WHERE status = 'active' LIMIT 1",
+            )
+            .fetch_one(pool)
+            .await,
+        }
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let enabled = match store {
+        PlatformStore::Sqlite(store) => sqlx::query_scalar::<_, i64>(
+            "SELECT auto_generate_serial_number FROM tenants WHERE id = ?",
+        )
+        .bind(tenant_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .map(|value| value != 0),
+        PlatformStore::Timescale(pool) => {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT auto_generate_serial_number FROM tenants WHERE id = $1",
+            )
+            .bind(tenant_id)
+            .fetch_one(pool)
+            .await
+        }
+    }
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok((
+        u8::try_from(length).map_err(|_| ManagementSessionError::Unavailable)?,
+        enabled,
+    ))
+}
+
+#[derive(Deserialize)]
 struct ResetTenantAccountForm {
     slug: String,
     password: String,
@@ -748,7 +809,7 @@ struct UserDeviceForm {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserClaimDeviceForm {
-    device_id: String,
+    serial_number: String,
     code: String,
 }
 
@@ -763,6 +824,8 @@ struct CreateTenantAssetForm {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProvisionTenantDeviceForm {
+    #[serde(default)]
+    serial_number: String,
     display_name: String,
 }
 
@@ -1085,6 +1148,8 @@ struct ManagementAssetProfileResponse {
 
 #[derive(Deserialize)]
 struct ProvisionDeviceRequest {
+    #[serde(default)]
+    serial_number: String,
     display_name: String,
     #[serde(default)]
     asset_id: Option<Uuid>,
@@ -1146,6 +1211,7 @@ struct ManagementTopologyRequest {
 #[derive(Serialize)]
 struct ManagementDeviceResponse {
     device_id: String,
+    serial_number: Option<String>,
     display_name: Option<String>,
     owner_user_id: Option<Uuid>,
     asset_id: Option<Uuid>,
@@ -1183,8 +1249,11 @@ struct ManagementDeviceTelemetryPage {
 #[derive(Serialize)]
 struct ManagementDeviceClaimCodeResponse {
     device_id: String,
+    serial_number: String,
     code: String,
     expires_at: chrono::DateTime<chrono::Utc>,
+    pairing_uri: String,
+    qr_svg: String,
 }
 
 async fn login(

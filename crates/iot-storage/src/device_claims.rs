@@ -14,7 +14,7 @@ use crate::{
     AuditAction, AuditPrincipal, AuditTargetType, PlatformStore, PlatformStoreError, audit,
 };
 
-const CLAIM_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CLAIM_CODE_ALPHABET: &[u8] = b"0123456789";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceClaimPolicy {
@@ -28,9 +28,9 @@ pub struct DeviceClaimPolicy {
 impl Default for DeviceClaimPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             ttl_seconds: 900,
-            code_length: 12,
+            code_length: 6,
             max_failed_attempts: 5,
             request_cooldown_seconds: 30,
         }
@@ -145,6 +145,14 @@ pub trait DeviceClaimRepository: Send + Sync {
         device_id: &'a str,
         code: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<ClaimedDevice, DeviceClaimError>> + Send + 'a>>;
+
+    fn claim_device_with_serial_number<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        serial_number: &'a str,
+        code: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaimedDevice, DeviceClaimError>> + Send + 'a>>;
 }
 
 impl DeviceClaimRepository for PlatformStore {
@@ -215,6 +223,18 @@ impl DeviceClaimRepository for PlatformStore {
         Box::pin(
             async move { claim_device_with_code(self, tenant_id, user_id, device_id, code).await },
         )
+    }
+
+    fn claim_device_with_serial_number<'a>(
+        &'a self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        serial_number: &'a str,
+        code: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaimedDevice, DeviceClaimError>> + Send + 'a>> {
+        Box::pin(async move {
+            claim_device_with_serial_number(self, tenant_id, user_id, serial_number, code).await
+        })
     }
 }
 
@@ -624,6 +644,41 @@ async fn claim_device_with_code(
     })
 }
 
+async fn claim_device_with_serial_number(
+    store: &PlatformStore,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    serial_number: &str,
+    code: &str,
+) -> Result<ClaimedDevice, DeviceClaimError> {
+    let serial_number = serial_number.trim().to_ascii_uppercase();
+    let device_id = match store {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT device_id FROM devices
+             WHERE tenant_id = ? AND upper(serial_number) = ? AND deleted_at IS NULL",
+            )
+            .bind(tenant_id.to_string())
+            .bind(&serial_number)
+            .fetch_optional(store.pool())
+            .await?
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT device_id FROM devices
+             WHERE tenant_id = $1 AND upper(serial_number) = $2 AND deleted_at IS NULL",
+            )
+            .bind(tenant_id)
+            .bind(&serial_number)
+            .fetch_optional(pool)
+            .await?
+        }
+    }
+    .ok_or(DeviceClaimError::DeviceUnavailable)?;
+
+    claim_device_with_code(store, tenant_id, user_id, &device_id, code).await
+}
+
 async fn sqlite_complete_claim(
     transaction: &mut Transaction<'_, Sqlite>,
     tenant_id: Uuid,
@@ -923,7 +978,7 @@ fn timescale_claim_status_from_row(row: PgRow) -> Result<DeviceClaimCodeStatus, 
 
 fn validate_policy(policy: DeviceClaimPolicy) -> Result<(), DeviceClaimError> {
     if !(60..=86_400).contains(&policy.ttl_seconds)
-        || !(8..=32).contains(&policy.code_length)
+        || policy.code_length != 6
         || !(1..=20).contains(&policy.max_failed_attempts)
         || !(10..=3_600).contains(&policy.request_cooldown_seconds)
     {
@@ -943,11 +998,7 @@ fn generate_claim_code(length: u8) -> String {
             characters.push(CLAIM_CODE_ALPHABET[index % CLAIM_CODE_ALPHABET.len()] as char);
         }
     }
-    characters
-        .chunks(4)
-        .map(|chunk| chunk.iter().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("-")
+    characters.into_iter().collect()
 }
 
 fn hash_claim_code(code: &str) -> Result<String, DeviceClaimError> {

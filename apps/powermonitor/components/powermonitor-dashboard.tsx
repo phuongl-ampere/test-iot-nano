@@ -43,6 +43,25 @@ type PowerMonitorDashboardProps = {
   initialDeviceId?: string;
 };
 
+type BarcodeDetectorLike = {
+  detect(source: ImageBitmapSource): Promise<Array<{ rawValue?: string }>>;
+};
+
+type BarcodeDetectorConstructor = new (options: { formats: string[] }) => BarcodeDetectorLike;
+
+function parsePairingQr(value: string): { serialNumber: string; code: string } {
+  const uri = new URL(value);
+  if (uri.protocol !== "iotnano:" || uri.hostname !== "claim") {
+    throw new Error("This QR code is not an IoT Nano pairing code.");
+  }
+  const serialNumber = uri.searchParams.get("serial_number")?.trim() ?? "";
+  const code = uri.searchParams.get("code")?.trim() ?? "";
+  if (serialNumber.length === 0 || code.length === 0) {
+    throw new Error("The pairing QR code is incomplete.");
+  }
+  return { serialNumber, code };
+}
+
 export function PowerMonitorDashboard({
   initialAssetId,
   initialDeviceId,
@@ -58,7 +77,7 @@ export function PowerMonitorDashboard({
   const [commandBusy, setCommandBusy] = useState(false);
   const [claimBusy, setClaimBusy] = useState(false);
   const [claimCode, setClaimCode] = useState("");
-  const [claimDeviceId, setClaimDeviceId] = useState("");
+  const [claimSerialNumber, setClaimSerialNumber] = useState("");
   const [claimOpen, setClaimOpen] = useState(false);
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
@@ -331,23 +350,49 @@ export function PowerMonitorDashboard({
 
   const submitDeviceClaim = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const deviceId = claimDeviceId.trim();
+    const serialNumber = claimSerialNumber.trim();
     const code = claimCode.trim();
-    if (deviceId.length === 0 || code.length === 0) {
+    if (serialNumber.length === 0 || code.length === 0) {
       return;
     }
     setClaimBusy(true);
     setError(null);
     try {
-      const device = await claimDevice(deviceId, code);
+      const device = await claimDevice(serialNumber, code);
       setClaimCode("");
-      setClaimDeviceId("");
+      setClaimSerialNumber("");
       setClaimOpen(false);
       selectedAssetIdRef.current = null;
       selectedDeviceIdRef.current = device.id;
       setSelectedAssetId(null);
       setSelectedDeviceId(device.id);
       await refreshWorkspaceAndTelemetry();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setClaimBusy(false);
+    }
+  };
+
+  const scanClaimQr = async (file: File) => {
+    const BarcodeDetector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
+    if (!BarcodeDetector) {
+      setError("QR scanning is unavailable in this browser. Enter the serial number and pairing code manually.");
+      return;
+    }
+    setClaimBusy(true);
+    setError(null);
+    try {
+      const bitmap = await createImageBitmap(file);
+      try {
+        const code = (await new BarcodeDetector({ formats: ["qr_code"] }).detect(bitmap))[0]?.rawValue;
+        if (!code) throw new Error("No QR code was found in the selected image.");
+        const pairing = parsePairingQr(code);
+        setClaimSerialNumber(pairing.serialNumber);
+        setClaimCode(pairing.code);
+      } finally {
+        bitmap.close();
+      }
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -548,15 +593,29 @@ export function PowerMonitorDashboard({
             <header className="section-heading"><h2>Add device</h2></header>
             <form onSubmit={(event) => void submitDeviceClaim(event)}>
               <label>
-                <span>Device ID</span>
-                <input autoComplete="off" disabled={claimBusy} onChange={(event) => setClaimDeviceId(event.target.value)} value={claimDeviceId} />
+                <span>Serial number</span>
+                <input autoComplete="off" disabled={claimBusy} onChange={(event) => setClaimSerialNumber(event.target.value)} value={claimSerialNumber} />
               </label>
               <label>
                 <span>Pairing code</span>
                 <input autoComplete="one-time-code" disabled={claimBusy} onChange={(event) => setClaimCode(event.target.value)} value={claimCode} />
               </label>
+              <label>
+                <span>Scan pairing QR</span>
+                <input
+                  accept="image/*"
+                  capture="environment"
+                  disabled={claimBusy}
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    event.currentTarget.value = "";
+                    if (file) void scanClaimQr(file);
+                  }}
+                  type="file"
+                />
+              </label>
               <div className="invitation-actions">
-                <button disabled={claimBusy || claimDeviceId.trim().length === 0 || claimCode.trim().length === 0} type="submit">Add device</button>
+                <button disabled={claimBusy || claimSerialNumber.trim().length === 0 || claimCode.trim().length === 0} type="submit">Add device</button>
                 <button disabled={claimBusy} onClick={() => setClaimOpen(false)} type="button">Cancel</button>
               </div>
             </form>

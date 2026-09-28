@@ -62,7 +62,7 @@ fn enabled_policy() -> DeviceClaimPolicy {
     DeviceClaimPolicy {
         enabled: true,
         ttl_seconds: 900,
-        code_length: 12,
+        code_length: 6,
         max_failed_attempts: 5,
         request_cooldown_seconds: 30,
     }
@@ -92,7 +92,8 @@ async fn sqlite_claim_code_is_hashed_and_claims_an_unassigned_device_once() {
         DeviceClaimRepository::issue_device_claim_code(&store, tenant_id(), "claimable-device")
             .await
             .unwrap();
-    assert_eq!(issued.code.len(), 14);
+    assert_eq!(issued.code.len(), 6);
+    assert!(issued.code.bytes().all(|digit| digit.is_ascii_digit()));
     let stored = sqlx::query(
         "SELECT code_hash, consumed_at FROM device_claim_codes
          WHERE tenant_id = ? AND device_id = ?",
@@ -153,6 +154,16 @@ async fn sqlite_claim_policy_rejects_invalid_values_and_disabled_issuance() {
         .unwrap_err();
     assert!(matches!(error, DeviceClaimError::InvalidPolicy));
 
+    DeviceClaimRepository::update_device_claim_policy(
+        &store,
+        tenant_id(),
+        DeviceClaimPolicy {
+            enabled: false,
+            ..DeviceClaimPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
     let error =
         DeviceClaimRepository::issue_device_claim_code(&store, tenant_id(), "policy-device")
             .await

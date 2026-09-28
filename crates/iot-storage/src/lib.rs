@@ -34,7 +34,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
-pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 1;
+pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 4;
 
 pub use contracts::{
     AccountClass, AlertComparison, AlertEvaluationEvent, AlertEvaluationRepository,

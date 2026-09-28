@@ -19,6 +19,7 @@ pub const MANAGEMENT_DEVICE_TELEMETRY_LIMIT: usize = 100;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManagementDevice {
     pub device_id: String,
+    pub serial_number: Option<String>,
     pub display_name: Option<String>,
     pub owner_user_id: Option<Uuid>,
     pub asset_id: Option<Uuid>,
@@ -217,6 +218,7 @@ impl ManagementDeviceTelemetryRepository for PlatformStore {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvisionManagementDevice {
+    pub serial_number: String,
     pub display_name: String,
     pub asset_id: Option<Uuid>,
     pub device_profile_id: Option<Uuid>,
@@ -226,6 +228,8 @@ pub struct ProvisionManagementDevice {
 
 #[derive(Debug, Error)]
 pub enum ProvisionManagementDeviceError {
+    #[error("invalid device serial number")]
+    InvalidSerialNumber,
     #[error("invalid device display name")]
     InvalidDisplayName,
     #[error("device attributes must be an object")]
@@ -257,6 +261,15 @@ impl PlatformStore {
         tenant_id: Uuid,
         device: ProvisionManagementDevice,
     ) -> Result<DeviceTokenRecord, ProvisionManagementDeviceError> {
+        let device_id = Uuid::now_v7().to_string();
+        let serial_number = if device.serial_number.trim().is_empty() {
+            None
+        } else {
+            Some(
+                normalize_serial_number(&device.serial_number)
+                    .ok_or(ProvisionManagementDeviceError::InvalidSerialNumber)?,
+            )
+        };
         let display_name = validate_display_name(&device.display_name)
             .map_err(map_management_device_provision_error)?
             .to_owned();
@@ -264,7 +277,6 @@ impl PlatformStore {
             return Err(ProvisionManagementDeviceError::AttributesMustBeObject);
         }
 
-        let device_id = Uuid::now_v7().to_string();
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin().await?;
@@ -278,10 +290,11 @@ impl PlatformStore {
                 .map_err(map_management_device_provision_error)?;
                 sqlx::query(
                     "INSERT INTO devices (
-                         device_id, tenant_id, display_name, asset_id, device_profile_id, metadata
-                     ) VALUES (?, ?, ?, ?, ?, ?)",
+                         device_id, serial_number, tenant_id, display_name, asset_id, device_profile_id, metadata
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(&device_id)
+                .bind(&serial_number)
                 .bind(tenant_id.to_string())
                 .bind(display_name)
                 .bind(device.asset_id.map(|id| id.to_string()))
@@ -307,10 +320,11 @@ impl PlatformStore {
                 .map_err(map_management_device_provision_error)?;
                 sqlx::query(
                     "INSERT INTO devices (
-                         device_id, tenant_id, display_name, asset_id, device_profile_id, metadata
-                     ) VALUES ($1, $2, $3, $4, $5, $6)",
+                         device_id, serial_number, tenant_id, display_name, asset_id, device_profile_id, metadata
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
                 .bind(&device_id)
+                .bind(&serial_number)
                 .bind(tenant_id)
                 .bind(display_name)
                 .bind(device.asset_id)
@@ -369,7 +383,7 @@ async fn list_management_devices(
     match store {
         PlatformStore::Sqlite(store) => {
             let rows = sqlx::query(
-                "SELECT device_id, display_name, owner_user_id, asset_id, device_profile_id, metadata, last_seen_at,
+                "SELECT device_id, serial_number, display_name, owner_user_id, asset_id, device_profile_id, metadata, last_seen_at,
                         is_gateway, gateway_device_id, gateway_last_read_at, gateway_read_quality
                  FROM devices
                  WHERE tenant_id = ? AND deleted_at IS NULL
@@ -384,7 +398,7 @@ async fn list_management_devices(
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "SELECT d.device_id, d.display_name, d.owner_user_id, d.asset_id, d.device_profile_id, d.metadata,
+                "SELECT d.device_id, d.serial_number, d.display_name, d.owner_user_id, d.asset_id, d.device_profile_id, d.metadata,
                         runtime.last_seen_at, d.is_gateway, d.gateway_device_id,
                         runtime.gateway_last_read_at, runtime.gateway_read_quality
                  FROM devices AS d
@@ -411,7 +425,7 @@ async fn management_device(
     match store {
         PlatformStore::Sqlite(store) => {
             let row = sqlx::query(
-                "SELECT device_id, display_name, owner_user_id, asset_id, device_profile_id, metadata, last_seen_at,
+                "SELECT device_id, serial_number, display_name, owner_user_id, asset_id, device_profile_id, metadata, last_seen_at,
                         is_gateway, gateway_device_id, gateway_last_read_at, gateway_read_quality
                  FROM devices
                  WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
@@ -425,7 +439,7 @@ async fn management_device(
         }
         PlatformStore::Timescale(pool) => {
             let row = sqlx::query(
-                "SELECT d.device_id, d.display_name, d.owner_user_id, d.asset_id, d.device_profile_id, d.metadata,
+                "SELECT d.device_id, d.serial_number, d.display_name, d.owner_user_id, d.asset_id, d.device_profile_id, d.metadata,
                         runtime.last_seen_at, d.is_gateway, d.gateway_device_id,
                         runtime.gateway_last_read_at, runtime.gateway_read_quality
                  FROM devices AS d
@@ -543,6 +557,7 @@ fn sqlite_management_device_from_row(
     );
     Ok(ManagementDevice {
         device_id: row.try_get("device_id")?,
+        serial_number: row.try_get("serial_number")?,
         display_name: row.try_get("display_name")?,
         owner_user_id: row
             .try_get::<Option<String>, _>("owner_user_id")?
@@ -582,6 +597,7 @@ fn timescale_management_device_from_row(
     );
     Ok(ManagementDevice {
         device_id: row.try_get("device_id")?,
+        serial_number: row.try_get("serial_number")?,
         display_name: row.try_get("display_name")?,
         owner_user_id: row.try_get("owner_user_id")?,
         asset_id: row.try_get("asset_id")?,
@@ -1069,6 +1085,16 @@ pub(super) fn validate_device_id(device_id: &str) -> Result<(), ManagementDevice
     } else {
         Err(ManagementDeviceError::InvalidDeviceId(device_id.to_owned()))
     }
+}
+
+fn normalize_serial_number(value: &str) -> Option<String> {
+    let serial_number = value.trim().to_ascii_uppercase();
+    (!serial_number.is_empty()
+        && serial_number.len() <= 128
+        && serial_number.bytes().all(|value| {
+            value.is_ascii_alphanumeric() || value == b'-' || value == b'_' || value == b'.'
+        }))
+    .then_some(serial_number)
 }
 
 fn validate_display_name(value: &str) -> Result<&str, ManagementDeviceError> {

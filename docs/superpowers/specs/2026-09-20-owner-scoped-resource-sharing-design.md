@@ -20,6 +20,19 @@ Make Device and Asset access explicit: a Tenant Account assigns one regular-user
 - Tenant Accounts no longer create resource grants through Device, Asset, or generic tenant permission forms. They assign ownership instead.
 - The resource record does not duplicate recipient lists. The user workspace derives “Shared by <owner>” from the owner/grant data; the owner detail derives “Shared with” rows from the same grants.
 
+## New user defaults
+
+When a Tenant Account creates a regular user, the user receives these capabilities:
+
+- Create assets
+- Claim devices
+- Control devices
+- Share owned resources
+
+The user starts without owning an Asset or Device, and has no `view`, `manager`, or `control` permission on a specific resource. They therefore cannot see or operate resources owned by another user.
+
+After the user claims a Device or creates an Asset, they become its owner. An owner can share that resource, can control their own Device, and is the only actor allowed to delete their own Asset. A new user does not receive `Create devices`, `Edit resources`, `Manage device tokens`, `Assign profiles`, or tenant-wide resource access by default.
+
 ## UX
 
 - Tenant Device and Asset editors replace “User access” with one `Assigned user` selector and an explicit unassign action. Saving warns that transfer clears existing shares.

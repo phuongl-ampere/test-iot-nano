@@ -14,6 +14,13 @@
     <h1>System Console</h1>
     <p>Tenant lifecycle, platform readiness, and configuration capability status.</p>
   </section>
+  <section class="workspace-panel">
+    <header class="panel-heading"><div><h2>Serial generation</h2><p class="panel-caption">Default length for tenant automatic serial generation.</p></div></header>
+    <form class="form-grid" action="/system/settings/serial-number-length" method="post">
+      <label class="field"><span>Serial length</span><input name="serial_number_length" type="number" min="6" max="32" value="{{ page.serial_number_length }}" required></label>
+      <div class="form-actions"><button type="submit">Save serial length</button></div>
+    </form>
+  </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}

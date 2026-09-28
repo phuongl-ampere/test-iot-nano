@@ -317,6 +317,7 @@ ensure_device() {
   local devices_body="$state_dir/devices.json"
   local match_count
   local device_id
+  local serial_number
   local actual_asset_id
   local create_status
 
@@ -337,11 +338,14 @@ ensure_device() {
     return 1
   fi
 
+  serial_number="SEED-$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | tr -cs 'A-Z0-9' '-')"
+  serial_number="${serial_number%-}"
+
   create_status="$(request_status "$state_dir/device-create.json" \
     --cookie "$tenant_cookie" \
     --header 'Content-Type: application/json' \
-    --data "$(jq -nc --arg name "$name" --arg asset_id "$asset_id" --arg device_profile_id "$device_profile_id" \
-      '{display_name: $name, asset_id: $asset_id, device_profile_id: $device_profile_id, attributes: {local_seed: "owner-sharing-demo"}}')" \
+    --data "$(jq -nc --arg serial_number "$serial_number" --arg name "$name" --arg asset_id "$asset_id" --arg device_profile_id "$device_profile_id" \
+      '{serial_number: $serial_number, display_name: $name, asset_id: $asset_id, device_profile_id: $device_profile_id, attributes: {local_seed: "owner-sharing-demo"}}')" \
     "$management_url/api/management/devices")"
   require_status "$create_status" 201 "Device seed ($name)"
   device_id="$(jq -r '.device_id' "$state_dir/device-create.json")"

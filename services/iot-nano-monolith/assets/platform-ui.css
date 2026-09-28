@@ -220,8 +220,9 @@ body {
 }
 
 .content {
-  width: min(100%, 1180px);
-  padding: 28px;
+  width: 100%;
+  min-width: 0;
+  padding: clamp(20px, 2vw, 36px);
 }
 
 .page-heading {
@@ -337,6 +338,7 @@ h2 {
 
 .workspace-panel {
   margin-top: 20px;
+  min-width: 0;
 }
 
 .workspace-panel header {
@@ -656,7 +658,10 @@ button[aria-disabled="true"] {
 }
 
 .table-scroll {
+  width: 100%;
+  max-width: 100%;
   overflow-x: auto;
+  overscroll-behavior-inline: contain;
 }
 
 .device-telemetry-scroll {
@@ -691,6 +696,7 @@ button[aria-disabled="true"] {
 
 .data-table {
   width: 100%;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 13px;
   text-align: left;
@@ -1173,6 +1179,21 @@ button[aria-disabled="true"] {
   font-size: 12px;
 }
 
+.pairing-qr {
+  width: min(12rem, 100%);
+  margin-top: 12px;
+  padding: 8px;
+  border: 1px solid #c7d3e0;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.pairing-qr svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
 .visually-hidden {
   width: 1px;
   height: 1px;
@@ -1237,6 +1258,15 @@ button[aria-disabled="true"] {
 
   .content {
     padding: 20px 14px;
+  }
+
+  .table-scroll .data-table {
+    min-width: 680px;
+  }
+
+  .table-scroll .device-telemetry-scroll .data-table,
+  .device-telemetry-scroll .data-table {
+    min-width: 100%;
   }
 
   .summary-grid {

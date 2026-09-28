@@ -97,7 +97,12 @@ async fn sqlite_management_user_repository_creates_users_without_application_con
     assert_eq!(created.account_class, AccountClass::User);
     assert_eq!(
         created.capabilities,
-        [UserCapability::ClaimDevices, UserCapability::CreateAssets]
+        [
+            UserCapability::ClaimDevices,
+            UserCapability::ControlDevices,
+            UserCapability::CreateAssets,
+            UserCapability::ShareOwnedResources,
+        ]
     );
     assert_eq!(
         ManagementUserRepository::list_management_users(&store, test_tenant_id())
@@ -283,7 +288,12 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
     assert_eq!(created.account_class, AccountClass::User);
     assert_eq!(
         created.capabilities,
-        [UserCapability::ClaimDevices, UserCapability::CreateAssets]
+        [
+            UserCapability::ClaimDevices,
+            UserCapability::ControlDevices,
+            UserCapability::CreateAssets,
+            UserCapability::ShareOwnedResources,
+        ]
     );
 
     let updated = ManagementUserRepository::update_management_user(

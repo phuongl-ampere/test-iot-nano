@@ -26,7 +26,8 @@
     <form class="form-grid" action="/tenant/devices/claim-policy" method="post">
       <label class="field field--checkbox"><input name="enabled" type="checkbox"{% if page.enabled %} checked{% endif %}><span>Enable pairing</span></label>
       <label class="field"><span>Code lifetime (seconds)</span><input name="ttl_seconds" type="number" min="60" max="86400" value="{{ page.ttl_seconds }}" required></label>
-      <label class="field"><span>Code length</span><input name="code_length" type="number" min="8" max="32" value="{{ page.code_length }}" required></label>
+      <input name="code_length" type="hidden" value="6">
+      <p class="panel-caption">Pairing codes are always six digits.</p>
       <label class="field"><span>Maximum failed attempts</span><input name="max_failed_attempts" type="number" min="1" max="20" value="{{ page.max_failed_attempts }}" required></label>
       <label class="field"><span>Request cooldown (seconds)</span><input name="request_cooldown_seconds" type="number" min="10" max="3600" value="{{ page.request_cooldown_seconds }}" required></label>
       <div class="form-actions"><button type="submit">Save policy</button></div>

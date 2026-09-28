@@ -168,6 +168,7 @@ pub(super) fn management_device_response(
 ) -> ManagementDeviceResponse {
     ManagementDeviceResponse {
         device_id: device.device_id,
+        serial_number: device.serial_number,
         display_name: device.display_name,
         owner_user_id: device.owner_user_id,
         asset_id: device.asset_id,
@@ -306,7 +307,8 @@ pub(super) fn management_device_provision_error(
     error: ProvisionManagementDeviceError,
 ) -> ManagementSessionError {
     match error {
-        ProvisionManagementDeviceError::InvalidDisplayName
+        ProvisionManagementDeviceError::InvalidSerialNumber
+        | ProvisionManagementDeviceError::InvalidDisplayName
         | ProvisionManagementDeviceError::AttributesMustBeObject => {
             ManagementSessionError::BadRequest
         }

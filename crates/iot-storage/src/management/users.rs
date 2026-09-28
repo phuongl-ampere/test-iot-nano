@@ -289,7 +289,12 @@ async fn create_management_user(
             .execute(&mut *transaction)
             .await
             .map_err(|error| map_management_username_conflict(error, &username))?;
-            for capability in [UserCapability::CreateAssets, UserCapability::ClaimDevices] {
+            for capability in [
+                UserCapability::CreateAssets,
+                UserCapability::ClaimDevices,
+                UserCapability::ControlDevices,
+                UserCapability::ShareOwnedResources,
+            ] {
                 sqlx::query(
                     "INSERT INTO user_capabilities (user_id, tenant_id, capability) VALUES (?, ?, ?)",
                 )
@@ -315,7 +320,12 @@ async fn create_management_user(
             .execute(&mut *transaction)
             .await
             .map_err(|error| map_management_username_conflict(error, &username))?;
-            for capability in [UserCapability::CreateAssets, UserCapability::ClaimDevices] {
+            for capability in [
+                UserCapability::CreateAssets,
+                UserCapability::ClaimDevices,
+                UserCapability::ControlDevices,
+                UserCapability::ShareOwnedResources,
+            ] {
                 sqlx::query(
                     "INSERT INTO user_capabilities (user_id, tenant_id, capability) VALUES ($1, $2, $3)",
                 )

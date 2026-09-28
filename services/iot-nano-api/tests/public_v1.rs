@@ -547,9 +547,11 @@ async fn exported_public_claim_consumes_a_code_without_returning_it() {
     let (_directory, app, _core, store) = exported_router_with_store().await;
     let pool = store.sqlite_pool().unwrap();
     let device_id = format!("claim-via-public-api-{}", Uuid::now_v7());
-    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
+    let serial_number = format!("PUBLIC-CLAIM-{}", Uuid::now_v7());
+    sqlx::query("INSERT INTO devices (device_id, tenant_id, serial_number) VALUES (?, ?, ?)")
         .bind(&device_id)
         .bind(tenant_id().to_string())
+        .bind(&serial_number)
         .execute(pool)
         .await
         .unwrap();
@@ -575,7 +577,7 @@ async fn exported_public_claim_consumes_a_code_without_returning_it() {
             .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                json!({"device_id": device_id, "code": issued.code}).to_string(),
+                json!({"serial_number": serial_number, "code": issued.code}).to_string(),
             ))
             .unwrap()
     };
@@ -597,6 +599,7 @@ async fn exported_public_claim_consumes_a_code_without_returning_it() {
     let body = to_bytes(claimed.into_body(), usize::MAX).await.unwrap();
     let response: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(response["device_id"], device_id);
+    assert_eq!(response["serial_number"], serial_number);
     assert!(response.get("code").is_none());
     assert!(!String::from_utf8_lossy(&body).contains(&issued.code));
 

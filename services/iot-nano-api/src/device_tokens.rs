@@ -103,6 +103,7 @@ pub async fn provision_management_device_token(
     store: &PlatformStore,
     vault: &TokenVault,
     tenant_id: Uuid,
+    serial_number: &str,
     display_name: &str,
     asset_id: Option<Uuid>,
     device_profile_id: Option<Uuid>,
@@ -114,6 +115,7 @@ pub async fn provision_management_device_token(
             .provision_management_device_token(
                 tenant_id,
                 ProvisionManagementDevice {
+                    serial_number: serial_number.to_owned(),
                     display_name: display_name.to_owned(),
                     asset_id,
                     device_profile_id,

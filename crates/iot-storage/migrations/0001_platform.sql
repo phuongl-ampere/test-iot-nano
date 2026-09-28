@@ -1,12 +1,13 @@
 CREATE TABLE IF NOT EXISTS platform_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version = 1)
+    version INTEGER NOT NULL CHECK (version = 4)
 );
 
 CREATE TABLE IF NOT EXISTS system_accounts (
     id UUID PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
+    serial_number_length INTEGER NOT NULL DEFAULT 9 CHECK (serial_number_length BETWEEN 6 AND 32),
     status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     id UUID PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'deleted')),
+    auto_generate_serial_number BOOLEAN NOT NULL DEFAULT TRUE,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -289,6 +291,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS assets_tenant_root_name_unique_index
     WHERE parent_asset_id IS NULL;
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
+    serial_number TEXT,
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     display_name TEXT,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -311,6 +314,9 @@ CREATE TABLE IF NOT EXISTS devices (
     CHECK ((is_gateway = TRUE AND gateway_device_id IS NULL)
         OR (is_gateway = FALSE AND gateway_device_id IS DISTINCT FROM device_id))
 );
+CREATE UNIQUE INDEX IF NOT EXISTS devices_serial_number_unique_index
+    ON devices (tenant_id, lower(serial_number))
+    WHERE serial_number IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_asset_id_index ON devices (asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_tenant_asset_index ON devices (tenant_id, asset_id) WHERE asset_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS devices_device_profile_id_index ON devices (device_profile_id) WHERE device_profile_id IS NOT NULL;
@@ -326,9 +332,9 @@ CREATE INDEX IF NOT EXISTS assets_owner_user_id_index ON assets (owner_user_id) 
 
 CREATE TABLE IF NOT EXISTS tenant_device_claim_policies (
     tenant_id UUID PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
-    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
     ttl_seconds INTEGER NOT NULL DEFAULT 900 CHECK (ttl_seconds BETWEEN 60 AND 86400),
-    code_length INTEGER NOT NULL DEFAULT 12 CHECK (code_length BETWEEN 8 AND 32),
+    code_length INTEGER NOT NULL DEFAULT 6 CHECK (code_length = 6),
     max_failed_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_failed_attempts BETWEEN 1 AND 20),
     request_cooldown_seconds INTEGER NOT NULL DEFAULT 30
         CHECK (request_cooldown_seconds BETWEEN 10 AND 3600),

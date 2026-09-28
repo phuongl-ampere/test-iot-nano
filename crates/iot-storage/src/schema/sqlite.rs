@@ -44,11 +44,12 @@ pub(crate) const CANONICAL_TABLES: &[&str] = &[
 pub(crate) const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS platform_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version = 1)
+    version INTEGER NOT NULL CHECK (version = 4)
 );
 
 CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
+    serial_number TEXT,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     display_name TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
@@ -77,6 +78,9 @@ CREATE TABLE IF NOT EXISTS devices (
         OR (is_gateway = 0 AND gateway_device_id IS NOT device_id)
     )
 );
+CREATE UNIQUE INDEX IF NOT EXISTS devices_serial_number_unique_index
+    ON devices (tenant_id, lower(serial_number))
+    WHERE serial_number IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS telemetry (
     event_at TEXT NOT NULL,
@@ -158,6 +162,7 @@ CREATE TABLE IF NOT EXISTS system_accounts (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
+    serial_number_length INTEGER NOT NULL DEFAULT 9 CHECK (serial_number_length BETWEEN 6 AND 32),
     status TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -170,6 +175,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     status TEXT NOT NULL CHECK (status IN ('active', 'suspended', 'deleted')),
+    auto_generate_serial_number INTEGER NOT NULL DEFAULT 1 CHECK (auto_generate_serial_number IN (0, 1)),
     metadata TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -698,9 +704,9 @@ CREATE INDEX IF NOT EXISTS device_tokens_active_prefix_index
 
 CREATE TABLE IF NOT EXISTS tenant_device_claim_policies (
     tenant_id TEXT NOT NULL PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
-    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
     ttl_seconds INTEGER NOT NULL DEFAULT 900 CHECK (ttl_seconds BETWEEN 60 AND 86400),
-    code_length INTEGER NOT NULL DEFAULT 12 CHECK (code_length BETWEEN 8 AND 32),
+    code_length INTEGER NOT NULL DEFAULT 6 CHECK (code_length = 6),
     max_failed_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_failed_attempts BETWEEN 1 AND 20),
     request_cooldown_seconds INTEGER NOT NULL DEFAULT 30
         CHECK (request_cooldown_seconds BETWEEN 10 AND 3600),

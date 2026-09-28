@@ -35,7 +35,7 @@
   <section class="workspace-panel">
     <header class="panel-heading"><h2>Add device</h2></header>
     <form class="form-grid" action="/app/devices/claim" method="post">
-      <label class="field"><span>Device ID</span><input name="device_id" type="text" maxlength="128" required></label>
+      <label class="field"><span>Serial number</span><input name="serial_number" type="text" maxlength="128" autocomplete="off" required></label>
       <label class="field"><span>Pairing code</span><input name="code" type="text" autocomplete="one-time-code" maxlength="40" required></label>
       <div class="form-actions"><button type="submit">Add device</button></div>
     </form>

@@ -430,8 +430,8 @@ fn tenant_layout_renders_only_tenant_navigation() {
     assert!(rendered.contains("href=\"/tenant/permissions\""));
     assert!(rendered.contains("href=\"/tenant/alerts\""));
     assert!(rendered.contains("href=\"/tenant/audit\""));
-    assert!(!rendered.contains("href=\"/tenant/profiles/device\""));
-    assert!(!rendered.contains("href=\"/tenant/profiles/asset\""));
+    assert!(rendered.contains("href=\"/tenant/profiles/device\""));
+    assert!(rendered.contains("href=\"/tenant/profiles/asset\""));
     assert!(rendered.contains("href=\"/tenant/applications\""));
     assert!(rendered.contains("href=\"/tenant/profile\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
@@ -468,6 +468,33 @@ fn tenant_applications_template_does_not_link_to_an_application_profile_page() {
 
     assert!(!template.contains("Domain profile"));
     assert!(!template.contains("/tenant/applications/{{ application.app_id }}"));
+}
+
+#[test]
+fn tenant_devices_table_includes_the_assigned_user() {
+    let template = platform_template_source("tenant_devices.html");
+
+    assert!(template.contains("<th scope=\"col\">Assigned user</th>"));
+    assert!(template.contains("{{ device.assigned_user }}"));
+}
+
+#[test]
+fn tenant_resource_editors_load_and_save_json_attributes() {
+    let assets = platform_template_source("tenant_assets.html");
+    let devices = platform_template_source("tenant_devices.html");
+
+    for template in [&assets, &devices] {
+        assert!(template.contains("<span>Attributes (JSON)</span>"));
+        assert!(template.contains("<textarea name=\"attributes\""));
+        assert!(template.contains("attributes: ui.parseObject(fields.attributes.value)"));
+    }
+
+    assert!(assets.contains(
+        "fields.attributes.value = JSON.stringify(selectedAsset.attributes || {}, null, 2);"
+    ));
+    assert!(devices.contains(
+        "fields.attributes.value = JSON.stringify(selectedDevice.attributes || {}, null, 2);"
+    ));
 }
 
 #[test]
@@ -828,7 +855,8 @@ fn user_workspace_renders_a_secret_free_device_claim_form_only_with_capability()
         .split_once("</form>")
         .expect("claim form is closed");
 
-    assert!(claim_form.contains("name=\"device_id\""));
+    assert!(claim_form.contains("name=\"serial_number\""));
+    assert!(!claim_form.contains("name=\"device_id\""));
     assert!(claim_form.contains(
         "name=\"code\" type=\"text\" autocomplete=\"one-time-code\" maxlength=\"40\" required"
     ));
@@ -1117,7 +1145,8 @@ fn tenant_pairing_policy_and_device_editor_keep_pairing_codes_out_of_server_rend
     for marker in [
         "name=\"enabled\" type=\"checkbox\"",
         "name=\"ttl_seconds\" type=\"number\" min=\"60\" max=\"86400\"",
-        "name=\"code_length\" type=\"number\" min=\"8\" max=\"32\"",
+        "name=\"code_length\" type=\"hidden\" value=\"6\"",
+        "Pairing codes are always six digits.",
         "name=\"max_failed_attempts\" type=\"number\" min=\"1\" max=\"20\"",
         "name=\"request_cooldown_seconds\" type=\"number\" min=\"10\" max=\"3600\"",
         "Save policy",

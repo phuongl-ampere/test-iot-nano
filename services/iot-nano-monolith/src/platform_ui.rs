@@ -76,6 +76,7 @@ impl SystemTenantRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemPlatformPage {
     tenants: Vec<SystemTenantRow>,
+    serial_number_length: u8,
     operational_health: String,
     notice: &'static str,
     has_notice: bool,
@@ -400,9 +401,11 @@ impl TenantAssetsPage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantDeviceRow {
     device_id: String,
+    serial_number: String,
     display_name: String,
     status: String,
     asset: String,
+    assigned_user: String,
     claim_status: String,
     has_active_claim_code: bool,
 }
@@ -410,15 +413,19 @@ pub struct TenantDeviceRow {
 impl TenantDeviceRow {
     pub(crate) fn new(
         device_id: impl Into<String>,
+        serial_number: impl Into<String>,
         display_name: impl Into<String>,
         status: impl Into<String>,
         asset: impl Into<String>,
+        assigned_user: impl Into<String>,
     ) -> Self {
         Self {
             device_id: device_id.into(),
+            serial_number: serial_number.into(),
             display_name: display_name.into(),
             status: status.into(),
             asset: asset.into(),
+            assigned_user: assigned_user.into(),
             claim_status: "No active pairing code".to_owned(),
             has_active_claim_code: false,
         }
@@ -438,6 +445,8 @@ impl TenantDeviceRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantDevicesPage {
     devices: Vec<TenantDeviceRow>,
+    serial_number_length: u8,
+    auto_generate_serial_number: bool,
     notice: &'static str,
     has_notice: bool,
 }
@@ -446,9 +455,24 @@ impl TenantDevicesPage {
     pub(crate) fn new(devices: Vec<TenantDeviceRow>, notice: Option<&'static str>) -> Self {
         Self {
             devices,
+            serial_number_length: 9,
+            auto_generate_serial_number: true,
             notice: notice.unwrap_or_default(),
             has_notice: notice.is_some(),
         }
+    }
+
+    pub(crate) fn with_serial_number_length(mut self, serial_number_length: u8) -> Self {
+        self.serial_number_length = serial_number_length;
+        self
+    }
+
+    pub(crate) fn with_auto_generate_serial_number(
+        mut self,
+        auto_generate_serial_number: bool,
+    ) -> Self {
+        self.auto_generate_serial_number = auto_generate_serial_number;
+        self
     }
 }
 
@@ -1198,6 +1222,7 @@ impl SystemPlatformPage {
     pub fn new(tenants: Vec<SystemTenantRow>) -> Self {
         Self {
             tenants,
+            serial_number_length: 9,
             operational_health: "Not ready".to_owned(),
             notice: "",
             has_notice: false,
@@ -1206,6 +1231,11 @@ impl SystemPlatformPage {
 
     pub(crate) fn with_operational_health(mut self, operational_health: impl Into<String>) -> Self {
         self.operational_health = operational_health.into();
+        self
+    }
+
+    pub(crate) fn with_serial_number_length(mut self, serial_number_length: u8) -> Self {
+        self.serial_number_length = serial_number_length;
         self
     }
 

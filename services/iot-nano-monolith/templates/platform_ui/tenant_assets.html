@@ -88,7 +88,7 @@
     <header class="dialog-header">
       <div>
         <h2 id="asset-editor-title">Edit asset</h2>
-        <p class="panel-caption">Parent, profile and metadata are saved through the tenant management API.</p>
+        <p class="panel-caption">Parent, profile, metadata and attributes are saved through the tenant management API.</p>
       </div>
       <button type="button" class="dialog-close" data-dialog-close aria-label="Close asset editor" title="Close">Close</button>
     </header>
@@ -108,6 +108,10 @@
       <label class="field">
         <span>Metadata (JSON)</span>
         <textarea name="metadata" rows="6" required></textarea>
+      </label>
+      <label class="field">
+        <span>Attributes (JSON)</span>
+        <textarea name="attributes" rows="6" required></textarea>
       </label>
       <div class="dialog-actions">
         <button type="button" class="button-link-secondary" data-dialog-close>Cancel</button>
@@ -216,6 +220,7 @@
           );
           replaceOptions(fields.asset_profile_id, profiles, selectedAsset.asset_profile_id, "No profile");
           fields.metadata.value = JSON.stringify(selectedAsset.metadata || {}, null, 2);
+          fields.attributes.value = JSON.stringify(selectedAsset.attributes || {}, null, 2);
           editor.showModal();
           void loadOwner();
           fields.name.focus();
@@ -287,7 +292,7 @@
               parent_asset_id: fields.parent_asset_id.value || null,
               asset_profile_id: fields.asset_profile_id.value || null,
               metadata: ui.parseObject(fields.metadata.value),
-              attributes: selectedAsset.attributes || null,
+              attributes: ui.parseObject(fields.attributes.value),
             },
           });
           editor.close();

@@ -350,6 +350,7 @@ struct TenantProfileAssignmentResponse {
 #[derive(Debug, Serialize)]
 struct DeviceResponse {
     device_id: String,
+    serial_number: Option<String>,
     display_name: Option<String>,
     metadata: Value,
     asset_id: Option<Uuid>,
@@ -365,7 +366,7 @@ struct DeviceResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClaimDeviceRequest {
-    device_id: String,
+    serial_number: String,
     code: String,
 }
 
@@ -855,6 +856,19 @@ fn validate_device_id(device_id: String) -> Result<String, PublicApiError> {
     Ok(device_id.to_owned())
 }
 
+fn validate_serial_number(serial_number: String) -> Result<String, PublicApiError> {
+    let serial_number = serial_number.trim().to_ascii_uppercase();
+    if serial_number.is_empty()
+        || serial_number.len() > 128
+        || !serial_number.bytes().all(|value| {
+            value.is_ascii_alphanumeric() || value == b'-' || value == b'_' || value == b'.'
+        })
+    {
+        return Err(PublicApiError::BadRequest);
+    }
+    Ok(serial_number)
+}
+
 fn validate_display_name(display_name: Option<String>) -> Result<Option<String>, PublicApiError> {
     display_name
         .map(|display_name| validate_name(display_name))
@@ -944,22 +958,26 @@ async fn claim_device(
     let (store, principal) = authenticate(&context, &headers, "devices:write").await?;
     require_user_capability(store.as_ref(), &principal, UserCapability::ClaimDevices).await?;
     let user_id = principal.user_id.ok_or(PublicApiError::Forbidden)?;
-    let device_id = validate_device_id(request.device_id)?;
-    DeviceClaimRepository::claim_device_with_code(
+    let serial_number = validate_serial_number(request.serial_number)?;
+    let claimed = DeviceClaimRepository::claim_device_with_serial_number(
         store.as_ref(),
         principal.tenant_id,
         user_id,
-        &device_id,
+        &serial_number,
         &request.code,
     )
     .await
     .map_err(public_device_claim_error)?;
-    let device = PublicApiRepository::get_public_device(store.as_ref(), &principal, &device_id)
-        .await
-        .map_err(|_| PublicApiError::Unavailable)?
-        .ok_or(PublicApiError::Forbidden)?;
+    let device =
+        PublicApiRepository::get_public_device(store.as_ref(), &principal, &claimed.device_id)
+            .await
+            .map_err(|_| PublicApiError::Unavailable)?
+            .ok_or(PublicApiError::Forbidden)?;
     let health = device_health_by_id(store.as_ref(), principal.tenant_id).await?;
-    Ok(Json(device_response(device, health.get(&device_id))))
+    Ok(Json(device_response(
+        device,
+        health.get(&claimed.device_id),
+    )))
 }
 
 async fn list_devices(
@@ -1517,6 +1535,7 @@ fn device_response(device: PublicDevice, health: Option<&DeviceHealth>) -> Devic
     let (online, last_seen_at) = health.cloned().unwrap_or((false, None));
     DeviceResponse {
         device_id: device.device_id,
+        serial_number: device.serial_number,
         display_name: device.display_name,
         metadata: device.metadata,
         asset_id: device.asset_id,

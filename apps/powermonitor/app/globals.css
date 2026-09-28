@@ -495,7 +495,7 @@ button:disabled {
 
 .claim-device-panel form {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(160px, 0.8fr) auto;
+  grid-template-columns: repeat(3, minmax(160px, 1fr)) auto;
   align-items: end;
   gap: 12px;
 }

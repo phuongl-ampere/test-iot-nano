@@ -245,16 +245,16 @@ pub(in crate::management) async fn claim_user_device_form(
         Ok(form) => form,
         Err(error) => return user_claim_device_form_error(error),
     };
-    let device_id = form.device_id.trim();
+    let serial_number = form.serial_number.trim();
     let code = form.code.trim();
-    if device_id.is_empty() || device_id.len() > 128 || code.is_empty() || code.len() > 40 {
+    if serial_number.is_empty() || serial_number.len() > 128 || code.is_empty() || code.len() > 40 {
         return user_claim_device_form_error(ManagementSessionError::BadRequest);
     }
-    match DeviceClaimRepository::claim_device_with_code(
+    match DeviceClaimRepository::claim_device_with_serial_number(
         state.store.as_ref(),
         session.tenant_id,
         session.user_id,
-        device_id,
+        serial_number,
         code,
     )
     .await
@@ -943,6 +943,25 @@ pub(in crate::management) async fn platform_page(
             let tenants = TenantIdentityRepository::list_tenant_summaries(state.store.as_ref())
                 .await
                 .map_err(|_| ManagementSessionError::Unavailable)?;
+            let serial_number_length: i64 = match state.store.as_ref() {
+                PlatformStore::Sqlite(store) => {
+                    sqlx::query_scalar(
+                        "SELECT serial_number_length FROM system_accounts WHERE id = ?",
+                    )
+                    .bind(system_account_id.to_string())
+                    .fetch_one(store.pool())
+                    .await
+                }
+                PlatformStore::Timescale(pool) => {
+                    sqlx::query_scalar(
+                        "SELECT serial_number_length FROM system_accounts WHERE id = $1",
+                    )
+                    .bind(system_account_id)
+                    .fetch_one(pool)
+                    .await
+                }
+            }
+            .map_err(|_| ManagementSessionError::Unavailable)?;
             let page = crate::SystemPlatformPage::new(
                 tenants
                     .into_iter()
@@ -955,6 +974,10 @@ pub(in crate::management) async fn platform_page(
                     .collect(),
             )
             .with_operational_health(state.infrastructure_status.operational_health())
+            .with_serial_number_length(
+                u8::try_from(serial_number_length)
+                    .map_err(|_| ManagementSessionError::Unavailable)?,
+            )
             .with_notice(system_notice);
             crate::PlatformUiRenderer::render_system(
                 &crate::PlatformUiIdentity::new(format!("System Account {system_account_id}")),

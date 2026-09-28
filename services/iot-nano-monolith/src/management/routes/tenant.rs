@@ -258,13 +258,26 @@ pub(in crate::management) async fn tenant_devices_page(
         ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
             .await
             .map_err(management_device_error)?;
+    let users =
+        ManagementUserRepository::list_management_users(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_user_error)?;
+    let (serial_number_length, auto_generate_serial_number) =
+        tenant_serial_generation_settings(state.store.as_ref(), tenant.tenant_id).await?;
     let asset_names: HashMap<Uuid, String> = assets
         .into_iter()
         .map(|asset| (asset.id, asset.name))
         .collect();
+    let user_names: HashMap<Uuid, String> = users
+        .into_iter()
+        .map(|user| (user.id, user.username))
+        .collect();
     let mut rows = Vec::with_capacity(devices.len());
     for device in devices {
         let device_id = device.device_id;
+        let serial_number = device
+            .serial_number
+            .unwrap_or_else(|| "No serial number".to_owned());
         let display_name = device.display_name.unwrap_or_else(|| device_id.clone());
         let asset = device.asset_id.map_or_else(
             || "Unassigned".to_owned(),
@@ -274,6 +287,15 @@ pub(in crate::management) async fn tenant_devices_page(
                     .cloned()
                     .unwrap_or_else(|| asset_id.to_string());
                 format!("{asset_name} ({asset_id})")
+            },
+        );
+        let assigned_user = device.owner_user_id.map_or_else(
+            || "Unassigned".to_owned(),
+            |user_id| {
+                user_names
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| user_id.to_string())
             },
         );
         let claim_status = DeviceClaimRepository::active_device_claim_code(
@@ -300,6 +322,7 @@ pub(in crate::management) async fn tenant_devices_page(
         rows.push(
             crate::TenantDeviceRow::new(
                 device_id,
+                serial_number,
                 display_name,
                 if device.health.online {
                     "Online"
@@ -307,11 +330,14 @@ pub(in crate::management) async fn tenant_devices_page(
                     "Offline"
                 },
                 asset,
+                assigned_user,
             )
             .with_claim_status(claim_status, has_active_claim_code),
         );
     }
-    let page = crate::TenantDevicesPage::new(rows, notice);
+    let page = crate::TenantDevicesPage::new(rows, notice)
+        .with_serial_number_length(serial_number_length)
+        .with_auto_generate_serial_number(auto_generate_serial_number);
     let rendered = crate::PlatformUiRenderer::render_tenant_devices(
         &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
         &page,
@@ -835,8 +861,9 @@ pub(in crate::management) async fn provision_tenant_device_form(
                 .map(|redirect| redirect.into_response());
         }
     };
+    let serial_number = request.serial_number.trim();
     let display_name = request.display_name.trim();
-    if display_name.is_empty() || display_name.len() > 128 {
+    if serial_number.len() > 128 || display_name.is_empty() || display_name.len() > 128 {
         return tenant_management_form_error(
             TenantManagementPage::Devices,
             ManagementSessionError::BadRequest,
@@ -844,11 +871,15 @@ pub(in crate::management) async fn provision_tenant_device_form(
         .map(|redirect| redirect.into_response());
     }
     let _lease = authorize_tenant_mutation(&state, &headers).await?;
-    let token = match provision_platform_device_token(
+    let token = match provision_management_device_token(
         &state.store,
         &state.token_vault,
         tenant.tenant_id,
+        serial_number,
         display_name,
+        None,
+        None,
+        json!({}),
     )
     .await
     {
@@ -917,6 +948,36 @@ pub(in crate::management) async fn update_tenant_device_claim_policy_form(
         )),
         Err(error) => tenant_device_claim_policy_form_error(management_device_claim_error(error)),
     }
+}
+
+pub(in crate::management) async fn update_tenant_serial_generation_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let form: TenantSerialGenerationForm = management_request_form(&state, request).await?;
+    let enabled = form.enabled.is_some();
+    let updated = match state.store.as_ref() {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query("UPDATE tenants SET auto_generate_serial_number = ? WHERE id = ?")
+                .bind(i64::from(enabled))
+                .bind(tenant.tenant_id.to_string())
+                .execute(store.pool())
+                .await
+                .map(|_| ())
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query("UPDATE tenants SET auto_generate_serial_number = $1 WHERE id = $2")
+                .bind(enabled)
+                .bind(tenant.tenant_id)
+                .execute(pool)
+                .await
+                .map(|_| ())
+        }
+    };
+    updated.map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Redirect::to("/tenant/devices"))
 }
 
 pub(in crate::management) async fn revoke_tenant_device_claim_code_form(

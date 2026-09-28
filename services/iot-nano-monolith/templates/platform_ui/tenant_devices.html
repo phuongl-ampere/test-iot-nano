@@ -23,7 +23,12 @@
       </div>
       <a class="button-link button-link-secondary" href="/tenant/devices/claim-policy">Pairing policy</a>
     </header>
-    <form class="form-grid" action="/tenant/devices" method="post" data-device-provision-form>
+    <form class="form-grid" action="/tenant/devices" method="post" data-device-provision-form data-serial-number-length="{{ page.serial_number_length }}">
+      <label class="field">
+        <span>Serial number</span>
+        <input name="serial_number" type="text" maxlength="128" autocomplete="off" required>
+        <button type="button" class="button-link-secondary" data-serial-number-generate>Generate serial</button>
+      </label>
       <label class="field">
         <span>Display name</span>
         <input name="display_name" type="text" maxlength="128" required>
@@ -68,9 +73,11 @@
           <thead>
             <tr>
               <th scope="col">Device ID</th>
+              <th scope="col">Serial number</th>
               <th scope="col">Display name</th>
               <th scope="col">Device status</th>
               <th scope="col">Assigned asset</th>
+              <th scope="col">Assigned user</th>
               <th scope="col">Pairing</th>
               <th scope="col">Actions</th>
             </tr>
@@ -79,9 +86,11 @@
             {% for device in page.devices %}
               <tr id="device-{{ device.device_id|urlencode_strict }}">
                 <td><a class="row-anchor" href="#device-{{ device.device_id|urlencode_strict }}" aria-label="Link to device {{ device.display_name }}"><code>{{ device.device_id }}</code></a></td>
+                <td><code>{{ device.serial_number }}</code></td>
                 <td>{{ device.display_name }}</td>
                 <td><span class="status-chip">{{ device.status }}</span></td>
                 <td>{{ device.asset }}</td>
+                <td>{{ device.assigned_user }}</td>
                 <td>
                   <span class="operation-note">{{ device.claim_status }}</span>
                   {% if device.has_active_claim_code %}
@@ -113,6 +122,10 @@
       <button type="button" class="dialog-close" data-dialog-close aria-label="Close device editor" title="Close">Close</button>
     </header>
     <form data-device-editor-form>
+      <label class="field">
+        <span>Serial number</span>
+        <input name="serial_number" type="text" readonly>
+      </label>
       <label class="field">
         <span>Display name</span>
         <input name="display_name" type="text" maxlength="128" required>
@@ -160,6 +173,7 @@
         </div>
         <div data-device-claim-code-reveal>
           <output class="dialog-output" data-device-claim-code-value></output>
+          <div class="pairing-qr" data-device-claim-code-qr hidden></div>
           <div class="dialog-actions">
             <span class="json-feedback" data-device-claim-code-status role="status"></span>
             <button type="button" data-device-claim-code-copy disabled>Copy code</button>
@@ -281,6 +295,7 @@
     (() => {
       const ui = window.PlatformUi;
       const provisionForm = document.querySelector("[data-device-provision-form]");
+      const generateSerialNumber = provisionForm.querySelector("[data-serial-number-generate]");
       const editor = document.getElementById("device-editor");
       const editorForm = document.querySelector("[data-device-editor-form]");
       const credentialDialog = document.getElementById("device-credential");
@@ -293,6 +308,7 @@
       const copyToken = editorForm.querySelector("[data-device-token-copy]");
       const issueClaimCode = editorForm.querySelector("[data-device-claim-code-issue]");
       const claimCodeValue = editorForm.querySelector("[data-device-claim-code-value]");
+      const claimCodeQr = editorForm.querySelector("[data-device-claim-code-qr]");
       const claimCodeStatus = editorForm.querySelector("[data-device-claim-code-status]");
       const copyClaimCode = editorForm.querySelector("[data-device-claim-code-copy]");
       const telemetryRange = editorForm.querySelector("[data-device-telemetry-range]");
@@ -337,6 +353,8 @@
       };
       const clearIssuedClaimCode = () => {
         claimCodeValue.textContent = "";
+        claimCodeQr.replaceChildren();
+        claimCodeQr.hidden = true;
         claimCodeStatus.textContent = "";
         copyClaimCode.disabled = true;
       };
@@ -467,6 +485,14 @@
         window.location.reload();
       };
 
+      generateSerialNumber?.addEventListener("click", () => {
+        const length = Number(provisionForm.dataset.serialNumberLength) || 9;
+        const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        const values = new Uint32Array(length);
+        crypto.getRandomValues(values);
+        provisionForm.elements.serial_number.value = Array.from(values, (value) => alphabet[value % alphabet.length]).join("");
+      });
+
       const openEditor = async (deviceId, control) => {
         ui.setPending(control, true);
         try {
@@ -479,6 +505,7 @@
           if (!selectedDevice) throw new Error("The device no longer exists.");
 
           const fields = editorForm.elements;
+          fields.serial_number.value = selectedDevice.serial_number || "No serial number";
           fields.display_name.value = selectedDevice.display_name || selectedDevice.device_id;
           replaceOptions(fields.asset_id, assets, selectedDevice.asset_id, "Unassigned");
           replaceOptions(fields.device_profile_id, profiles, selectedDevice.device_profile_id, "No profile");
@@ -528,7 +555,10 @@
         try {
           const response = await ui.request("/api/management/devices", {
             method: "POST",
-            body: { display_name: provisionForm.elements.display_name.value.trim() },
+            body: {
+              serial_number: provisionForm.elements.serial_number.value.trim(),
+              display_name: provisionForm.elements.display_name.value.trim(),
+            },
           });
           provisionForm.reset();
           credentialValue.textContent = response.token || "Credential was not returned.";
@@ -676,6 +706,10 @@
           );
           if (!response.code || !response.expires_at) throw new Error("The pairing code was not returned. Try again.");
           claimCodeValue.textContent = response.code;
+          if (response.qr_svg) {
+            claimCodeQr.innerHTML = response.qr_svg;
+            claimCodeQr.hidden = false;
+          }
           const expiresAt = new Date(response.expires_at);
           claimCodeStatus.textContent = Number.isNaN(expiresAt.valueOf())
             ? "Copy the pairing code now."

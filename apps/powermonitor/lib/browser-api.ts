@@ -4,6 +4,7 @@ export type Permission = "viewer" | "controller" | "manager" | "owner";
 
 export type Device = {
   id: string;
+  serial_number?: string | null;
   name?: string;
   asset_id?: string | null;
   device_profile_id?: string | null;
@@ -135,10 +136,10 @@ export async function listUserCapabilities(): Promise<string[]> {
   return stringList(response.capabilities) ?? [];
 }
 
-export async function claimDevice(deviceId: string, code: string): Promise<Device> {
+export async function claimDevice(serialNumber: string, code: string): Promise<Device> {
   return normalizeDevice(await request<PublicDevice>(
     "/api/v1/devices/claim",
-    jsonRequest({ device_id: deviceId, code }),
+    jsonRequest({ serial_number: serialNumber, code }),
   ));
 }
 
@@ -485,6 +486,7 @@ type PublicDevice = {
   name?: string;
   online?: unknown;
   permission?: Permission;
+  serial_number?: string | null;
   switch_state?: unknown;
 };
 
@@ -538,6 +540,7 @@ function normalizeDevice(response: PublicDevice): Device {
     id,
     name: response.name ?? response.display_name ?? id,
   };
+  if (response.serial_number !== undefined) device.serial_number = response.serial_number;
   if (response.asset_id !== undefined) device.asset_id = response.asset_id;
   if (response.device_profile_id !== undefined) device.device_profile_id = response.device_profile_id;
   const permission = response.permission ?? response.effective_permission;

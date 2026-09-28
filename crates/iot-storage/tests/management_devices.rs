@@ -273,6 +273,38 @@ async fn sqlite_management_devices_reject_cross_tenant_lookup_mutation_and_asset
     );
 }
 
+#[tokio::test]
+async fn sqlite_device_serial_numbers_are_optional_and_unique_per_tenant() {
+    let (_directory, store, _default_tenant_id) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let tenant_a = seed_tenant(pool, "serial-tenant-a").await;
+    let tenant_b = seed_tenant(pool, "serial-tenant-b").await;
+
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, serial_number)
+         VALUES ('optional-serial', ?, NULL),
+                ('serial-a', ?, 'METER-001'),
+                ('serial-b', ?, 'METER-001')",
+    )
+    .bind(tenant_a.to_string())
+    .bind(tenant_a.to_string())
+    .bind(tenant_b.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        sqlx::query(
+            "INSERT INTO devices (device_id, tenant_id, serial_number)
+         VALUES ('duplicate-serial', ?, 'meter-001')",
+        )
+        .bind(tenant_a.to_string())
+        .execute(pool)
+        .await
+        .is_err()
+    );
+}
+
 struct TimescaleTestLock {
     _connection: PgConnection,
 }

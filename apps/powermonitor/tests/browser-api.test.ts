@@ -69,7 +69,7 @@ describe("browser PowerMonitor API", () => {
     );
     vi.stubGlobal("fetch", fetcher);
 
-    await expect(claimDevice("pairing-device", "ABCD-2345-EFGH")).resolves.toMatchObject({
+    await expect(claimDevice("PM-PAIRING-001", "ABCD-2345-EFGH")).resolves.toMatchObject({
       id: "pairing-device",
       name: "Pairing device",
     });
@@ -77,7 +77,7 @@ describe("browser PowerMonitor API", () => {
     expect(fetcher).toHaveBeenCalledWith(
       "/api/v1/devices/claim",
       expect.objectContaining({
-        body: JSON.stringify({ device_id: "pairing-device", code: "ABCD-2345-EFGH" }),
+        body: JSON.stringify({ serial_number: "PM-PAIRING-001", code: "ABCD-2345-EFGH" }),
         method: "POST",
       }),
     );

@@ -1,4 +1,6 @@
 use super::*;
+use qrcodegen::{QrCode, QrCodeEcc};
+use std::fmt::Write as _;
 
 pub(super) async fn create_application(
     State(state): State<ManagementState>,
@@ -77,8 +79,9 @@ pub(super) async fn provision_device(
     let headers = request.headers().clone();
     let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let request: ProvisionDeviceRequest = management_request_json(&state, request).await?;
+    let serial_number = request.serial_number.trim();
     let display_name = request.display_name.trim();
-    if display_name.is_empty() || display_name.len() > 128 {
+    if serial_number.len() > 128 || display_name.is_empty() || display_name.len() > 128 {
         return Err(ManagementSessionError::BadRequest);
     }
     let _lease = authorize_tenant_mutation(&state, &headers).await?;
@@ -86,6 +89,7 @@ pub(super) async fn provision_device(
         &state.store,
         &state.token_vault,
         tenant.tenant_id,
+        serial_number,
         display_name,
         request.asset_id,
         request.device_profile_id,
@@ -1269,6 +1273,14 @@ pub(super) async fn issue_management_device_claim_code(
 > {
     let tenant = require_tenant_account(&state.session_verifier, &headers)?;
     let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let serial_number =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_device_error)?
+            .into_iter()
+            .find(|device| device.device_id == device_id)
+            .and_then(|device| device.serial_number)
+            .ok_or(ManagementSessionError::Conflict)?;
     let issued = DeviceClaimRepository::issue_device_claim_code_from_console(
         state.store.as_ref(),
         tenant.tenant_id,
@@ -1276,14 +1288,41 @@ pub(super) async fn issue_management_device_claim_code(
     )
     .await
     .map_err(management_device_claim_error)?;
+    let pairing_uri = format!(
+        "iotnano://claim?serial_number={serial_number}&code={}",
+        issued.code
+    );
+    let qr_svg = device_claim_qr_svg(&pairing_uri)?;
     Ok((
         StatusCode::CREATED,
         [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         Json(ManagementDeviceClaimCodeResponse {
             device_id,
+            serial_number,
             code: issued.code,
             expires_at: issued.expires_at,
+            pairing_uri,
+            qr_svg,
         }),
+    ))
+}
+
+fn device_claim_qr_svg(pairing_uri: &str) -> Result<String, ManagementSessionError> {
+    let qr = QrCode::encode_text(pairing_uri, QrCodeEcc::Medium)
+        .map_err(|_| ManagementSessionError::BadRequest)?;
+    let border = 4;
+    let size = qr.size() + border * 2;
+    let mut modules = String::new();
+    for y in 0..qr.size() {
+        for x in 0..qr.size() {
+            if qr.get_module(x, y) {
+                write!(&mut modules, "M{} {}h1v1h-1z", x + border, y + border)
+                    .map_err(|_| ManagementSessionError::Unavailable)?;
+            }
+        }
+    }
+    Ok(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" role=\"img\" aria-label=\"Pairing QR code\"><rect width=\"100%\" height=\"100%\" fill=\"white\"/><path d=\"{modules}\" fill=\"black\"/></svg>"
     ))
 }
 

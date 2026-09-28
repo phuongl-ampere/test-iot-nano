@@ -18,6 +18,42 @@ pub(in crate::management) async fn platform_system(
     .await
 }
 
+pub(in crate::management) async fn update_system_serial_number_length_form(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<Redirect, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let PlatformUiSession::System { system_account_id } =
+        state.session_verifier.platform_session(&headers)?
+    else {
+        return Err(ManagementSessionError::Forbidden);
+    };
+    let form: SystemSerialNumberLengthForm = management_request_form(&state, request).await?;
+    if !(6..=32).contains(&form.serial_number_length) {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let updated = match state.store.as_ref() {
+        PlatformStore::Sqlite(store) => {
+            sqlx::query("UPDATE system_accounts SET serial_number_length = ? WHERE id = ?")
+                .bind(i64::from(form.serial_number_length))
+                .bind(system_account_id.to_string())
+                .execute(store.pool())
+                .await
+                .map(|_| ())
+        }
+        PlatformStore::Timescale(pool) => {
+            sqlx::query("UPDATE system_accounts SET serial_number_length = $1 WHERE id = $2")
+                .bind(i32::from(form.serial_number_length))
+                .bind(system_account_id)
+                .execute(pool)
+                .await
+                .map(|_| ())
+        }
+    };
+    updated.map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Redirect::to("/system"))
+}
+
 pub(in crate::management) async fn platform_system_infrastructure(
     State(state): State<ManagementState>,
     headers: HeaderMap,

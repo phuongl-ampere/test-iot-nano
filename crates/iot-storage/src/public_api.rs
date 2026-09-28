@@ -97,6 +97,7 @@ pub struct PublicAsset {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublicDevice {
     pub device_id: String,
+    pub serial_number: Option<String>,
     pub display_name: Option<String>,
     pub metadata: serde_json::Value,
     pub asset_id: Option<Uuid>,
@@ -566,7 +567,7 @@ async fn get_public_device(
 ) -> Result<Option<PublicDevice>, PlatformStoreError> {
     match store {
         PlatformStore::Sqlite(store) => sqlx::query(
-            "SELECT device_id, display_name, metadata, asset_id, device_profile_id
+            "SELECT device_id, serial_number, display_name, metadata, asset_id, device_profile_id
              FROM devices
              WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
         )
@@ -577,7 +578,7 @@ async fn get_public_device(
         .map(sqlite_device_record)
         .transpose(),
         PlatformStore::Timescale(pool) => sqlx::query(
-            "SELECT device_id, display_name, metadata, asset_id, device_profile_id
+            "SELECT device_id, serial_number, display_name, metadata, asset_id, device_profile_id
              FROM devices
              WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
         )
@@ -617,10 +618,10 @@ async fn list_public_devices_with_handoff_token(
             let user_id = subject.user_id.to_string();
             let rows = sqlx::query(
                 "WITH RECURSIVE candidates(
-                     device_id, display_name, metadata, asset_id, device_profile_id,
+                     device_id, serial_number, display_name, metadata, asset_id, device_profile_id,
                      owner_user_id
                  ) AS (
-                     SELECT device_id, display_name, metadata, asset_id, device_profile_id,
+                     SELECT device_id, serial_number, display_name, metadata, asset_id, device_profile_id,
                             owner_user_id
                      FROM devices
                      WHERE tenant_id = ?
@@ -713,7 +714,7 @@ async fn list_public_devices_with_handoff_token(
                      ) AS ranked_access
                      WHERE access_rank = 1
                  )
-                 SELECT candidates.device_id, candidates.display_name, candidates.metadata,
+                 SELECT candidates.device_id, candidates.serial_number, candidates.display_name, candidates.metadata,
                         candidates.asset_id, candidates.device_profile_id,
                         authorized.effective_permission, authorized.access_source
                  FROM candidates
@@ -744,10 +745,10 @@ async fn list_public_devices_with_handoff_token(
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
                 "WITH RECURSIVE candidates(
-                     device_id, display_name, metadata, asset_id, device_profile_id,
+                     device_id, serial_number, display_name, metadata, asset_id, device_profile_id,
                      owner_user_id
                  ) AS (
-                     SELECT device_id, display_name, metadata, asset_id, device_profile_id,
+                     SELECT device_id, serial_number, display_name, metadata, asset_id, device_profile_id,
                             owner_user_id
                      FROM devices
                      WHERE tenant_id = $1
@@ -840,7 +841,7 @@ async fn list_public_devices_with_handoff_token(
                      ) AS ranked_access
                      WHERE access_rank = 1
                  )
-                 SELECT candidates.device_id, candidates.display_name, candidates.metadata,
+                 SELECT candidates.device_id, candidates.serial_number, candidates.display_name, candidates.metadata,
                         candidates.asset_id, candidates.device_profile_id,
                         authorized.effective_permission, authorized.access_source
                  FROM candidates
@@ -898,7 +899,7 @@ async fn create_public_device(
                     owner_user_id
                  )
                  VALUES (?, ?, ?, ?, ?, ?, ?)
-                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+                 RETURNING device_id, serial_number, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(&device.device_id)
             .bind(principal.tenant_id.to_string())
@@ -954,7 +955,7 @@ async fn create_public_device(
                     owner_user_id
                  )
                  VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+                 RETURNING device_id, serial_number, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(&device.device_id)
             .bind(principal.tenant_id)
@@ -1013,7 +1014,7 @@ async fn update_public_device(
                 "UPDATE devices
                  SET display_name = ?, metadata = ?, asset_id = ?, device_profile_id = ?
                  WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL
-                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+                 RETURNING device_id, serial_number, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(&device.display_name)
             .bind(device.metadata.to_string())
@@ -1072,7 +1073,7 @@ async fn update_public_device(
                 "UPDATE devices
                  SET display_name = $2, metadata = $3, asset_id = $4, device_profile_id = $5
                  WHERE device_id = $1 AND tenant_id = $6 AND deleted_at IS NULL
-                 RETURNING device_id, display_name, metadata, asset_id, device_profile_id",
+                 RETURNING device_id, serial_number, display_name, metadata, asset_id, device_profile_id",
             )
             .bind(device_id)
             .bind(&device.display_name)
@@ -3015,12 +3016,21 @@ async fn delete_public_asset(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
+    let Some(user_id) = principal.user_id else {
+        return Ok(false);
+    };
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
-            if !sqlite_public_asset_manager_permission(&mut transaction, principal, asset_id)
-                .await?
-            {
+            let owner: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE id = ? AND tenant_id = ? AND owner_user_id = ?)",
+            )
+            .bind(asset_id.to_string())
+            .bind(principal.tenant_id.to_string())
+            .bind(user_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !owner {
                 return Ok(false);
             }
             let affected = sqlx::query("DELETE FROM assets WHERE id = ? AND tenant_id = ?")
@@ -3037,9 +3047,15 @@ async fn delete_public_asset(
             sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
                 .execute(&mut *transaction)
                 .await?;
-            if !timescale_public_asset_manager_permission(&mut transaction, principal, asset_id)
-                .await?
-            {
+            let owner: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2 AND owner_user_id = $3)",
+            )
+            .bind(asset_id)
+            .bind(principal.tenant_id)
+            .bind(user_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !owner {
                 return Ok(false);
             }
             let affected = sqlx::query("DELETE FROM assets WHERE id = $1 AND tenant_id = $2")
@@ -3080,6 +3096,7 @@ fn sqlite_device_record(row: SqliteRow) -> Result<PublicDevice, PlatformStoreErr
         })?;
     Ok(PublicDevice {
         device_id: row.try_get("device_id")?,
+        serial_number: row.try_get("serial_number")?,
         display_name: row.try_get("display_name")?,
         metadata,
         asset_id,
@@ -3091,6 +3108,7 @@ fn sqlite_device_record(row: SqliteRow) -> Result<PublicDevice, PlatformStoreErr
 fn timescale_device_record(row: PgRow) -> Result<PublicDevice, PlatformStoreError> {
     Ok(PublicDevice {
         device_id: row.try_get("device_id")?,
+        serial_number: row.try_get("serial_number")?,
         display_name: row.try_get("display_name")?,
         metadata: row.try_get::<Json<serde_json::Value>, _>("metadata")?.0,
         asset_id: row.try_get("asset_id")?,

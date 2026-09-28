@@ -211,9 +211,11 @@ async fn user_claims_a_device_through_a_secret_post_form() {
             .unwrap();
     grant_user_capabilities(pool, &tenant_id, &viewer_id, &["claim_devices"]).await;
     let device_id = "session-claim-device";
-    sqlx::query("INSERT INTO devices (device_id, tenant_id) VALUES (?, ?)")
+    let serial_number = "PM-SESSION-CLAIM-001";
+    sqlx::query("INSERT INTO devices (device_id, tenant_id, serial_number) VALUES (?, ?, ?)")
         .bind(device_id)
         .bind(&tenant_id)
+        .bind(serial_number)
         .execute(pool)
         .await
         .unwrap();
@@ -240,7 +242,7 @@ async fn user_claims_a_device_through_a_secret_post_form() {
         .oneshot(system_lifecycle_form(
             "/app/devices/claim",
             Some(&cookie),
-            &format!("device_id={device_id}&code={}", issued.code),
+            &format!("serial_number={serial_number}&code={}", issued.code),
         ))
         .await
         .unwrap();
@@ -292,7 +294,8 @@ async fn tenant_updates_the_pairing_policy_without_a_tenant_side_code() {
     )
     .unwrap();
     assert!(page.contains("Pairing policy"));
-    assert!(!page.contains("Pairing code"));
+    assert!(page.contains("Pairing codes are always six digits."));
+    assert!(!page.contains("data-device-claim-code"));
 
     let saved = management
         .router
@@ -300,7 +303,7 @@ async fn tenant_updates_the_pairing_policy_without_a_tenant_side_code() {
         .oneshot(system_lifecycle_form(
             "/tenant/devices/claim-policy",
             Some(&cookie),
-            "enabled=on&ttl_seconds=1200&code_length=16&max_failed_attempts=4&request_cooldown_seconds=45",
+            "enabled=on&ttl_seconds=1200&code_length=6&max_failed_attempts=4&request_cooldown_seconds=45",
         ))
         .await
         .unwrap();
@@ -323,7 +326,7 @@ async fn tenant_updates_the_pairing_policy_without_a_tenant_side_code() {
         DeviceClaimPolicy {
             enabled: true,
             ttl_seconds: 1200,
-            code_length: 16,
+            code_length: 6,
             max_failed_attempts: 4,
             request_cooldown_seconds: 45,
         }
@@ -356,6 +359,12 @@ async fn tenant_account_can_issue_and_immediately_replace_a_manual_device_claim_
     let device =
         management_provision_device(&router, &tenant_cookie, "Manual Pairing Device").await;
     let device_id = device["device_id"].as_str().unwrap();
+    let serial_number: String =
+        sqlx::query_scalar("SELECT serial_number FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
 
     let first = router
         .clone()
@@ -375,7 +384,18 @@ async fn tenant_account_can_issue_and_immediately_replace_a_manual_device_claim_
         serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
     let first_code = first["code"].as_str().unwrap().to_owned();
     assert_eq!(first["device_id"], device_id);
+    assert_eq!(first["serial_number"], serial_number);
     assert!(first["expires_at"].is_string());
+    assert!(
+        first["pairing_uri"]
+            .as_str()
+            .is_some_and(|uri| uri.contains(&format!("serial_number={serial_number}")))
+    );
+    assert!(
+        first["qr_svg"]
+            .as_str()
+            .is_some_and(|svg| svg.starts_with("<svg"))
+    );
 
     let replacement = router
         .clone()
@@ -3798,6 +3818,12 @@ async fn tenant_account_provisioning_accepts_assignment_and_attributes() {
             .fetch_one(store.sqlite_pool().unwrap())
             .await
             .unwrap();
+    let stored_serial_number: Option<String> =
+        sqlx::query_scalar("SELECT serial_number FROM devices WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
     let stored_attributes: String =
         sqlx::query_scalar("SELECT metadata FROM devices WHERE device_id = ?")
             .bind(device_id)
@@ -3806,6 +3832,7 @@ async fn tenant_account_provisioning_accepts_assignment_and_attributes() {
             .unwrap();
     assert_eq!(stored_asset.as_deref(), asset["id"].as_str());
     assert_eq!(stored_profile.as_deref(), profile["id"].as_str());
+    assert_eq!(stored_serial_number, None);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&stored_attributes).unwrap(),
         json!({"site": "lab"})
@@ -4832,7 +4859,11 @@ async fn management_provision_device(
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, cookie)
                 .body(Body::from(
-                    json!({ "display_name": display_name }).to_string(),
+                    json!({
+                        "serial_number": format!("TEST-{}", uuid::Uuid::now_v7()),
+                        "display_name": display_name,
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
@@ -5843,7 +5874,7 @@ async fn system_created_tenant_can_create_and_sign_in_a_user_from_the_platform_f
         .fetch_one(store.sqlite_pool().unwrap())
         .await
         .unwrap(),
-        2
+        4
     );
 
     let user_login = router
