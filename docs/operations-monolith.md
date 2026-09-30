@@ -124,8 +124,8 @@ systemctl status iot-nano-monolith.service
 journalctl -u iot-nano-monolith.service --since "5 minutes ago"
 ```
 
-The first administrative user is a one-time operation. Load the bootstrap
-credentials only for that invocation, run `--bootstrap-admin`, remove those
+The first System Account is a one-time operation. Load the bootstrap
+credentials only for that invocation, run `--bootstrap-system`, remove those
 variables, and restart the normal service. Do not leave bootstrap credentials
 in the persistent environment file.
 
