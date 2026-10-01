@@ -82,6 +82,7 @@ impl Fixture {
                 management_http: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mqtt_tcp: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mqtt_tls: SocketAddr::from(([127, 0, 0, 1], 0)),
+                web_https_enabled: false,
                 tls_cert_path: mqtt_fixtures.join("server.crt"),
                 tls_key_path: mqtt_fixtures.join("server.key"),
                 shutdown_deadline: Duration::from_secs(1),

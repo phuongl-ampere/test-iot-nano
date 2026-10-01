@@ -56,6 +56,7 @@ const DEFAULT_MQTT_TCP_ADDRESS: &str = "0.0.0.0:1883";
 const DEFAULT_MQTT_TLS_ADDRESS: &str = "0.0.0.0:8883";
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SHUTDOWN_DEADLINE_SECONDS: u64 = 30;
+const DEFAULT_WEB_HTTPS_ENABLED: bool = false;
 const MAX_BUSY_TIMEOUT_MS: u64 = 60_000;
 const MAX_SHUTDOWN_DEADLINE_SECONDS: u64 = 300;
 
@@ -68,6 +69,9 @@ pub struct MonolithConfig {
     pub management_http: SocketAddr,
     pub mqtt_tcp: SocketAddr,
     pub mqtt_tls: SocketAddr,
+    /// Whether the public web origin is HTTPS and browser cookies must carry
+    /// the Secure attribute. Defaults to false for LAN HTTP deployments.
+    pub web_https_enabled: bool,
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
     pub shutdown_deadline: Duration,
@@ -112,6 +116,8 @@ impl MonolithConfig {
             "IOT_NANO_MQTT_TLS_ADDRESS",
             DEFAULT_MQTT_TLS_ADDRESS,
         )?;
+        let web_https_enabled =
+            boolean(&values, "IOT_NANO_HTTPS_ENABLED", DEFAULT_WEB_HTTPS_ENABLED)?;
         validate_unique_addresses([public_http, management_http, mqtt_tcp, mqtt_tls])?;
         let shutdown_deadline = Duration::from_secs(bounded_u64(
             &values,
@@ -128,10 +134,29 @@ impl MonolithConfig {
             management_http,
             mqtt_tcp,
             mqtt_tls,
+            web_https_enabled,
             tls_cert_path,
             tls_key_path,
             shutdown_deadline,
         })
+    }
+}
+
+fn boolean(
+    values: &BTreeMap<String, String>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    let Some(value) = values.get(name) else {
+        return Ok(default);
+    };
+    match value.as_str() {
+        "true" | "1" | "on" => Ok(true),
+        "false" | "0" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidBoolean {
+            name,
+            value: value.to_owned(),
+        }),
     }
 }
 
@@ -314,4 +339,6 @@ pub enum ConfigError {
     DuplicateListenerAddress(SocketAddr),
     #[error("{name} must be a positive integer within its supported range, got {value:?}")]
     InvalidUnsignedInteger { name: &'static str, value: String },
+    #[error("{name} must be true/false, 1/0, or on/off, got {value:?}")]
+    InvalidBoolean { name: &'static str, value: String },
 }

@@ -312,11 +312,15 @@ function passwordLoginError(appBaseUrl: string, error: PasswordLoginError): Resp
 function cookieOptions(maxAge: number) {
   return {
     httpOnly: true,
-    secure: true,
+    secure: webHttpsEnabled(),
     sameSite: "lax" as const,
     path: "/",
     maxAge,
   };
+}
+
+function webHttpsEnabled(): boolean {
+  return ["true", "1", "on"].includes(process.env.IOT_NANO_HTTPS_ENABLED?.toLowerCase() ?? "");
 }
 
 function required(name: string): string {

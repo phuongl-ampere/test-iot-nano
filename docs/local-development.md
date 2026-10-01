@@ -102,11 +102,19 @@ Set these values for the local monolith:
 ```dotenv
 PLATFORM_BASE_URL=http://127.0.0.1:18080
 PLATFORM_AUTH_BASE_URL=http://127.0.0.1:18080
+IOT_NANO_HTTPS_ENABLED=false
 OAUTH_CLIENT_ID=powermonitor-client
 OAUTH_REDIRECT_URI=http://localhost:3002/api/auth/callback
 OAUTH_SCOPE=devices:read devices:write assets:read assets:write telemetry:read alerts:read alerts:write commands:read commands:write authorization:read authorization:write
 SESSION_SECRET=replace-with-at-least-32-random-bytes
 ```
+
+`IOT_NANO_HTTPS_ENABLED` defaults to `false`: both the monolith console and
+PowerMonitor therefore issue HTTP-compatible `HttpOnly` cookies for a LAN.
+For HTTPS behind a reverse proxy, set it to `true` in both the monolith
+environment and PowerMonitor environment, and change all three URLs above to
+their `https://` origins. The variable controls cookie security; the monolith
+does not itself terminate web TLS.
 
 Generate a unique `SESSION_SECRET`, for example with `openssl rand -base64
 48`. Delete the `OAUTH_CLIENT_SECRET` line entirely: the local seed registers

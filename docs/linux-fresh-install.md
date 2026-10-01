@@ -125,9 +125,12 @@ sudo systemctl status iot-nano-monolith.service --no-pager
 sudo journalctl -u iot-nano-monolith.service --since '5 minutes ago' --no-pager
 ```
 
-Open the public console through the HTTPS reverse proxy you operate for the
-host. Use SSH port forwarding or an operator-only network path for the
-management listener.
+By default, open the public console directly at
+`http://<LAN-IP>:8080`; browser cookies are compatible with HTTP LAN access.
+Use SSH port forwarding or an operator-only network path for the management
+listener. If you terminate HTTPS at a reverse proxy, set
+`IOT_NANO_HTTPS_ENABLED=true` in `/etc/iot-nano/monolith.env` and use matching
+HTTPS PowerMonitor URLs.
 
 ## 7. Firewall and backup baseline
 

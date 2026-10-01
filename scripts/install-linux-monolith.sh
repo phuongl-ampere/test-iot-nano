@@ -15,6 +15,7 @@ public_address="0.0.0.0:8080"
 management_address="127.0.0.1:8081"
 mqtt_address="0.0.0.0:1883"
 mqtt_tls_address="0.0.0.0:8883"
+web_https_enabled="false"
 tls_common_name="iot-nano"
 system_username="systemadmin"
 system_password="systemadmin"
@@ -66,6 +67,7 @@ prompt_install_values() {
   printf '%s\n' 'Press Enter to use each displayed default.'
   public_address="$(prompt 'Public HTTP address' "$public_address")"
   management_address="$(prompt 'Management address (keep private)' "$management_address")"
+  web_https_enabled="$(prompt 'HTTPS enabled for browser cookies: true or false' "$web_https_enabled")"
   seed_mode="$(prompt 'Seed mode: starter or none' "$seed_mode")"
   system_username="$(prompt 'System username' "$system_username")"
   system_password="$(prompt 'System password' "$system_password")"
@@ -77,6 +79,7 @@ prompt_install_values() {
   user2_username="$(prompt 'Second user username' "$user2_username")"
   user2_password="$(prompt 'Second user password' "$user2_password")"
   case "$seed_mode" in starter|none) ;; *) printf '%s\n' 'Seed mode must be starter or none.' >&2; exit 2;; esac
+  case "$web_https_enabled" in true|false|1|0|on|off) ;; *) printf '%s\n' 'HTTPS mode must be true/false, 1/0, or on/off.' >&2; exit 2;; esac
 }
 
 install_dependencies() {
@@ -130,6 +133,7 @@ IOT_NANO_PUBLIC_HTTP_ADDRESS=$public_address
 IOT_NANO_MANAGEMENT_ADDRESS=$management_address
 IOT_NANO_MQTT_TCP_ADDRESS=$mqtt_address
 IOT_NANO_MQTT_TLS_ADDRESS=$mqtt_tls_address
+IOT_NANO_HTTPS_ENABLED=$web_https_enabled
 IOT_DEVICE_TOKEN_VAULT_KEY=$vault_key
 EOF
   chown root:"$service_user" "$config_root/monolith.env"

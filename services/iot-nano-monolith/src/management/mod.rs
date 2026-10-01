@@ -159,6 +159,20 @@ impl ManagementSessionRouter {
         token_vault: TokenVault,
         infrastructure_status: SystemInfrastructureStatus,
     ) -> Self {
+        Self::new_with_infrastructure_status_and_https(
+            store,
+            token_vault,
+            infrastructure_status,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_infrastructure_status_and_https(
+        store: Arc<PlatformStore>,
+        token_vault: TokenVault,
+        infrastructure_status: SystemInfrastructureStatus,
+        web_https_enabled: bool,
+    ) -> Self {
         let session_verifier = Arc::new(ManagementSessionVerifier::default());
         let state = ManagementState {
             store,
@@ -167,6 +181,7 @@ impl ManagementSessionRouter {
             login_limiter: Arc::new(Mutex::new(LoginRateLimiter::default())),
             authorization_gate: Arc::new(ManagementAuthorizationGate::default()),
             infrastructure_status,
+            web_https_enabled,
             #[cfg(test)]
             authorization_test_hooks: None,
         };
@@ -1332,7 +1347,7 @@ async fn login(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .record_success(&attempt_key);
     Ok((
-        session_cookie_headers(&session_id),
+        session_cookie_headers(&session_id, state.web_https_enabled),
         Json(PlatformLoginResponse {
             principal_kind: principal.kind,
             principal_id: principal.principal_id,
@@ -1389,7 +1404,7 @@ async fn system_login(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .record_success(&attempt_key);
     Ok((
-        session_cookie_headers(&session_id),
+        session_cookie_headers(&session_id, state.web_https_enabled),
         Json(SystemSessionResponse {
             principal_kind: PrincipalKind::System,
             tenant_id: None,
@@ -1451,7 +1466,7 @@ async fn tenant_login(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .record_success(&attempt_key);
     Ok((
-        session_cookie_headers(&session_id),
+        session_cookie_headers(&session_id, state.web_https_enabled),
         Json(TenantSessionResponse {
             principal_kind: PrincipalKind::Tenant,
             tenant_account_id: principal.principal_id,
@@ -1533,7 +1548,7 @@ async fn user_login(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .record_success(&attempt_key);
     Ok((
-        session_cookie_headers(&session_id),
+        session_cookie_headers(&session_id, state.web_https_enabled),
         Json(UserSessionResponse {
             principal_kind: PrincipalKind::User,
             user_id: principal.principal_id,
@@ -1674,7 +1689,7 @@ async fn platform_login_submit(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .record_success(&attempt_key);
     (
-        session_cookie_headers(&session_id),
+        session_cookie_headers(&session_id, state.web_https_enabled),
         Redirect::to(destination),
     )
 }
@@ -1684,7 +1699,10 @@ async fn platform_logout(
     headers: HeaderMap,
 ) -> (HeaderMap, Redirect) {
     state.session_verifier.revoke(&headers);
-    (expired_session_cookie_headers(), Redirect::to("/login"))
+    (
+        expired_session_cookie_headers(state.web_https_enabled),
+        Redirect::to("/login"),
+    )
 }
 
 fn login_error_requested(query: Option<&str>) -> bool {
@@ -1700,7 +1718,10 @@ async fn logout(
     headers: HeaderMap,
 ) -> (StatusCode, HeaderMap) {
     state.session_verifier.revoke(&headers);
-    (StatusCode::NO_CONTENT, expired_session_cookie_headers())
+    (
+        StatusCode::NO_CONTENT,
+        expired_session_cookie_headers(state.web_https_enabled),
+    )
 }
 
 async fn current_session(

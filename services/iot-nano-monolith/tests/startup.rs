@@ -41,6 +41,7 @@ impl Fixture {
                 management_http: reserve_address().await,
                 mqtt_tcp: reserve_address().await,
                 mqtt_tls: reserve_address().await,
+                web_https_enabled: false,
                 tls_cert_path,
                 tls_key_path,
                 shutdown_deadline: Duration::from_secs(1),

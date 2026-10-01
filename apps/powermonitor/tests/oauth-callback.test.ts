@@ -32,8 +32,29 @@ describe("PowerMonitor OAuth BFF", () => {
     expect(cookies.set).toHaveBeenCalledWith(
       "powermonitor_oauth_state",
       expect.any(String),
-      expect.objectContaining({ httpOnly: true, secure: true, sameSite: "lax" }),
+      expect.objectContaining({ httpOnly: true, secure: false, sameSite: "lax" }),
     );
+  });
+
+  it("marks cookies Secure when HTTPS is explicitly enabled", async () => {
+    vi.stubEnv("IOT_NANO_HTTPS_ENABLED", "true");
+    const cookies = { set: vi.fn() };
+    await createLoginHandler({
+      requestUrl: "https://powermonitor.example.test/dashboard",
+      cookies,
+      config: {
+        platformBaseUrl: "https://platform.example.test",
+        clientId: "powermonitor-client",
+        redirectUri: "https://powermonitor.example.test/api/auth/callback",
+        scope: "devices:read telemetry:read",
+      },
+    });
+    expect(cookies.set).toHaveBeenCalledWith(
+      "powermonitor_oauth_state",
+      expect.any(String),
+      expect.objectContaining({ secure: true }),
+    );
+    vi.unstubAllEnvs();
   });
 
   it("exchanges the callback code server-side and creates an HttpOnly session", async () => {
@@ -64,7 +85,7 @@ describe("PowerMonitor OAuth BFF", () => {
     expect(cookies.set).toHaveBeenCalledWith(
       "powermonitor_session",
       expect.any(String),
-      expect.objectContaining({ httpOnly: true, secure: true, sameSite: "lax" }),
+      expect.objectContaining({ httpOnly: true, secure: false, sameSite: "lax" }),
     );
   });
 

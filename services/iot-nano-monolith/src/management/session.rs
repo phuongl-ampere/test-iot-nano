@@ -194,6 +194,7 @@ pub(super) struct ManagementState {
     pub(super) login_limiter: Arc<Mutex<LoginRateLimiter>>,
     pub(super) authorization_gate: Arc<ManagementAuthorizationGate>,
     pub(super) infrastructure_status: SystemInfrastructureStatus,
+    pub(super) web_https_enabled: bool,
     #[cfg(test)]
     pub(super) authorization_test_hooks: Option<Arc<ManagementAuthorizationTestHooks>>,
 }
@@ -358,23 +359,58 @@ fn prune_expired_sessions(sessions: &mut HashMap<String, Session>) {
     sessions.retain(|_, session| session.expires_at > now);
 }
 
-pub(super) fn session_cookie_headers(session_id: &str) -> HeaderMap {
+pub(super) fn session_cookie_headers(session_id: &str, web_https_enabled: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
+    let secure = if web_https_enabled { "; Secure" } else { "" };
     let value = HeaderValue::try_from(format!(
-        "{SESSION_COOKIE}={session_id}; HttpOnly; Secure; SameSite=Lax; Path=/"
+        "{SESSION_COOKIE}={session_id}; HttpOnly{secure}; SameSite=Lax; Path=/"
     ))
     .expect("generated session IDs are valid cookie values");
     headers.insert(SET_COOKIE, value);
     headers
 }
 
-pub(super) fn expired_session_cookie_headers() -> HeaderMap {
+pub(super) fn expired_session_cookie_headers(web_https_enabled: bool) -> HeaderMap {
     let mut headers = HeaderMap::new();
+    let secure = if web_https_enabled { "; Secure" } else { "" };
     headers.insert(
         SET_COOKIE,
-        HeaderValue::from_static(
-            "iot_nano_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
-        ),
+        HeaderValue::try_from(format!(
+            "iot_nano_session=; HttpOnly{secure}; SameSite=Lax; Path=/; Max-Age=0"
+        ))
+        .expect("generated cookie attributes are valid"),
     );
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expired_session_cookie_headers, session_cookie_headers};
+    use crate::management::SESSION_COOKIE;
+
+    #[test]
+    fn browser_cookie_security_follows_the_configured_web_scheme() {
+        let lan_cookie = session_cookie_headers("session-id", false);
+        let lan_cookie = lan_cookie.get("set-cookie").unwrap().to_str().unwrap();
+        assert!(lan_cookie.starts_with(&format!("{SESSION_COOKIE}=session-id; HttpOnly")));
+        assert!(!lan_cookie.contains("Secure"));
+
+        let https_cookie = session_cookie_headers("session-id", true);
+        assert!(
+            https_cookie
+                .get("set-cookie")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("; Secure;")
+        );
+        assert!(
+            !expired_session_cookie_headers(false)
+                .get("set-cookie")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Secure")
+        );
+    }
 }

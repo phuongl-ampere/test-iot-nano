@@ -51,6 +51,25 @@ fn config_accepts_only_complete_sqlite_or_timescale_storage() {
         sqlite.internal_dir,
         std::path::PathBuf::from("/var/lib/iot-nano/internal")
     );
+    assert!(!sqlite.web_https_enabled);
+
+    let mut https_enabled_values = sqlite_values();
+    https_enabled_values.insert("IOT_NANO_HTTPS_ENABLED".to_owned(), "true".to_owned());
+    assert!(
+        MonolithConfig::from_values(https_enabled_values)
+            .unwrap()
+            .web_https_enabled
+    );
+
+    let mut invalid_https_values = sqlite_values();
+    invalid_https_values.insert("IOT_NANO_HTTPS_ENABLED".to_owned(), "sometimes".to_owned());
+    assert!(matches!(
+        MonolithConfig::from_values(invalid_https_values),
+        Err(ConfigError::InvalidBoolean {
+            name: "IOT_NANO_HTTPS_ENABLED",
+            ..
+        })
+    ));
 
     let timescale = MonolithConfig::from_values(timescale_values()).unwrap();
     accepts_storage_configuration(&timescale.storage);

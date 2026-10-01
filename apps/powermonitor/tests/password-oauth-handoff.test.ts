@@ -70,7 +70,7 @@ describe("PowerMonitor password OAuth handoff", () => {
     expect(cookies.set).toHaveBeenCalledWith(
       sessionCookieName,
       "sealed-powermonitor-session",
-      expect.objectContaining({ httpOnly: true, secure: true, sameSite: "lax" }),
+      expect.objectContaining({ httpOnly: true, secure: false, sameSite: "lax" }),
     );
     expect(cookies.set).not.toHaveBeenCalledWith(
       oauthStateCookieName,

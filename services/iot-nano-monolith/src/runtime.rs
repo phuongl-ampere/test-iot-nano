@@ -154,10 +154,11 @@ impl MonolithRuntime {
         let readiness = Readiness::default();
         let token_vault = TokenVault::from_key_material(&config.device_token_vault_key);
         let infrastructure_status = SystemInfrastructureStatus::starting(readiness.clone());
-        let management_sessions = ManagementSessionRouter::new_with_infrastructure_status(
+        let management_sessions = ManagementSessionRouter::new_with_infrastructure_status_and_https(
             Arc::clone(&platform),
             token_vault.clone(),
             infrastructure_status.clone(),
+            config.web_https_enabled,
         );
         let browser_session_verifier: Arc<dyn iot_api::OAuthBrowserSessionVerifier> =
             management_sessions.session_verifier.clone();

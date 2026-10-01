@@ -53,6 +53,7 @@ impl Fixture {
                 management_http: reserve_address().await,
                 mqtt_tcp: reserve_address().await,
                 mqtt_tls: reserve_address().await,
+                web_https_enabled: false,
                 tls_cert_path: fixtures.join("server.crt"),
                 tls_key_path: fixtures.join("server.key"),
                 shutdown_deadline: SHUTDOWN_TIMEOUT,

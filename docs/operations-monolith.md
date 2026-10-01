@@ -79,6 +79,19 @@ environment variables before binding listeners.
 
 Protect the environment file and token vault key:
 
+## LAN HTTP and HTTPS proxy mode
+
+The default is LAN HTTP: `IOT_NANO_HTTPS_ENABLED=false`. The monolith serves
+its web listeners over HTTP and sends `HttpOnly; SameSite=Lax` browser cookies
+without the `Secure` attribute, so a direct `http://<LAN-IP>:8080` installation
+works without a certificate.
+
+When a reverse proxy terminates HTTPS, set `IOT_NANO_HTTPS_ENABLED=true` in
+`/etc/iot-nano/monolith.env` and set the same variable in PowerMonitor. This
+adds the `Secure` cookie attribute; it does not make the monolith's HTTP
+listener perform TLS itself. Use matching `https://` platform/auth/callback
+URLs in the PowerMonitor configuration.
+
 ```bash
 install -d -o root -g root -m 0755 /etc/iot-nano
 install -d -o iotnano -g iotnano -m 0700 /var/lib/iot-nano/platform
