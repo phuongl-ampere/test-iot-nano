@@ -5903,7 +5903,7 @@ async fn system_created_tenant_can_create_and_sign_in_a_user_from_the_platform_f
         .fetch_one(store.sqlite_pool().unwrap())
         .await
         .unwrap(),
-        4
+        5
     );
 
     let user_login = router

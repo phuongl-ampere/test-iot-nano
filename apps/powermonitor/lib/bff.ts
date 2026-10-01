@@ -26,6 +26,13 @@ export async function createBffResponse(input: {
       "Profiles are assigned by the Tenant Account and are read-only in PowerMonitor.",
     );
   }
+  if (isDeviceTokenPath(requestUrl.pathname)) {
+    return errorResponse(
+      405,
+      "token_unavailable",
+      "Device tokens are managed in Tenant Console and are unavailable in PowerMonitor.",
+    );
+  }
 
   const path = requestUrl.pathname.slice("/api/v1".length) + requestUrl.search;
   const headers = forwardableHeaders(input.request.headers);
@@ -94,6 +101,10 @@ function isResourceProfileMutation(pathname: string, method: string, body: strin
   } catch {
     return false;
   }
+}
+
+function isDeviceTokenPath(pathname: string): boolean {
+  return /^\/api\/v1\/devices\/[^/]+\/token$/.test(pathname);
 }
 
 function forwardableHeaders(source: Headers): Headers {

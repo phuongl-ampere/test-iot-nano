@@ -95,4 +95,20 @@ describe("generic platform BFF", () => {
     await expect(response.json()).resolves.toMatchObject({ code: "profile_read_only" });
     expect(platformRequest).not.toHaveBeenCalled();
   });
+
+  it("never proxies device token reveal or regeneration from PowerMonitor", async () => {
+    const platformRequest = vi.fn();
+
+    const response = await createBffResponse({
+      platformRequest,
+      request: new Request("https://powermonitor.example.test/api/v1/devices/meter-1/token", {
+        method: "POST",
+      }),
+      session: { accessToken: "opaque-user-token" },
+    });
+
+    expect(response.status).toBe(405);
+    await expect(response.json()).resolves.toMatchObject({ code: "token_unavailable" });
+    expect(platformRequest).not.toHaveBeenCalled();
+  });
 });

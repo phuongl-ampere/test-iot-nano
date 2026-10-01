@@ -35,6 +35,7 @@ pub enum UserCapability {
     CreateAssets,
     CreateDevices,
     ClaimDevices,
+    AssignDevicesToAssets,
     EditResources,
     ControlDevices,
     ShareOwnedResources,
@@ -48,6 +49,7 @@ impl UserCapability {
             Self::CreateAssets => "create_assets",
             Self::CreateDevices => "create_devices",
             Self::ClaimDevices => "claim_devices",
+            Self::AssignDevicesToAssets => "assign_devices_to_assets",
             Self::EditResources => "edit_resources",
             Self::ControlDevices => "control_devices",
             Self::ShareOwnedResources => "share_owned_resources",
@@ -61,6 +63,7 @@ impl UserCapability {
             "create_assets" => Ok(Self::CreateAssets),
             "create_devices" => Ok(Self::CreateDevices),
             "claim_devices" => Ok(Self::ClaimDevices),
+            "assign_devices_to_assets" => Ok(Self::AssignDevicesToAssets),
             "edit_resources" => Ok(Self::EditResources),
             "control_devices" => Ok(Self::ControlDevices),
             "share_owned_resources" => Ok(Self::ShareOwnedResources),
@@ -292,6 +295,7 @@ async fn create_management_user(
             for capability in [
                 UserCapability::CreateAssets,
                 UserCapability::ClaimDevices,
+                UserCapability::AssignDevicesToAssets,
                 UserCapability::ControlDevices,
                 UserCapability::ShareOwnedResources,
             ] {
@@ -323,6 +327,7 @@ async fn create_management_user(
             for capability in [
                 UserCapability::CreateAssets,
                 UserCapability::ClaimDevices,
+                UserCapability::AssignDevicesToAssets,
                 UserCapability::ControlDevices,
                 UserCapability::ShareOwnedResources,
             ] {

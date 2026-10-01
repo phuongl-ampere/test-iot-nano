@@ -19,6 +19,7 @@ import {
   listResourceInvitations,
   listUserCapabilities,
   sendDeviceCommandAndWait,
+  updateDevice,
   type Alert,
   type Asset,
   type CommandLifecycle,
@@ -82,6 +83,8 @@ export function PowerMonitorDashboard({
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [deviceProfileNames, setDeviceProfileNames] = useState<Record<string, string>>({});
+  const [deviceAssignments, setDeviceAssignments] = useState<Record<string, string>>({});
+  const [deviceAssignmentBusyId, setDeviceAssignmentBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [invitationBusyId, setInvitationBusyId] = useState<string | null>(null);
   const [invitations, setInvitations] = useState<ResourceInvitation[]>([]);
@@ -100,6 +103,7 @@ export function PowerMonitorDashboard({
   const [range, setRange] = useState<TimeRange>("1h");
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(initialAssetId ?? null);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(initialDeviceId ?? null);
+  const [sidebarTab, setSidebarTab] = useState<"assets" | "devices">("assets");
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
   const [telemetryLoading, setTelemetryLoading] = useState(false);
   const selectedAssetIdRef = useRef<string | null>(initialAssetId ?? null);
@@ -149,6 +153,15 @@ export function PowerMonitorDashboard({
     || selectedResource?.permission === "owner";
   const canCreateAssets = capabilities.includes("create_assets");
   const canClaimDevices = capabilities.includes("claim_devices");
+  const canAssignDevicesToAssets = capabilities.includes("assign_devices_to_assets");
+  const unassignedDevices = useMemo(
+    () => devices.filter((device) => device.asset_id === null || device.asset_id === undefined),
+    [devices],
+  );
+  const assignableAssets = useMemo(
+    () => assets.filter((asset) => asset.permission === "manager" || asset.permission === "owner"),
+    [assets],
+  );
   const resourcePath = useMemo(
     () => getResourcePath(assets, selectedAsset, selectedDevice),
     [assets, selectedAsset, selectedDevice],
@@ -376,6 +389,33 @@ export function PowerMonitorDashboard({
     }
   };
 
+  const assignUnassignedDevice = async (device: Device) => {
+    const assetId = deviceAssignments[device.id];
+    if (
+      assetId === undefined
+      || !canAssignDevicesToAssets
+      || (device.permission !== "manager" && device.permission !== "owner")
+      || !assignableAssets.some((asset) => asset.id === assetId)
+    ) {
+      return;
+    }
+    setDeviceAssignmentBusyId(device.id);
+    setError(null);
+    try {
+      await updateDevice(device.id, { asset_id: assetId });
+      setDeviceAssignments((current) => {
+        const next = { ...current };
+        delete next[device.id];
+        return next;
+      });
+      await refreshWorkspaceAndTelemetry();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setDeviceAssignmentBusyId(null);
+    }
+  };
+
   const scanClaimQr = async (file: File) => {
     const BarcodeDetector = (window as Window & { BarcodeDetector?: BarcodeDetectorConstructor }).BarcodeDetector;
     if (!BarcodeDetector) {
@@ -486,6 +526,24 @@ export function PowerMonitorDashboard({
           selectedAssetId={selectedAssetId}
           selectedDeviceId={selectedDeviceId}
         />
+        <div aria-label="Workspace views" className="explorer-tabs" role="tablist">
+          <button
+            aria-selected={sidebarTab === "assets"}
+            onClick={() => setSidebarTab("assets")}
+            role="tab"
+            type="button"
+          >
+            Assets
+          </button>
+          <button
+            aria-selected={sidebarTab === "devices"}
+            onClick={() => setSidebarTab("devices")}
+            role="tab"
+            type="button"
+          >
+            Devices{unassignedDevices.length > 0 ? ` (${unassignedDevices.length})` : ""}
+          </button>
+        </div>
       </aside>
 
       <section className="workspace">
@@ -546,6 +604,64 @@ export function PowerMonitorDashboard({
             </form>
           </div>
         </header>
+
+        {sidebarTab === "devices" && (
+          <section aria-label="Unassigned devices" className="unassigned-device-panel">
+            <header className="section-heading">
+              <div>
+                <span className="eyebrow">Devices</span>
+                <h2>Unassigned devices</h2>
+              </div>
+              <span>{unassignedDevices.length} awaiting an Asset</span>
+            </header>
+            {unassignedDevices.length === 0 ? (
+              <p className="empty-state">Every visible device is assigned to an Asset.</p>
+            ) : (
+              <ul className="unassigned-device-list">
+                {unassignedDevices.map((device) => {
+                  const canAssign = canAssignDevicesToAssets
+                    && (device.permission === "manager" || device.permission === "owner")
+                    && assignableAssets.length > 0;
+                  const selectedAssignment = deviceAssignments[device.id] ?? "";
+                  const busy = deviceAssignmentBusyId === device.id;
+                  return (
+                    <li key={device.id}>
+                      <div>
+                        <strong>{device.name ?? device.id}</strong>
+                        <span>{device.serial_number ?? device.id}</span>
+                      </div>
+                      {canAssign ? (
+                        <div className="unassigned-device-actions">
+                          <select
+                            aria-label={`Assign ${device.name ?? device.id} to asset`}
+                            disabled={busy}
+                            onChange={(event) => setDeviceAssignments((current) => ({
+                              ...current,
+                              [device.id]: event.target.value,
+                            }))}
+                            value={selectedAssignment}
+                          >
+                            <option value="">Select an Asset</option>
+                            {assignableAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+                          </select>
+                          <button
+                            disabled={busy || selectedAssignment === ""}
+                            onClick={() => void assignUnassignedDevice(device)}
+                            type="button"
+                          >
+                            {busy ? "Assigning" : "Assign to asset"}
+                          </button>
+                        </div>
+                      ) : (
+                        <span className="permission-note">You need manager access and Assign devices to assets to assign this device.</span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+        )}
 
         {invitationsOpen && (
           <section aria-label="Pending invitations" className="invitation-panel" id="resource-invitations">

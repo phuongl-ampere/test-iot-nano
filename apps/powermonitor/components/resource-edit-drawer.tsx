@@ -9,8 +9,6 @@ import {
   createDeviceAlertRule,
   createDeviceResourceInvitation,
   listDeviceAlertRules,
-  regenerateDeviceToken,
-  revealDeviceToken,
   updateAsset,
   updateDevice,
   updateDeviceAlertRule,
@@ -70,9 +68,6 @@ export function ResourceEditDrawer({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [token, setToken] = useState<string | null>(null);
-  const [tokenLoading, setTokenLoading] = useState(isDevice && canShare);
-  const [tokenBusy, setTokenBusy] = useState(false);
   const [shareUsername, setShareUsername] = useState("");
   const [sharePermission, setSharePermission] = useState<"viewer" | "manager">("viewer");
   const [sharing, setSharing] = useState(false);
@@ -86,29 +81,6 @@ export function ResourceEditDrawer({
     () => isDevice ? assets : assets.filter((asset) => asset.id !== resource.id),
     [assets, isDevice, resource.id],
   );
-
-  useEffect(() => {
-    let active = true;
-    if (!isDevice || !canShare) {
-      setTokenLoading(false);
-      return () => {
-        active = false;
-      };
-    }
-    void revealDeviceToken(resource.id)
-      .then((response) => {
-        if (active) setToken(response.token ?? null);
-      })
-      .catch((reason) => {
-        if (active) setError(messageFor(reason));
-      })
-      .finally(() => {
-        if (active) setTokenLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [canShare, isDevice, resource.id]);
 
   useEffect(() => {
     let active = true;
@@ -157,31 +129,6 @@ export function ResourceEditDrawer({
       setError(messageFor(reason));
     } finally {
       setSaving(false);
-    }
-  };
-
-  const copyToken = async () => {
-    if (token === null) return;
-    try {
-      await navigator.clipboard.writeText(token);
-      setNotice("Device token copied.");
-    } catch {
-      setError("Device token could not be copied.");
-    }
-  };
-
-  const regenerateToken = async () => {
-    setTokenBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const next = await regenerateDeviceToken(resource.id);
-      setToken(next.token ?? null);
-      setNotice("Device token regenerated. The previous token is no longer active.");
-    } catch (reason) {
-      setError(messageFor(reason));
-    } finally {
-      setTokenBusy(false);
     }
   };
 
@@ -325,23 +272,6 @@ export function ResourceEditDrawer({
         </form>
       ) : (
         <p className="empty-state">You can view this resource but cannot change its configuration.</p>
-      )}
-
-      {isDevice && canShare && (
-        <section className="drawer-section">
-          <h3>Device token</h3>
-          {tokenLoading ? <p className="empty-state">Loading active token...</p> : (
-            <div className="token-controls">
-              <input aria-label="Active device token" readOnly type="text" value={token ?? "No active token"} />
-              <div>
-                <button disabled={token === null} onClick={() => void copyToken()} type="button">Copy token</button>
-                <button disabled={tokenBusy} onClick={() => void regenerateToken()} type="button">
-                  {tokenBusy ? "Regenerating" : "Regenerate token"}
-                </button>
-              </div>
-            </div>
-          )}
-        </section>
       )}
 
       {canShare && (

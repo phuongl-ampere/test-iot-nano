@@ -718,11 +718,12 @@ fn tenant_users_layout_renders_a_capability_editor_only_for_user_accounts() {
     assert!(rendered.contains("/capabilities"));
     assert!(rendered.contains("name=\"create_devices\""));
     assert!(rendered.contains("name=\"claim_devices\""));
+    assert!(rendered.contains("name=\"assign_devices_to_assets\""));
     assert!(rendered.contains("name=\"control_devices\""));
     assert!(
         rendered.contains("data-capabilities=\"create_devices claim_devices control_devices\"")
     );
-    assert!(rendered.contains("\"create_devices\", \"claim_devices\", \"edit_resources\""));
+    assert!(rendered.contains("\"create_devices\", \"claim_devices\", \"assign_devices_to_assets\", \"edit_resources\""));
     assert_eq!(rendered.matches("data-user-id=").count(), 1);
 }
 

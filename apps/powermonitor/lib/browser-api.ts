@@ -71,12 +71,6 @@ export type ResourceProfile = {
   name: string;
 };
 
-export type DeviceToken = {
-  id?: string;
-  token?: string;
-  token_prefix?: string;
-};
-
 export type DeviceAlertRule = {
   id: string;
   name: string;
@@ -192,17 +186,6 @@ export async function updateAsset(
     "/api/v1/assets/" + encodeURIComponent(assetId),
     jsonRequest(input, "PATCH"),
   ));
-}
-
-export async function revealDeviceToken(deviceId: string): Promise<DeviceToken> {
-  return request<DeviceToken>("/api/v1/devices/" + encodeURIComponent(deviceId) + "/token");
-}
-
-export async function regenerateDeviceToken(deviceId: string): Promise<DeviceToken> {
-  return request<DeviceToken>(
-    "/api/v1/devices/" + encodeURIComponent(deviceId) + "/token",
-    { method: "POST" },
-  );
 }
 
 export async function listDeviceAlertRules(deviceId: string): Promise<DeviceAlertRule[]> {

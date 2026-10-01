@@ -19,8 +19,6 @@ import {
   listAssets,
   listDevices,
   listResourceInvitations,
-  regenerateDeviceToken,
-  revealDeviceToken,
   sendDeviceCommandAndWait,
   submitDeviceCommand,
   updateAsset,
@@ -347,8 +345,6 @@ describe("browser PowerMonitor API", () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ device_id: "meter-1", display_name: "Renamed meter" }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ id: "farm-1", name: "Renamed farm" }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "token-1", token: "iotn_old" }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "token-2", token: "iotn_new" }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ items: [] }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ ...rule, device_id: "meter-1", id: "rule-1" }), { status: 201 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ ...rule, device_id: "meter-1", id: "rule-1", threshold: 600 }), { status: 200 }))
@@ -357,8 +353,6 @@ describe("browser PowerMonitor API", () => {
 
     await expect(updateDevice("meter-1", { asset_id: null, display_name: "Renamed meter" })).resolves.toMatchObject({ name: "Renamed meter" });
     await expect(updateAsset("farm-1", { name: "Renamed farm", parent_asset_id: null })).resolves.toMatchObject({ name: "Renamed farm" });
-    await expect(revealDeviceToken("meter-1")).resolves.toMatchObject({ token: "iotn_old" });
-    await expect(regenerateDeviceToken("meter-1")).resolves.toMatchObject({ token: "iotn_new" });
     await expect(listDeviceAlertRules("meter-1")).resolves.toEqual([]);
     await expect(createDeviceAlertRule("meter-1", rule)).resolves.toMatchObject({ id: "rule-1" });
     await expect(updateDeviceAlertRule("meter-1", "rule-1", { ...rule, threshold: 600 })).resolves.toMatchObject({ threshold: 600 });
@@ -370,17 +364,12 @@ describe("browser PowerMonitor API", () => {
       expect.objectContaining({ body: JSON.stringify({ asset_id: null, display_name: "Renamed meter" }), method: "PATCH" }),
     );
     expect(fetcher).toHaveBeenNthCalledWith(
-      4,
-      "/api/v1/devices/meter-1/token",
-      expect.objectContaining({ method: "POST" }),
-    );
-    expect(fetcher).toHaveBeenNthCalledWith(
-      7,
+      5,
       "/api/v1/devices/meter-1/alert-rules/rule-1",
       expect.objectContaining({ method: "PUT" }),
     );
     expect(fetcher).toHaveBeenNthCalledWith(
-      8,
+      6,
       "/api/v1/devices/meter-1/alert-rules/rule-1",
       expect.objectContaining({ method: "DELETE" }),
     );

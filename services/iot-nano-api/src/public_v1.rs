@@ -318,6 +318,10 @@ where
 }
 
 impl<T> OptionalUpdate<T> {
+    fn is_present(&self) -> bool {
+        matches!(self, Self::Value(_))
+    }
+
     fn resolve(self, current: Option<T>) -> Option<T> {
         match self {
             Self::Absent => current,
@@ -1455,7 +1459,6 @@ async fn update_device(
 ) -> Result<Json<DeviceResponse>, PublicApiError> {
     let headers = request.headers().clone();
     let (store, principal) = authenticate(&context, &headers, "devices:write").await?;
-    require_user_capability(store.as_ref(), &principal, UserCapability::EditResources).await?;
     if !PublicApiRepository::public_device_permission(store.as_ref(), &principal, &device_id)
         .await
         .map_err(|_| PublicApiError::Unavailable)?
@@ -1473,6 +1476,26 @@ async fn update_device(
             .map_err(|_| PublicApiError::BadRequest)?,
     )
     .map_err(|_| PublicApiError::BadRequest)?;
+    if request.asset_id.is_present() {
+        require_user_capability(
+            store.as_ref(),
+            &principal,
+            UserCapability::AssignDevicesToAssets,
+        )
+        .await?;
+        if let OptionalUpdate::Value(Some(asset_id)) = &request.asset_id {
+            if !PublicApiRepository::public_asset_permission(store.as_ref(), &principal, *asset_id)
+                .await
+                .map_err(|_| PublicApiError::Unavailable)?
+                .is_some_and(|permission| permission.allows(ResourcePermission::Manager))
+            {
+                return Err(PublicApiError::Forbidden);
+            }
+        }
+    }
+    if request.display_name.is_some() || request.metadata.is_some() {
+        require_user_capability(store.as_ref(), &principal, UserCapability::EditResources).await?;
+    }
     let device = PublicApiRepository::update_public_device(
         store.as_ref(),
         &principal,

@@ -55,6 +55,50 @@ describe("PowerMonitor dashboard", () => {
     expect(await screen.findByRole("button", { name: "Add device" })).toBeTruthy();
   });
 
+  it("lists unassigned devices in the Devices tab and assigns only with resource permissions", async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = typeof input === "string" ? input : input.toString();
+      if (path === "/api/v1/devices") {
+        return json({ items: [{
+          device_id: "meter-1",
+          display_name: "Unassigned meter",
+          effective_permission: "manager",
+        }] });
+      }
+      if (path === "/api/v1/assets") {
+        return json({ items: [{ id: "zone-1", name: "Main zone", effective_permission: "manager" }] });
+      }
+      if (path === "/api/v1/alerts" || path === "/api/v1/resource-invitations") return json({ items: [] });
+      if (path === "/api/v1/device-profiles" || path === "/api/v1/asset-profiles") return json([]);
+      if (path === "/api/v1/user-capabilities") return json({ capabilities: ["assign_devices_to_assets"] });
+      if (path === "/api/v1/devices/meter-1/live-view") return json({ charts: [], profile: null });
+      if (path.startsWith("/api/v1/telemetry/meter-1?")) return json({ items: [] });
+      if (path === "/api/v1/devices/meter-1" && init?.method === "PATCH") {
+        return json({ asset_id: "zone-1", device_id: "meter-1", display_name: "Unassigned meter" });
+      }
+      throw new Error("Unexpected BFF request: " + path);
+    });
+    vi.stubGlobal("fetch", fetcher);
+
+    render(<PowerMonitorDashboard />);
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Devices" }));
+    expect(await screen.findByRole("heading", { name: "Unassigned devices" })).toBeTruthy();
+    expect(screen.getAllByText("Unassigned meter").length).toBeGreaterThan(1);
+    fireEvent.change(screen.getByLabelText("Assign Unassigned meter to asset"), {
+      target: { value: "zone-1" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Assign to asset" }));
+
+    await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/devices/meter-1",
+      expect.objectContaining({
+        body: JSON.stringify({ asset_id: "zone-1" }),
+        method: "PATCH",
+      }),
+    ));
+  });
+
   it("renders a concise workspace header, telemetry, alerts, and command surfaces", () => {
     const markup = renderToStaticMarkup(<PowerMonitorDashboard initialDeviceId="meter-1" />);
 

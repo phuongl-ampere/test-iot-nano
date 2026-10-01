@@ -34,6 +34,7 @@ these capabilities:
 
 - `create_assets`
 - `claim_devices`
+- `assign_devices_to_assets`
 - `control_devices`
 - `share_owned_resources`
 
@@ -47,6 +48,18 @@ The following capabilities are not granted by default:
 - `edit_resources`
 - `manage_device_tokens`
 - `assign_application_profiles`
+
+`assign_devices_to_assets` is limited to assigning or removing a Device's
+Asset relationship. It does not grant general resource editing, profile
+assignment, token access, or ownership transfer. The User must also have
+`manager` or `owner` access to the Device and, for an assignment, to the target
+Asset. Tenant Account can turn this capability on or off from **Users**.
+
+PowerMonitor exposes unassigned Devices in its **Devices** tab. A User with
+this capability and `manager`/`owner` access to both the Device and target
+Asset can assign the Device there. PowerMonitor never exposes a device token
+or token regeneration controls; `manage_device_tokens` remains off by default
+and is a Tenant Console-only operation.
 
 Tenant Account can replace a User's capability set from the Users page.
 

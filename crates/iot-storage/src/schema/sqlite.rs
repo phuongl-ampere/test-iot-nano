@@ -297,7 +297,7 @@ CREATE TABLE IF NOT EXISTS user_capabilities (
     user_id TEXT NOT NULL,
     tenant_id TEXT NOT NULL,
     capability TEXT NOT NULL CHECK (capability IN (
-        'create_assets', 'create_devices', 'claim_devices', 'edit_resources', 'control_devices',
+        'create_assets', 'create_devices', 'claim_devices', 'assign_devices_to_assets', 'edit_resources', 'control_devices',
         'share_owned_resources', 'assign_application_profiles', 'manage_device_tokens'
     )),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

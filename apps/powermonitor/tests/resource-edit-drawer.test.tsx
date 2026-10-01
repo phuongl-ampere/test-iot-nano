@@ -17,9 +17,6 @@ describe("ResourceEditDrawer", () => {
       if (path === "/api/v1/devices/meter-1/live-view") {
         return json({ charts: [], profile: { id: "power-meter", name: "Power meter" } });
       }
-      if (path === "/api/v1/devices/meter-1/token") {
-        return json({ token: "iotn_test_token" });
-      }
       if (path === "/api/v1/devices/meter-1/alert-rules") {
         return json({ items: [] });
       }
@@ -49,10 +46,10 @@ describe("ResourceEditDrawer", () => {
     expect((screen.getByLabelText("Assigned asset") as HTMLSelectElement).value).toBe("farm-1");
     expect(screen.queryByLabelText("Device profile")).toBeNull();
     expect(screen.getByText("Power meter")).toBeTruthy();
-    expect((await screen.findByLabelText("Active device token") as HTMLInputElement).value).toBe("iotn_test_token");
-    expect(screen.getByRole("button", { name: "Regenerate token" })).toBeTruthy();
+    expect(screen.queryByLabelText("Active device token")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Regenerate token" })).toBeNull();
     expect(screen.getByLabelText("Recipient username")).toBeTruthy();
-    expect((screen.getByLabelText("Alert metric key") as HTMLInputElement).value).toBe("power_w");
+    expect((await screen.findByLabelText("Alert metric key") as HTMLInputElement).value).toBe("power_w");
   });
 
   it("uses an asset drawer without token or device alert controls", async () => {

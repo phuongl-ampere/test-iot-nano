@@ -98,6 +98,7 @@ async fn sqlite_management_user_repository_creates_users_without_application_con
     assert_eq!(
         created.capabilities,
         [
+            UserCapability::AssignDevicesToAssets,
             UserCapability::ClaimDevices,
             UserCapability::ControlDevices,
             UserCapability::CreateAssets,
@@ -289,6 +290,7 @@ async fn timescale_management_user_repository_matches_sqlite_contract() {
     assert_eq!(
         created.capabilities,
         [
+            UserCapability::AssignDevicesToAssets,
             UserCapability::ClaimDevices,
             UserCapability::ControlDevices,
             UserCapability::CreateAssets,

@@ -1094,6 +1094,7 @@ pub(super) fn management_user_capability(
         "create_assets" => Ok(UserCapability::CreateAssets),
         "create_devices" => Ok(UserCapability::CreateDevices),
         "claim_devices" => Ok(UserCapability::ClaimDevices),
+        "assign_devices_to_assets" => Ok(UserCapability::AssignDevicesToAssets),
         "edit_resources" => Ok(UserCapability::EditResources),
         "control_devices" => Ok(UserCapability::ControlDevices),
         "share_owned_resources" => Ok(UserCapability::ShareOwnedResources),
