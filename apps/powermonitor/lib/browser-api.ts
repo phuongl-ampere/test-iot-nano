@@ -71,10 +71,6 @@ export type ResourceProfile = {
   name: string;
 };
 
-export type TenantProfileAssignment = {
-  profile_id: string | null;
-};
-
 export type DeviceToken = {
   id?: string;
   token?: string;
@@ -178,29 +174,9 @@ export async function listResourceProfiles(
   return (await listResponse<PublicProfile>(path)).map(normalizeProfile);
 }
 
-export async function assignDeviceTenantProfile(
-  deviceId: string,
-  profileId: string | null,
-): Promise<TenantProfileAssignment> {
-  return request<TenantProfileAssignment>(
-    "/api/v1/devices/" + encodeURIComponent(deviceId) + "/tenant-profile",
-    jsonRequest({ profile_id: profileId }, "PUT"),
-  );
-}
-
-export async function assignAssetTenantProfile(
-  assetId: string,
-  profileId: string | null,
-): Promise<TenantProfileAssignment> {
-  return request<TenantProfileAssignment>(
-    "/api/v1/assets/" + encodeURIComponent(assetId) + "/tenant-profile",
-    jsonRequest({ profile_id: profileId }, "PUT"),
-  );
-}
-
 export async function updateDevice(
   deviceId: string,
-  input: { display_name?: string; asset_id?: string | null; device_profile_id?: string | null },
+  input: { display_name?: string; asset_id?: string | null },
 ): Promise<Device> {
   return normalizeDevice(await request<PublicDevice>(
     "/api/v1/devices/" + encodeURIComponent(deviceId),
@@ -210,7 +186,7 @@ export async function updateDevice(
 
 export async function updateAsset(
   assetId: string,
-  input: { name?: string; parent_asset_id?: string | null; asset_profile_id?: string | null },
+  input: { name?: string; parent_asset_id?: string | null },
 ): Promise<Asset> {
   return normalizeAsset(await request<PublicAsset>(
     "/api/v1/assets/" + encodeURIComponent(assetId),

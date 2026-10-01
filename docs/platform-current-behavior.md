@@ -61,6 +61,18 @@ For example, `control_devices` alone does not expose every device in the
 tenant. A user needs both `control_devices` and ownership or `control` access
 to the specific device before a command can be sent.
 
+## PowerMonitor profile behavior
+
+PowerMonitor treats Device and Asset Profiles as platform-owned metadata. It
+reads the assigned profile ID from the authorized resource inventory, resolves
+the profile name from IoT Nano, and uses that information to choose its
+profile-specific presentation. It does not persist a separate profile mapping.
+
+Users cannot change a Device or Asset Profile from PowerMonitor: the profile
+is displayed read-only and the PowerMonitor BFF rejects both dedicated profile
+assignment requests and resource update payloads containing a profile ID.
+Tenant Account assigns profiles in Tenant Console.
+
 ## Ownership and sharing
 
 Tenant Account assigns one regular User as the owner of an Asset or Device.

@@ -14,9 +14,6 @@ describe("ResourceEditDrawer", () => {
   it("keeps device configuration in the edit drawer", async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const path = typeof input === "string" ? input : input.toString();
-      if (path === "/api/v1/tenant-profile/profiles?kind=device") {
-        return json([{ id: "power-meter", name: "Power meter" }]);
-      }
       if (path === "/api/v1/devices/meter-1/live-view") {
         return json({ charts: [], profile: { id: "power-meter", name: "Power meter" } });
       }
@@ -41,6 +38,8 @@ describe("ResourceEditDrawer", () => {
           kind: "device",
           name: "Main meter",
           permission: "owner",
+          device_profile_id: "power-meter",
+          profile_name: "Power meter",
         }}
       />,
     );
@@ -48,7 +47,8 @@ describe("ResourceEditDrawer", () => {
     expect(screen.getByRole("heading", { name: "Edit Main meter" })).toBeTruthy();
     expect((screen.getByLabelText("Device name") as HTMLInputElement).value).toBe("Main meter");
     expect((screen.getByLabelText("Assigned asset") as HTMLSelectElement).value).toBe("farm-1");
-    expect(await screen.findByLabelText("Device profile")).toBeTruthy();
+    expect(screen.queryByLabelText("Device profile")).toBeNull();
+    expect(screen.getByText("Power meter")).toBeTruthy();
     expect((await screen.findByLabelText("Active device token") as HTMLInputElement).value).toBe("iotn_test_token");
     expect(screen.getByRole("button", { name: "Regenerate token" })).toBeTruthy();
     expect(screen.getByLabelText("Recipient username")).toBeTruthy();
@@ -58,9 +58,6 @@ describe("ResourceEditDrawer", () => {
   it("uses an asset drawer without token or device alert controls", async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const path = typeof input === "string" ? input : input.toString();
-      if (path === "/api/v1/tenant-profile/profiles?kind=asset") {
-        return json([{ id: "farm-profile", name: "Power farm" }]);
-      }
       if (path === "/api/v1/assets/farm-1/live-view") {
         return json({ charts: [], profile: { id: "farm-profile", name: "Power farm" } });
       }
@@ -82,6 +79,8 @@ describe("ResourceEditDrawer", () => {
           name: "Main farm",
           parent_id: "root-1",
           permission: "owner",
+          asset_profile_id: "farm-profile",
+          profile_name: "Power farm",
         }}
       />,
     );
@@ -90,6 +89,8 @@ describe("ResourceEditDrawer", () => {
     expect((screen.getByLabelText("Asset name") as HTMLInputElement).value).toBe("Main farm");
     expect((screen.getByLabelText("Parent asset") as HTMLSelectElement).value).toBe("root-1");
     expect(screen.queryByLabelText("Active device token")).toBeNull();
+    expect(screen.queryByLabelText("Asset profile")).toBeNull();
+    expect(screen.getByText("Power farm")).toBeTruthy();
     expect(screen.queryByLabelText("Alert metric key")).toBeNull();
   });
 });

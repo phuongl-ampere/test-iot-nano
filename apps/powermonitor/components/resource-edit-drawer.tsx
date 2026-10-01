@@ -8,14 +8,12 @@ import {
   createAssetResourceInvitation,
   createDeviceAlertRule,
   createDeviceResourceInvitation,
-  listResourceProfiles,
   listDeviceAlertRules,
   regenerateDeviceToken,
   revealDeviceToken,
   updateAsset,
   updateDevice,
   updateDeviceAlertRule,
-  type ResourceProfile,
   type Asset,
   type DeviceAlertRule,
   type DeviceAlertRuleInput,
@@ -30,6 +28,7 @@ type EditableResource = {
   asset_id?: string | null;
   asset_profile_id?: string | null;
   device_profile_id?: string | null;
+  profile_name?: string | null;
   parent_id?: string | null;
 };
 
@@ -68,12 +67,6 @@ export function ResourceEditDrawer({
   const [assignmentId, setAssignmentId] = useState(
     isDevice ? resource.asset_id ?? "" : resource.parent_id ?? "",
   );
-  const [profiles, setProfiles] = useState<ResourceProfile[]>([]);
-  const [profileId, setProfileId] = useState(
-    isDevice ? resource.device_profile_id ?? "" : resource.asset_profile_id ?? "",
-  );
-  const [profilesLoading, setProfilesLoading] = useState(canManage);
-  const [profilesUnavailable, setProfilesUnavailable] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -93,33 +86,6 @@ export function ResourceEditDrawer({
     () => isDevice ? assets : assets.filter((asset) => asset.id !== resource.id),
     [assets, isDevice, resource.id],
   );
-
-  useEffect(() => {
-    let active = true;
-    if (!canManage) {
-      setProfilesLoading(false);
-      return () => {
-        active = false;
-      };
-    }
-    void listResourceProfiles(resource.kind)
-      .then((items) => {
-        if (!active) return;
-        setProfiles(items);
-      })
-      .catch((reason) => {
-        if (active) {
-          setError(messageFor(reason));
-          setProfilesUnavailable(true);
-        }
-      })
-      .finally(() => {
-        if (active) setProfilesLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [canManage, resource.kind]);
 
   useEffect(() => {
     let active = true;
@@ -177,12 +143,10 @@ export function ResourceEditDrawer({
       if (isDevice) {
         await updateDevice(resource.id, {
           asset_id: assignmentId === "" ? null : assignmentId,
-          device_profile_id: profileId === "" ? null : profileId,
           display_name: name,
         });
       } else {
         await updateAsset(resource.id, {
-          asset_profile_id: profileId === "" ? null : profileId,
           name,
           parent_asset_id: assignmentId === "" ? null : assignmentId,
         });
@@ -350,23 +314,14 @@ export function ResourceEditDrawer({
           </section>
 
           <section>
-            <h3>PowerMonitor profile</h3>
-            {profilesLoading ? <p className="empty-state">Loading profiles...</p> : (
-              <label>
-                <span>{isDevice ? "Device profile" : "Asset profile"}</span>
-                <select
-                  aria-label={isDevice ? "Device profile" : "Asset profile"}
-                  disabled={saving || profilesUnavailable}
-                  onChange={(event) => setProfileId(event.target.value)}
-                  value={profileId}
-                >
-                  <option value="">Unassigned</option>
-                  {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
-                </select>
-              </label>
-            )}
+            <h3>Profile</h3>
+            <p className="read-only-value">
+              <span>{isDevice ? "Device profile" : "Asset profile"}</span>
+              <strong>{resource.profile_name ?? "Unassigned"}</strong>
+            </p>
+            <p className="form-hint">Profiles are assigned by the Tenant Account and are read-only in PowerMonitor.</p>
           </section>
-          <button disabled={saving || profilesLoading || profilesUnavailable} type="submit">{saving ? "Saving" : "Save configuration"}</button>
+          <button disabled={saving} type="submit">{saving ? "Saving" : "Save configuration"}</button>
         </form>
       ) : (
         <p className="empty-state">You can view this resource but cannot change its configuration.</p>

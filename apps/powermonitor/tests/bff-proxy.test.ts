@@ -60,4 +60,39 @@ describe("generic platform BFF", () => {
     expect(response.status).toBe(403);
     await expect(response.json()).resolves.toMatchObject({ code: "forbidden" });
   });
+
+  it("never proxies profile assignment mutations from PowerMonitor", async () => {
+    const platformRequest = vi.fn();
+
+    const response = await createBffResponse({
+      platformRequest,
+      request: new Request(
+        "https://powermonitor.example.test/api/v1/devices/meter-1/tenant-profile",
+        { method: "PUT" },
+      ),
+      session: { accessToken: "opaque-user-token" },
+    });
+
+    expect(response.status).toBe(405);
+    await expect(response.json()).resolves.toMatchObject({ code: "profile_read_only" });
+    expect(platformRequest).not.toHaveBeenCalled();
+  });
+
+  it("never forwards a profile field through a generic resource patch", async () => {
+    const platformRequest = vi.fn();
+
+    const response = await createBffResponse({
+      platformRequest,
+      request: new Request("https://powermonitor.example.test/api/v1/devices/meter-1", {
+        body: JSON.stringify({ device_profile_id: "other-profile" }),
+        headers: { "content-type": "application/json" },
+        method: "PATCH",
+      }),
+      session: { accessToken: "opaque-user-token" },
+    });
+
+    expect(response.status).toBe(405);
+    await expect(response.json()).resolves.toMatchObject({ code: "profile_read_only" });
+    expect(platformRequest).not.toHaveBeenCalled();
+  });
 });

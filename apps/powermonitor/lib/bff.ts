@@ -19,12 +19,26 @@ export async function createBffResponse(input: {
   if (!requestUrl.pathname.startsWith("/api/v1/")) {
     return errorResponse(404, "not_found", "Unknown BFF resource.");
   }
+  if (isProfileAssignmentMutation(requestUrl.pathname, input.request.method)) {
+    return errorResponse(
+      405,
+      "profile_read_only",
+      "Profiles are assigned by the Tenant Account and are read-only in PowerMonitor.",
+    );
+  }
 
   const path = requestUrl.pathname.slice("/api/v1".length) + requestUrl.search;
   const headers = forwardableHeaders(input.request.headers);
   const body = input.request.method === "GET" || input.request.method === "HEAD"
     ? undefined
     : await input.request.text();
+  if (isResourceProfileMutation(requestUrl.pathname, input.request.method, body)) {
+    return errorResponse(
+      405,
+      "profile_read_only",
+      "Profiles are assigned by the Tenant Account and are read-only in PowerMonitor.",
+    );
+  }
 
   try {
     const upstream = await input.platformRequest(path, input.session, {
@@ -53,6 +67,32 @@ export async function createBffResponse(input: {
       return errorResponse(error.status, "platform_request_failed", "The platform request failed.");
     }
     return errorResponse(502, "platform_unavailable", "The platform could not be reached.");
+  }
+}
+
+function isProfileAssignmentMutation(pathname: string, method: string): boolean {
+  return method !== "GET"
+    && method !== "HEAD"
+    && /^\/api\/v1\/(?:devices|assets)\/[^/]+\/tenant-profile$/.test(pathname);
+}
+
+function isResourceProfileMutation(pathname: string, method: string, body: string | undefined): boolean {
+  if ((method !== "PATCH" && method !== "PUT") || body === undefined) {
+    return false;
+  }
+  const field = /^\/api\/v1\/devices\/[^/]+$/.test(pathname)
+    ? "device_profile_id"
+    : /^\/api\/v1\/assets\/[^/]+$/.test(pathname)
+      ? "asset_profile_id"
+      : null;
+  if (field === null) return false;
+  try {
+    const payload: unknown = JSON.parse(body);
+    return typeof payload === "object"
+      && payload !== null
+      && Object.prototype.hasOwnProperty.call(payload, field);
+  } catch {
+    return false;
   }
 }
 

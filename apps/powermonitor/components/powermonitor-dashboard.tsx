@@ -118,6 +118,11 @@ export function PowerMonitorDashboard({
     () => assets.find((asset) => asset.id === selectedAssetId) ?? null,
     [assets, selectedAssetId],
   );
+  const selectedProfileName = selectedDevice?.device_profile_id
+    ? deviceProfileNames[selectedDevice.device_profile_id]
+    : selectedAsset?.asset_profile_id
+      ? assetProfileNames[selectedAsset.asset_profile_id]
+      : undefined;
   const onlineCount = devices.filter((device) => device.online).length;
   const selectedResource = selectedAsset !== null
     ? {
@@ -127,6 +132,7 @@ export function PowerMonitorDashboard({
       parent_id: selectedAsset.parent_id,
       permission: selectedAsset.permission,
       asset_profile_id: selectedAsset.asset_profile_id,
+      profile_name: selectedProfileName,
     }
     : selectedDevice !== null
       ? {
@@ -136,6 +142,7 @@ export function PowerMonitorDashboard({
         name: selectedDevice.name,
         permission: selectedDevice.permission,
         device_profile_id: selectedDevice.device_profile_id,
+        profile_name: selectedProfileName,
       }
       : null;
   const canManageSelectedResource = selectedResource?.permission === "manager"
@@ -146,11 +153,6 @@ export function PowerMonitorDashboard({
     () => getResourcePath(assets, selectedAsset, selectedDevice),
     [assets, selectedAsset, selectedDevice],
   );
-  const selectedProfileName = selectedDevice?.device_profile_id
-    ? deviceProfileNames[selectedDevice.device_profile_id]
-    : selectedAsset?.asset_profile_id
-      ? assetProfileNames[selectedAsset.asset_profile_id]
-      : undefined;
   const profilePresentation = powerProfilePresentation(
     selectedDevice !== null ? "device" : "asset",
     selectedProfileName,
@@ -501,7 +503,7 @@ export function PowerMonitorDashboard({
                   {selectedDevice.online ? "Online" : "Offline"}
                 </span>
               )}
-              {profilePresentation !== null && <span>{profilePresentation.label}</span>}
+              {selectedProfileName !== undefined && <span>{selectedProfileName}</span>}
               <span>{selectedDevice?.id ?? selectedAsset?.id ?? "All accessible resources"}</span>
             </div>
           </div>

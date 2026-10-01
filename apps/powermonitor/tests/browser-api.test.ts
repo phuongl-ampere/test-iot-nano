@@ -3,8 +3,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   acceptResourceInvitation,
   archiveDeviceAlertRule,
-  assignAssetTenantProfile,
-  assignDeviceTenantProfile,
   cancelResourceInvitation,
   claimDevice,
   createAsset,
@@ -306,22 +304,18 @@ describe("browser PowerMonitor API", () => {
     );
   });
 
-  it("loads tenant profile catalogs and saves assignments through dedicated routes", async () => {
+  it("loads tenant profile catalogs read-only", async () => {
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify([
         { id: "meter-v1", name: "Power Meter v1" },
       ]), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify([
         { id: "farm-v1", name: "Power Farm v1" },
-      ]), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ profile_id: "meter-v1" }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ profile_id: null }), { status: 200 }));
+      ]), { status: 200 }));
     vi.stubGlobal("fetch", fetcher);
 
     await expect(listTenantProfiles("device")).resolves.toEqual([{ id: "meter-v1", name: "Power Meter v1" }]);
     await expect(listTenantProfiles("asset")).resolves.toEqual([{ id: "farm-v1", name: "Power Farm v1" }]);
-    await expect(assignDeviceTenantProfile("meter-1", "meter-v1")).resolves.toEqual({ profile_id: "meter-v1" });
-    await expect(assignAssetTenantProfile("farm-1", null)).resolves.toEqual({ profile_id: null });
 
     expect(fetcher).toHaveBeenNthCalledWith(
       1,
@@ -332,22 +326,6 @@ describe("browser PowerMonitor API", () => {
       2,
       "/api/v1/tenant-profile/profiles?kind=asset",
       expect.objectContaining({ credentials: "same-origin" }),
-    );
-    expect(fetcher).toHaveBeenNthCalledWith(
-      3,
-      "/api/v1/devices/meter-1/tenant-profile",
-      expect.objectContaining({
-        body: JSON.stringify({ profile_id: "meter-v1" }),
-        method: "PUT",
-      }),
-    );
-    expect(fetcher).toHaveBeenNthCalledWith(
-      4,
-      "/api/v1/assets/farm-1/tenant-profile",
-      expect.objectContaining({
-        body: JSON.stringify({ profile_id: null }),
-        method: "PUT",
-      }),
     );
   });
 

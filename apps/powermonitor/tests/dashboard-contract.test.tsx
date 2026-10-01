@@ -127,8 +127,7 @@ describe("PowerMonitor dashboard", () => {
     expect(screen.getByRole("button", { name: "Invitations" })).toBeTruthy();
   });
 
-  it("lets a manager assign a device profile from the edit drawer", async () => {
-    let liveViewReads = 0;
+  it("shows a manager device profile as read-only and never patches it", async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = typeof input === "string" ? input : input.toString();
       if (path === "/api/v1/devices") {
@@ -152,14 +151,11 @@ describe("PowerMonitor dashboard", () => {
         ]);
       }
       if (path === "/api/v1/devices/meter-1/live-view") {
-        liveViewReads += 1;
         return json({
-          profile: liveViewReads === 1
-            ? { id: "meter-v1", name: "Power Meter v1" }
-            : { id: "inverter-v1", name: "Solar Inverter v1" },
+          profile: { id: "meter-v1", name: "Power Meter v1" },
           charts: [{
             aggregation: "last",
-            label: liveViewReads === 1 ? "Configured device power" : "Updated device power",
+            label: "Configured device power",
             metric: "power_w",
             unit: "W",
           }],
@@ -172,7 +168,7 @@ describe("PowerMonitor dashboard", () => {
         return json({ items: [] });
       }
       if (path === "/api/v1/devices/meter-1" && init?.method === "PATCH") {
-        return json({ device_id: "meter-1", device_profile_id: "inverter-v1", display_name: "Main meter" });
+        return json({ device_id: "meter-1", device_profile_id: "meter-v1", display_name: "Main meter" });
       }
       throw new Error("Unexpected BFF request: " + path);
     });
@@ -182,22 +178,20 @@ describe("PowerMonitor dashboard", () => {
 
     expect(await screen.findByText("Configured device power")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Edit device" }));
-    const profile = await screen.findByLabelText("Device profile");
-    fireEvent.change(profile, { target: { value: "inverter-v1" } });
-    await waitFor(() => expect((profile as HTMLSelectElement).value).toBe("inverter-v1"));
+    expect(screen.queryByLabelText("Device profile")).toBeNull();
+    expect((await screen.findAllByText("Power Meter v1")).length).toBeGreaterThan(1);
     fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
 
     await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
       "/api/v1/devices/meter-1",
       expect.objectContaining({
-        body: JSON.stringify({ asset_id: null, device_profile_id: "inverter-v1", display_name: "Main meter" }),
+        body: JSON.stringify({ asset_id: null, display_name: "Main meter" }),
         method: "PATCH",
       }),
     ));
-    expect(await screen.findByText("Updated device power")).toBeTruthy();
   });
 
-  it("lets a manager assign an asset profile from the edit drawer", async () => {
+  it("shows a manager asset profile as read-only and never patches it", async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = typeof input === "string" ? input : input.toString();
       if (path === "/api/v1/devices" || path === "/api/v1/alerts") {
@@ -230,7 +224,7 @@ describe("PowerMonitor dashboard", () => {
         return json({ items: [] });
       }
       if (path === "/api/v1/assets/farm-1" && init?.method === "PATCH") {
-        return json({ asset_profile_id: null, id: "farm-1", name: "Main farm" });
+        return json({ asset_profile_id: "farm-v1", id: "farm-1", name: "Main farm" });
       }
       throw new Error("Unexpected BFF request: " + path);
     });
@@ -239,15 +233,14 @@ describe("PowerMonitor dashboard", () => {
     render(<PowerMonitorDashboard initialAssetId="farm-1" />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Edit asset" }));
-    const profile = await screen.findByLabelText("Asset profile");
-    await waitFor(() => expect((profile as HTMLSelectElement).value).toBe("farm-v1"));
-    fireEvent.change(profile, { target: { value: "" } });
+    expect(screen.queryByLabelText("Asset profile")).toBeNull();
+    expect((await screen.findAllByText("Power Farm v1")).length).toBeGreaterThan(1);
     fireEvent.click(screen.getByRole("button", { name: "Save configuration" }));
 
     await waitFor(() => expect(fetcher).toHaveBeenCalledWith(
       "/api/v1/assets/farm-1",
       expect.objectContaining({
-        body: JSON.stringify({ asset_profile_id: null, name: "Main farm", parent_asset_id: null }),
+        body: JSON.stringify({ name: "Main farm", parent_asset_id: null }),
         method: "PATCH",
       }),
     ));
