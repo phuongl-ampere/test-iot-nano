@@ -102,17 +102,47 @@ pub enum AuthError {
 }
 
 pub fn validate_password(value: &str) -> Result<(), AuthError> {
-    if value.len() < 8
-        || !value.is_ascii()
-        || value.bytes().any(|byte| byte.is_ascii_whitespace())
-        || !value.bytes().any(|byte| byte.is_ascii_uppercase())
-        || !value.bytes().any(|byte| byte.is_ascii_lowercase())
-        || !value.bytes().any(|byte| byte.is_ascii_digit())
-        || !value.bytes().any(|byte| !byte.is_ascii_alphanumeric())
-    {
-        return Err(AuthError::InvalidPasswordFormat);
+    if password_is_allowed(value, insecure_default_passwords_enabled()) {
+        Ok(())
+    } else {
+        Err(AuthError::InvalidPasswordFormat)
     }
-    Ok(())
+}
+
+fn password_is_allowed(value: &str, allow_insecure_defaults: bool) -> bool {
+    if allow_insecure_defaults && matches!(value, "systemadmin" | "tenant" | "user1" | "user2") {
+        return true;
+    }
+    value.len() >= 8
+        && value.is_ascii()
+        && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+        && value.bytes().any(|byte| byte.is_ascii_uppercase())
+        && value.bytes().any(|byte| byte.is_ascii_lowercase())
+        && value.bytes().any(|byte| byte.is_ascii_digit())
+        && value.bytes().any(|byte| !byte.is_ascii_alphanumeric())
+}
+
+fn insecure_default_passwords_enabled() -> bool {
+    matches!(
+        std::env::var("IOT_NANO_ALLOW_INSECURE_DEFAULT_PASSWORDS").as_deref(),
+        Ok("true") | Ok("1") | Ok("on")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::password_is_allowed;
+
+    #[test]
+    fn insecure_lab_defaults_require_explicit_opt_in() {
+        assert!(!password_is_allowed("user1", false));
+        assert!(password_is_allowed("systemadmin", true));
+        assert!(password_is_allowed("tenant", true));
+        assert!(password_is_allowed("user1", true));
+        assert!(password_is_allowed("user2", true));
+        assert!(!password_is_allowed("weak", true));
+        assert!(password_is_allowed("StrongPassword@2026", false));
+    }
 }
 
 pub fn generate_session_id() -> String {

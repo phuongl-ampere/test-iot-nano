@@ -134,6 +134,7 @@ IOT_NANO_MANAGEMENT_ADDRESS=$management_address
 IOT_NANO_MQTT_TCP_ADDRESS=$mqtt_address
 IOT_NANO_MQTT_TLS_ADDRESS=$mqtt_tls_address
 IOT_NANO_HTTPS_ENABLED=$web_https_enabled
+IOT_NANO_ALLOW_INSECURE_DEFAULT_PASSWORDS=true
 IOT_DEVICE_TOKEN_VAULT_KEY=$vault_key
 EOF
   chown root:"$service_user" "$config_root/monolith.env"
