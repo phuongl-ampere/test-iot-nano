@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS platform_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version = 4)
+    version INTEGER NOT NULL CHECK (version = 5)
 );
 
 CREATE TABLE IF NOT EXISTS system_accounts (
@@ -341,6 +341,30 @@ CREATE TABLE IF NOT EXISTS tenant_device_claim_policies (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS tenant_ota_policies (
+    tenant_id UUID NOT NULL PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+    require_matching_device_profile BOOLEAN NOT NULL DEFAULT TRUE,
+    require_newer_version BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ota_artifacts (
+    id UUID NOT NULL PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    device_profile_id UUID NOT NULL,
+    version TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, device_profile_id, version),
+    FOREIGN KEY (device_profile_id, tenant_id)
+        REFERENCES device_profiles(id, tenant_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS ota_artifacts_tenant_profile_version_index
+    ON ota_artifacts (tenant_id, device_profile_id, version);
 
 CREATE TABLE IF NOT EXISTS device_claim_codes (
     id UUID PRIMARY KEY DEFAULT public.uuid_generate_v4(),

@@ -130,6 +130,37 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
+        "/api/management/ota/artifacts",
+        vec![
+            (
+                "get",
+                management_list_operation("List OTA firmware artifacts", "OtaArtifactList"),
+            ),
+            ("post", ota_upload_operation()),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/management/ota/policy",
+        vec![
+            (
+                "get",
+                management_list_operation("Get OTA delivery policy", "OtaPolicy"),
+            ),
+            (
+                "put",
+                documented_operation(
+                    "Update OTA delivery policy",
+                    Some("managementSession"),
+                    Some(("application/json", "OtaPolicy")),
+                    ("204", "OTA delivery policy updated", None),
+                    &management_errors(),
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
         "/api/management/alerts",
         vec![(
             "get",
@@ -630,6 +661,28 @@ fn management_list_operation(summary: &str, response_schema: &str) -> Value {
     )
 }
 
+fn ota_upload_operation() -> Value {
+    let mut operation = documented_operation(
+        "Upload an OTA firmware artifact",
+        Some("managementSession"),
+        Some(("application/octet-stream", "OtaArtifactUpload")),
+        ("201", "Firmware artifact stored", Some("OtaArtifact")),
+        &management_errors(),
+    );
+    operation
+        .as_object_mut()
+        .expect("documented operation is an object")
+        .insert(
+            "parameters".to_owned(),
+            json!([
+                {"name": "x-ota-device-profile-id", "in": "header", "required": true, "schema": {"type": "string", "format": "uuid"}},
+                {"name": "x-ota-version", "in": "header", "required": true, "schema": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"}},
+                {"name": "x-ota-filename", "in": "header", "required": true, "schema": {"type": "string"}}
+            ]),
+        );
+    operation
+}
+
 fn tenant_management_list_operation(summary: &str, response_schema: &str) -> Value {
     documented_operation(
         summary,
@@ -765,6 +818,41 @@ fn management_openapi_schemas() -> Value {
     schemas.insert(
         "Error".to_owned(),
         object_schema(json!({"error": {"type": "string"}}), &["error"]),
+    );
+    schemas.insert(
+        "OtaPolicy".to_owned(),
+        object_schema(
+            json!({
+                "require_matching_device_profile": {"type": "boolean"},
+                "require_newer_version": {"type": "boolean"}
+            }),
+            &["require_matching_device_profile", "require_newer_version"],
+        ),
+    );
+    schemas.insert(
+        "OtaArtifact".to_owned(),
+        object_schema(
+            json!({
+                "id": uuid_schema_non_null(),
+                "device_profile_id": uuid_schema_non_null(),
+                "version": {"type": "string"},
+                "filename": {"type": "string"},
+                "sha256": {"type": "string"},
+                "size_bytes": {"type": "integer", "minimum": 0}
+            }),
+            &[
+                "id",
+                "device_profile_id",
+                "version",
+                "filename",
+                "sha256",
+                "size_bytes",
+            ],
+        ),
+    );
+    schemas.insert(
+        "OtaArtifactUpload".to_owned(),
+        json!({"type": "string", "format": "binary"}),
     );
     schemas.insert(
         "LoginRequest".to_owned(),
@@ -1269,6 +1357,7 @@ fn management_openapi_schemas() -> Value {
         ("AssetProfileList", "AssetProfile"),
         ("ManagementDeviceList", "ManagementDevice"),
         ("ManagementAssetList", "ManagementAsset"),
+        ("OtaArtifactList", "OtaArtifact"),
     ] {
         schemas.insert(name.to_owned(), array_schema(item));
     }

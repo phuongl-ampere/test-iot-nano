@@ -1,6 +1,7 @@
 mod alerts;
 mod assets;
 pub(super) mod devices;
+mod ota;
 mod profiles;
 pub(super) mod tokens;
 mod users;
@@ -25,6 +26,8 @@ pub use devices::{
     ManagementGatewayStatus, ProvisionManagementDevice, ProvisionManagementDeviceError,
     UpdateManagementDevice,
 };
+
+pub use ota::{OtaArtifact, OtaPolicy};
 
 pub use profiles::{
     CreateManagementAssetProfile, CreateManagementDeviceProfile, ManagementAssetProfile,

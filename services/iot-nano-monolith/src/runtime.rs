@@ -162,6 +162,7 @@ impl MonolithRuntime {
         let browser_session_verifier: Arc<dyn iot_api::OAuthBrowserSessionVerifier> =
             management_sessions.session_verifier.clone();
         let public_router = health_router(readiness.clone())
+            .merge(crate::ota::router(Arc::clone(&platform)))
             .merge(iot_api::public_v1_router(
                 Arc::clone(&platform),
                 token_vault,

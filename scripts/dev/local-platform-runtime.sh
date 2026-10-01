@@ -23,6 +23,7 @@ local_platform_configure() {
   IOT_NANO_LOCAL_PLATFORM_ROOT="$root"
   IOT_NANO_LOCAL_PLATFORM_PATH="$root/platform.sqlite"
   IOT_NANO_LOCAL_INTERNAL_DIR="$root/internal"
+  IOT_NANO_LOCAL_OTA_DIR="$root/ota"
   IOT_NANO_LOCAL_VAULT_PATH="$root/vault.key"
   IOT_NANO_LOCAL_TLS_CERT_PATH="$root/mqtt-cert.pem"
   IOT_NANO_LOCAL_TLS_KEY_PATH="$root/mqtt-key.pem"
@@ -83,7 +84,7 @@ local_platform_assert_ownership() {
     return 0
   fi
 
-  if [[ -e "$IOT_NANO_LOCAL_PLATFORM_PATH" || -e "$IOT_NANO_LOCAL_INTERNAL_DIR" ]]; then
+  if [[ -e "$IOT_NANO_LOCAL_PLATFORM_PATH" || -e "$IOT_NANO_LOCAL_INTERNAL_DIR" || -e "$IOT_NANO_LOCAL_OTA_DIR" ]]; then
     local_platform_fail 'local runtime state exists without an ownership marker or verified listener'
     return 1
   fi
@@ -200,7 +201,7 @@ local_platform_clear_state() {
     "$IOT_NANO_LOCAL_PLATFORM_PATH-wal" \
     "$IOT_NANO_LOCAL_PLATFORM_PATH-shm" \
     "$IOT_NANO_LOCAL_PID_FILE"
-  rm -rf "$IOT_NANO_LOCAL_INTERNAL_DIR"
+  rm -rf "$IOT_NANO_LOCAL_INTERNAL_DIR" "$IOT_NANO_LOCAL_OTA_DIR"
 }
 
 local_platform_require_material() {

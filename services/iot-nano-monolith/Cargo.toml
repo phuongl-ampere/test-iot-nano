@@ -22,6 +22,7 @@ rustix = { version = "1.1.4", features = ["fs", "process"] }
 rusqlite = "0.37.0"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10.9"
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -108,6 +108,32 @@ Manual pairing identifies a Device by `serial_number`, not `device_id`.
 Generating a new code revokes the prior active code. Codes are stored hashed
 and are not returned by ordinary list or resource APIs.
 
+## OTA firmware
+
+Tenant Account uses **OTA** in the Tenant Console to upload one firmware image
+for a Device Profile and semantic version (`x.y.z`). The platform stores the
+host file outside the database, persists its filename, SHA-256, byte size, and
+profile/version metadata, and prevents duplicate versions for the same tenant
+and Device Profile.
+
+Device firmware uses its active device token:
+
+1. `GET /api/device/ota/manifest?current_version=x.y.z` returns either
+   `{ "update": false }` or an artifact ID, SHA-256, size, version, and
+   authenticated download path.
+2. `GET /api/device/ota/artifacts/{artifact_id}?current_version=x.y.z` returns
+   the file only after the same authorization checks pass.
+
+Tenant Account can independently enable or disable two checks. Both default to
+enabled: the Device Profile must match the artifact, and the artifact version
+must be newer than the device's reported `current_version`. A device token from
+another tenant, an invalid token, a mismatched profile under the default policy,
+or a nonexistent artifact does not receive firmware bytes.
+
+When newer-version enforcement is enabled, devices must supply a valid numeric
+`current_version` in both calls. An omitted version yields no manifest update
+and no download; an invalid version returns `400 Bad Request`.
+
 ## Console layout behavior
 
 The console content area grows to the available desktop width. Data tables fill

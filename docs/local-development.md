@@ -133,7 +133,8 @@ IOT_NANO_ALLOW_LOCAL_SEED=1 ./scripts/dev/seed-local-platform.sh --reset
 ```
 
 It stops only a verified monolith for this workspace, removes its disposable
-platform SQLite database and internal stream, MQTTD, and cache state,
+platform SQLite database, uploaded OTA firmware files, and internal stream,
+MQTTD, and cache state,
 bootstraps the system account, starts a fresh monolith, and creates the
 PowerMonitor fixture. It records the PowerMonitor launch URL and callback as
 `http://localhost:3002`; keep that port when starting the UI below.

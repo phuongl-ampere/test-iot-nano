@@ -49,6 +49,70 @@ pub(in crate::management) async fn platform_tenant_devices(
     tenant_devices_page(&state, tenant, tenant_devices_notice(request.uri().query())).await
 }
 
+pub(in crate::management) async fn platform_tenant_ota(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    tenant_ota_page(&state, tenant).await
+}
+
+async fn tenant_ota_page(
+    state: &ManagementState,
+    tenant: TenantSession,
+) -> Result<Html<String>, ManagementSessionError> {
+    let policy = state
+        .store
+        .ota_policy(tenant.tenant_id)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let artifacts = state
+        .store
+        .list_ota_artifacts(tenant.tenant_id)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let profiles = ManagementDeviceProfileRepository::list_management_device_profiles(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(management_device_profile_error)?;
+    let profile_names = profiles
+        .iter()
+        .map(|profile| (profile.id, profile.name.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let page = crate::TenantOtaPage::new(
+        profiles
+            .into_iter()
+            .map(|profile| crate::TenantOtaProfileRow::new(profile.id.to_string(), profile.name))
+            .collect(),
+        artifacts
+            .into_iter()
+            .map(|artifact| {
+                crate::TenantOtaArtifactRow::new(
+                    artifact.id.to_string(),
+                    profile_names
+                        .get(&artifact.device_profile_id)
+                        .map(String::as_str)
+                        .unwrap_or("Deleted profile"),
+                    artifact.version,
+                    artifact.filename,
+                    artifact.sha256,
+                    artifact.size_bytes,
+                )
+            })
+            .collect(),
+        policy.require_matching_device_profile,
+        policy.require_newer_version,
+    );
+    let rendered = crate::PlatformUiRenderer::render_tenant_ota(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
 pub(in crate::management) async fn platform_tenant_device_claim_policy(
     State(state): State<ManagementState>,
     request: Request,

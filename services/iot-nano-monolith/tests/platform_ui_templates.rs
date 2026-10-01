@@ -8,10 +8,11 @@ use iot_nano_monolith::{
 use std::fs;
 use std::path::Path;
 
-const TENANT_NAVIGATION: [(&str, &str, &str); 14] = [
+const TENANT_NAVIGATION: [(&str, &str, &str); 15] = [
     ("overview", "/tenant", "Overview"),
     ("devices", "/tenant/devices", "Devices"),
     ("assets", "/tenant/assets", "Assets"),
+    ("ota", "/tenant/ota", "OTA"),
     ("alerts", "/tenant/alerts", "Alerts"),
     ("audit", "/tenant/audit", "Audit"),
     ("topology", "/tenant/topology", "Topology"),
@@ -33,10 +34,11 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 14] = [
     ("applications", "/tenant/applications", "Applications"),
 ];
 
-const TENANT_TEMPLATES: [(&str, &str); 16] = [
+const TENANT_TEMPLATES: [(&str, &str); 17] = [
     ("tenant.html", "overview"),
     ("tenant_devices.html", "devices"),
     ("tenant_assets.html", "assets"),
+    ("tenant_ota.html", "ota"),
     ("tenant_alerts.html", "alerts"),
     ("tenant_audit.html", "audit"),
     ("tenant_topology.html", "topology"),
@@ -51,6 +53,28 @@ const TENANT_TEMPLATES: [(&str, &str); 16] = [
     ("tenant_device_credential.html", "devices"),
     ("tenant_device_claim_policy.html", "devices"),
 ];
+
+#[test]
+fn tenant_ota_template_offers_profile_scoped_upload_and_policy_controls() {
+    let template = platform_template_source("tenant_ota.html");
+
+    for marker in [
+        "data-ota-upload-form",
+        "data-ota-policy-form",
+        "data-ota-artifact-items",
+        "Device profile",
+        "Semantic version",
+        "/api/management/ota/artifacts",
+        "/api/management/ota/policy",
+        "x-ota-device-profile-id",
+        "x-ota-version",
+        "x-ota-filename",
+        "require_matching_device_profile",
+        "require_newer_version",
+    ] {
+        assert!(template.contains(marker), "OTA template contains {marker}");
+    }
+}
 
 fn platform_template_source(name: &str) -> String {
     fs::read_to_string(

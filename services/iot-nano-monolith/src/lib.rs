@@ -4,6 +4,7 @@ mod adapters;
 mod cache;
 mod config;
 mod management;
+mod ota;
 mod platform_ui;
 mod readiness;
 mod runtime;
@@ -27,7 +28,8 @@ pub use platform_ui::{
     TenantDeviceClaimPolicyLayout, TenantDeviceClaimPolicyPage, TenantDeviceCredentialLayout,
     TenantDeviceCredentialPage, TenantDeviceProfilesLayout, TenantDeviceProfilesPage,
     TenantDeviceRow, TenantDevicesLayout, TenantDevicesPage, TenantGroupMemberRow, TenantGroupRow,
-    TenantGroupsLayout, TenantGroupsPage, TenantLayout, TenantOverviewPage, TenantPermissionRow,
+    TenantGroupsLayout, TenantGroupsPage, TenantLayout, TenantOtaArtifactRow, TenantOtaLayout,
+    TenantOtaPage, TenantOtaProfileRow, TenantOverviewPage, TenantPermissionRow,
     TenantPermissionsLayout, TenantPermissionsPage, TenantProfileLayout, TenantProfilePage,
     TenantProfileRow, TenantRelationRow, TenantRelationsLayout, TenantRelationsPage,
     TenantSelectOption, TenantTopologyLayout, TenantTopologyPage, TenantTopologyRow, TenantUserRow,

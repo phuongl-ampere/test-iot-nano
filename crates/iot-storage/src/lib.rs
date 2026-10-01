@@ -34,7 +34,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
-pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 4;
+pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 5;
 
 pub use contracts::{
     AccountClass, AlertComparison, AlertEvaluationEvent, AlertEvaluationRepository,
@@ -92,10 +92,10 @@ pub use management::{
     ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
     ManagementDeviceRepository, ManagementDeviceTelemetry, ManagementDeviceTelemetryRepository,
     ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser, ManagementUserError,
-    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOwnedDeviceToken,
-    ProvisionManagementDevice, ProvisionManagementDeviceError, UpdateManagementAlertRule,
-    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser, UserCapability,
+    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOwnedDeviceToken, OtaArtifact,
+    OtaPolicy, ProvisionManagementDevice, ProvisionManagementDeviceError,
+    UpdateManagementAlertRule, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser, UserCapability,
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, PublicAlert, PublicApiRepository, PublicAsset,

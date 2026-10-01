@@ -236,6 +236,7 @@ impl ManagementSessionRouter {
                 "/tenant/devices",
                 get(platform_tenant_devices).post(provision_tenant_device_form),
             )
+            .route("/tenant/ota", get(platform_tenant_ota))
             .route(
                 "/tenant/devices/claim-policy",
                 get(platform_tenant_device_claim_policy)
@@ -423,6 +424,14 @@ impl ManagementSessionRouter {
             .route(
                 "/api/management/devices",
                 get(list_management_devices).post(provision_device),
+            )
+            .route(
+                "/api/management/ota/artifacts",
+                get(list_ota_artifacts).post(upload_ota_artifact),
+            )
+            .route(
+                "/api/management/ota/policy",
+                get(get_ota_policy).put(update_ota_policy),
             )
             .route(
                 "/api/management/devices/{device_id}",

@@ -237,9 +237,9 @@ impl Drop for ManagementMutationLease<'_> {
 #[cfg(test)]
 #[derive(Clone)]
 pub(super) struct ManagementAuthorizationTestHooks {
-    mutation_authorized: Arc<Barrier>,
-    release_mutation: Arc<Barrier>,
-    pause_mutation: Arc<AtomicBool>,
+    pub(super) mutation_authorized: Arc<Barrier>,
+    pub(super) release_mutation: Arc<Barrier>,
+    pub(super) pause_mutation: Arc<AtomicBool>,
 }
 
 pub(super) struct Session {

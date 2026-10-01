@@ -1,6 +1,85 @@
 use super::*;
 use qrcodegen::{QrCode, QrCodeEcc};
+use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+
+#[derive(Deserialize)]
+struct OtaPolicyRequest {
+    require_matching_device_profile: bool,
+    require_newer_version: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct OtaArtifactResponse {
+    id: Uuid,
+    device_profile_id: Uuid,
+    version: String,
+    filename: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+pub(super) async fn list_ota_artifacts(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<OtaArtifactResponse>>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    state
+        .store
+        .list_ota_artifacts(tenant.tenant_id)
+        .await
+        .map(|artifacts| {
+            Json(
+                artifacts
+                    .into_iter()
+                    .map(|artifact| OtaArtifactResponse {
+                        id: artifact.id,
+                        device_profile_id: artifact.device_profile_id,
+                        version: artifact.version,
+                        filename: artifact.filename,
+                        sha256: artifact.sha256,
+                        size_bytes: artifact.size_bytes,
+                    })
+                    .collect(),
+            )
+        })
+        .map_err(|_| ManagementSessionError::Unavailable)
+}
+
+pub(super) async fn get_ota_policy(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<iot_storage::OtaPolicy>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    state
+        .store
+        .ota_policy(tenant.tenant_id)
+        .await
+        .map(Json)
+        .map_err(|_| ManagementSessionError::Unavailable)
+}
+
+pub(super) async fn update_ota_policy(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<StatusCode, ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let policy: OtaPolicyRequest = management_request_json(&state, request).await?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    state
+        .store
+        .set_ota_policy(
+            tenant.tenant_id,
+            iot_storage::OtaPolicy {
+                require_matching_device_profile: policy.require_matching_device_profile,
+                require_newer_version: policy.require_newer_version,
+            },
+        )
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 pub(super) async fn create_application(
     State(state): State<ManagementState>,
@@ -62,6 +141,88 @@ pub(super) async fn create_application(
             app_id: application.app_id.as_str().to_owned(),
             client_id: application.client_id.as_str().to_owned(),
         }),
+    ))
+}
+
+pub(super) async fn upload_ota_artifact(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<(StatusCode, Json<serde_json::Value>), ManagementSessionError> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let profile_id = headers
+        .get("x-ota-device-profile-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(ManagementSessionError::BadRequest)?;
+    let version = headers
+        .get("x-ota-version")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or(ManagementSessionError::BadRequest)?;
+    let filename = headers
+        .get("x-ota-filename")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 128 && !value.contains('/'))
+        .ok_or(ManagementSessionError::BadRequest)?;
+    let profile_exists = ManagementDeviceProfileRepository::list_management_device_profiles(
+        state.store.as_ref(),
+        tenant.tenant_id,
+    )
+    .await
+    .map_err(|_| ManagementSessionError::Unavailable)?
+    .into_iter()
+    .any(|profile| profile.id == profile_id);
+    if !profile_exists {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
+        .await
+        .map_err(|_| ManagementSessionError::PayloadTooLarge)?;
+    if body.is_empty() {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let artifact_id = Uuid::now_v7();
+    let ota_root =
+        std::env::var("IOT_NANO_INTERNAL_DIR").map_err(|_| ManagementSessionError::Unavailable)?;
+    let ota_dir = std::path::Path::new(&ota_root)
+        .parent()
+        .ok_or(ManagementSessionError::Unavailable)?
+        .join("ota")
+        .join(tenant.tenant_id.to_string());
+    tokio::fs::create_dir_all(&ota_dir)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let storage_path = ota_dir.join(artifact_id.to_string());
+    tokio::fs::write(&storage_path, &body)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let sha256 = format!("{:x}", Sha256::digest(&body));
+    let artifact = iot_storage::OtaArtifact {
+        id: artifact_id,
+        tenant_id: tenant.tenant_id,
+        device_profile_id: profile_id,
+        version: version.to_owned(),
+        filename: filename.to_owned(),
+        storage_path: storage_path.to_string_lossy().into_owned(),
+        sha256: sha256.clone(),
+        size_bytes: body.len() as u64,
+    };
+    if state.store.create_ota_artifact(&artifact).await.is_err() {
+        let _ = tokio::fs::remove_file(&storage_path).await;
+        return Err(ManagementSessionError::Conflict);
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": artifact_id,
+            "device_profile_id": profile_id,
+            "version": version,
+            "filename": filename,
+            "sha256": sha256,
+            "size_bytes": body.len(),
+        })),
     ))
 }
 

@@ -744,6 +744,75 @@ pub struct TenantApplicationsPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantOtaProfileRow {
+    id: String,
+    name: String,
+}
+
+impl TenantOtaProfileRow {
+    pub(crate) fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantOtaArtifactRow {
+    id: String,
+    profile_name: String,
+    version: String,
+    filename: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+impl TenantOtaArtifactRow {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        profile_name: impl Into<String>,
+        version: impl Into<String>,
+        filename: impl Into<String>,
+        sha256: impl Into<String>,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            profile_name: profile_name.into(),
+            version: version.into(),
+            filename: filename.into(),
+            sha256: sha256.into(),
+            size_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantOtaPage {
+    profiles: Vec<TenantOtaProfileRow>,
+    artifacts: Vec<TenantOtaArtifactRow>,
+    require_matching_device_profile: bool,
+    require_newer_version: bool,
+}
+
+impl TenantOtaPage {
+    pub(crate) fn new(
+        profiles: Vec<TenantOtaProfileRow>,
+        artifacts: Vec<TenantOtaArtifactRow>,
+        require_matching_device_profile: bool,
+        require_newer_version: bool,
+    ) -> Self {
+        Self {
+            profiles,
+            artifacts,
+            require_matching_device_profile,
+            require_newer_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantProfilePage {
     configuration_json: String,
 }
@@ -1362,6 +1431,13 @@ impl PlatformUiRenderer {
         TenantApplicationsLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_ota(
+        identity: &PlatformUiIdentity,
+        page: &TenantOtaPage,
+    ) -> Result<String, askama::Error> {
+        TenantOtaLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_profile(
         identity: &PlatformUiIdentity,
         page: &TenantProfilePage,
@@ -1631,6 +1707,19 @@ pub struct TenantRelationsLayout<'a> {
 pub struct TenantApplicationsLayout<'a> {
     identity: &'a PlatformUiIdentity,
     page: &'a TenantApplicationsPage,
+}
+
+#[derive(Template)]
+#[template(path = "platform_ui/tenant_ota.html")]
+pub struct TenantOtaLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantOtaPage,
+}
+
+impl<'a> TenantOtaLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantOtaPage) -> Self {
+        Self { identity, page }
+    }
 }
 
 #[derive(Template)]

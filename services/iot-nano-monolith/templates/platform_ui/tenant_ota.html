@@ -1,0 +1,146 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}OTA | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  {% let active_nav = "ota" %}
+  {% include "platform_ui/tenant_navigation.html" %}
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>OTA firmware</h1>
+    <p>Upload a signed firmware image for a device profile. Devices must authenticate before they receive its manifest or bytes.</p>
+  </section>
+
+  <section class="workspace-panel">
+    <header class="panel-heading">
+      <div>
+        <h2>Delivery policy</h2>
+        <p class="panel-caption">Both checks are enabled by default for a safe device-pull rollout.</p>
+      </div>
+    </header>
+    <form class="form-grid" data-ota-policy-form>
+      <label class="field field--checkbox">
+        <input name="require_matching_device_profile" type="checkbox"{% if page.require_matching_device_profile %} checked{% endif %}>
+        <span><strong>Require matching device profile</strong><small>Only devices with the artifact's profile can receive it.</small></span>
+      </label>
+      <label class="field field--checkbox">
+        <input name="require_newer_version" type="checkbox"{% if page.require_newer_version %} checked{% endif %}>
+        <span><strong>Only offer newer versions</strong><small>Device current_version must be lower than the artifact version.</small></span>
+      </label>
+      <div class="form-actions"><button type="submit">Save policy</button></div>
+    </form>
+  </section>
+
+  <section class="workspace-panel">
+    <header>
+      <div class="panel-heading"><h2>Upload firmware</h2></div>
+      <p class="panel-caption">The image is stored on this host. Version uses numeric semantic format: x.y.z.</p>
+    </header>
+    {% if page.profiles.is_empty() %}
+      <p class="operation-note">Create a Device Profile before uploading firmware.</p>
+    {% else %}
+      <form class="form-grid form-grid--profile" data-ota-upload-form>
+        <label class="field">
+          <span>Device profile</span>
+          <select name="device_profile_id" required>
+            {% for profile in page.profiles %}
+              <option value="{{ profile.id }}">{{ profile.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label class="field">
+          <span>Semantic version</span>
+          <input name="version" type="text" placeholder="1.2.3" pattern="[0-9]+\.[0-9]+\.[0-9]+" maxlength="64" required>
+        </label>
+        <label class="field">
+          <span>Firmware file</span>
+          <input name="firmware" type="file" required>
+        </label>
+        <div class="form-actions"><button type="submit">Upload firmware</button></div>
+      </form>
+    {% endif %}
+  </section>
+
+  <section class="workspace-panel">
+    <header>
+      <div class="panel-heading"><h2>Uploaded artifacts</h2></div>
+      <p class="panel-caption">SHA-256 is calculated by the platform when the image is uploaded.</p>
+    </header>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead><tr><th scope="col">File</th><th scope="col">Device profile</th><th scope="col">Version</th><th scope="col">Size</th><th scope="col">SHA-256</th><th scope="col">Artifact ID</th></tr></thead>
+        <tbody data-ota-artifact-items>
+          {% for artifact in page.artifacts %}
+            <tr><td>{{ artifact.filename }}</td><td>{{ artifact.profile_name }}</td><td>{{ artifact.version }}</td><td>{{ artifact.size_bytes }} bytes</td><td><code>{{ artifact.sha256 }}</code></td><td><code>{{ artifact.id }}</code></td></tr>
+          {% else %}
+            <tr><td colspan="6">No firmware artifacts uploaded.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    (() => {
+      const ui = window.PlatformUi;
+      const policyForm = document.querySelector("[data-ota-policy-form]");
+      const uploadForm = document.querySelector("[data-ota-upload-form]");
+      if (!ui) return;
+
+      policyForm?.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const submit = policyForm.querySelector("button[type=submit]");
+        ui.setPending(submit, true);
+        try {
+          await ui.request("/api/management/ota/policy", {
+            method: "PUT",
+            body: {
+              require_matching_device_profile: policyForm.elements.require_matching_device_profile.checked,
+              require_newer_version: policyForm.elements.require_newer_version.checked,
+            },
+          });
+          ui.announce("OTA delivery policy saved.");
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+
+      uploadForm?.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const file = uploadForm.elements.firmware.files[0];
+        const submit = uploadForm.querySelector("button[type=submit]");
+        if (!file) {
+          ui.announce("Select a firmware file first.", "error");
+          return;
+        }
+        ui.setPending(submit, true);
+        try {
+          const response = await fetch("/api/management/ota/artifacts", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+              "x-ota-device-profile-id": uploadForm.elements.device_profile_id.value,
+              "x-ota-version": uploadForm.elements.version.value.trim(),
+              "x-ota-filename": file.name,
+            },
+            body: file,
+          });
+          if (!response.ok) {
+            throw new Error("Firmware upload could not be completed.");
+          }
+          ui.announce("Firmware uploaded. Refreshing the artifact list.");
+          window.setTimeout(() => window.location.reload(), 400);
+        } catch (error) {
+          ui.announce(error.message, "error");
+        } finally {
+          ui.setPending(submit, false);
+        }
+      });
+    })();
+  </script>
+{% endblock %}
