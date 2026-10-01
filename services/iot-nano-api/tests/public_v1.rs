@@ -665,7 +665,7 @@ async fn exported_public_devices_include_current_runtime_health() {
 }
 
 #[tokio::test]
-async fn exported_public_router_rejects_an_unavailable_device_profile() {
+async fn exported_public_router_rejects_user_device_profile_selection() {
     let (_directory, app, _core) = exported_router().await;
     let response = app
         .oneshot(
@@ -687,7 +687,7 @@ async fn exported_public_router_rejects_an_unavailable_device_profile() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -901,7 +901,7 @@ async fn exported_public_profile_catalogs_are_scoped_to_the_token_tenant() {
 }
 
 #[tokio::test]
-async fn exported_public_manager_can_assign_and_clear_a_device_profile() {
+async fn exported_public_manager_cannot_change_a_device_profile() {
     let (_directory, app, _core, store) = exported_router_with_store().await;
     let pool = store.sqlite_pool().unwrap();
     let profile_id = Uuid::now_v7();
@@ -931,29 +931,7 @@ async fn exported_public_manager_can_assign_and_clear_a_device_profile() {
         )
         .await
         .unwrap();
-    assert_eq!(assign_response.status(), StatusCode::OK);
-
-    let clear_response = app
-        .oneshot(
-            Request::builder()
-                .method("PATCH")
-                .uri(format!("/api/v1/devices/{DEVICE_ID}"))
-                .header(header::AUTHORIZATION, format!("Bearer {ACCESS_TOKEN}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({ "device_profile_id": null }).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(clear_response.status(), StatusCode::OK);
-    let cleared: Value = serde_json::from_slice(
-        &to_bytes(clear_response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(cleared["device_profile_id"], Value::Null);
+    assert_eq!(assign_response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

@@ -935,6 +935,9 @@ async fn create_device(
             .map_err(|_| PublicApiError::BadRequest)?,
     )
     .map_err(|_| PublicApiError::BadRequest)?;
+    if request.device_profile_id.is_some() {
+        return Err(PublicApiError::Forbidden);
+    }
     let device = PublicApiRepository::create_public_device(
         store.as_ref(),
         &principal,
@@ -1476,6 +1479,9 @@ async fn update_device(
             .map_err(|_| PublicApiError::BadRequest)?,
     )
     .map_err(|_| PublicApiError::BadRequest)?;
+    if request.device_profile_id.is_present() {
+        return Err(PublicApiError::Forbidden);
+    }
     if request.asset_id.is_present() {
         require_user_capability(
             store.as_ref(),
