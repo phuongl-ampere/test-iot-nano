@@ -29,6 +29,12 @@ describe("PowerMonitor YMS style", () => {
     expect(styles).toContain(".range-control,\n.command-mode,\n.relay-actions {");
   });
 
+  it("keeps the navy rail readable and device assignment controls within a narrow screen", () => {
+    expect(styles).toMatch(/\.explorer\s*\{[\s\S]*?--pm-live: #7ee2b8;/);
+    expect(styles).toMatch(/\.unassigned-device-actions\s*\{[\s\S]*?flex-wrap: wrap;/);
+    expect(styles).toMatch(/\.unassigned-device-actions select\s*\{[\s\S]*?width: 100%;/);
+  });
+
   it("styles the resource hierarchy and workspace path", () => {
     expect(styles).toContain(".tree-children {");
     expect(styles).toContain(".tree-disclosure {");

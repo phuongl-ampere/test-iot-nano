@@ -1385,6 +1385,7 @@ button:disabled {
   --pm-accent-hover: #ffffff;
   --pm-accent-soft: rgb(255 119 92 / 18%);
   --pm-accent-bright: #ffffff;
+  --pm-live: #7ee2b8;
   color: var(--pm-text);
 }
 
@@ -1473,6 +1474,8 @@ button:disabled {
 .brightness-control button,
 .drawer-form button,
 .token-controls button,
+.drawer-close,
+.drawer-rule-list button,
 .powermonitor-login-action {
   min-height: 38px;
   border-radius: var(--yms-radius);
@@ -1501,6 +1504,10 @@ button:disabled {
   border-radius: var(--yms-radius);
 }
 
+.explorer-tabs button {
+  border-radius: var(--yms-radius);
+}
+
 @media (max-width: 760px) {
   .workspace-actions,
   .invitation-actions,
@@ -1519,5 +1526,21 @@ button:disabled {
   .resource-share,
   .alert-panel {
     padding: 18px;
+  }
+
+  .unassigned-device-list > li {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .unassigned-device-actions {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .unassigned-device-actions select,
+  .unassigned-device-actions button {
+    width: 100%;
+    min-width: 0;
   }
 }
