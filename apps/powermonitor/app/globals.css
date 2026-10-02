@@ -1,31 +1,39 @@
 :root {
-  color-scheme: dark;
-  --pm-canvas: #11181f;
-  --pm-sidebar: #0d151c;
-  --pm-surface: #1c2732;
-  --pm-surface-hover: #263744;
-  --pm-input: #16212b;
-  --pm-border: #31424f;
-  --pm-border-strong: #46606e;
-  --pm-border-subtle: #293945;
-  --pm-text: #edf5f7;
-  --pm-text-muted: #b2c6cf;
-  --pm-text-dim: #87a0ad;
-  --pm-accent: #22a6ad;
-  --pm-accent-hover: #198c95;
-  --pm-accent-soft: #153a43;
-  --pm-accent-bright: #69dde2;
-  --pm-live: #48d3ad;
-  --pm-offline: #718793;
-  --pm-warning: #f3bd5b;
-  --pm-on-warning: #1c1710;
-  --pm-danger: #ff8275;
-  --pm-danger-soft: #3b252a;
-  --pm-danger-text: #ffb4ad;
-  --pm-on-accent: #f7fcfd;
+  color-scheme: light;
+  --yms-canvas: #eef1f2;
+  --yms-panel: #ffffff;
+  --yms-primary: #253957;
+  --yms-accent: #ff775c;
+  --yms-radius: 9px;
+  --yms-panel-shadow: 0 2px 10px rgb(37 57 87 / 7%);
+  --yms-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --yms-font-serif: "Iowan Old Style", Iowan Old Style, Georgia, serif;
+  --pm-canvas: var(--yms-canvas);
+  --pm-sidebar: var(--yms-primary);
+  --pm-surface: var(--yms-panel);
+  --pm-surface-hover: #314866;
+  --pm-input: #f8fafb;
+  --pm-border: #d9e0e4;
+  --pm-border-strong: #bdc8d0;
+  --pm-border-subtle: #e8edef;
+  --pm-text: #253957;
+  --pm-text-muted: #53647a;
+  --pm-text-dim: #738197;
+  --pm-accent: var(--yms-primary);
+  --pm-accent-hover: #1c2d48;
+  --pm-accent-soft: #fff0ec;
+  --pm-accent-bright: var(--yms-accent);
+  --pm-live: #218765;
+  --pm-offline: #7a8796;
+  --pm-warning: #b87318;
+  --pm-on-warning: #253957;
+  --pm-danger: #bd4a42;
+  --pm-danger-soft: #fff0ee;
+  --pm-danger-text: #923a33;
+  --pm-on-accent: #ffffff;
   color: var(--pm-text);
   background: var(--pm-canvas);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--yms-font-sans);
 }
 
 * {
@@ -58,7 +66,7 @@ button:focus-visible,
 a:focus-visible,
 select:focus-visible,
 input:focus-visible {
-  outline: 3px solid var(--pm-warning);
+  outline: 3px solid var(--yms-accent);
   outline-offset: 2px;
 }
 
@@ -1362,5 +1370,154 @@ button:disabled {
 
   .reading-strip > div:nth-child(-n + 2) {
     border-bottom: 1px solid var(--pm-border);
+  }
+}
+
+/* YMS surface and control refinements */
+.explorer {
+  --pm-border: rgb(255 255 255 / 18%);
+  --pm-border-strong: rgb(255 255 255 / 28%);
+  --pm-border-subtle: rgb(255 255 255 / 13%);
+  --pm-text: #f7f9fb;
+  --pm-text-muted: #c4d0dd;
+  --pm-text-dim: #a8b9cc;
+  --pm-accent: var(--yms-accent);
+  --pm-accent-hover: #ffffff;
+  --pm-accent-soft: rgb(255 119 92 / 18%);
+  --pm-accent-bright: #ffffff;
+  color: var(--pm-text);
+}
+
+.brand-mark {
+  border-radius: var(--yms-radius);
+  background: var(--yms-accent);
+}
+
+.explorer-tabs button[aria-selected="true"] {
+  border-color: var(--yms-accent);
+  background: rgb(255 119 92 / 18%);
+  color: #ffffff;
+}
+
+.brand-lockup strong,
+.workspace-header h1,
+.section-heading h2,
+.command-panel h2,
+.device-control-panel h2,
+.resource-edit-header h2,
+.drawer-form h3,
+.drawer-section h3,
+.profile-line-chart h3 {
+  font-family: "Iowan Old Style", Iowan Old Style, Georgia, serif;
+  letter-spacing: -0.01em;
+}
+
+.reading-strip,
+.unassigned-device-panel,
+.invitation-panel,
+.claim-device-panel,
+.telemetry-section,
+.asset-details,
+.resource-profile,
+.resource-share,
+.alert-panel,
+.profile-line-chart,
+.powermonitor-login-panel,
+.resource-edit-drawer {
+  border: 1px solid var(--pm-border);
+  border-radius: var(--yms-radius);
+  background: var(--yms-panel);
+  box-shadow: var(--yms-panel-shadow);
+}
+
+.telemetry-section,
+.asset-details,
+.invitation-panel,
+.claim-device-panel,
+.resource-profile,
+.resource-share,
+.alert-panel {
+  margin: 18px 0;
+  padding: 22px;
+}
+
+.reading-strip {
+  overflow: hidden;
+}
+
+.reading-strip > div:last-child {
+  border-right: 0;
+}
+
+.workspace-actions,
+.invitation-actions,
+.share-form,
+.profile-form,
+.command-controls,
+.drawer-form-actions {
+  flex-wrap: wrap;
+}
+
+.workspace-actions,
+.invitation-actions,
+.command-controls {
+  align-items: center;
+}
+
+.workspace-actions > button,
+.workspace-actions > form > button,
+.invitation-actions button,
+.share-form button,
+.profile-form button,
+.command-controls > button,
+.brightness-control button,
+.drawer-form button,
+.token-controls button,
+.powermonitor-login-action {
+  min-height: 38px;
+  border-radius: var(--yms-radius);
+}
+
+.range-control,
+.command-mode,
+.relay-actions {
+  min-height: 38px;
+  border-radius: var(--yms-radius);
+}
+
+.unassigned-device-list > li,
+.invitation-list li,
+.claim-device-panel input,
+.share-form input,
+.share-form select,
+.profile-form select,
+.command-controls select,
+.brightness-control input[type="number"],
+.drawer-form input,
+.drawer-form select,
+.token-controls input,
+.powermonitor-login-field input,
+.switch-state {
+  border-radius: var(--yms-radius);
+}
+
+@media (max-width: 760px) {
+  .workspace-actions,
+  .invitation-actions,
+  .share-form,
+  .profile-form,
+  .command-controls,
+  .drawer-form-actions {
+    align-items: stretch;
+  }
+
+  .telemetry-section,
+  .asset-details,
+  .invitation-panel,
+  .claim-device-panel,
+  .resource-profile,
+  .resource-share,
+  .alert-panel {
+    padding: 18px;
   }
 }

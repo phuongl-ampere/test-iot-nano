@@ -5,18 +5,28 @@ import { describe, expect, it } from "vitest";
 
 const styles = readFileSync(resolve(process.cwd(), "app/globals.css"), "utf8");
 
-describe("PowerMonitor dark mode", () => {
-  it("uses dark application, workspace, and form surfaces", () => {
-    expect(styles).toContain("--pm-canvas: #11181f;");
-    expect(styles).toContain("--pm-surface: #1c2732;");
-    expect(styles).toContain("--pm-input: #16212b;");
-    expect(styles).toContain("color-scheme: dark;");
+describe("PowerMonitor YMS style", () => {
+  it("declares the approved light workspace tokens", () => {
+    expect(styles).toContain("--yms-canvas: #eef1f2;");
+    expect(styles).toContain("--yms-panel: #ffffff;");
+    expect(styles).toContain("--yms-primary: #253957;");
+    expect(styles).toContain("--yms-accent: #ff775c;");
+    expect(styles).toContain("--yms-radius: 9px;");
+    expect(styles).toContain("--pm-sidebar: var(--yms-primary);");
+    expect(styles).toContain("color-scheme: light;");
   });
 
-  it("preserves distinct semantic colors for live and error states", () => {
-    expect(styles).toContain("--pm-live: #48d3ad;");
-    expect(styles).toContain("--pm-danger: #ff8275;");
-    expect(styles).toContain("--pm-warning: #f3bd5b;");
+  it("uses serif display headings and coral keyboard focus", () => {
+    expect(styles).toContain('font-family: "Iowan Old Style", Iowan Old Style, Georgia, serif;');
+    expect(styles).toContain("outline: 3px solid var(--yms-accent);");
+  });
+
+  it("gives panels and responsive action groups the approved treatment", () => {
+    expect(styles).toContain("border-radius: var(--yms-radius);");
+    expect(styles).toContain("box-shadow: var(--yms-panel-shadow);");
+    expect(styles).toContain(".workspace-actions {");
+    expect(styles).toContain("flex-wrap: wrap;");
+    expect(styles).toContain(".range-control,\n.command-mode,\n.relay-actions {");
   });
 
   it("styles the resource hierarchy and workspace path", () => {
