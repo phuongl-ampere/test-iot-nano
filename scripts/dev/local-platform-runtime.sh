@@ -186,9 +186,9 @@ local_platform_stop() {
     return 1
   fi
 
+  local_platform_remove_launch_agent
   "$IOT_NANO_LOCAL_KILL_BIN" -TERM "$pid"
   local_platform_wait_for_shutdown "$pid"
-  local_platform_remove_launch_agent
   rm -f "$IOT_NANO_LOCAL_PID_FILE"
 }
 
@@ -282,6 +282,11 @@ local_platform_bootstrap() {
       run -p iot-nano-monolith -- --bootstrap-system
 }
 
+local_platform_build() {
+  "$IOT_NANO_LOCAL_CARGO_LANE" local-platform -- \
+    build -p iot-nano-monolith
+}
+
 local_platform_wait_for_http() {
   local path="$1"
   local attempts=0
@@ -317,7 +322,7 @@ local_platform_write_runner() {
     printf 'export IOT_NANO_LANE_TARGET_ROOT=%q\n' "$IOT_NANO_LOCAL_LANE_TARGET_ROOT"
     printf 'export PATH=%q\n' "$IOT_NANO_LOCAL_CARGO_BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin"
     printf 'cd %q\n' "$local_platform_helper_root"
-    printf 'exec %q local-platform -- run -p iot-nano-monolith\n' "$IOT_NANO_LOCAL_CARGO_LANE"
+    printf 'exec %q\n' "$IOT_NANO_LOCAL_BINARY_PATH"
   } >"$IOT_NANO_LOCAL_RUNNER_FILE"
   chmod 700 "$IOT_NANO_LOCAL_RUNNER_FILE"
 }
@@ -326,6 +331,7 @@ local_platform_start() {
   local pid
 
   local_platform_export_environment
+  local_platform_build
   local_platform_write_runner
   if [[ "$(uname -s)" == Darwin && -x "$IOT_NANO_LOCAL_LAUNCHCTL_BIN" ]]; then
     local_platform_remove_launch_agent

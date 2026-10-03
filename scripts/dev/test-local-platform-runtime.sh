@@ -94,6 +94,7 @@ if [[ "$1" == -0 ]]; then
   exit
 fi
 printf '%s\n' "$*" >>"$IOT_NANO_TEST_KILL_LOG"
+printf 'kill %s\n' "$*" >>"$IOT_NANO_TEST_LIFECYCLE_LOG"
 rm -f "$IOT_NANO_TEST_LISTENER"
 EOF
 chmod +x "$fixture/bin/kill"
@@ -103,15 +104,17 @@ cat >"$fixture/bin/launchctl" <<'EOF'
 set -euo pipefail
 
 printf '%s\n' "$*" >>"$IOT_NANO_TEST_LAUNCHCTL_LOG"
+printf 'launchctl %s\n' "$*" >>"$IOT_NANO_TEST_LIFECYCLE_LOG"
 EOF
 chmod +x "$fixture/bin/launchctl"
 
 export PATH="$fixture/bin:$PATH"
 export IOT_NANO_LOCAL_PLATFORM_ROOT="$platform_root"
-export IOT_NANO_HTTP_ADDRESS='127.0.0.1:18080'
+export IOT_NANO_HTTP_ADDRESS='127.0.0.1:18081'
 export IOT_NANO_TEST_LISTENER="$fixture/listener"
 export IOT_NANO_TEST_PLATFORM_PATH="$platform_root/platform.sqlite"
 export IOT_NANO_TEST_KILL_LOG="$fixture/kill.log"
+export IOT_NANO_TEST_LIFECYCLE_LOG="$fixture/lifecycle.log"
 export IOT_NANO_LOCAL_KILL_BIN="$fixture/bin/kill"
 export IOT_NANO_TEST_LAUNCHCTL_LOG="$fixture/launchctl.log"
 export IOT_NANO_LOCAL_LAUNCHCTL_BIN="$fixture/bin/launchctl"
@@ -138,6 +141,9 @@ local_platform_stop
 assert_present "$IOT_NANO_TEST_KILL_LOG"
 assert_present "$IOT_NANO_LOCAL_OWNER_FILE"
 assert_file_contains "$IOT_NANO_LOCAL_OWNER_FILE" "$root"
+first_lifecycle_action="$(head -n 1 "$IOT_NANO_TEST_LIFECYCLE_LOG")"
+[[ "$first_lifecycle_action" == 'launchctl remove '* ]] || \
+  fail 'launchd job must be removed before terminating the local monolith'
 
 local_platform_clear_state
 assert_missing "$platform_root/platform.sqlite"
@@ -149,11 +155,11 @@ assert_present "$platform_root/vault.key"
 assert_present "$platform_root/mqtt-cert.pem"
 assert_present "$platform_root/mqtt-key.pem"
 
-IOT_NANO_HTTP_ADDRESS='0.0.0.0:18080'
+IOT_NANO_HTTP_ADDRESS='0.0.0.0:18081'
 if local_platform_preflight 2>"$fixture/non-loopback.err"; then
   fail 'non-loopback runtime bindings must be rejected before reset'
 fi
-IOT_NANO_HTTP_ADDRESS='127.0.0.1:18080'
+IOT_NANO_HTTP_ADDRESS='127.0.0.1:18081'
 
 assert_file_contains "$seed" 'IOT_NANO_SEED_CONTROLLER_USERNAME'
 assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME'
@@ -172,8 +178,11 @@ assert_file_contains "$helper" 'IOT_NANO_ALLOW_INSECURE_DEFAULT_PASSWORDS'
 assert_file_contains "$helper" 'export IOT_NANO_LANE_TARGET_ROOT=%q'
 assert_file_contains "$helper" "cd %q\\n' \"\$local_platform_helper_root\""
 assert_file_contains "$helper" 'IOT_NANO_LOCAL_STARTUP_ATTEMPTS'
-assert_file_contains "$helper" 'local_platform_wait_for_management'
-assert_file_contains "$seed" 'management_url="$IOT_NANO_MANAGEMENT_URL"'
+assert_file_contains "$helper" 'local_platform_wait_for_http'
+assert_file_contains "$helper" 'local_platform_build'
+assert_file_contains "$helper" 'build -p iot-nano-monolith'
+assert_file_contains "$helper" "exec %q\\n' \"\$IOT_NANO_LOCAL_BINARY_PATH\""
+assert_file_contains "$seed" 'management_url="${IOT_NANO_HTTP_URL:-http://127.0.0.1:18081}"'
 assert_file_not_contains "$seed" '/domain-profiles'
 assert_file_contains "$seed" 'IOT_NANO_SEED_CONTROLLER_USERNAME:=seed-controller'
 assert_file_contains "$seed" 'IOT_NANO_SEED_UNASSIGNED_USERNAME:=seed-unassigned'
@@ -187,5 +196,12 @@ assert_file_contains "$seed" "'Power Farm'"
 assert_file_contains "$seed" "'Power Zone'"
 assert_file_contains "$seed" 'asset_profile_id: $asset_profile_id'
 assert_file_contains "$seed" 'device_profile_id: $device_profile_id'
+assert_file_contains "$seed" 'ensure_high_power_alert_rule'
+assert_file_contains "$seed" '"$management_url/api/v1/management/alert-rules"'
+assert_file_contains "$seed" 'name: "High active power"'
+assert_file_contains "$seed" 'metric_key: "power_w"'
+assert_file_contains "$seed" 'rule_type: "event_threshold"'
+assert_file_contains "$seed" 'threshold: 500'
+assert_file_contains "$seed" 'ensure_high_power_alert_rule "$device_id"'
 
 printf 'test-local-platform-runtime: ok\n'

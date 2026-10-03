@@ -356,6 +356,48 @@ ensure_device() {
   printf '%s' "$device_id"
 }
 
+ensure_high_power_alert_rule() {
+  local device_id="$1"
+  local rules_body="$state_dir/alert-rules.json"
+  local match_count
+  local rule_status
+
+  curl --fail --silent --show-error --cookie "$tenant_cookie" \
+    "$management_url/api/v1/management/alert-rules" >"$rules_body"
+  match_count="$(jq --arg device_id "$device_id" \
+    '[.[] | select(.device_id == $device_id and .name == "High active power")] | length' \
+    "$rules_body")"
+  if [[ "$match_count" == '1' ]]; then
+    return
+  fi
+  if [[ "$match_count" != '0' ]]; then
+    printf 'Seed alert rule for device %s is ambiguous.\n' "$device_id" >&2
+    return 1
+  fi
+
+  rule_status="$(request_status "$state_dir/alert-rule-${device_id}.json" \
+    --cookie "$tenant_cookie" \
+    --header 'Content-Type: application/json' \
+    --data "$(jq -nc --arg device_id "$device_id" '{
+      name: "High active power",
+      enabled: true,
+      device_id: $device_id,
+      metric_key: "power_w",
+      rule_type: "event_threshold",
+      comparison: "gt",
+      threshold: 500,
+      window_seconds: null,
+      for_seconds: 0,
+      resolve_after_seconds: 300,
+      reopen_grace_seconds: 3600,
+      hysteresis: null,
+      severity: "warning",
+      reminder_interval_seconds: 86400
+    }')" \
+    "$management_url/api/v1/management/alert-rules")"
+  require_status "$rule_status" 201 "High-power alert rule seed ($device_id)"
+}
+
 assign_asset_owner() {
   local asset_id="$1"
   local owner_user_id="$2"
@@ -497,6 +539,7 @@ for device_id in \
   "$farm_2_zone_1_device_1_id" "$farm_2_zone_1_device_2_id" \
   "$farm_2_zone_2_device_1_id" "$farm_2_zone_2_device_2_id"; do
   assign_device_owner "$device_id" "$owner_user_id"
+  ensure_high_power_alert_rule "$device_id"
 done
 
 login_owner
