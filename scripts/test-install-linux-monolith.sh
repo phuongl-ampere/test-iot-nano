@@ -20,6 +20,8 @@ assert_contains() {
 
 help_output="$(bash "$installer" --help)"
 assert_contains "$help_output" '--seed-mode MODE       starter (default), demo, or none.'
+assert_contains "$help_output" '--public-address ADDR  Default: 0.0.0.0:18080.'
+assert_contains "$(<"$installer")" 'public_address="0.0.0.0:18080"'
 assert_contains "$(<"$installer")" 'demo_seed()'
 assert_contains "$(<"$installer")" 'demo) demo_seed ;;'
 assert_contains "$(<"$installer")" 'http://127.0.0.1:${public_address##*:}'

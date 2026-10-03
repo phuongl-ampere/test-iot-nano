@@ -9,16 +9,16 @@ services:
       IOT_NANO_INTERNAL_DIR: /var/lib/iot-nano/internal
       IOT_NANO_TLS_CERT_PATH: /run/tls/mqtt-cert.pem
       IOT_NANO_TLS_KEY_PATH: /run/tls/mqtt-key.pem
-      IOT_NANO_HTTP_ADDRESS: 0.0.0.0:8080
+      IOT_NANO_HTTP_ADDRESS: 0.0.0.0:18080
       IOT_NANO_MQTT_TCP_ADDRESS: 0.0.0.0:1883
       IOT_NANO_MQTT_TLS_ADDRESS: 0.0.0.0:8883
       IOT_DEVICE_TOKEN_VAULT_KEY: ${IOT_DEVICE_TOKEN_VAULT_KEY:?IOT_DEVICE_TOKEN_VAULT_KEY is required}
     ports:
-      - "8080:8080"
+      - "18080:18080"
       - "1883:1883"
       - "8883:8883"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:18080/healthz"]
       interval: 5s
       timeout: 3s
       retries: 20

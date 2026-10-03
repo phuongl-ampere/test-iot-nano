@@ -103,6 +103,13 @@ fn config_uses_one_http_address_and_rejects_retired_listener_names() {
 }
 
 #[test]
+fn config_defaults_the_single_http_listener_to_18081() {
+    let config = MonolithConfig::from_values(sqlite_values()).unwrap();
+
+    assert_eq!(config.http, "127.0.0.1:18081".parse().unwrap());
+}
+
+#[test]
 fn config_requires_a_strong_device_token_vault_key() {
     let mut missing_key = sqlite_values();
     missing_key.remove("IOT_DEVICE_TOKEN_VAULT_KEY");

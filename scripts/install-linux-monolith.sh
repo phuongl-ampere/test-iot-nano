@@ -11,7 +11,7 @@ data_root="/var/lib/iot-nano"
 service_name="iot-nano-monolith.service"
 service_user="iotnano"
 seed_mode="starter"
-public_address="0.0.0.0:8080"
+public_address="0.0.0.0:18080"
 mqtt_address="0.0.0.0:1883"
 mqtt_tls_address="0.0.0.0:8883"
 web_https_enabled="false"
@@ -40,7 +40,7 @@ Commands:
 
 Options:
   --seed-mode MODE       starter (default), demo, or none.
-  --public-address ADDR  Default: 0.0.0.0:8080.
+  --public-address ADDR  Default: 0.0.0.0:18080.
   --powermonitor-url URL Launch URL seeded for Power Monitor demo mode.
   --yes                  Skip destructive uninstall confirmation.
   --purge-data           With uninstall, remove /var/lib/iot-nano.

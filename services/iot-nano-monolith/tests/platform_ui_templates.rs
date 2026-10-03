@@ -385,7 +385,7 @@ fn infrastructure_layout_renders_escaped_status_and_system_navigation_only() {
         vec![
             SystemInfrastructureStatusRow::new(
                 "Public HTTP listener",
-                "Listening on 127.0.0.1:8080",
+                "Listening on 127.0.0.1:18080",
             ),
             SystemInfrastructureStatusRow::new(
                 "MQTT TLS listener",
@@ -408,7 +408,7 @@ fn infrastructure_layout_renders_escaped_status_and_system_navigation_only() {
     assert!(rendered.contains("Runtime health"));
     assert!(rendered.contains("Ready"));
     assert!(rendered.contains("Public HTTP listener"));
-    assert!(rendered.contains("Listening on 127.0.0.1:8080"));
+    assert!(rendered.contains("Listening on 127.0.0.1:18080"));
     assert!(rendered.contains("Migrations"));
     assert!(rendered.contains("SQLite connected"));
     assert!(rendered.contains("&#60;secret-value&#62;"));

@@ -622,7 +622,7 @@ def main():
     )
     parser.add_argument(
         "--api-url",
-        default=os.environ.get("IOT_API_URL", "http://127.0.0.1:8080"),
+        default=os.environ.get("IOT_API_URL", "http://127.0.0.1:18080"),
     )
     parser.add_argument(
         "--admin-username",
