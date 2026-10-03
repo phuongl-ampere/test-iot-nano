@@ -142,3 +142,35 @@ Expected: all enabled tests and the Power Monitor build pass; environment-gated 
 - [ ] **Step 2: Mark plan and commit complete work**
 
 Mark every completed checkbox, inspect `git diff --check`, then commit the storage, API, console, test, and plan files with `feat: add tenant account personal access token`.
+
+### Task 5: Preserve Tenant Account actors for commands and invitations
+
+**Files:**
+- Modify: `crates/iot-storage/src/{schema/sqlite.rs,schema/postgres.rs,migrations/0001_platform.sql,contracts/resources.rs,domain/authorization.rs}`
+- Modify: `services/iot-nano-api/src/{core_facade.rs,public_v1.rs}`
+- Modify: `services/iot-nano-core` command authorization/storage contracts that consume `CoreAuthorizedCommandCreateRequest`
+- Modify: focused resource-ownership, command, and PAT API tests.
+
+**Interfaces:**
+- Produces an explicit tenant-scoped actor union (`TenantUser` or `TenantAccount`) for invitation sender and command issuer/audit records.
+- Consumes the existing `AuditPrincipal::TenantAccount` value rather than fabricating a `users` row.
+
+- [ ] **Step 1: Write failing PAT command and invitation contracts**
+
+Add PAT integration tests that issue a tenant-scoped command and create/cancel an invitation with a Tenant Account PAT. Assert the persisted command audit actor and invitation sender principal are the real Tenant Account, and a PAT from another tenant receives `403`.
+
+- [ ] **Step 2: Verify the contracts are red**
+
+Run: `cargo test -p iot-nano-api --test personal_access_tokens tenant_account_pat_can_issue_commands_and_invitations -- --exact`
+
+Expected: current public API rejects the `user_id: None` PAT principal before downstream operation, or storage cannot persist a Tenant Account sender.
+
+- [ ] **Step 3: Implement the explicit actor migration**
+
+Replace user-only invitation sender columns/model fields with a principal kind plus principal id constrained to exactly one tenant actor. Update SQLite and PostgreSQL canonical schemas/migration validation, invitation repository SQL, response-name resolution, and audit writes. Replace `CoreAuthorizedCommandCreateRequest.user_id` with `AuditPrincipal`, validate Tenant Account ownership of the target device in the same tenant, and preserve existing Tenant User behavior. Route PAT creation/cancel/command operations through `AuditPrincipal::TenantAccount`.
+
+- [ ] **Step 4: Verify actor parity is green**
+
+Run: `cargo test -p iot-nano-api --test personal_access_tokens -- --nocapture && cargo test -p iot-storage --test resource_ownership -- --nocapture && cargo test -p iot-nano-monolith --test command_response -- --nocapture`
+
+Expected: PAT and password-authenticated Tenant Account operations record the same truthful actor, with no cross-tenant access.

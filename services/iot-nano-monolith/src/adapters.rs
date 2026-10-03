@@ -79,7 +79,7 @@ impl CoreFacade for PlatformCoreFacade {
         let store = Arc::clone(&self.store);
         Box::pin(async move {
             validate_device_id(&request.command.device_id)?;
-            let user_id = request.user_id;
+            let actor = request.actor;
             let command = request.command;
             let tenant_id = command.tenant_id;
             let device_id = command.device_id;
@@ -94,7 +94,7 @@ impl CoreFacade for PlatformCoreFacade {
             .map_err(|_| CoreFacadeError::Rejected(400))?;
             let record = store
                 .enqueue_authorized_command(
-                    user_id,
+                    actor,
                     NewCommandOutboxEntry {
                         id: command.id.to_string(),
                         tenant_id,

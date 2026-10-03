@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS platform_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version = 5)
+    version INTEGER NOT NULL CHECK (version = 6)
 );
 
 CREATE TABLE IF NOT EXISTS system_accounts (
@@ -534,7 +534,9 @@ CREATE INDEX IF NOT EXISTS resource_permissions_active_asset_group_index
 CREATE TABLE IF NOT EXISTS resource_invitations (
     id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
-    sender_user_id UUID NOT NULL,
+    sender_principal_kind TEXT NOT NULL
+        CHECK (sender_principal_kind IN ('tenant_user', 'tenant_account')),
+    sender_principal_id UUID NOT NULL,
     recipient_user_id UUID NOT NULL,
     asset_id UUID,
     device_id TEXT,
@@ -548,8 +550,6 @@ CREATE TABLE IF NOT EXISTS resource_invitations (
         (asset_id IS NOT NULL AND device_id IS NULL)
         OR (asset_id IS NULL AND device_id IS NOT NULL)
     ),
-    FOREIGN KEY (sender_user_id, tenant_id)
-        REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (recipient_user_id, tenant_id)
         REFERENCES users(id, tenant_id) ON DELETE RESTRICT,
     FOREIGN KEY (asset_id, tenant_id)

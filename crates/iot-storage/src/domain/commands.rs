@@ -8,11 +8,12 @@ use sqlx::{
 };
 
 use crate::{
-    AccountClass, CommandLifecycleRepository, CommandOutboxRecord, CommandOutboxState,
-    CommandRepository, NewCommandOutboxEntry, NewNotificationOutboxEntry, NotificationKind,
-    NotificationOutboxRecord, NotificationOutboxState, NotificationRepository, PlatformStore,
-    PlatformStoreError, SqliteStore, SqliteStoreError, authorization_account_class,
-    canonical_notification, canonical_postgres_timestamp, timescale_tenant_device_is_locked,
+    AccountClass, AuditAction, AuditPrincipal, AuditTargetType, CommandLifecycleRepository,
+    CommandOutboxRecord, CommandOutboxState, CommandRepository, NewCommandOutboxEntry,
+    NewNotificationOutboxEntry, NotificationKind, NotificationOutboxRecord,
+    NotificationOutboxState, NotificationRepository, PlatformStore, PlatformStoreError,
+    SqliteStore, SqliteStoreError, audit, authorization_account_class, canonical_notification,
+    canonical_postgres_timestamp, timescale_tenant_device_is_locked,
 };
 
 impl PlatformStore {
@@ -44,7 +45,7 @@ impl PlatformStore {
 
     pub async fn enqueue_authorized_command(
         &self,
-        user_id: uuid::Uuid,
+        actor: AuditPrincipal,
         mut command: NewCommandOutboxEntry,
     ) -> Result<Option<CommandOutboxRecord>, PlatformStoreError> {
         let id = uuid::Uuid::parse_str(&command.id)
@@ -60,9 +61,9 @@ impl PlatformStore {
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
-                if !sqlite_user_can_issue_command(
+                if !sqlite_actor_can_issue_command(
                     &mut transaction,
-                    user_id,
+                    actor,
                     command.tenant_id,
                     &command.device_id,
                 )
@@ -73,6 +74,15 @@ impl PlatformStore {
                 let record =
                     enqueue_sqlite_platform_command_in_transaction(&mut transaction, &command)
                         .await?;
+                let event = audit::NewAuditEvent::new(
+                    command.tenant_id,
+                    actor,
+                    AuditAction::CommandIssued,
+                    AuditTargetType::Command,
+                    command.id.clone(),
+                    serde_json::json!({"device_id": command.device_id}),
+                );
+                audit::insert_sqlite_audit_event(&mut transaction, &event).await?;
                 transaction.commit().await?;
                 Ok(Some(record))
             }
@@ -81,9 +91,9 @@ impl PlatformStore {
                 sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
                     .execute(&mut *transaction)
                     .await?;
-                if !timescale_user_can_issue_command(
+                if !timescale_actor_can_issue_command(
                     &mut transaction,
-                    user_id,
+                    actor,
                     command.tenant_id,
                     &command.device_id,
                 )
@@ -98,6 +108,15 @@ impl PlatformStore {
                     &command,
                 )
                 .await?;
+                let event = audit::NewAuditEvent::new(
+                    command.tenant_id,
+                    actor,
+                    AuditAction::CommandIssued,
+                    AuditTargetType::Command,
+                    command.id.clone(),
+                    serde_json::json!({"device_id": command.device_id}),
+                );
+                audit::insert_timescale_audit_event(&mut transaction, &event).await?;
                 transaction.commit().await?;
                 Ok(Some(record))
             }
@@ -664,6 +683,58 @@ async fn enqueue_timescale_platform_command_in_transaction(
     }
 }
 
+async fn sqlite_actor_can_issue_command(
+    transaction: &mut Transaction<'_, Sqlite>,
+    actor: AuditPrincipal,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    match actor {
+        AuditPrincipal::User(user_id) => {
+            sqlite_user_can_issue_command(transaction, user_id, tenant_id, device_id).await
+        }
+        AuditPrincipal::TenantAccount(tenant_account_id) => {
+            sqlite_tenant_account_can_issue_command(
+                transaction,
+                tenant_account_id,
+                tenant_id,
+                device_id,
+            )
+            .await
+        }
+        AuditPrincipal::SystemAccount(_) => Ok(false),
+    }
+}
+
+async fn sqlite_tenant_account_can_issue_command(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_account_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    let account_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM tenant_accounts
+         WHERE id = ? AND tenant_id = ? AND status = 'active'",
+    )
+    .bind(tenant_account_id.to_string())
+    .bind(tenant_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some();
+    if !account_exists {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM devices
+         WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+    )
+    .bind(device_id)
+    .bind(tenant_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
 async fn sqlite_user_can_issue_command(
     transaction: &mut Transaction<'_, Sqlite>,
     user_id: uuid::Uuid,
@@ -752,6 +823,60 @@ async fn sqlite_user_can_issue_command(
     .bind(&user_id)
     .bind(&user_id)
     .bind(&user_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some())
+}
+
+async fn timescale_actor_can_issue_command(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: AuditPrincipal,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    match actor {
+        AuditPrincipal::User(user_id) => {
+            timescale_user_can_issue_command(transaction, user_id, tenant_id, device_id).await
+        }
+        AuditPrincipal::TenantAccount(tenant_account_id) => {
+            timescale_tenant_account_can_issue_command(
+                transaction,
+                tenant_account_id,
+                tenant_id,
+                device_id,
+            )
+            .await
+        }
+        AuditPrincipal::SystemAccount(_) => Ok(false),
+    }
+}
+
+async fn timescale_tenant_account_can_issue_command(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_account_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    device_id: &str,
+) -> Result<bool, PlatformStoreError> {
+    let account_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM tenant_accounts
+         WHERE id = $1 AND tenant_id = $2 AND status = 'active'
+         FOR SHARE",
+    )
+    .bind(tenant_account_id)
+    .bind(tenant_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .is_some();
+    if !account_exists {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM devices
+         WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+         FOR SHARE",
+    )
+    .bind(device_id)
+    .bind(tenant_id)
     .fetch_optional(&mut **transaction)
     .await?
     .is_some())

@@ -108,12 +108,14 @@ async fn sqlite_public_assets_are_invisible_across_tenants() {
     let tenant_a_principal = PublicPrincipal {
         tenant_id: tenant_a_id,
         user_id: Some(tenant_a_user_id),
+        tenant_account_id: None,
         app_id: "public-tenant-a-app".to_owned(),
         account_class: AccountClass::User,
     };
     let tenant_b_principal = PublicPrincipal {
         tenant_id: tenant_b_id,
         user_id: Some(tenant_b_user_id),
+        tenant_account_id: None,
         app_id: "public-tenant-b-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -163,18 +165,21 @@ async fn sqlite_tenant_account_principal_has_full_tenant_public_resource_authori
     let owner = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(owner_id),
+        tenant_account_id: None,
         app_id: "tenant-account-owner-app".to_owned(),
         account_class: AccountClass::User,
     };
     let tenant_account = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: None,
+        tenant_account_id: None,
         app_id: "tenant-personal-access-token".to_owned(),
         account_class: AccountClass::Admin,
     };
     let app_only = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: None,
+        tenant_account_id: None,
         app_id: "ordinary-app-only-token".to_owned(),
         account_class: AccountClass::User,
     };
@@ -452,12 +457,14 @@ async fn sqlite_public_legacy_admin_group_inherited_permission_controls_resource
     let owner = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(owner_id),
+        tenant_account_id: None,
         app_id: "public-owner-app".to_owned(),
         account_class: AccountClass::User,
     };
     let member = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(member_id),
+        tenant_account_id: None,
         app_id: "public-member-app".to_owned(),
         account_class: AccountClass::Admin,
     };
@@ -715,12 +722,14 @@ async fn sqlite_public_legacy_admin_is_denied_unshared_resources_and_mutations()
     let owner = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(owner_id),
+        tenant_account_id: None,
         app_id: "public-unshared-owner-app".to_owned(),
         account_class: AccountClass::User,
     };
     let legacy_admin = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(admin_id),
+        tenant_account_id: None,
         app_id: "public-legacy-admin-app".to_owned(),
         account_class: AccountClass::Admin,
     };
@@ -999,12 +1008,14 @@ async fn sqlite_public_asset_mutations_require_destination_access_and_valid_cont
     let owner = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(owner_id),
+        tenant_account_id: None,
         app_id: "public-parent-owner-app".to_owned(),
         account_class: AccountClass::User,
     };
     let source_owner = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(source_owner_id),
+        tenant_account_id: None,
         app_id: "public-parent-source-owner-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1182,12 +1193,14 @@ async fn timescale_public_legacy_admin_is_denied_unshared_assets() {
     let owner = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(owner_id),
+        tenant_account_id: None,
         app_id: "public-timescale-owner-app".to_owned(),
         account_class: AccountClass::User,
     };
     let legacy_admin = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(admin_id),
+        tenant_account_id: None,
         app_id: "public-timescale-admin-app".to_owned(),
         account_class: AccountClass::Admin,
     };
@@ -1261,6 +1274,7 @@ async fn sqlite_public_application_principal_cannot_create_resources() {
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: None,
+        tenant_account_id: None,
         app_id: "public-application-only".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1356,6 +1370,7 @@ async fn sqlite_public_telemetry_requires_a_matching_telemetry_tenant() {
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "public-telemetry-owner-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1563,6 +1578,7 @@ async fn sqlite_public_repository_filters_assets() {
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "public-repository-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1642,6 +1658,7 @@ async fn sqlite_public_device_permission_denies_direct_permissions_for_deleted_d
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "public-deleted-device-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1670,6 +1687,7 @@ async fn sqlite_public_device_repository_creates_updates_and_soft_deletes_owned_
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "public-device-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1781,6 +1799,7 @@ async fn sqlite_public_gateway_delete_refuses_active_children() {
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "public-gateway-delete-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1860,6 +1879,7 @@ async fn sqlite_public_device_asset_assignment_requires_asset_manager_permission
     let attacker = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(attacker_id),
+        tenant_account_id: None,
         app_id: "public-asset-attacker-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1932,6 +1952,7 @@ async fn sqlite_public_device_create_rejects_an_unavailable_profile_atomically()
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "public-profile-create-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -1983,6 +2004,7 @@ async fn sqlite_public_device_update_rejects_an_unavailable_profile_atomically()
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "public-profile-update-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -2059,6 +2081,7 @@ async fn sqlite_public_asset_create_rejects_a_cross_tenant_profile_atomically() 
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(owner_id),
+        tenant_account_id: None,
         app_id: "public-asset-profile-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -2125,6 +2148,7 @@ async fn sqlite_public_asset_update_rejects_a_cross_tenant_profile_atomically() 
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(owner_id),
+        tenant_account_id: None,
         app_id: "public-asset-profile-update-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -2206,6 +2230,7 @@ async fn sqlite_public_device_repository_hides_unknown_inaccessible_and_deleted_
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(viewer_id),
+        tenant_account_id: None,
         app_id: "public-device-app-2".to_owned(),
         account_class: AccountClass::User,
     };
@@ -2291,6 +2316,7 @@ async fn timescale_public_repository_creates_and_reads_an_asset() {
         &PublicPrincipal {
             tenant_id: test_tenant_id(),
             user_id: Some(user_id),
+            tenant_account_id: None,
             app_id: "timescale-public-app".to_owned(),
             account_class: AccountClass::User,
         },
@@ -2309,6 +2335,7 @@ async fn timescale_public_repository_creates_and_reads_an_asset() {
             &PublicPrincipal {
                 tenant_id: test_tenant_id(),
                 user_id: Some(user_id),
+                tenant_account_id: None,
                 app_id: "timescale-public-app".to_owned(),
                 account_class: AccountClass::User,
             },
@@ -2361,6 +2388,7 @@ async fn timescale_public_device_repository_matches_sqlite_mutation_contract() {
     let principal = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "timescale-public-device-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -2459,6 +2487,7 @@ async fn timescale_public_gateway_delete_refuses_active_children() {
     let principal = PublicPrincipal {
         tenant_id,
         user_id: Some(user_id),
+        tenant_account_id: None,
         app_id: "timescale-public-gateway-delete-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -2548,6 +2577,7 @@ async fn timescale_public_device_asset_assignment_requires_asset_manager_permiss
     let attacker = PublicPrincipal {
         tenant_id: test_tenant_id(),
         user_id: Some(attacker_id),
+        tenant_account_id: None,
         app_id: format!("timescale-public-asset-attacker-app-{unique}"),
         account_class: AccountClass::User,
     };
@@ -2644,6 +2674,7 @@ async fn timescale_public_device_create_rejects_an_unavailable_profile_atomicall
         &PublicPrincipal {
             tenant_id: test_tenant_id(),
             user_id: Some(user_id),
+            tenant_account_id: None,
             app_id: format!("timescale-unavailable-profile-app-{unavailable_profile_id}"),
             account_class: AccountClass::User,
         },
@@ -2743,6 +2774,7 @@ async fn timescale_public_device_assignment_serializes_with_management_asset_del
             &PublicPrincipal {
                 tenant_id: test_tenant_id(),
                 user_id: Some(owner_id),
+                tenant_account_id: None,
                 app_id: format!("timescale-asset-delete-app-{unique}"),
                 account_class: AccountClass::User,
             },
@@ -2855,6 +2887,7 @@ async fn timescale_public_device_assignment_waits_for_device_profile_lock() {
             &PublicPrincipal {
                 tenant_id: test_tenant_id(),
                 user_id: Some(user_id),
+                tenant_account_id: None,
                 app_id: format!("timescale-device-profile-lock-app-{unique}"),
                 account_class: AccountClass::User,
             },

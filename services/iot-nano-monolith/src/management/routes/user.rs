@@ -79,14 +79,18 @@ pub(in crate::management) async fn platform_app_invitations(
                         ),
                         _ => ("Resource", "Unavailable".to_owned()),
                     };
+                let sender_username = match invitation.sender {
+                    TenantActor::TenantUser(sender_user_id) => usernames
+                        .get(&sender_user_id)
+                        .cloned()
+                        .unwrap_or_else(|| sender_user_id.to_string()),
+                    TenantActor::TenantAccount(sender_account_id) => sender_account_id.to_string(),
+                };
                 crate::UserInvitationRow::new(
                     invitation.id,
                     resource_kind,
                     resource_name,
-                    usernames
-                        .get(&invitation.sender_user_id)
-                        .cloned()
-                        .unwrap_or_else(|| invitation.sender_user_id.to_string()),
+                    sender_username,
                     resource_permission_label(invitation.permission),
                 )
             })
@@ -615,7 +619,7 @@ pub(in crate::management) async fn create_user_resource_permission_form(
     match ResourceInvitationRepository::create_owner_resource_invitation(
         state.store.as_ref(),
         session.tenant_id,
-        session.user_id,
+        TenantActor::TenantUser(session.user_id),
         target.id,
         scope.ownership_target(),
         permission,
@@ -662,7 +666,7 @@ pub(in crate::management) async fn cancel_user_resource_invitation_form(
     ResourceInvitationRepository::cancel_resource_invitation(
         state.store.as_ref(),
         session.tenant_id,
-        session.user_id,
+        TenantActor::TenantUser(session.user_id),
         invitation_id,
     )
     .await

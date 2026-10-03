@@ -233,6 +233,7 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     let principal = PublicPrincipal {
         tenant_id,
         user_id: Some(viewer_id),
+        tenant_account_id: None,
         app_id: "public-list-handoff-app".to_owned(),
         account_class: AccountClass::User,
     };
@@ -249,6 +250,7 @@ async fn sqlite_public_device_list_handoff_only_pauses_the_selected_request() {
     let unrelated_principal = PublicPrincipal {
         tenant_id,
         user_id: Some(viewer_id),
+        tenant_account_id: None,
         app_id: "public-list-same-user-other-app".to_owned(),
         account_class: AccountClass::User,
     };

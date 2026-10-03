@@ -41,7 +41,7 @@ pub use resources::{
     NewResourcePermission, NewUserGroup, OwnershipTransferTarget, PermissionCreator,
     ResourceAccess, ResourceAccessSource, ResourceInvitation, ResourceInvitationRepository,
     ResourceInvitationState, ResourceKind, ResourcePermission, ResourcePermissionRecord,
-    TenantAuthorizationError, TenantAuthorizationRepository, TenantUserGroup,
+    TenantActor, TenantAuthorizationError, TenantAuthorizationRepository, TenantUserGroup,
     TenantUserGroupMember, UserDeviceActivity, UserDeviceActivityRepository, UserDeviceAlert,
     UserDeviceTelemetry, UserGroup,
 };

@@ -9,7 +9,7 @@ use crate::{
     AuthorizedDeviceListEntry, AuthorizedDeviceSummary, NewResourcePermission, NewUserGroup,
     OwnershipTransferTarget, PermissionCreator, PlatformStore, PlatformStoreError, ResourceAccess,
     ResourceAccessSource, ResourceInvitation, ResourceInvitationRepository,
-    ResourceInvitationState, ResourcePermission, ResourcePermissionRecord,
+    ResourceInvitationState, ResourcePermission, ResourcePermissionRecord, TenantActor,
     TenantAuthorizationError, TenantAuthorizationRepository, TenantUserGroup,
     TenantUserGroupMember, UserGroup, audit, authorization_account_class,
     parse_authorized_device_timestamp,
@@ -1331,7 +1331,7 @@ impl PlatformStore {
     pub async fn create_owner_resource_invitation(
         &self,
         tenant_id: uuid::Uuid,
-        sender_user_id: uuid::Uuid,
+        sender: TenantActor,
         recipient_user_id: uuid::Uuid,
         target: OwnershipTransferTarget,
         permission: ResourcePermission,
@@ -1342,20 +1342,25 @@ impl PlatformStore {
         ) {
             return Err(TenantAuthorizationError::InvalidPermissionLevel { permission });
         }
-        if sender_user_id == recipient_user_id {
+        if matches!(sender, TenantActor::TenantUser(sender_user_id) if sender_user_id == recipient_user_id)
+        {
             return Err(TenantAuthorizationError::OwnerCannotShareWithSelf);
         }
         let (asset_id, device_id) = resource_permission_scope(&target);
+        let (sender_principal_kind, sender_principal_id) = tenant_actor_storage_fields(sender);
         let invitation_id = uuid::Uuid::now_v7();
 
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
-                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
-                    .await?;
+                sqlite_require_resource_invitation_sender(
+                    &mut transaction,
+                    tenant_id,
+                    &target,
+                    sender,
+                )
+                .await?;
                 sqlite_require_regular_tenant_user(&mut transaction, tenant_id, recipient_user_id)
-                    .await?;
-                sqlite_require_resource_owner(&mut transaction, tenant_id, &target, sender_user_id)
                     .await?;
                 let existing_id = match asset_id {
                     Some(asset_id) => {
@@ -1387,11 +1392,13 @@ impl PlatformStore {
                     Some(existing_id) => {
                         sqlx::query(
                             "UPDATE resource_invitations
-                             SET permission = ?, sender_user_id = ?, updated_at = ?
+                             SET permission = ?, sender_principal_kind = ?,
+                                 sender_principal_id = ?, updated_at = ?
                              WHERE id = ? AND tenant_id = ?",
                         )
                         .bind(permission.as_str())
-                        .bind(sender_user_id.to_string())
+                        .bind(sender_principal_kind)
+                        .bind(sender_principal_id.to_string())
                         .bind(Utc::now().to_rfc3339())
                         .bind(&existing_id)
                         .bind(tenant_id.to_string())
@@ -1403,13 +1410,14 @@ impl PlatformStore {
                     None => {
                         sqlx::query(
                             "INSERT INTO resource_invitations (
-                                id, tenant_id, sender_user_id, recipient_user_id, asset_id,
-                                device_id, permission, state
-                             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+                                id, tenant_id, sender_principal_kind, sender_principal_id,
+                                recipient_user_id, asset_id, device_id, permission, state
+                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
                         )
                         .bind(invitation_id.to_string())
                         .bind(tenant_id.to_string())
-                        .bind(sender_user_id.to_string())
+                        .bind(sender_principal_kind)
+                        .bind(sender_principal_id.to_string())
                         .bind(recipient_user_id.to_string())
                         .bind(asset_id.map(|id| id.to_string()))
                         .bind(device_id.as_deref())
@@ -1423,7 +1431,7 @@ impl PlatformStore {
                 Ok(ResourceInvitation {
                     id,
                     tenant_id,
-                    sender_user_id,
+                    sender,
                     recipient_user_id,
                     asset_id,
                     device_id,
@@ -1433,19 +1441,17 @@ impl PlatformStore {
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
-                timescale_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
-                    .await?;
+                timescale_require_resource_invitation_sender(
+                    &mut transaction,
+                    tenant_id,
+                    &target,
+                    sender,
+                )
+                .await?;
                 timescale_require_regular_tenant_user(
                     &mut transaction,
                     tenant_id,
                     recipient_user_id,
-                )
-                .await?;
-                timescale_require_resource_owner(
-                    &mut transaction,
-                    tenant_id,
-                    &target,
-                    sender_user_id,
                 )
                 .await?;
                 let existing_id = match asset_id {
@@ -1480,12 +1486,14 @@ impl PlatformStore {
                     Some(existing_id) => {
                         sqlx::query(
                             "UPDATE resource_invitations
-                             SET permission = $2, sender_user_id = $3, updated_at = now()
-                             WHERE id = $1 AND tenant_id = $4",
+                             SET permission = $2, sender_principal_kind = $3,
+                                 sender_principal_id = $4, updated_at = now()
+                             WHERE id = $1 AND tenant_id = $5",
                         )
                         .bind(existing_id)
                         .bind(permission.as_str())
-                        .bind(sender_user_id)
+                        .bind(sender_principal_kind)
+                        .bind(sender_principal_id)
                         .bind(tenant_id)
                         .execute(&mut *transaction)
                         .await?;
@@ -1494,13 +1502,14 @@ impl PlatformStore {
                     None => {
                         sqlx::query(
                             "INSERT INTO resource_invitations (
-                                id, tenant_id, sender_user_id, recipient_user_id, asset_id,
-                                device_id, permission, state
-                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')",
+                                id, tenant_id, sender_principal_kind, sender_principal_id,
+                                recipient_user_id, asset_id, device_id, permission, state
+                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')",
                         )
                         .bind(invitation_id)
                         .bind(tenant_id)
-                        .bind(sender_user_id)
+                        .bind(sender_principal_kind)
+                        .bind(sender_principal_id)
                         .bind(recipient_user_id)
                         .bind(asset_id)
                         .bind(device_id.as_deref())
@@ -1514,7 +1523,7 @@ impl PlatformStore {
                 Ok(ResourceInvitation {
                     id,
                     tenant_id,
-                    sender_user_id,
+                    sender,
                     recipient_user_id,
                     asset_id,
                     device_id,
@@ -1536,9 +1545,20 @@ impl PlatformStore {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
                 sqlite_require_regular_tenant_user(&mut transaction, tenant_id, recipient_user_id)
                     .await?;
-                let (sender, asset_id, device_id, permission, state) =
-                    sqlx::query_as::<_, (String, Option<String>, Option<String>, String, String)>(
-                        "SELECT sender_user_id, asset_id, device_id, permission, state
+                let (sender_kind, sender_id, asset_id, device_id, permission, state) =
+                    sqlx::query_as::<
+                        _,
+                        (
+                            String,
+                            String,
+                            Option<String>,
+                            Option<String>,
+                            String,
+                            String,
+                        ),
+                    >(
+                        "SELECT sender_principal_kind, sender_principal_id,
+                                asset_id, device_id, permission, state
                      FROM resource_invitations
                      WHERE id = ? AND tenant_id = ? AND recipient_user_id = ?",
                     )
@@ -1556,15 +1576,17 @@ impl PlatformStore {
                 if state != ResourceInvitationState::Pending {
                     return Err(TenantAuthorizationError::InvitationNotPending { invitation_id });
                 }
-                let sender_user_id = uuid::Uuid::parse_str(&sender)
-                    .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+                let sender = tenant_actor_from_storage(&sender_kind, &sender_id)?;
                 let target =
                     invitation_target_from_sqlite(asset_id.as_deref(), device_id.as_deref())?;
                 let permission = invitation_permission(&permission)?;
-                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
-                    .await?;
-                sqlite_require_resource_owner(&mut transaction, tenant_id, &target, sender_user_id)
-                    .await?;
+                sqlite_require_resource_invitation_sender(
+                    &mut transaction,
+                    tenant_id,
+                    &target,
+                    sender,
+                )
+                .await?;
                 let (target_asset_id, target_device_id) = resource_permission_scope(&target);
                 let existing_permission = match target_asset_id {
                     Some(asset_id) => {
@@ -1611,11 +1633,14 @@ impl PlatformStore {
                     }
                     None => {
                         let permission_id = uuid::Uuid::now_v7();
+                        let (created_by_user_id, created_by_tenant_account_id) =
+                            invitation_permission_creator_ids(sender);
                         sqlx::query(
                             "INSERT INTO resource_permissions (
                                 id, tenant_id, subject_user_id, asset_id, device_id,
-                                permission, inherit_children, created_by_user_id
-                             ) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                                permission, inherit_children, created_by_user_id,
+                                created_by_tenant_account_id
+                             ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
                         )
                         .bind(permission_id.to_string())
                         .bind(tenant_id.to_string())
@@ -1623,7 +1648,8 @@ impl PlatformStore {
                         .bind(target_asset_id.map(|id| id.to_string()))
                         .bind(target_device_id.as_deref())
                         .bind(permission.as_str())
-                        .bind(sender_user_id.to_string())
+                        .bind(created_by_user_id.map(|id| id.to_string()))
+                        .bind(created_by_tenant_account_id.map(|id| id.to_string()))
                         .execute(&mut *transaction)
                         .await?;
                     }
@@ -1644,7 +1670,7 @@ impl PlatformStore {
                 Ok(ResourceInvitation {
                     id: invitation_id,
                     tenant_id,
-                    sender_user_id,
+                    sender,
                     recipient_user_id,
                     asset_id: target_asset_id,
                     device_id: target_device_id,
@@ -1660,44 +1686,46 @@ impl PlatformStore {
                     recipient_user_id,
                 )
                 .await?;
-                let (sender_user_id, asset_id, device_id, permission, state) = sqlx::query_as::<
-                    _,
-                    (
-                        uuid::Uuid,
-                        Option<uuid::Uuid>,
-                        Option<String>,
-                        String,
-                        String,
-                    ),
-                >(
-                    "SELECT sender_user_id, asset_id, device_id, permission, state
+                let (sender_kind, sender_id, asset_id, device_id, permission, state) =
+                    sqlx::query_as::<
+                        _,
+                        (
+                            String,
+                            uuid::Uuid,
+                            Option<uuid::Uuid>,
+                            Option<String>,
+                            String,
+                            String,
+                        ),
+                    >(
+                        "SELECT sender_principal_kind, sender_principal_id,
+                            asset_id, device_id, permission, state
                      FROM resource_invitations
                      WHERE id = $1 AND tenant_id = $2 AND recipient_user_id = $3
                      FOR UPDATE",
-                )
-                .bind(invitation_id)
-                .bind(tenant_id)
-                .bind(recipient_user_id)
-                .fetch_optional(&mut *transaction)
-                .await?
-                .ok_or(TenantAuthorizationError::InvitationNotFound {
-                    tenant_id,
-                    invitation_id,
-                })?;
+                    )
+                    .bind(invitation_id)
+                    .bind(tenant_id)
+                    .bind(recipient_user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .ok_or(TenantAuthorizationError::InvitationNotFound {
+                        tenant_id,
+                        invitation_id,
+                    })?;
                 let state = ResourceInvitationState::parse(&state)
                     .ok_or(TenantAuthorizationError::InvalidStoredRecord)?;
                 if state != ResourceInvitationState::Pending {
                     return Err(TenantAuthorizationError::InvitationNotPending { invitation_id });
                 }
+                let sender = tenant_actor_from_postgres_storage(&sender_kind, sender_id)?;
                 let target = invitation_target_from_timescale(asset_id, device_id.as_deref())?;
                 let permission = invitation_permission(&permission)?;
-                timescale_require_regular_tenant_user(&mut transaction, tenant_id, sender_user_id)
-                    .await?;
-                timescale_require_resource_owner(
+                timescale_require_resource_invitation_sender(
                     &mut transaction,
                     tenant_id,
                     &target,
-                    sender_user_id,
+                    sender,
                 )
                 .await?;
                 let (target_asset_id, target_device_id) = resource_permission_scope(&target);
@@ -1747,11 +1775,14 @@ impl PlatformStore {
                         }
                     }
                     None => {
+                        let (created_by_user_id, created_by_tenant_account_id) =
+                            invitation_permission_creator_ids(sender);
                         sqlx::query(
                             "INSERT INTO resource_permissions (
                                 id, tenant_id, subject_user_id, asset_id, device_id,
-                                permission, inherit_children, created_by_user_id
-                             ) VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7)",
+                                permission, inherit_children, created_by_user_id,
+                                created_by_tenant_account_id
+                             ) VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8)",
                         )
                         .bind(uuid::Uuid::now_v7())
                         .bind(tenant_id)
@@ -1759,7 +1790,8 @@ impl PlatformStore {
                         .bind(target_asset_id)
                         .bind(target_device_id.as_deref())
                         .bind(permission.as_str())
-                        .bind(sender_user_id)
+                        .bind(created_by_user_id)
+                        .bind(created_by_tenant_account_id)
                         .execute(&mut *transaction)
                         .await?;
                     }
@@ -1777,7 +1809,7 @@ impl PlatformStore {
                 Ok(ResourceInvitation {
                     id: invitation_id,
                     tenant_id,
-                    sender_user_id,
+                    sender,
                     recipient_user_id,
                     asset_id: target_asset_id,
                     device_id: target_device_id,
@@ -1791,51 +1823,105 @@ impl PlatformStore {
     pub async fn cancel_resource_invitation(
         &self,
         tenant_id: uuid::Uuid,
-        recipient_user_id: uuid::Uuid,
+        actor: TenantActor,
         invitation_id: uuid::Uuid,
     ) -> Result<bool, TenantAuthorizationError> {
         match self {
             Self::Sqlite(store) => {
                 let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
-                sqlite_require_regular_tenant_user(&mut transaction, tenant_id, recipient_user_id)
-                    .await?;
-                let cancelled = sqlx::query(
-                    "UPDATE resource_invitations
-                     SET state = 'cancelled', updated_at = ?, closed_at = ?
-                     WHERE id = ? AND tenant_id = ? AND recipient_user_id = ? AND state = 'pending'",
-                )
-                .bind(Utc::now().to_rfc3339())
-                .bind(Utc::now().to_rfc3339())
-                .bind(invitation_id.to_string())
-                .bind(tenant_id.to_string())
-                .bind(recipient_user_id.to_string())
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected()
-                    > 0;
+                let cancelled = match actor {
+                    TenantActor::TenantUser(recipient_user_id) => {
+                        sqlite_require_regular_tenant_user(
+                            &mut transaction,
+                            tenant_id,
+                            recipient_user_id,
+                        )
+                        .await?;
+                        sqlx::query(
+                            "UPDATE resource_invitations
+                             SET state = 'cancelled', updated_at = ?, closed_at = ?
+                             WHERE id = ? AND tenant_id = ? AND recipient_user_id = ?
+                               AND state = 'pending'",
+                        )
+                        .bind(Utc::now().to_rfc3339())
+                        .bind(Utc::now().to_rfc3339())
+                        .bind(invitation_id.to_string())
+                        .bind(tenant_id.to_string())
+                        .bind(recipient_user_id.to_string())
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected()
+                            > 0
+                    }
+                    TenantActor::TenantAccount(tenant_account_id) => {
+                        sqlite_require_tenant_account(
+                            &mut transaction,
+                            tenant_id,
+                            tenant_account_id,
+                        )
+                        .await?;
+                        sqlx::query(
+                            "UPDATE resource_invitations
+                             SET state = 'cancelled', updated_at = ?, closed_at = ?
+                             WHERE id = ? AND tenant_id = ? AND state = 'pending'",
+                        )
+                        .bind(Utc::now().to_rfc3339())
+                        .bind(Utc::now().to_rfc3339())
+                        .bind(invitation_id.to_string())
+                        .bind(tenant_id.to_string())
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected()
+                            > 0
+                    }
+                };
                 transaction.commit().await?;
                 Ok(cancelled)
             }
             Self::Timescale(pool) => {
                 let mut transaction = pool.begin().await?;
-                timescale_require_regular_tenant_user(
-                    &mut transaction,
-                    tenant_id,
-                    recipient_user_id,
-                )
-                .await?;
-                let cancelled = sqlx::query(
-                    "UPDATE resource_invitations
-                     SET state = 'cancelled', updated_at = now(), closed_at = now()
-                     WHERE id = $1 AND tenant_id = $2 AND recipient_user_id = $3 AND state = 'pending'",
-                )
-                .bind(invitation_id)
-                .bind(tenant_id)
-                .bind(recipient_user_id)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected()
-                    > 0;
+                let cancelled = match actor {
+                    TenantActor::TenantUser(recipient_user_id) => {
+                        timescale_require_regular_tenant_user(
+                            &mut transaction,
+                            tenant_id,
+                            recipient_user_id,
+                        )
+                        .await?;
+                        sqlx::query(
+                            "UPDATE resource_invitations
+                             SET state = 'cancelled', updated_at = now(), closed_at = now()
+                             WHERE id = $1 AND tenant_id = $2 AND recipient_user_id = $3
+                               AND state = 'pending'",
+                        )
+                        .bind(invitation_id)
+                        .bind(tenant_id)
+                        .bind(recipient_user_id)
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected()
+                            > 0
+                    }
+                    TenantActor::TenantAccount(tenant_account_id) => {
+                        timescale_require_tenant_account(
+                            &mut transaction,
+                            tenant_id,
+                            tenant_account_id,
+                        )
+                        .await?;
+                        sqlx::query(
+                            "UPDATE resource_invitations
+                             SET state = 'cancelled', updated_at = now(), closed_at = now()
+                             WHERE id = $1 AND tenant_id = $2 AND state = 'pending'",
+                        )
+                        .bind(invitation_id)
+                        .bind(tenant_id)
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected()
+                            > 0
+                    }
+                };
                 transaction.commit().await?;
                 Ok(cancelled)
             }
@@ -1855,12 +1941,14 @@ impl PlatformStore {
                         String,
                         String,
                         String,
+                        String,
                         Option<String>,
                         Option<String>,
                         String,
                     ),
                 >(
-                    "SELECT id, sender_user_id, recipient_user_id, asset_id, device_id, permission
+                    "SELECT id, sender_principal_kind, sender_principal_id,
+                            recipient_user_id, asset_id, device_id, permission
                      FROM resource_invitations
                      WHERE tenant_id = ? AND recipient_user_id = ? AND state = 'pending'
                      ORDER BY created_at, id",
@@ -1870,29 +1958,38 @@ impl PlatformStore {
                 .fetch_all(store.pool())
                 .await?;
                 rows.into_iter()
-                    .map(|(id, sender, recipient, asset_id, device_id, permission)| {
-                        let id = uuid::Uuid::parse_str(&id)
-                            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
-                        let sender_user_id = uuid::Uuid::parse_str(&sender)
-                            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
-                        let recipient_user_id = uuid::Uuid::parse_str(&recipient)
-                            .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
-                        let target = invitation_target_from_sqlite(
-                            asset_id.as_deref(),
-                            device_id.as_deref(),
-                        )?;
-                        let (asset_id, device_id) = resource_permission_scope(&target);
-                        Ok(ResourceInvitation {
+                    .map(
+                        |(
                             id,
-                            tenant_id,
-                            sender_user_id,
-                            recipient_user_id,
+                            sender_kind,
+                            sender_id,
+                            recipient,
                             asset_id,
                             device_id,
-                            permission: invitation_permission(&permission)?,
-                            state: ResourceInvitationState::Pending,
-                        })
-                    })
+                            permission,
+                        )| {
+                            let id = uuid::Uuid::parse_str(&id)
+                                .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+                            let sender = tenant_actor_from_storage(&sender_kind, &sender_id)?;
+                            let recipient_user_id = uuid::Uuid::parse_str(&recipient)
+                                .map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+                            let target = invitation_target_from_sqlite(
+                                asset_id.as_deref(),
+                                device_id.as_deref(),
+                            )?;
+                            let (asset_id, device_id) = resource_permission_scope(&target);
+                            Ok(ResourceInvitation {
+                                id,
+                                tenant_id,
+                                sender,
+                                recipient_user_id,
+                                asset_id,
+                                device_id,
+                                permission: invitation_permission(&permission)?,
+                                state: ResourceInvitationState::Pending,
+                            })
+                        },
+                    )
                     .collect()
             }
             Self::Timescale(pool) => {
@@ -1900,6 +1997,7 @@ impl PlatformStore {
                     _,
                     (
                         uuid::Uuid,
+                        String,
                         uuid::Uuid,
                         uuid::Uuid,
                         Option<uuid::Uuid>,
@@ -1907,7 +2005,8 @@ impl PlatformStore {
                         String,
                     ),
                 >(
-                    "SELECT id, sender_user_id, recipient_user_id, asset_id, device_id, permission
+                    "SELECT id, sender_principal_kind, sender_principal_id,
+                            recipient_user_id, asset_id, device_id, permission
                      FROM resource_invitations
                      WHERE tenant_id = $1 AND recipient_user_id = $2 AND state = 'pending'
                      ORDER BY created_at, id",
@@ -1920,19 +2019,22 @@ impl PlatformStore {
                     .map(
                         |(
                             id,
-                            sender_user_id,
+                            sender_kind,
+                            sender_id,
                             recipient_user_id,
                             asset_id,
                             device_id,
                             permission,
                         )| {
+                            let sender =
+                                tenant_actor_from_postgres_storage(&sender_kind, sender_id)?;
                             let target =
                                 invitation_target_from_timescale(asset_id, device_id.as_deref())?;
                             let (asset_id, device_id) = resource_permission_scope(&target);
                             Ok(ResourceInvitation {
                                 id,
                                 tenant_id,
-                                sender_user_id,
+                                sender,
                                 recipient_user_id,
                                 asset_id,
                                 device_id,
@@ -2585,7 +2687,7 @@ impl ResourceInvitationRepository for PlatformStore {
     fn create_owner_resource_invitation<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
-        sender_user_id: uuid::Uuid,
+        sender: TenantActor,
         recipient_user_id: uuid::Uuid,
         target: OwnershipTransferTarget,
         permission: ResourcePermission,
@@ -2596,7 +2698,7 @@ impl ResourceInvitationRepository for PlatformStore {
             PlatformStore::create_owner_resource_invitation(
                 self,
                 tenant_id,
-                sender_user_id,
+                sender,
                 recipient_user_id,
                 target,
                 permission,
@@ -2627,17 +2729,11 @@ impl ResourceInvitationRepository for PlatformStore {
     fn cancel_resource_invitation<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
-        recipient_user_id: uuid::Uuid,
+        actor: TenantActor,
         invitation_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>> {
         Box::pin(async move {
-            PlatformStore::cancel_resource_invitation(
-                self,
-                tenant_id,
-                recipient_user_id,
-                invitation_id,
-            )
-            .await
+            PlatformStore::cancel_resource_invitation(self, tenant_id, actor, invitation_id).await
         })
     }
 
@@ -3027,6 +3123,42 @@ fn invitation_target_from_timescale(
     }
 }
 
+fn tenant_actor_storage_fields(actor: TenantActor) -> (&'static str, uuid::Uuid) {
+    match actor {
+        TenantActor::TenantUser(id) => ("tenant_user", id),
+        TenantActor::TenantAccount(id) => ("tenant_account", id),
+    }
+}
+
+fn tenant_actor_from_storage(
+    kind: &str,
+    id: &str,
+) -> Result<TenantActor, TenantAuthorizationError> {
+    let id =
+        uuid::Uuid::parse_str(id).map_err(|_| TenantAuthorizationError::InvalidStoredRecord)?;
+    tenant_actor_from_postgres_storage(kind, id)
+}
+
+fn tenant_actor_from_postgres_storage(
+    kind: &str,
+    id: uuid::Uuid,
+) -> Result<TenantActor, TenantAuthorizationError> {
+    match kind {
+        "tenant_user" => Ok(TenantActor::TenantUser(id)),
+        "tenant_account" => Ok(TenantActor::TenantAccount(id)),
+        _ => Err(TenantAuthorizationError::InvalidStoredRecord),
+    }
+}
+
+fn invitation_permission_creator_ids(
+    actor: TenantActor,
+) -> (Option<uuid::Uuid>, Option<uuid::Uuid>) {
+    match actor {
+        TenantActor::TenantUser(id) => (Some(id), None),
+        TenantActor::TenantAccount(id) => (None, Some(id)),
+    }
+}
+
 fn resource_permission_scope(
     target: &OwnershipTransferTarget,
 ) -> (Option<uuid::Uuid>, Option<String>) {
@@ -3282,6 +3414,31 @@ async fn sqlite_require_tenant_account(
     }
 }
 
+async fn sqlite_require_resource_invitation_sender(
+    transaction: &mut Transaction<'_, Sqlite>,
+    tenant_id: uuid::Uuid,
+    target: &OwnershipTransferTarget,
+    sender: TenantActor,
+) -> Result<(), TenantAuthorizationError> {
+    match sender {
+        TenantActor::TenantUser(user_id) => {
+            sqlite_require_regular_tenant_user(transaction, tenant_id, user_id).await?;
+            sqlite_require_resource_owner(transaction, tenant_id, target, user_id).await
+        }
+        TenantActor::TenantAccount(tenant_account_id) => {
+            sqlite_require_tenant_account(transaction, tenant_id, tenant_account_id).await?;
+            match target {
+                OwnershipTransferTarget::Asset(asset_id) => {
+                    sqlite_require_tenant_asset(transaction, tenant_id, *asset_id).await
+                }
+                OwnershipTransferTarget::Device(device_id) => {
+                    sqlite_require_tenant_device(transaction, tenant_id, device_id).await
+                }
+            }
+        }
+    }
+}
+
 async fn sqlite_require_tenant_audit_actor(
     transaction: &mut Transaction<'_, Sqlite>,
     tenant_id: uuid::Uuid,
@@ -3528,6 +3685,31 @@ async fn timescale_require_tenant_account(
             tenant_id,
             tenant_account_id,
         })
+    }
+}
+
+async fn timescale_require_resource_invitation_sender(
+    transaction: &mut Transaction<'_, Postgres>,
+    tenant_id: uuid::Uuid,
+    target: &OwnershipTransferTarget,
+    sender: TenantActor,
+) -> Result<(), TenantAuthorizationError> {
+    match sender {
+        TenantActor::TenantUser(user_id) => {
+            timescale_require_regular_tenant_user(transaction, tenant_id, user_id).await?;
+            timescale_require_resource_owner(transaction, tenant_id, target, user_id).await
+        }
+        TenantActor::TenantAccount(tenant_account_id) => {
+            timescale_require_tenant_account(transaction, tenant_id, tenant_account_id).await?;
+            match target {
+                OwnershipTransferTarget::Asset(asset_id) => {
+                    timescale_require_tenant_asset(transaction, tenant_id, *asset_id).await
+                }
+                OwnershipTransferTarget::Device(device_id) => {
+                    timescale_require_tenant_device(transaction, tenant_id, device_id).await
+                }
+            }
+        }
     }
 }
 

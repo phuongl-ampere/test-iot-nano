@@ -198,6 +198,12 @@ pub enum PermissionCreator {
     TenantAccount(uuid::Uuid),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantActor {
+    TenantUser(uuid::Uuid),
+    TenantAccount(uuid::Uuid),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipTransferTarget {
     Asset(uuid::Uuid),
@@ -240,7 +246,7 @@ impl ResourceInvitationState {
 pub struct ResourceInvitation {
     pub id: uuid::Uuid,
     pub tenant_id: uuid::Uuid,
-    pub sender_user_id: uuid::Uuid,
+    pub sender: TenantActor,
     pub recipient_user_id: uuid::Uuid,
     pub asset_id: Option<uuid::Uuid>,
     pub device_id: Option<String>,
@@ -536,7 +542,7 @@ pub trait ResourceInvitationRepository: Send + Sync {
     fn create_owner_resource_invitation<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
-        sender_user_id: uuid::Uuid,
+        sender: TenantActor,
         recipient_user_id: uuid::Uuid,
         target: OwnershipTransferTarget,
         permission: ResourcePermission,
@@ -554,7 +560,7 @@ pub trait ResourceInvitationRepository: Send + Sync {
     fn cancel_resource_invitation<'a>(
         &'a self,
         tenant_id: uuid::Uuid,
-        recipient_user_id: uuid::Uuid,
+        actor: TenantActor,
         invitation_id: uuid::Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<bool, TenantAuthorizationError>> + Send + 'a>>;
     fn list_pending_resource_invitations<'a>(

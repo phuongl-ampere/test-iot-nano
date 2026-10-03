@@ -3,9 +3,10 @@ use iot_storage::{
     AuditPrincipal, AuthorizationRepository, CreateManagementAsset, DeviceTokenRepository,
     DeviceTokenRepositoryError, ManagementAssetError, ManagementAssetRepository,
     ManagementDeviceError, ManagementDeviceRepository, NewDeviceToken, NewOwnedDeviceToken,
-    OwnershipTransferTarget, PlatformStore, ResourceAccessSource, ResourceInvitationRepository,
-    ResourceInvitationState, ResourcePermission, TenantAuthorizationError,
-    TenantAuthorizationRepository, UpdateManagementAsset, UpdateManagementDevice,
+    OwnershipTransferTarget, PermissionCreator, PlatformStore, ResourceAccessSource,
+    ResourceInvitationRepository, ResourceInvitationState, ResourcePermission, TenantActor,
+    TenantAuthorizationError, TenantAuthorizationRepository, UpdateManagementAsset,
+    UpdateManagementDevice,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -228,7 +229,7 @@ async fn pending_owner_invitation_does_not_authorize_the_recipient() {
     let invitation = ResourceInvitationRepository::create_owner_resource_invitation(
         &store,
         tenant_id,
-        owner,
+        TenantActor::TenantUser(owner),
         recipient,
         OwnershipTransferTarget::Device("invited-device".to_owned()),
         ResourcePermission::Viewer,
@@ -267,7 +268,7 @@ async fn accepting_owner_invitation_creates_one_direct_permission() {
     let invitation = ResourceInvitationRepository::create_owner_resource_invitation(
         &store,
         tenant_id,
-        owner,
+        TenantActor::TenantUser(owner),
         recipient,
         OwnershipTransferTarget::Device("accepted-device".to_owned()),
         ResourcePermission::Manager,
@@ -337,7 +338,7 @@ async fn accepting_a_higher_access_invitation_updates_an_existing_direct_grant()
     let invitation = ResourceInvitationRepository::create_owner_resource_invitation(
         &store,
         tenant_id,
-        owner,
+        TenantActor::TenantUser(owner),
         recipient,
         OwnershipTransferTarget::Device("upgraded-device".to_owned()),
         ResourcePermission::Manager,
@@ -363,6 +364,57 @@ async fn accepting_a_higher_access_invitation_updates_an_existing_direct_grant()
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1);
     assert_eq!(matching[0].permission, ResourcePermission::Manager);
+}
+
+#[tokio::test]
+async fn tenant_account_invitation_sender_is_preserved_without_a_tenant_user() {
+    let (_directory, store, tenant_id, tenant_account_id) = sqlite_store().await;
+    let recipient = seed_regular_user(&store, tenant_id, "tenant-account-recipient").await;
+    sqlx::query(
+        "INSERT INTO devices (device_id, tenant_id, display_name)
+         VALUES ('tenant-account-invited-device', ?, 'Tenant account invited device')",
+    )
+    .bind(tenant_id.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+
+    let invitation = ResourceInvitationRepository::create_owner_resource_invitation(
+        &store,
+        tenant_id,
+        TenantActor::TenantAccount(tenant_account_id),
+        recipient,
+        OwnershipTransferTarget::Device("tenant-account-invited-device".to_owned()),
+        ResourcePermission::Manager,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        invitation.sender,
+        TenantActor::TenantAccount(tenant_account_id)
+    );
+
+    ResourceInvitationRepository::accept_resource_invitation(
+        &store,
+        tenant_id,
+        recipient,
+        invitation.id,
+    )
+    .await
+    .unwrap();
+    let permission =
+        TenantAuthorizationRepository::list_active_resource_permissions(&store, tenant_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|permission| {
+                permission.device_id.as_deref() == Some("tenant-account-invited-device")
+            })
+            .unwrap();
+    assert_eq!(
+        permission.created_by,
+        PermissionCreator::TenantAccount(tenant_account_id)
+    );
 }
 
 #[tokio::test]

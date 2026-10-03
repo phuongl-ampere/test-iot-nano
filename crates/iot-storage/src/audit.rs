@@ -41,6 +41,7 @@ impl AuditPrincipal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditAction {
+    CommandIssued,
     PermissionGranted,
     PermissionRevoked,
     GroupMemberAdded,
@@ -57,6 +58,7 @@ pub enum AuditAction {
 impl AuditAction {
     pub(crate) fn as_storage(self) -> &'static str {
         match self {
+            Self::CommandIssued => "command.issued",
             Self::PermissionGranted => "permission.granted",
             Self::PermissionRevoked => "permission.revoked",
             Self::GroupMemberAdded => "group.member_added",
@@ -73,6 +75,7 @@ impl AuditAction {
 
     fn from_storage(value: &str) -> Result<Self, AuditEventError> {
         match value {
+            "command.issued" => Ok(Self::CommandIssued),
             "permission.granted" => Ok(Self::PermissionGranted),
             "permission.revoked" => Ok(Self::PermissionRevoked),
             "group.member_added" => Ok(Self::GroupMemberAdded),
@@ -91,6 +94,7 @@ impl AuditAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditTargetType {
+    Command,
     ResourcePermission,
     UserGroup,
     Asset,
@@ -101,6 +105,7 @@ pub enum AuditTargetType {
 impl AuditTargetType {
     pub(crate) fn as_storage(self) -> &'static str {
         match self {
+            Self::Command => "command",
             Self::ResourcePermission => "resource_permission",
             Self::UserGroup => "user_group",
             Self::Asset => "asset",
@@ -111,6 +116,7 @@ impl AuditTargetType {
 
     fn from_storage(value: &str) -> Result<Self, AuditEventError> {
         match value {
+            "command" => Ok(Self::Command),
             "resource_permission" => Ok(Self::ResourcePermission),
             "user_group" => Ok(Self::UserGroup),
             "asset" => Ok(Self::Asset),

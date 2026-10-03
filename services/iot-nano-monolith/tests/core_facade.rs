@@ -7,7 +7,10 @@ use iot_api::{
 };
 use iot_nano_foundation::{DatabaseStorage, RpcMode, StorageConfiguration, TelemetryEvent};
 use iot_nano_monolith::PlatformCoreFacade;
-use iot_storage::{PlatformStore, TopologyRepository};
+use iot_storage::{
+    AuditAction, AuditEventRepository, AuditPrincipal, AuditTargetType, PlatformStore,
+    TopologyRepository,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -198,7 +201,7 @@ async fn sqlite_core_facade_denies_authorized_command_after_permission_revocatio
     assert!(
         facade
             .create_authorized_command(CoreAuthorizedCommandCreateRequest {
-                user_id: manager_id,
+                actor: AuditPrincipal::User(manager_id),
                 command: command_request(
                     Uuid::now_v7(),
                     device_id,
@@ -217,7 +220,7 @@ async fn sqlite_core_facade_denies_authorized_command_after_permission_revocatio
     assert!(matches!(
         facade
             .create_authorized_command(CoreAuthorizedCommandCreateRequest {
-                user_id: manager_id,
+                actor: AuditPrincipal::User(manager_id),
                 command: command_request(
                     Uuid::now_v7(),
                     device_id,
@@ -228,6 +231,53 @@ async fn sqlite_core_facade_denies_authorized_command_after_permission_revocatio
             .await,
         Err(CoreFacadeError::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn sqlite_core_facade_records_tenant_account_command_issuer_in_audit() {
+    let (_directory, store) = sqlite_store().await;
+    let tenant_account_id = Uuid::now_v7();
+    let device_id = "facade-tenant-account-command";
+    sqlx::query(
+        "INSERT INTO tenant_accounts (
+            id, tenant_id, username, password_hash, status, credential_version
+         ) VALUES (?, ?, 'facade-tenant-account', 'unused', 'active', 1)",
+    )
+    .bind(tenant_account_id.to_string())
+    .bind(TEST_TENANT_ID.to_string())
+    .execute(store.sqlite_pool().unwrap())
+    .await
+    .unwrap();
+    TopologyRepository::register_device(store.as_ref(), TEST_TENANT_ID, device_id)
+        .await
+        .unwrap();
+
+    let facade = PlatformCoreFacade::new(store.clone());
+    let now = Utc.with_ymd_and_hms(2026, 10, 3, 10, 5, 0).unwrap();
+    let command_id = Uuid::now_v7();
+    let command = facade
+        .create_authorized_command(CoreAuthorizedCommandCreateRequest {
+            actor: AuditPrincipal::TenantAccount(tenant_account_id),
+            command: command_request(command_id, device_id, json!({"source": "pat"}), now),
+        })
+        .await
+        .unwrap();
+    assert_eq!(command.id, command_id);
+
+    let events =
+        AuditEventRepository::list_tenant_audit_events(store.as_ref(), TEST_TENANT_ID, None, 100)
+            .await
+            .unwrap();
+    let issued = events
+        .iter()
+        .find(|event| event.target_id == command_id.to_string())
+        .unwrap();
+    assert_eq!(
+        issued.actor,
+        AuditPrincipal::TenantAccount(tenant_account_id)
+    );
+    assert_eq!(issued.action, AuditAction::CommandIssued);
+    assert_eq!(issued.target_type, AuditTargetType::Command);
 }
 
 #[tokio::test]

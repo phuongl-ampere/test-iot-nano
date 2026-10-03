@@ -47,11 +47,11 @@ use iot_storage::{
     NewApplication, NewOAuthClientSecret, NewSystemAccount, NewTenant, NewTenantAccount,
     NewUserGroup, OAuthRepository, OwnershipTransferTarget, PlatformStore, PlatformStoreError,
     ProvisionManagementDeviceError, RedirectUri, ResourceAccess, ResourceAccessSource,
-    ResourceInvitationRepository, ResourcePermission, SystemAccount, TenantAuthorizationError,
-    TenantAuthorizationRepository, TenantIdentityError, TenantIdentityRepository,
-    TenantProfileConfiguration, TenantProfileRepository, TenantStatus, UpdateManagementAlertRule,
-    UpdateManagementAsset, UpdateManagementAssetProfile, UpdateManagementDevice,
-    UpdateManagementDeviceProfile, UpdateManagementUser, UserCapability,
+    ResourceInvitationRepository, ResourcePermission, SystemAccount, TenantActor,
+    TenantAuthorizationError, TenantAuthorizationRepository, TenantIdentityError,
+    TenantIdentityRepository, TenantProfileConfiguration, TenantProfileRepository, TenantStatus,
+    UpdateManagementAlertRule, UpdateManagementAsset, UpdateManagementAssetProfile,
+    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser, UserCapability,
     UserDeviceActivityRepository,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

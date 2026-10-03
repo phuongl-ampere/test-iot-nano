@@ -2,6 +2,7 @@ use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
 use iot_nano_foundation::RpcMode;
+use iot_storage::AuditPrincipal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -18,9 +19,9 @@ pub struct CoreCommandCreateRequest {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct CoreAuthorizedCommandCreateRequest {
-    pub user_id: Uuid,
+    pub actor: AuditPrincipal,
     pub command: CoreCommandCreateRequest,
 }
 

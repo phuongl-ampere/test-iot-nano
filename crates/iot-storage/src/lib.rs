@@ -34,7 +34,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
-pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 5;
+pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 6;
 
 pub use contracts::{
     AccountClass, AlertComparison, AlertEvaluationEvent, AlertEvaluationRepository,
@@ -56,7 +56,7 @@ pub use contracts::{
     OAuthRepository, OwnershipTransferTarget, PermissionCreator, RedirectUri, ResourceAccess,
     ResourceAccessSource, ResourceInvitation, ResourceInvitationRepository,
     ResourceInvitationState, ResourceKind, ResourcePermission, ResourcePermissionRecord,
-    TelemetryAggregate, TelemetryAggregateRepository, TelemetryRepository,
+    TelemetryAggregate, TelemetryAggregateRepository, TelemetryRepository, TenantActor,
     TenantAuthorizationError, TenantAuthorizationRepository, TenantProfileConfiguration,
     TenantProfileContainmentRule, TenantProfileDefinition, TenantProfileRepository,
     TenantUserGroup, TenantUserGroupMember, TopologyRepository, UpdateApplicationDomainProfile,

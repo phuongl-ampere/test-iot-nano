@@ -1366,6 +1366,7 @@ pub(super) fn audit_actor_label(actor: AuditPrincipal) -> &'static str {
 
 pub(super) fn audit_action(action: AuditAction) -> &'static str {
     match action {
+        AuditAction::CommandIssued => "command.issued",
         AuditAction::PermissionGranted => "permission.granted",
         AuditAction::PermissionRevoked => "permission.revoked",
         AuditAction::GroupMemberAdded => "group.member_added",
@@ -1382,6 +1383,7 @@ pub(super) fn audit_action(action: AuditAction) -> &'static str {
 
 pub(super) fn audit_target_type(target_type: AuditTargetType) -> &'static str {
     match target_type {
+        AuditTargetType::Command => "command",
         AuditTargetType::ResourcePermission => "resource_permission",
         AuditTargetType::UserGroup => "user_group",
         AuditTargetType::Asset => "asset",

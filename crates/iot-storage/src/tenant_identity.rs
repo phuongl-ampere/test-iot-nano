@@ -301,6 +301,33 @@ impl TenantIdentityRepository {
         }
     }
 
+    pub async fn tenant_account_username(
+        store: &PlatformStore,
+        tenant_id: Uuid,
+        tenant_account_id: Uuid,
+    ) -> Result<Option<String>, TenantIdentityError> {
+        match store {
+            PlatformStore::Sqlite(store) => sqlx::query_scalar(
+                "SELECT username FROM tenant_accounts
+                 WHERE id = ? AND tenant_id = ? AND status = 'active'",
+            )
+            .bind(tenant_account_id.to_string())
+            .bind(tenant_id.to_string())
+            .fetch_optional(&store.pool)
+            .await
+            .map_err(TenantIdentityError::from),
+            PlatformStore::Timescale(pool) => sqlx::query_scalar(
+                "SELECT username FROM tenant_accounts
+                 WHERE id = $1 AND tenant_id = $2 AND status = 'active'",
+            )
+            .bind(tenant_account_id)
+            .bind(tenant_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(TenantIdentityError::from),
+        }
+    }
+
     pub async fn tenant_account_credential_by_username(
         store: &PlatformStore,
         username: &str,

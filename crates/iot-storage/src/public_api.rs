@@ -80,6 +80,7 @@ async fn wait_for_public_device_list_handoff_hook(_: Option<Uuid>) {}
 pub struct PublicPrincipal {
     pub tenant_id: Uuid,
     pub user_id: Option<Uuid>,
+    pub tenant_account_id: Option<Uuid>,
     pub app_id: String,
     pub account_class: AccountClass,
 }

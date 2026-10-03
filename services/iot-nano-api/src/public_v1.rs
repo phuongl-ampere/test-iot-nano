@@ -11,15 +11,15 @@ use axum::{
 use chrono::Utc;
 use iot_nano_foundation::RpcMode;
 use iot_storage::{
-    AccountClass, ApplicationDomainResourceKind, AuthorizationRepository,
+    AccountClass, ApplicationDomainResourceKind, AuditPrincipal, AuthorizationRepository,
     CreateManagementAlertRule, DeviceClaimError, DeviceClaimRepository, ManagementAlertRule,
     ManagementAlertRuleError, ManagementAlertRuleRepository, ManagementAssetProfileRepository,
     ManagementAssetRepository, ManagementDeviceProfileRepository, ManagementDeviceRepository,
     ManagementUserRepository, NewPublicAsset, NewPublicDevice, OwnershipTransferTarget,
     PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice,
     PublicDeviceError, PublicPrincipal, PublicTelemetry, ResourceInvitation,
-    ResourceInvitationRepository, ResourcePermission, TenantProfileRepository,
-    UpdateManagementAlertRule, UserCapability,
+    ResourceInvitationRepository, ResourcePermission, TenantActor, TenantIdentityRepository,
+    TenantProfileRepository, UpdateManagementAlertRule, UserCapability,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -479,12 +479,13 @@ async fn authenticate(
     if !token.allows_scope(scope) {
         return Err(PublicApiError::Forbidden);
     }
-    if token.tenant_account_id.is_some() {
+    if let Some(tenant_account_id) = token.tenant_account_id {
         return Ok((
             store,
             PublicPrincipal {
                 tenant_id: token.tenant_id,
                 user_id: None,
+                tenant_account_id: Some(tenant_account_id),
                 app_id: PERSONAL_ACCESS_TOKEN_APP_ID.to_owned(),
                 account_class: AccountClass::Admin,
             },
@@ -508,6 +509,7 @@ async fn authenticate(
         PublicPrincipal {
             tenant_id,
             user_id: Some(user_id),
+            tenant_account_id: None,
             app_id: token.app_id,
             account_class,
         },
@@ -519,6 +521,9 @@ async fn require_user_capability(
     principal: &PublicPrincipal,
     capability: UserCapability,
 ) -> Result<(), PublicApiError> {
+    if is_tenant_account_principal(principal) {
+        return Ok(());
+    }
     let user_id = principal.user_id.ok_or(PublicApiError::Forbidden)?;
     let enabled = ManagementUserRepository::user_has_management_capability(
         store,
@@ -533,6 +538,33 @@ async fn require_user_capability(
     } else {
         Err(PublicApiError::Forbidden)
     }
+}
+
+fn is_tenant_account_principal(principal: &PublicPrincipal) -> bool {
+    principal.tenant_account_id.is_some()
+        && principal.user_id.is_none()
+        && principal.account_class == AccountClass::Admin
+        && principal.app_id == PERSONAL_ACCESS_TOKEN_APP_ID
+}
+
+fn audit_actor(principal: &PublicPrincipal) -> Result<AuditPrincipal, PublicApiError> {
+    if let Some(tenant_account_id) = principal.tenant_account_id {
+        return Ok(AuditPrincipal::TenantAccount(tenant_account_id));
+    }
+    principal
+        .user_id
+        .map(AuditPrincipal::User)
+        .ok_or(PublicApiError::Forbidden)
+}
+
+fn tenant_actor(principal: &PublicPrincipal) -> Result<TenantActor, PublicApiError> {
+    if let Some(tenant_account_id) = principal.tenant_account_id {
+        return Ok(TenantActor::TenantAccount(tenant_account_id));
+    }
+    principal
+        .user_id
+        .map(TenantActor::TenantUser)
+        .ok_or(PublicApiError::Forbidden)
 }
 
 async fn list_user_capabilities(
@@ -1629,7 +1661,7 @@ async fn create_resource_invitation(
     target: OwnershipTransferTarget,
     request: CreateResourceInvitationRequest,
 ) -> Result<ResourceInvitation, PublicApiError> {
-    let sender_user_id = principal.user_id.ok_or(PublicApiError::Forbidden)?;
+    let sender = tenant_actor(principal)?;
     let username = request.username.trim();
     if username.is_empty() || username.len() > 64 {
         return Err(PublicApiError::BadRequest);
@@ -1650,7 +1682,7 @@ async fn create_resource_invitation(
     ResourceInvitationRepository::create_owner_resource_invitation(
         store,
         principal.tenant_id,
-        sender_user_id,
+        sender,
         recipient_user_id,
         target,
         permission,
@@ -1715,7 +1747,7 @@ async fn cancel_resource_invitation(
     ResourceInvitationRepository::cancel_resource_invitation(
         store.as_ref(),
         principal.tenant_id,
-        principal.user_id.ok_or(PublicApiError::Forbidden)?,
+        tenant_actor(&principal)?,
         invitation_id,
     )
     .await
@@ -1730,11 +1762,23 @@ async fn resource_invitation_response(
     let users = ManagementUserRepository::list_management_users(store, invitation.tenant_id)
         .await
         .map_err(|_| PublicApiError::Unavailable)?;
-    let sender_username = users
-        .iter()
-        .find(|user| user.id == invitation.sender_user_id)
-        .map(|user| user.username.clone())
-        .unwrap_or_else(|| invitation.sender_user_id.to_string());
+    let sender_username = match invitation.sender {
+        TenantActor::TenantUser(sender_user_id) => users
+            .iter()
+            .find(|user| user.id == sender_user_id)
+            .map(|user| user.username.clone())
+            .unwrap_or_else(|| sender_user_id.to_string()),
+        TenantActor::TenantAccount(sender_account_id) => {
+            TenantIdentityRepository::tenant_account_username(
+                store,
+                invitation.tenant_id,
+                sender_account_id,
+            )
+            .await
+            .map_err(|_| PublicApiError::Unavailable)?
+            .unwrap_or_else(|| sender_account_id.to_string())
+        }
+    };
     let (resource_kind, resource_id, resource_name) =
         match (invitation.asset_id, invitation.device_id.as_deref()) {
             (Some(asset_id), None) => {
@@ -2256,7 +2300,7 @@ async fn create_command(
         .ok_or(PublicApiError::Unavailable)?;
     let record = facade
         .create_authorized_command(CoreAuthorizedCommandCreateRequest {
-            user_id: principal.user_id.ok_or(PublicApiError::Forbidden)?,
+            actor: audit_actor(&principal)?,
             command: CoreCommandCreateRequest {
                 id: command_id,
                 tenant_id: principal.tenant_id,
