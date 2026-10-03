@@ -32,13 +32,11 @@ local_platform_configure() {
   IOT_NANO_LOCAL_RUNNER_FILE="${IOT_NANO_LOCAL_RUNNER_FILE:-$root/monolith-runner.sh}"
   IOT_NANO_LOCAL_OWNER_FILE="${IOT_NANO_LOCAL_OWNER_FILE:-$root/workspace-root}"
   IOT_NANO_LOCAL_STARTUP_ATTEMPTS="${IOT_NANO_LOCAL_STARTUP_ATTEMPTS:-300}"
-  IOT_NANO_PUBLIC_HTTP_ADDRESS="${IOT_NANO_PUBLIC_HTTP_ADDRESS:-127.0.0.1:18080}"
-  IOT_NANO_MANAGEMENT_ADDRESS="${IOT_NANO_MANAGEMENT_ADDRESS:-127.0.0.1:18081}"
+  IOT_NANO_HTTP_ADDRESS="${IOT_NANO_HTTP_ADDRESS:-127.0.0.1:18081}"
   IOT_NANO_MQTT_TCP_ADDRESS="${IOT_NANO_MQTT_TCP_ADDRESS:-127.0.0.1:18883}"
   IOT_NANO_MQTT_TLS_ADDRESS="${IOT_NANO_MQTT_TLS_ADDRESS:-127.0.0.1:18884}"
   IOT_NANO_HTTPS_ENABLED="${IOT_NANO_HTTPS_ENABLED:-false}"
   IOT_NANO_ALLOW_INSECURE_DEFAULT_PASSWORDS="${IOT_NANO_ALLOW_INSECURE_DEFAULT_PASSWORDS:-true}"
-  IOT_NANO_MANAGEMENT_URL="${IOT_NANO_MANAGEMENT_URL:-http://$IOT_NANO_MANAGEMENT_ADDRESS}"
   IOT_NANO_LOCAL_CARGO_LANE="${IOT_NANO_LOCAL_CARGO_LANE:-$local_platform_helper_root/scripts/dev/cargo-lane.sh}"
   IOT_NANO_LOCAL_LANE_TARGET_ROOT="${IOT_NANO_LOCAL_LANE_TARGET_ROOT:-${IOT_NANO_LANE_TARGET_ROOT:-$cache_root/rush-iot-nano/cargo-lanes}}"
   IOT_NANO_LOCAL_WORKSPACE_KEY="$(local_platform_workspace_key)"
@@ -101,7 +99,7 @@ local_platform_require_reset() {
 }
 
 local_platform_public_port() {
-  local address="$IOT_NANO_PUBLIC_HTTP_ADDRESS"
+  local address="$IOT_NANO_HTTP_ADDRESS"
   printf '%s\n' "${address##*:}"
 }
 
@@ -126,8 +124,7 @@ local_platform_has_listeners() {
   local port
 
   for address in \
-    "$IOT_NANO_PUBLIC_HTTP_ADDRESS" \
-    "$IOT_NANO_MANAGEMENT_ADDRESS" \
+    "$IOT_NANO_HTTP_ADDRESS" \
     "$IOT_NANO_MQTT_TCP_ADDRESS" \
     "$IOT_NANO_MQTT_TLS_ADDRESS"; do
     port="${address##*:}"
@@ -245,8 +242,7 @@ local_platform_preflight() {
       return 1
     }
   done
-  local_platform_validate_loopback_address IOT_NANO_PUBLIC_HTTP_ADDRESS "$IOT_NANO_PUBLIC_HTTP_ADDRESS" || return 1
-  local_platform_validate_loopback_address IOT_NANO_MANAGEMENT_ADDRESS "$IOT_NANO_MANAGEMENT_ADDRESS" || return 1
+  local_platform_validate_loopback_address IOT_NANO_HTTP_ADDRESS "$IOT_NANO_HTTP_ADDRESS" || return 1
   local_platform_validate_loopback_address IOT_NANO_MQTT_TCP_ADDRESS "$IOT_NANO_MQTT_TCP_ADDRESS" || return 1
   local_platform_validate_loopback_address IOT_NANO_MQTT_TLS_ADDRESS "$IOT_NANO_MQTT_TLS_ADDRESS" || return 1
 }
@@ -266,8 +262,7 @@ local_platform_export_environment() {
   export IOT_NANO_INTERNAL_DIR="$IOT_NANO_LOCAL_INTERNAL_DIR"
   export IOT_NANO_TLS_CERT_PATH="$IOT_NANO_LOCAL_TLS_CERT_PATH"
   export IOT_NANO_TLS_KEY_PATH="$IOT_NANO_LOCAL_TLS_KEY_PATH"
-  export IOT_NANO_PUBLIC_HTTP_ADDRESS
-  export IOT_NANO_MANAGEMENT_ADDRESS
+  export IOT_NANO_HTTP_ADDRESS
   export IOT_NANO_MQTT_TCP_ADDRESS
   export IOT_NANO_MQTT_TLS_ADDRESS
   export IOT_NANO_HTTPS_ENABLED
@@ -292,24 +287,10 @@ local_platform_wait_for_http() {
   local attempts=0
 
   while ! curl --fail --silent --show-error --max-time 2 \
-    "http://$IOT_NANO_PUBLIC_HTTP_ADDRESS$path" >/dev/null; do
+    "http://$IOT_NANO_HTTP_ADDRESS$path" >/dev/null; do
     attempts=$((attempts + 1))
     if [[ "$attempts" -gt "$IOT_NANO_LOCAL_STARTUP_ATTEMPTS" ]]; then
       local_platform_fail "timed out waiting for $path"
-      return 1
-    fi
-    sleep 0.2
-  done
-}
-
-local_platform_wait_for_management() {
-  local attempts=0
-
-  while ! curl --silent --show-error --output /dev/null --max-time 2 \
-    "http://$IOT_NANO_MANAGEMENT_ADDRESS/api/system/auth/login"; do
-    attempts=$((attempts + 1))
-    if [[ "$attempts" -gt "$IOT_NANO_LOCAL_STARTUP_ATTEMPTS" ]]; then
-      local_platform_fail 'timed out waiting for the management listener'
       return 1
     fi
     sleep 0.2
@@ -327,8 +308,7 @@ local_platform_write_runner() {
     printf 'export IOT_NANO_INTERNAL_DIR=%q\n' "$IOT_NANO_INTERNAL_DIR"
     printf 'export IOT_NANO_TLS_CERT_PATH=%q\n' "$IOT_NANO_TLS_CERT_PATH"
     printf 'export IOT_NANO_TLS_KEY_PATH=%q\n' "$IOT_NANO_TLS_KEY_PATH"
-    printf 'export IOT_NANO_PUBLIC_HTTP_ADDRESS=%q\n' "$IOT_NANO_PUBLIC_HTTP_ADDRESS"
-    printf 'export IOT_NANO_MANAGEMENT_ADDRESS=%q\n' "$IOT_NANO_MANAGEMENT_ADDRESS"
+    printf 'export IOT_NANO_HTTP_ADDRESS=%q\n' "$IOT_NANO_HTTP_ADDRESS"
     printf 'export IOT_NANO_MQTT_TCP_ADDRESS=%q\n' "$IOT_NANO_MQTT_TCP_ADDRESS"
     printf 'export IOT_NANO_MQTT_TLS_ADDRESS=%q\n' "$IOT_NANO_MQTT_TLS_ADDRESS"
     printf 'export IOT_NANO_HTTPS_ENABLED=%q\n' "$IOT_NANO_HTTPS_ENABLED"
@@ -358,8 +338,7 @@ local_platform_start() {
     nohup "$IOT_NANO_LOCAL_RUNNER_FILE" >"$IOT_NANO_LOCAL_LOG_FILE" 2>&1 < /dev/null &
   fi
 
-  if ! local_platform_wait_for_http /healthz || ! local_platform_wait_for_http /readyz || \
-    ! local_platform_wait_for_management; then
+  if ! local_platform_wait_for_http /healthz || ! local_platform_wait_for_http /readyz; then
     local_platform_remove_launch_agent
     return 1
   fi

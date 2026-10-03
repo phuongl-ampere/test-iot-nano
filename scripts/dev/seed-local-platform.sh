@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 runtime_helper="${IOT_NANO_LOCAL_RUNTIME_HELPER:-$root/scripts/dev/local-platform-runtime.sh}"
 seed_file="${IOT_NANO_LOCAL_SEED_FILE:-$root/infra/monolith/local-platform-seed.env}"
-management_url="${IOT_NANO_MANAGEMENT_URL:-http://127.0.0.1:8081}"
+management_url="${IOT_NANO_HTTP_URL:-http://127.0.0.1:18081}"
 powermonitor_url="${IOT_NANO_POWERMONITOR_URL:-http://localhost:3002}"
 
 if [[ ! -f "$runtime_helper" ]]; then
@@ -15,7 +15,7 @@ fi
 source "$runtime_helper"
 local_platform_require_reset "$@"
 local_platform_configure
-management_url="$IOT_NANO_MANAGEMENT_URL"
+management_url="http://$IOT_NANO_HTTP_ADDRESS"
 
 if [[ "${IOT_NANO_ALLOW_LOCAL_SEED:-}" != "1" ]]; then
   printf '%s\n' 'Set IOT_NANO_ALLOW_LOCAL_SEED=1 to run the fixed local seed.' >&2
@@ -115,7 +115,7 @@ system_login_status="$(request_status "$system_login_body" \
     --arg username "$IOT_NANO_SEED_SYSTEM_USERNAME" \
     --arg password "$IOT_NANO_SEED_SYSTEM_PASSWORD" \
     '{username: $username, password: $password}')" \
-  "$management_url/api/system/auth/login")"
+  "$management_url/api/v1/system/auth/login")"
 require_status "$system_login_status" 200 'System login'
 
 tenant_create_body="$state_dir/tenant-create.json"
@@ -127,7 +127,7 @@ tenant_create_status="$(request_status "$tenant_create_body" \
     --arg username "$IOT_NANO_SEED_TENANT_USERNAME" \
     --arg password "$IOT_NANO_SEED_TENANT_PASSWORD" \
     '{slug: $slug, metadata: {}, tenant_account_username: $username, tenant_account_password: $password}')" \
-  "$management_url/api/system/tenants")"
+  "$management_url/api/v1/system/tenants")"
 case "$tenant_create_status" in
   201|409) ;;
   *) require_status "$tenant_create_status" 201 'Tenant seed' ;;
@@ -141,12 +141,12 @@ tenant_login_status="$(request_status "$tenant_login_body" \
     --arg tenant_slug "$IOT_NANO_SEED_TENANT_SLUG" \
     --arg password "$IOT_NANO_SEED_TENANT_PASSWORD" \
     '{tenant_slug: $tenant_slug, password: $password}')" \
-  "$management_url/api/tenant/auth/login")"
+  "$management_url/api/v1/tenant/auth/login")"
 require_status "$tenant_login_status" 200 'Tenant Account login'
 
 list_users() {
   curl --fail --silent --show-error --cookie "$tenant_cookie" \
-    "$management_url/api/management/users"
+    "$management_url/api/v1/management/users"
 }
 
 ensure_user() {
@@ -189,7 +189,7 @@ ensure_user() {
 
 list_assets() {
   curl --fail --silent --show-error --cookie "$tenant_cookie" \
-    "$management_url/api/management/assets"
+    "$management_url/api/v1/management/assets"
 }
 
 powermonitor_app_id='powermonitor'
@@ -203,7 +203,7 @@ ensure_powermonitor_application() {
     kind: "full_stack",
     launch_url: $powermonitor_url,
     client_id: "powermonitor-client",
-    redirect_uris: [($powermonitor_url + "/api/auth/callback")],
+    redirect_uris: [($powermonitor_url + "/api/v1/auth/callback")],
     allowed_scopes: [
       "assets:read", "assets:write", "alerts:read", "alerts:write",
       "authorization:read", "authorization:write", "commands:read", "commands:write",
@@ -215,7 +215,7 @@ ensure_powermonitor_application() {
     --cookie "$tenant_cookie" \
     --header 'Content-Type: application/json' \
     --data "$application_payload" \
-    "$management_url/api/management/applications")"
+    "$management_url/api/v1/management/applications")"
   require_status "$application_status" 201 'PowerMonitor application seed'
 }
 
@@ -236,7 +236,7 @@ create_device_profile() {
       --argjson metric_mapping "$metric_mapping" \
       --argjson reporting_settings "$reporting_settings" \
       '{name: $name, telemetry_schema: $telemetry_schema, metric_mapping: $metric_mapping, reporting_settings: $reporting_settings}')" \
-    "$management_url/api/management/profiles/device-profiles")"
+    "$management_url/api/v1/management/profiles/device-profiles")"
   require_status "$profile_status" 201 "Device profile seed ($name)"
   jq -r '.id' "$profile_body"
 }
@@ -256,7 +256,7 @@ create_asset_profile() {
       --argjson fields "$fields" \
       --argjson dashboard_defaults "$dashboard_defaults" \
       '{name: $name, fields: $fields, dashboard_defaults: $dashboard_defaults}')" \
-    "$management_url/api/management/profiles/asset-profiles")"
+    "$management_url/api/v1/management/profiles/asset-profiles")"
   require_status "$profile_status" 201 "Asset profile seed ($name)"
   jq -r '.id' "$profile_body"
 }
@@ -295,7 +295,7 @@ ensure_asset() {
     --header 'Content-Type: application/json' \
     --data "$(jq -nc --arg name "$name" --arg parent_asset_id "$parent_asset_id" --arg asset_profile_id "$asset_profile_id" \
       '{name: $name, asset_profile_id: $asset_profile_id, parent_asset_id: (if $parent_asset_id == "" then null else $parent_asset_id end), metadata: {local_seed: "owner-sharing-demo"}, attributes: null}')" \
-    "$management_url/api/management/assets")"
+    "$management_url/api/v1/management/assets")"
   require_status "$create_status" 201 "Asset seed ($name)"
   asset_id="$(jq -r '.id' "$state_dir/asset-create.json")"
   if [[ -z "$asset_id" || "$asset_id" == 'null' ]]; then
@@ -307,7 +307,7 @@ ensure_asset() {
 
 list_devices() {
   curl --fail --silent --show-error --cookie "$tenant_cookie" \
-    "$management_url/api/management/devices"
+    "$management_url/api/v1/management/devices"
 }
 
 ensure_device() {
@@ -346,7 +346,7 @@ ensure_device() {
     --header 'Content-Type: application/json' \
     --data "$(jq -nc --arg serial_number "$serial_number" --arg name "$name" --arg asset_id "$asset_id" --arg device_profile_id "$device_profile_id" \
       '{serial_number: $serial_number, display_name: $name, asset_id: $asset_id, device_profile_id: $device_profile_id, attributes: {local_seed: "owner-sharing-demo"}}')" \
-    "$management_url/api/management/devices")"
+    "$management_url/api/v1/management/devices")"
   require_status "$create_status" 201 "Device seed ($name)"
   device_id="$(jq -r '.device_id' "$state_dir/device-create.json")"
   if [[ -z "$device_id" || "$device_id" == 'null' ]]; then
@@ -373,7 +373,7 @@ assign_asset_owner() {
     --request PUT \
     --header 'Content-Type: application/json' \
     --data "$(jq -nc --arg user_id "$owner_user_id" '{user_id: $user_id}')" \
-    "$management_url/api/management/assets/$asset_id/owner")"
+    "$management_url/api/v1/management/assets/$asset_id/owner")"
   require_status "$owner_status" 204 "Asset owner assignment ($asset_id)"
 }
 
@@ -394,7 +394,7 @@ assign_device_owner() {
     --request PUT \
     --header 'Content-Type: application/json' \
     --data "$(jq -nc --arg user_id "$owner_user_id" '{user_id: $user_id}')" \
-    "$management_url/api/management/devices/$device_id/owner")"
+    "$management_url/api/v1/management/devices/$device_id/owner")"
   require_status "$owner_status" 204 "Device owner assignment ($device_id)"
 }
 

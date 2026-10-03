@@ -108,7 +108,7 @@ chmod +x "$fixture/bin/launchctl"
 
 export PATH="$fixture/bin:$PATH"
 export IOT_NANO_LOCAL_PLATFORM_ROOT="$platform_root"
-export IOT_NANO_PUBLIC_HTTP_ADDRESS='127.0.0.1:18080'
+export IOT_NANO_HTTP_ADDRESS='127.0.0.1:18080'
 export IOT_NANO_TEST_LISTENER="$fixture/listener"
 export IOT_NANO_TEST_PLATFORM_PATH="$platform_root/platform.sqlite"
 export IOT_NANO_TEST_KILL_LOG="$fixture/kill.log"
@@ -149,18 +149,18 @@ assert_present "$platform_root/vault.key"
 assert_present "$platform_root/mqtt-cert.pem"
 assert_present "$platform_root/mqtt-key.pem"
 
-IOT_NANO_PUBLIC_HTTP_ADDRESS='0.0.0.0:18080'
+IOT_NANO_HTTP_ADDRESS='0.0.0.0:18080'
 if local_platform_preflight 2>"$fixture/non-loopback.err"; then
   fail 'non-loopback runtime bindings must be rejected before reset'
 fi
-IOT_NANO_PUBLIC_HTTP_ADDRESS='127.0.0.1:18080'
+IOT_NANO_HTTP_ADDRESS='127.0.0.1:18080'
 
 assert_file_contains "$seed" 'IOT_NANO_SEED_CONTROLLER_USERNAME'
 assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME'
 assert_file_contains "$seed" 'IOT_NANO_SEED_UNASSIGNED_USERNAME'
 assert_file_contains "$seed" "ensure_direct_share \"\$IOT_NANO_SEED_CONTROLLER_USERNAME\" control"
 assert_file_contains "$seed" "ensure_direct_share \"\$IOT_NANO_SEED_VIEWER_USERNAME\" view"
-assert_file_contains "$seed" '"$management_url/api/tenant/auth/login"'
+assert_file_contains "$seed" '"$management_url/api/v1/tenant/auth/login"'
 assert_file_contains "$seed" "require_status \"\$tenant_login_status\" 200 'Tenant Account login'"
 assert_file_contains "$seed" "--arg tenant_slug \"\$IOT_NANO_SEED_TENANT_SLUG\""
 assert_file_contains "$seed" "'{tenant_slug: \$tenant_slug, password: \$password}'"
@@ -180,8 +180,8 @@ assert_file_contains "$seed" 'IOT_NANO_SEED_UNASSIGNED_USERNAME:=seed-unassigned
 assert_file_contains "$seed" 'IOT_NANO_SEED_VIEWER_USERNAME:=${IOT_NANO_SEED_RECIPIENT_USERNAME:-seed-viewer}'
 assert_file_contains "$seed" 'require_seed_variables'
 assert_file_contains "$seed" 'local_platform_preflight'
-assert_file_contains "$seed" '/api/management/profiles/device-profiles'
-assert_file_contains "$seed" '/api/management/profiles/asset-profiles'
+assert_file_contains "$seed" '/api/v1/management/profiles/device-profiles'
+assert_file_contains "$seed" '/api/v1/management/profiles/asset-profiles'
 assert_file_contains "$seed" "'Power Meter'"
 assert_file_contains "$seed" "'Power Farm'"
 assert_file_contains "$seed" "'Power Zone'"

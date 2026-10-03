@@ -129,8 +129,7 @@ IOT_NANO_SQLITE_PATH=$data_root/platform/platform.sqlite
 IOT_NANO_INTERNAL_DIR=$data_root/internal
 IOT_NANO_TLS_CERT_PATH=/run/tls/mqtt-cert.pem
 IOT_NANO_TLS_KEY_PATH=/run/tls/mqtt-key.pem
-IOT_NANO_PUBLIC_HTTP_ADDRESS=$public_address
-IOT_NANO_MANAGEMENT_ADDRESS=$management_address
+IOT_NANO_HTTP_ADDRESS=$public_address
 IOT_NANO_MQTT_TCP_ADDRESS=$mqtt_address
 IOT_NANO_MQTT_TLS_ADDRESS=$mqtt_tls_address
 IOT_NANO_HTTPS_ENABLED=$web_https_enabled
@@ -166,17 +165,17 @@ starter_seed() {
   system_cookie="$state_dir/system.cookie"; tenant_cookie="$state_dir/tenant.cookie"
   curl --fail --silent --show-error --cookie-jar "$system_cookie" -H 'Content-Type: application/json' \
     --data "$(jq -nc --arg username "$system_username" --arg password "$system_password" '{username:$username,password:$password}')" \
-    "$management_url/api/system/auth/login" >/dev/null
+    "$management_url/api/v1/system/auth/login" >/dev/null
   curl --fail --silent --show-error --cookie "$system_cookie" -H 'Content-Type: application/json' \
     --data "$(jq -nc --arg slug "$tenant_slug" --arg username "$tenant_username" --arg password "$tenant_password" '{slug:$slug,metadata:{},tenant_account_username:$username,tenant_account_password:$password}')" \
-    "$management_url/api/system/tenants" >/dev/null
+    "$management_url/api/v1/system/tenants" >/dev/null
   curl --fail --silent --show-error --cookie-jar "$tenant_cookie" -H 'Content-Type: application/json' \
     --data "$(jq -nc --arg tenant_slug "$tenant_slug" --arg password "$tenant_password" '{tenant_slug:$tenant_slug,password:$password}')" \
-    "$management_url/api/tenant/auth/login" >/dev/null
+    "$management_url/api/v1/tenant/auth/login" >/dev/null
   for user in "$user1_username:$user1_password" "$user2_username:$user2_password"; do
     curl --fail --silent --show-error --cookie "$tenant_cookie" -H 'Content-Type: application/json' \
       --data "$(jq -nc --arg username "${user%%:*}" --arg password "${user#*:}" '{username:$username,password:$password}')" \
-      "$management_url/api/management/users" >/dev/null
+      "$management_url/api/v1/management/users" >/dev/null
   done
 }
 
