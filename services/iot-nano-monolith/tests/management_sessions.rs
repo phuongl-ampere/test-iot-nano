@@ -6691,7 +6691,7 @@ async fn tenant_application_page_scopes_list_upserts_and_hides_client_secrets() 
     let application = ApplicationRepository::upsert_application(
         store.as_ref(),
         NewApplication {
-            app_id: "tenant-console".parse().unwrap(),
+            app_id: "powermonitor".parse().unwrap(),
             tenant_id,
             kind: ApplicationKind::Frontend,
             launch_url: "https://tenant.example.test/console".to_owned(),
@@ -6774,7 +6774,7 @@ async fn tenant_application_page_scopes_list_upserts_and_hides_client_secrets() 
             .to_vec(),
     )
     .unwrap();
-    assert!(page.contains("tenant-console"));
+    assert!(page.contains("powermonitor"));
     assert!(page.contains("tenant-console-client"));
     assert!(!page.contains("other-console"));
     assert!(!page.contains("tenant-console-secret"));
@@ -6784,7 +6784,7 @@ async fn tenant_application_page_scopes_list_upserts_and_hides_client_secrets() 
         .oneshot(system_lifecycle_form(
             "/tenant/applications",
             Some(&tenant_cookie),
-            "app_id=tenant-console&kind=full_stack&launch_url=https%3A%2F%2Ftenant.example.test%2Fupdated&client_id=tenant-console-client-v2&redirect_uris=https%3A%2F%2Ftenant.example.test%2Foauth%2Fcallback%0Ahttp%3A%2F%2Flocalhost%3A3000%2Foauth%2Fcallback&allowed_scopes=assets%3Aread%0Adevices%3Aread&enabled=on",
+            "app_id=powermonitor&kind=full_stack&launch_url=https%3A%2F%2Ftenant.example.test%2Fupdated&client_id=tenant-console-client-v2&redirect_uris=https%3A%2F%2Ftenant.example.test%2Foauth%2Fcallback%0Ahttp%3A%2F%2Flocalhost%3A3000%2Foauth%2Fcallback&allowed_scopes=assets%3Aread%0Adevices%3Aread&enabled=on",
         ))
         .await
         .unwrap();
@@ -6794,11 +6794,10 @@ async fn tenant_application_page_scopes_list_upserts_and_hides_client_secrets() 
         "/tenant/applications?notice=application-saved"
     );
 
-    let updated =
-        ApplicationRepository::find_application_by_app_id(store.as_ref(), "tenant-console")
-            .await
-            .unwrap()
-            .unwrap();
+    let updated = ApplicationRepository::find_application_by_app_id(store.as_ref(), "powermonitor")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(updated.tenant_id, tenant_id);
     assert_eq!(updated.kind, ApplicationKind::FullStack);
     assert_eq!(updated.client_id.as_str(), "tenant-console-client-v2");

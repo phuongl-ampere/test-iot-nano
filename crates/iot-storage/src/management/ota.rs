@@ -29,7 +29,180 @@ pub struct OtaArtifact {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OtaDeploymentStatus {
+    Started,
+    Succeeded,
+    Failed,
+}
+
+impl OtaDeploymentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOtaDeployment {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub device_id: String,
+    pub artifact_id: Uuid,
+    pub from_version: Option<String>,
+    pub target_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtaDeployment {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub device_id: String,
+    pub artifact_id: Uuid,
+    pub from_version: Option<String>,
+    pub target_version: String,
+    pub status: OtaDeploymentStatus,
+    pub error_message: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
 impl PlatformStore {
+    pub async fn create_ota_deployment(
+        &self,
+        deployment: NewOtaDeployment,
+    ) -> Result<(), PlatformStoreError> {
+        if deployment.device_id.is_empty() || !is_semver(&deployment.target_version) {
+            return Err(PlatformStoreError::Database(sqlx::Error::Protocol(
+                "invalid OTA deployment".to_owned(),
+            )));
+        }
+        match self {
+            Self::Sqlite(store) => {
+                sqlx::query(
+                    "INSERT INTO ota_deployments (id, tenant_id, device_id, artifact_id, from_version, target_version, status)
+                     VALUES (?, ?, ?, ?, ?, ?, 'started')",
+                )
+                .bind(deployment.id.to_string())
+                .bind(deployment.tenant_id.to_string())
+                .bind(deployment.device_id)
+                .bind(deployment.artifact_id.to_string())
+                .bind(deployment.from_version)
+                .bind(deployment.target_version)
+                .execute(store.pool())
+                .await?;
+            }
+            Self::Timescale(pool) => {
+                sqlx::query(
+                    "INSERT INTO ota_deployments (id, tenant_id, device_id, artifact_id, from_version, target_version, status)
+                     VALUES ($1, $2, $3, $4, $5, $6, 'started')",
+                )
+                .bind(deployment.id)
+                .bind(deployment.tenant_id)
+                .bind(deployment.device_id)
+                .bind(deployment.artifact_id)
+                .bind(deployment.from_version)
+                .bind(deployment.target_version)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn report_ota_deployment(
+        &self,
+        tenant_id: Uuid,
+        device_id: &str,
+        deployment_id: Uuid,
+        status: OtaDeploymentStatus,
+        error_message: Option<String>,
+    ) -> Result<(), PlatformStoreError> {
+        if status == OtaDeploymentStatus::Started {
+            return Err(PlatformStoreError::Database(sqlx::Error::Protocol(
+                "OTA deployment result must be succeeded or failed".to_owned(),
+            )));
+        }
+        match self {
+            Self::Sqlite(store) => {
+                let result = sqlx::query(
+                    "UPDATE ota_deployments
+                     SET status = ?, error_message = ?, completed_at = CURRENT_TIMESTAMP
+                     WHERE id = ? AND tenant_id = ? AND device_id = ? AND status = 'started'",
+                )
+                .bind(status.as_str())
+                .bind(error_message)
+                .bind(deployment_id.to_string())
+                .bind(tenant_id.to_string())
+                .bind(device_id)
+                .execute(store.pool())
+                .await?;
+                if result.rows_affected() != 1 {
+                    return Err(PlatformStoreError::Database(sqlx::Error::Protocol(
+                        "OTA deployment is unavailable for reporting".to_owned(),
+                    )));
+                }
+            }
+            Self::Timescale(pool) => {
+                let result = sqlx::query(
+                    "UPDATE ota_deployments
+                     SET status = $1, error_message = $2, completed_at = now()
+                     WHERE id = $3 AND tenant_id = $4 AND device_id = $5 AND status = 'started'",
+                )
+                .bind(status.as_str())
+                .bind(error_message)
+                .bind(deployment_id)
+                .bind(tenant_id)
+                .bind(device_id)
+                .execute(pool)
+                .await?;
+                if result.rows_affected() != 1 {
+                    return Err(PlatformStoreError::Database(sqlx::Error::Protocol(
+                        "OTA deployment is unavailable for reporting".to_owned(),
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list_ota_deployments(
+        &self,
+        tenant_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<OtaDeployment>, PlatformStoreError> {
+        let limit = i64::from(limit.clamp(1, 200));
+        match self {
+            Self::Sqlite(store) => {
+                let rows = sqlx::query_as::<_, (String, String, String, String, Option<String>, String, String, Option<String>, String, Option<String>)>(
+                    "SELECT id, tenant_id, device_id, artifact_id, from_version, target_version, status, error_message, started_at, completed_at
+                     FROM ota_deployments WHERE tenant_id = ? ORDER BY started_at DESC, id DESC LIMIT ?",
+                )
+                .bind(tenant_id.to_string())
+                .bind(limit)
+                .fetch_all(store.pool())
+                .await?;
+                rows.into_iter().map(sqlite_deployment).collect()
+            }
+            Self::Timescale(pool) => {
+                let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, Option<String>, String, String, Option<String>, String, Option<String>)>(
+                    "SELECT id, tenant_id, device_id, artifact_id, from_version, target_version, status, error_message,
+                            started_at::TEXT, completed_at::TEXT
+                     FROM ota_deployments WHERE tenant_id = $1 ORDER BY started_at DESC, id DESC LIMIT $2",
+                )
+                .bind(tenant_id)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+                rows.into_iter().map(postgres_deployment).collect()
+            }
+        }
+    }
+
     pub async fn list_ota_artifacts(
         &self,
         tenant_id: Uuid,
@@ -226,4 +399,101 @@ fn sqlite_artifact(
             PlatformStoreError::Database(sqlx::Error::Protocol("invalid OTA size".to_owned()))
         })?,
     })
+}
+
+fn sqlite_deployment(
+    row: (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ),
+) -> Result<OtaDeployment, PlatformStoreError> {
+    let (
+        id,
+        tenant_id,
+        device_id,
+        artifact_id,
+        from_version,
+        target_version,
+        status,
+        error_message,
+        started_at,
+        completed_at,
+    ) = row;
+    Ok(OtaDeployment {
+        id: parse_uuid(&id, "deployment id")?,
+        tenant_id: parse_uuid(&tenant_id, "deployment tenant")?,
+        device_id,
+        artifact_id: parse_uuid(&artifact_id, "deployment artifact")?,
+        from_version,
+        target_version,
+        status: ota_deployment_status(&status)?,
+        error_message,
+        started_at,
+        completed_at,
+    })
+}
+
+fn postgres_deployment(
+    row: (
+        Uuid,
+        Uuid,
+        String,
+        Uuid,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ),
+) -> Result<OtaDeployment, PlatformStoreError> {
+    let (
+        id,
+        tenant_id,
+        device_id,
+        artifact_id,
+        from_version,
+        target_version,
+        status,
+        error_message,
+        started_at,
+        completed_at,
+    ) = row;
+    Ok(OtaDeployment {
+        id,
+        tenant_id,
+        device_id,
+        artifact_id,
+        from_version,
+        target_version,
+        status: ota_deployment_status(&status)?,
+        error_message,
+        started_at,
+        completed_at,
+    })
+}
+
+fn parse_uuid(value: &str, field: &str) -> Result<Uuid, PlatformStoreError> {
+    Uuid::parse_str(value).map_err(|_| {
+        PlatformStoreError::Database(sqlx::Error::Protocol(format!("invalid OTA {field}")))
+    })
+}
+
+fn ota_deployment_status(value: &str) -> Result<OtaDeploymentStatus, PlatformStoreError> {
+    match value {
+        "started" => Ok(OtaDeploymentStatus::Started),
+        "succeeded" => Ok(OtaDeploymentStatus::Succeeded),
+        "failed" => Ok(OtaDeploymentStatus::Failed),
+        _ => Err(PlatformStoreError::Database(sqlx::Error::Protocol(
+            "invalid OTA deployment status".to_owned(),
+        ))),
+    }
 }

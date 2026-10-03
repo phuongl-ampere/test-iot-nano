@@ -119,6 +119,8 @@ pub enum PlatformStoreError {
     ApplicationClientIdConflict(String),
     #[error("application ID belongs to a different tenant: {0}")]
     ApplicationTenantConflict(ApplicationId),
+    #[error("tenant already has a registered application: {0}")]
+    TenantApplicationLimit(uuid::Uuid),
     #[error("OAuth application is not registered")]
     OAuthApplicationNotFound,
     #[error("OAuth client secret must not be empty")]

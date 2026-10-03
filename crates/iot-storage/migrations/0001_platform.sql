@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS platform_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version = 6)
+    version INTEGER NOT NULL CHECK (version = 8)
 );
 
 CREATE TABLE IF NOT EXISTS system_accounts (
@@ -111,7 +111,8 @@ CREATE TABLE IF NOT EXISTS applications (
     client_id TEXT NOT NULL UNIQUE,
     allowed_scopes_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    UNIQUE (app_id, tenant_id)
+    UNIQUE (app_id, tenant_id),
+    UNIQUE (tenant_id)
 );
 CREATE TABLE IF NOT EXISTS user_capabilities (
     user_id UUID NOT NULL,
@@ -365,6 +366,21 @@ CREATE TABLE IF NOT EXISTS ota_artifacts (
 );
 CREATE INDEX IF NOT EXISTS ota_artifacts_tenant_profile_version_index
     ON ota_artifacts (tenant_id, device_profile_id, version);
+
+CREATE TABLE IF NOT EXISTS ota_deployments (
+    id UUID NOT NULL PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    artifact_id UUID NOT NULL,
+    from_version TEXT,
+    target_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed')),
+    error_message TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS ota_deployments_tenant_started_index
+    ON ota_deployments (tenant_id, started_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS device_claim_codes (
     id UUID PRIMARY KEY DEFAULT public.uuid_generate_v4(),

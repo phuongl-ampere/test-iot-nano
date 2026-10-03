@@ -36,6 +36,7 @@ pub(crate) const CANONICAL_TABLES: &[&str] = &[
     "tenant_device_claim_policies",
     "tenant_ota_policies",
     "ota_artifacts",
+    "ota_deployments",
     "device_claim_codes",
     "alert_rules",
     "alert_rule_event_evaluations",
@@ -47,7 +48,7 @@ pub(crate) const CANONICAL_TABLES: &[&str] = &[
 pub(crate) const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS platform_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    version INTEGER NOT NULL CHECK (version = 6)
+    version INTEGER NOT NULL CHECK (version = 8)
 );
 
 CREATE TABLE IF NOT EXISTS devices (
@@ -292,7 +293,8 @@ CREATE TABLE IF NOT EXISTS applications (
     client_id TEXT NOT NULL UNIQUE,
     allowed_scopes_json TEXT NOT NULL DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    UNIQUE (app_id, tenant_id)
+    UNIQUE (app_id, tenant_id),
+    UNIQUE (tenant_id)
 );
 CREATE TABLE IF NOT EXISTS user_capabilities (
     user_id TEXT NOT NULL,
@@ -760,6 +762,21 @@ CREATE TABLE IF NOT EXISTS ota_artifacts (
 );
 CREATE INDEX IF NOT EXISTS ota_artifacts_tenant_profile_version_index
     ON ota_artifacts (tenant_id, device_profile_id, version);
+
+CREATE TABLE IF NOT EXISTS ota_deployments (
+    id TEXT NOT NULL PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    device_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    from_version TEXT,
+    target_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed')),
+    error_message TEXT,
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS ota_deployments_tenant_started_index
+    ON ota_deployments (tenant_id, started_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS device_claim_codes (
     id TEXT PRIMARY KEY,

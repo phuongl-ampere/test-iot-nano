@@ -77,6 +77,23 @@ async fn tenant_ota_page(
     )
     .await
     .map_err(management_device_profile_error)?;
+    let device_names =
+        ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
+            .await
+            .map_err(management_device_error)?
+            .into_iter()
+            .map(|device| {
+                (
+                    device.device_id.clone(),
+                    device.display_name.unwrap_or(device.device_id),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+    let deployments = state
+        .store
+        .list_ota_deployments(tenant.tenant_id, 100)
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
     let profile_names = profiles
         .iter()
         .map(|profile| (profile.id, profile.name.clone()))
@@ -99,6 +116,27 @@ async fn tenant_ota_page(
                     artifact.filename,
                     artifact.sha256,
                     artifact.size_bytes,
+                )
+            })
+            .collect(),
+        deployments
+            .into_iter()
+            .map(|deployment| {
+                crate::TenantOtaDeploymentRow::new(
+                    device_names
+                        .get(&deployment.device_id)
+                        .map(String::as_str)
+                        .unwrap_or(&deployment.device_id),
+                    deployment
+                        .from_version
+                        .unwrap_or_else(|| "Unknown".to_owned()),
+                    deployment.target_version,
+                    deployment.status.as_str(),
+                    deployment.started_at,
+                    deployment
+                        .completed_at
+                        .unwrap_or_else(|| "In progress".to_owned()),
+                    deployment.error_message.unwrap_or_default(),
                 )
             })
             .collect(),
@@ -1474,7 +1512,8 @@ pub(in crate::management) fn tenant_application_error(
         | PlatformStoreError::EmptyApplicationScope
         | PlatformStoreError::InvalidApplicationScopes => ManagementSessionError::BadRequest,
         PlatformStoreError::ApplicationClientIdConflict(_)
-        | PlatformStoreError::ApplicationTenantConflict(_) => ManagementSessionError::Conflict,
+        | PlatformStoreError::ApplicationTenantConflict(_)
+        | PlatformStoreError::TenantApplicationLimit(_) => ManagementSessionError::Conflict,
         _ => ManagementSessionError::Unavailable,
     }
 }

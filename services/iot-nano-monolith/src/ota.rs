@@ -5,9 +5,9 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
-use iot_storage::{IdentityRepository, PlatformStore};
+use iot_storage::{IdentityRepository, NewOtaDeployment, OtaDeploymentStatus, PlatformStore};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -40,11 +40,126 @@ struct UpdateManifest {
     download_path: String,
 }
 
+#[derive(Deserialize)]
+struct StartDeploymentRequest {
+    artifact_id: uuid::Uuid,
+    from_version: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StartDeploymentResponse {
+    deployment_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReportDeploymentRequest {
+    status: OtaDeploymentStatus,
+    error_message: Option<String>,
+}
+
 pub(crate) fn router(store: Arc<PlatformStore>) -> Router {
     Router::new()
         .route("/api/v1/device/ota/manifest", get(manifest))
         .route("/api/v1/device/ota/artifacts/{artifact_id}", get(download))
+        .route("/api/v1/device/ota/deployments", post(start_deployment))
+        .route(
+            "/api/v1/device/ota/deployments/{deployment_id}/report",
+            post(report_deployment),
+        )
         .with_state(OtaState { store })
+}
+
+async fn authenticated_device(
+    state: &OtaState,
+    headers: &HeaderMap,
+) -> Result<iot_storage::AuthenticatedDeviceToken, StatusCode> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    IdentityRepository::resolve_active_device_token(state.store.as_ref(), token)
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+async fn start_deployment(
+    State(state): State<OtaState>,
+    headers: HeaderMap,
+    Json(request): Json<StartDeploymentRequest>,
+) -> Result<(StatusCode, Json<StartDeploymentResponse>), StatusCode> {
+    validate_current_version(request.from_version.as_deref())?;
+    let device = authenticated_device(&state, &headers).await?;
+    let profile_id =
+        device_profile_id(state.store.as_ref(), device.tenant_id, &device.device_id).await?;
+    let policy = state
+        .store
+        .ota_policy(device.tenant_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let artifact = state
+        .store
+        .list_ota_artifacts(device.tenant_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .find(|artifact| {
+            artifact.id == request.artifact_id
+                && (!policy.require_matching_device_profile
+                    || artifact.device_profile_id == profile_id)
+                && (!policy.require_newer_version
+                    || is_newer(&artifact.version, request.from_version.as_deref()))
+        })
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let deployment_id = uuid::Uuid::now_v7();
+    state
+        .store
+        .create_ota_deployment(NewOtaDeployment {
+            id: deployment_id,
+            tenant_id: device.tenant_id,
+            device_id: device.device_id,
+            artifact_id: artifact.id,
+            from_version: request.from_version,
+            target_version: artifact.version,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(StartDeploymentResponse {
+            deployment_id: deployment_id.to_string(),
+        }),
+    ))
+}
+
+async fn report_deployment(
+    State(state): State<OtaState>,
+    headers: HeaderMap,
+    Path(deployment_id): Path<uuid::Uuid>,
+    Json(request): Json<ReportDeploymentRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if request.status == OtaDeploymentStatus::Started
+        || request
+            .error_message
+            .as_ref()
+            .is_some_and(|error| error.len() > 1_024)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let device = authenticated_device(&state, &headers).await?;
+    state
+        .store
+        .report_ota_deployment(
+            device.tenant_id,
+            &device.device_id,
+            deployment_id,
+            request.status,
+            request.error_message,
+        )
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn download(
@@ -441,5 +556,64 @@ mod tests {
             serde_json::from_slice(&to_bytes(offered.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(offered["update"], true);
+    }
+
+    #[tokio::test]
+    async fn device_reports_a_completed_ota_deployment_for_console_history() {
+        let (_directory, store, router, token, _profile_id) = fixture().await;
+        let artifact_id = sqlx::query_scalar::<_, String>("SELECT id FROM ota_artifacts")
+            .fetch_one(store.sqlite_pool().unwrap())
+            .await
+            .unwrap();
+        let started = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/device/ota/deployments")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"artifact_id": artifact_id, "from_version": "1.0.0"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::CREATED);
+        let started: serde_json::Value =
+            serde_json::from_slice(&to_bytes(started.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let deployment_id = started["deployment_id"].as_str().unwrap();
+
+        let completed = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/device/ota/deployments/{deployment_id}/report"
+                    ))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"status": "succeeded"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status(), StatusCode::NO_CONTENT);
+        let tenant_id = Uuid::parse_str(
+            &sqlx::query_scalar::<_, String>("SELECT id FROM tenants WHERE slug = 'ota-test'")
+                .fetch_one(store.sqlite_pool().unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let history = store.list_ota_deployments(tenant_id, 20).await.unwrap();
+        assert_eq!(history[0].from_version.as_deref(), Some("1.0.0"));
+        assert_eq!(history[0].target_version, "2.0.0");
+        assert_eq!(
+            history[0].status,
+            iot_storage::OtaDeploymentStatus::Succeeded
+        );
     }
 }

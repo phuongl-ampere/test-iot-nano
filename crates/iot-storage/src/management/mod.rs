@@ -28,7 +28,7 @@ pub use devices::{
     UpdateManagementDevice,
 };
 
-pub use ota::{OtaArtifact, OtaPolicy};
+pub use ota::{NewOtaDeployment, OtaArtifact, OtaDeployment, OtaDeploymentStatus, OtaPolicy};
 
 pub use personal_access_tokens::{
     NewTenantPersonalAccessToken, TenantPersonalAccessTokenRecord,

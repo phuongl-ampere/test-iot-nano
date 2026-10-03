@@ -83,6 +83,25 @@
     </div>
   </section>
 
+  <section class="workspace-panel">
+    <header>
+      <div class="panel-heading"><h2>Deployment history</h2></div>
+      <p class="panel-caption">Devices report their own OTA start and result. The platform never initiates an update.</p>
+    </header>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead><tr><th scope="col">Device</th><th scope="col">From</th><th scope="col">To</th><th scope="col">Status</th><th scope="col">Started</th><th scope="col">Completed</th><th scope="col">Error</th></tr></thead>
+        <tbody>
+          {% for deployment in page.deployments %}
+            <tr><td>{{ deployment.device_name }}</td><td>{{ deployment.from_version }}</td><td>{{ deployment.target_version }}</td><td>{{ deployment.status }}</td><td>{{ deployment.started_at }}</td><td>{{ deployment.completed_at }}</td><td>{{ deployment.error_message }}</td></tr>
+          {% else %}
+            <tr><td colspan="7">No device OTA deployments have been reported.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
   <script>
     (() => {
       const ui = window.PlatformUi;

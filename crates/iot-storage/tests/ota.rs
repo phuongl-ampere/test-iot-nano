@@ -1,5 +1,5 @@
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
-use iot_storage::{OtaPolicy, PlatformStore};
+use iot_storage::{NewOtaDeployment, OtaDeploymentStatus, OtaPolicy, PlatformStore};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -67,4 +67,39 @@ async fn sqlite_ota_artifact_rejects_non_semver_metadata() {
         })
         .await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn sqlite_ota_deployment_history_records_device_versions_and_result() {
+    let (_directory, store, tenant_id) = store().await;
+    let deployment_id = Uuid::now_v7();
+    store
+        .create_ota_deployment(NewOtaDeployment {
+            id: deployment_id,
+            tenant_id,
+            device_id: "ota-device-1".to_owned(),
+            artifact_id: Uuid::now_v7(),
+            from_version: Some("1.0.0".to_owned()),
+            target_version: "1.1.0".to_owned(),
+        })
+        .await
+        .unwrap();
+    store
+        .report_ota_deployment(
+            tenant_id,
+            "ota-device-1",
+            deployment_id,
+            OtaDeploymentStatus::Succeeded,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let history = store.list_ota_deployments(tenant_id, 20).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].device_id, "ota-device-1");
+    assert_eq!(history[0].from_version.as_deref(), Some("1.0.0"));
+    assert_eq!(history[0].target_version, "1.1.0");
+    assert_eq!(history[0].status, OtaDeploymentStatus::Succeeded);
+    assert!(history[0].completed_at.is_some());
 }

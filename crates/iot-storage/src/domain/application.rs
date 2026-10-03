@@ -28,6 +28,16 @@ impl PlatformStore {
                 application.app_id.clone(),
             ));
         }
+        if self
+            .list_applications_for_tenant(application.tenant_id)
+            .await?
+            .into_iter()
+            .any(|existing| existing.app_id != application.app_id)
+        {
+            return Err(PlatformStoreError::TenantApplicationLimit(
+                application.tenant_id,
+            ));
+        }
         match self {
             Self::Sqlite(store) => {
                 let conflicting_app_id = sqlx::query_scalar::<_, String>(
@@ -87,7 +97,11 @@ impl PlatformStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| {
-                    map_application_client_id_conflict(error, application.client_id.as_str())
+                    map_application_write_conflict(
+                        error,
+                        application.client_id.as_str(),
+                        application.tenant_id,
+                    )
                 })?;
                 if result.rows_affected() != 1 {
                     return Err(PlatformStoreError::ApplicationTenantConflict(
@@ -145,7 +159,11 @@ impl PlatformStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|error| {
-                    map_application_client_id_conflict(error, application.client_id.as_str())
+                    map_application_write_conflict(
+                        error,
+                        application.client_id.as_str(),
+                        application.tenant_id,
+                    )
                 })?;
                 if result.rows_affected() != 1 {
                     return Err(PlatformStoreError::ApplicationTenantConflict(
@@ -935,14 +953,33 @@ fn validate_application(application: &mut NewApplication) -> Result<(), Platform
     Ok(())
 }
 
-fn map_application_client_id_conflict(error: sqlx::Error, client_id: &str) -> PlatformStoreError {
+fn map_application_write_conflict(
+    error: sqlx::Error,
+    client_id: &str,
+    tenant_id: uuid::Uuid,
+) -> PlatformStoreError {
     if error
+        .as_database_error()
+        .is_some_and(is_application_tenant_unique_violation)
+    {
+        PlatformStoreError::TenantApplicationLimit(tenant_id)
+    } else if error
         .as_database_error()
         .is_some_and(is_application_client_id_unique_violation)
     {
         PlatformStoreError::ApplicationClientIdConflict(client_id.to_owned())
     } else {
         PlatformStoreError::Database(error)
+    }
+}
+
+fn is_application_tenant_unique_violation(database_error: &(dyn DatabaseError + 'static)) -> bool {
+    match database_error.code().as_deref() {
+        Some("23505") => database_error.constraint() == Some("applications_tenant_id_key"),
+        Some("19") | Some("2067") => database_error
+            .message()
+            .contains("UNIQUE constraint failed: applications.tenant_id"),
+        _ => false,
     }
 }
 

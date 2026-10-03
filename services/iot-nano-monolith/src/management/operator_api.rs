@@ -262,7 +262,7 @@ pub(super) async fn create_application(
         },
     )
     .await
-    .map_err(|_| ManagementSessionError::Unavailable)?;
+    .map_err(crate::management::tenant_application_error)?;
     if let Some(client_secret) = request.client_secret {
         if client_secret.is_empty() {
             return Err(ManagementSessionError::BadRequest);

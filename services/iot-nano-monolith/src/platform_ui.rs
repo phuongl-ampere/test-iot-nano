@@ -827,6 +827,7 @@ impl TenantOtaArtifactRow {
 pub struct TenantOtaPage {
     profiles: Vec<TenantOtaProfileRow>,
     artifacts: Vec<TenantOtaArtifactRow>,
+    deployments: Vec<TenantOtaDeploymentRow>,
     require_matching_device_profile: bool,
     require_newer_version: bool,
 }
@@ -835,14 +836,50 @@ impl TenantOtaPage {
     pub(crate) fn new(
         profiles: Vec<TenantOtaProfileRow>,
         artifacts: Vec<TenantOtaArtifactRow>,
+        deployments: Vec<TenantOtaDeploymentRow>,
         require_matching_device_profile: bool,
         require_newer_version: bool,
     ) -> Self {
         Self {
             profiles,
             artifacts,
+            deployments,
             require_matching_device_profile,
             require_newer_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantOtaDeploymentRow {
+    device_name: String,
+    from_version: String,
+    target_version: String,
+    status: String,
+    started_at: String,
+    completed_at: String,
+    error_message: String,
+}
+
+impl TenantOtaDeploymentRow {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        device_name: impl Into<String>,
+        from_version: impl Into<String>,
+        target_version: impl Into<String>,
+        status: impl Into<String>,
+        started_at: impl Into<String>,
+        completed_at: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            device_name: device_name.into(),
+            from_version: from_version.into(),
+            target_version: target_version.into(),
+            status: status.into(),
+            started_at: started_at.into(),
+            completed_at: completed_at.into(),
+            error_message: error_message.into(),
         }
     }
 }

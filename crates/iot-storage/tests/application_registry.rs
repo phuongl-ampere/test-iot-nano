@@ -111,6 +111,22 @@ async fn sqlite_application_registry_validates_canonicalizes_and_upserts() {
 }
 
 #[tokio::test]
+async fn sqlite_application_registry_allows_only_one_application_per_tenant() {
+    let (_directory, store) = sqlite_store().await;
+    ApplicationRepository::upsert_application(&store, application(true))
+        .await
+        .unwrap();
+    let mut second = application(true);
+    second.app_id = "charge-station".parse().unwrap();
+    second.client_id = "client-charge-station".parse().unwrap();
+
+    assert!(matches!(
+        ApplicationRepository::upsert_application(&store, second).await,
+        Err(PlatformStoreError::TenantApplicationLimit(tenant_id)) if tenant_id == test_tenant_id()
+    ));
+}
+
+#[tokio::test]
 async fn sqlite_application_registry_rejects_domain_invalid_values() {
     let (_directory, store) = sqlite_store().await;
 
@@ -183,6 +199,11 @@ fn redirect_uri_rejects_unsafe_or_malformed_callbacks() {
 async fn sqlite_application_registry_maps_write_time_client_id_conflicts_to_typed_errors() {
     let (_directory, store) = sqlite_store().await;
     let pool = store.sqlite_pool().unwrap();
+    sqlx::query("INSERT INTO tenants (id, slug, status) VALUES (?, 'application-race', 'active')")
+        .bind("00000000-0000-0000-0000-000000000999")
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(
         "CREATE TRIGGER application_client_id_race
          BEFORE INSERT ON applications
@@ -191,7 +212,7 @@ async fn sqlite_application_registry_maps_write_time_client_id_conflicts_to_type
              INSERT INTO applications (
                  app_id, tenant_id, kind, launch_url, client_id, allowed_scopes_json, enabled
              ) VALUES (
-                 'competing-app', NEW.tenant_id, 'frontend', 'https://apps.example.test/competing',
+                'competing-app', '00000000-0000-0000-0000-000000000999', 'frontend', 'https://apps.example.test/competing',
                  NEW.client_id, '[]', 1
              );
          END;",

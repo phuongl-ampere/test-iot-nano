@@ -34,7 +34,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
-pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 6;
+pub(crate) const PLATFORM_SCHEMA_VERSION: i64 = 8;
 
 pub use contracts::{
     AccountClass, AlertComparison, AlertEvaluationEvent, AlertEvaluationRepository,
@@ -92,12 +92,13 @@ pub use management::{
     ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
     ManagementDeviceRepository, ManagementDeviceTelemetry, ManagementDeviceTelemetryRepository,
     ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser, ManagementUserError,
-    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOwnedDeviceToken,
-    NewTenantPersonalAccessToken, OtaArtifact, OtaPolicy, ProvisionManagementDevice,
-    ProvisionManagementDeviceError, TenantPersonalAccessTokenRecord,
-    TenantPersonalAccessTokenRepository, TenantPersonalAccessTokenRepositoryError,
-    UpdateManagementAlertRule, UpdateManagementAsset, UpdateManagementAssetProfile,
-    UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser, UserCapability,
+    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOtaDeployment,
+    NewOwnedDeviceToken, NewTenantPersonalAccessToken, OtaArtifact, OtaDeployment,
+    OtaDeploymentStatus, OtaPolicy, ProvisionManagementDevice, ProvisionManagementDeviceError,
+    TenantPersonalAccessTokenRecord, TenantPersonalAccessTokenRepository,
+    TenantPersonalAccessTokenRepositoryError, UpdateManagementAlertRule, UpdateManagementAsset,
+    UpdateManagementAssetProfile, UpdateManagementDevice, UpdateManagementDeviceProfile,
+    UpdateManagementUser, UserCapability,
 };
 pub use public_api::{
     NewPublicAsset, NewPublicDevice, PublicAlert, PublicApiRepository, PublicAsset,

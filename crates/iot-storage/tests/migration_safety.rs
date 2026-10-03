@@ -114,7 +114,7 @@ async fn sqlite_fresh_initialization_records_the_canonical_schema_version() {
         .await
         .unwrap();
 
-    assert_eq!(marker, (1, 1));
+    assert_eq!(marker, (1, 8));
 }
 
 #[tokio::test]
