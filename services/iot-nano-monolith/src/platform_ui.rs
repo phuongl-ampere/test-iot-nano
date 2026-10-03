@@ -746,6 +746,39 @@ pub struct TenantApplicationsPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantPersonalAccessTokenPage {
+    has_token: bool,
+    name: String,
+    prefix: String,
+    created_at: String,
+    last_used_at: String,
+}
+
+impl TenantPersonalAccessTokenPage {
+    pub(crate) fn new(token: Option<iot_storage::TenantPersonalAccessTokenRecord>) -> Self {
+        match token {
+            Some(token) => Self {
+                has_token: true,
+                name: token.name,
+                prefix: token.token_prefix,
+                created_at: token.created_at.to_rfc3339(),
+                last_used_at: token
+                    .last_used_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "Never used".to_owned()),
+            },
+            None => Self {
+                has_token: false,
+                name: String::new(),
+                prefix: String::new(),
+                created_at: String::new(),
+                last_used_at: String::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantOtaProfileRow {
     id: String,
     name: String,
@@ -1433,6 +1466,13 @@ impl PlatformUiRenderer {
         TenantApplicationsLayout::new(identity, page).render()
     }
 
+    pub fn render_tenant_personal_access_tokens(
+        identity: &PlatformUiIdentity,
+        page: &TenantPersonalAccessTokenPage,
+    ) -> Result<String, askama::Error> {
+        TenantPersonalAccessTokenLayout::new(identity, page).render()
+    }
+
     pub fn render_tenant_ota(
         identity: &PlatformUiIdentity,
         page: &TenantOtaPage,
@@ -1712,6 +1752,13 @@ pub struct TenantApplicationsLayout<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "platform_ui/tenant_personal_access_tokens.html")]
+pub struct TenantPersonalAccessTokenLayout<'a> {
+    identity: &'a PlatformUiIdentity,
+    page: &'a TenantPersonalAccessTokenPage,
+}
+
+#[derive(Template)]
 #[template(path = "platform_ui/tenant_ota.html")]
 pub struct TenantOtaLayout<'a> {
     identity: &'a PlatformUiIdentity,
@@ -1739,6 +1786,12 @@ impl<'a> TenantProfileLayout<'a> {
 
 impl<'a> TenantApplicationsLayout<'a> {
     pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantApplicationsPage) -> Self {
+        Self { identity, page }
+    }
+}
+
+impl<'a> TenantPersonalAccessTokenLayout<'a> {
+    pub fn new(identity: &'a PlatformUiIdentity, page: &'a TenantPersonalAccessTokenPage) -> Self {
         Self { identity, page }
     }
 }

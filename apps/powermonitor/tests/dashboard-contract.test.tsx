@@ -110,7 +110,7 @@ describe("PowerMonitor dashboard", () => {
     expect(markup).toContain("Telemetry");
     expect(markup).toContain("Alerts");
     expect(markup).toContain("Send command");
-    expect(markup).toContain('action="/api/auth/logout"');
+    expect(markup).toContain('action="/api/v1/auth/logout"');
     expect(markup).toContain("Sign out");
   });
 

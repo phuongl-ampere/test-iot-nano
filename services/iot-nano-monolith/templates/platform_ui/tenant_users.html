@@ -147,7 +147,7 @@
         ui.setPending(submit, true);
         status.textContent = "";
         try {
-          await ui.request(`/api/management/users/${encodeURIComponent(selectedUsername)}/capabilities`, {
+          await ui.request(`/api/v1/management/users/${encodeURIComponent(selectedUsername)}/capabilities`, {
             method: "PUT",
             body: { capabilities },
           });

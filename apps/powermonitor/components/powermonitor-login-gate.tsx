@@ -10,7 +10,7 @@ export function PowerMonitorLoginGate({ error }: PowerMonitorLoginGateProps) {
         <p className="eyebrow">Power Monitor</p>
         <h1 id="powermonitor-login-title">Sign in to view your energy operations</h1>
         <p>Use your platform account to continue.</p>
-        <form action="/api/auth/login" aria-label="PowerMonitor sign in" className="powermonitor-login-form" method="post">
+        <form action="/api/v1/auth/login" aria-label="PowerMonitor sign in" className="powermonitor-login-form" method="post">
           <label className="powermonitor-login-field">
             <span>Username</span>
             <input autoComplete="username" name="username" required spellCheck={false} />

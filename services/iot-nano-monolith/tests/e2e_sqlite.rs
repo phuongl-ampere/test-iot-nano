@@ -29,8 +29,7 @@ struct Fixture {
     _directory: TempDir,
     platform_path: PathBuf,
     internal_dir: PathBuf,
-    public_address: SocketAddr,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
     mqtt_tcp_address: SocketAddr,
     mqtt_tls_address: SocketAddr,
     tls_cert_path: PathBuf,
@@ -53,8 +52,7 @@ impl Fixture {
         Self {
             platform_path: root.join("platform.sqlite"),
             internal_dir: root.join("internal"),
-            public_address: reserve_address().await,
-            management_address: reserve_address().await,
+            http_address: reserve_address().await,
             mqtt_tcp_address: reserve_address().await,
             mqtt_tls_address: reserve_address().await,
             tls_cert_path: tls_fixtures.join("server.crt"),
@@ -75,14 +73,7 @@ impl Fixture {
                 "IOT_DEVICE_TOKEN_VAULT_KEY",
                 "e2e-device-token-vault-key-material-0001",
             )
-            .env(
-                "IOT_NANO_PUBLIC_HTTP_ADDRESS",
-                self.public_address.to_string(),
-            )
-            .env(
-                "IOT_NANO_MANAGEMENT_ADDRESS",
-                self.management_address.to_string(),
-            )
+            .env("IOT_NANO_HTTP_ADDRESS", self.http_address.to_string())
             .env(
                 "IOT_NANO_MQTT_TCP_ADDRESS",
                 self.mqtt_tcp_address.to_string(),
@@ -199,12 +190,12 @@ async fn run_e2e_flow(
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    wait_ready(&client, fixture.public_address).await?;
+    wait_ready(&client, fixture.http_address).await?;
 
     let system_login = client
         .post(format!(
-            "http://{}/api/system/auth/login",
-            fixture.management_address
+            "http://{}/api/v1/system/auth/login",
+            fixture.http_address
         ))
         .json(&json!({ "username": "e2e-system", "password": "E2eBootstrapSystem@2026" }))
         .send()
@@ -222,8 +213,8 @@ async fn run_e2e_flow(
 
     let tenant = client
         .post(format!(
-            "http://{}/api/system/tenants",
-            fixture.management_address
+            "http://{}/api/v1/system/tenants",
+            fixture.http_address
         ))
         .header(COOKIE, &system_cookie)
         .json(&json!({
@@ -237,8 +228,8 @@ async fn run_e2e_flow(
 
     let tenant_login = client
         .post(format!(
-            "http://{}/api/tenant/auth/login",
-            fixture.management_address
+            "http://{}/api/v1/tenant/auth/login",
+            fixture.http_address
         ))
         .json(&json!({
             "tenant_slug": "e2e-tenant",
@@ -259,8 +250,8 @@ async fn run_e2e_flow(
 
     let registered = client
         .post(format!(
-            "http://{}/api/management/applications",
-            fixture.management_address
+            "http://{}/api/v1/management/applications",
+            fixture.http_address
         ))
         .header(COOKIE, &tenant_cookie)
         .json(&json!({
@@ -279,8 +270,8 @@ async fn run_e2e_flow(
 
     let user = client
         .post(format!(
-            "http://{}/api/management/users",
-            fixture.management_address
+            "http://{}/api/v1/management/users",
+            fixture.http_address
         ))
         .header(COOKIE, &tenant_cookie)
         .json(&json!({
@@ -293,8 +284,8 @@ async fn run_e2e_flow(
 
     let capabilities = client
         .put(format!(
-            "http://{}/api/management/users/e2e-user/capabilities",
-            fixture.management_address
+            "http://{}/api/v1/management/users/e2e-user/capabilities",
+            fixture.http_address
         ))
         .header(COOKIE, &tenant_cookie)
         .json(&json!({
@@ -306,8 +297,8 @@ async fn run_e2e_flow(
 
     let user_login = client
         .post(format!(
-            "http://{}/api/user/auth/login",
-            fixture.management_address
+            "http://{}/api/v1/user/auth/login",
+            fixture.http_address
         ))
         .json(&json!({
             "tenant_slug": "e2e-tenant",
@@ -328,7 +319,7 @@ async fn run_e2e_flow(
         .to_owned();
 
     let application_token: serde_json::Value = client
-        .post(format!("http://{}/oauth/token", fixture.public_address))
+        .post(format!("http://{}/oauth/token", fixture.http_address))
         .form(&[
             ("grant_type", "client_credentials"),
             ("client_id", "e2e-client"),
@@ -344,7 +335,7 @@ async fn run_e2e_flow(
         .expect("client credentials response omitted an access token");
     assert_eq!(
         client
-            .get(format!("http://{}/api/v1/devices", fixture.public_address))
+            .get(format!("http://{}/api/v1/devices", fixture.http_address))
             .bearer_auth(application_access_token)
             .send()
             .await?
@@ -354,7 +345,7 @@ async fn run_e2e_flow(
 
     let verifier = "e2e-sqlite-pkce-verifier-with-at-least-forty-three-characters";
     let authorize = client
-        .get(format!("http://{}/oauth/authorize", fixture.public_address))
+        .get(format!("http://{}/oauth/authorize", fixture.http_address))
         .query(&[
             ("response_type", "code"),
             ("client_id", "e2e-client"),
@@ -387,7 +378,7 @@ async fn run_e2e_flow(
         .expect("authorization redirect omitted the authorization code");
 
     let token = client
-        .post(format!("http://{}/oauth/token", fixture.public_address))
+        .post(format!("http://{}/oauth/token", fixture.http_address))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", authorization_code),
@@ -405,7 +396,7 @@ async fn run_e2e_flow(
         .expect("authorization-code response omitted an access token");
 
     let created = client
-        .post(format!("http://{}/api/v1/devices", fixture.public_address))
+        .post(format!("http://{}/api/v1/devices", fixture.http_address))
         .bearer_auth(access_token)
         .json(&json!({
             "device_id": "e2e-device",
@@ -417,7 +408,7 @@ async fn run_e2e_flow(
     assert_eq!(created.status(), StatusCode::CREATED);
 
     let devices: serde_json::Value = client
-        .get(format!("http://{}/api/v1/devices", fixture.public_address))
+        .get(format!("http://{}/api/v1/devices", fixture.http_address))
         .bearer_auth(access_token)
         .send()
         .await?
@@ -428,7 +419,7 @@ async fn run_e2e_flow(
     let detail: serde_json::Value = client
         .get(format!(
             "http://{}/api/v1/devices/e2e-device",
-            fixture.public_address
+            fixture.http_address
         ))
         .bearer_auth(access_token)
         .send()
@@ -439,8 +430,8 @@ async fn run_e2e_flow(
 
     let device_token: serde_json::Value = client
         .post(format!(
-            "http://{}/api/management/devices/e2e-device/tokens",
-            fixture.management_address
+            "http://{}/api/v1/management/devices/e2e-device/tokens",
+            fixture.http_address
         ))
         .header(COOKIE, &tenant_cookie)
         .send()
@@ -452,7 +443,7 @@ async fn run_e2e_flow(
         .expect("management device token response omitted the plaintext token");
 
     publish_device_telemetry(fixture.mqtt_tcp_address, "e2e-device", device_token).await?;
-    let telemetry = wait_for_telemetry(&client, fixture.public_address, access_token).await?;
+    let telemetry = wait_for_telemetry(&client, fixture.http_address, access_token).await?;
     assert_eq!(telemetry["items"][0]["device_id"], "e2e-device");
     assert_eq!(telemetry["items"][0]["measurements"]["temperature_c"], 22.5);
     let stream = rusqlite::Connection::open(fixture.internal_dir.join("stream.sqlite"))?;
@@ -467,8 +458,8 @@ async fn run_e2e_flow(
     let exit = timeout(Duration::from_secs(15), child.wait()).await??;
     assert!(exit.success(), "monolith exited with {exit}");
     for address in [
-        fixture.public_address,
-        fixture.management_address,
+        fixture.http_address,
+        fixture.http_address,
         fixture.mqtt_tcp_address,
         fixture.mqtt_tls_address,
     ] {
@@ -509,12 +500,12 @@ impl E2eSession {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        wait_ready(&client, fixture.public_address).await?;
+        wait_ready(&client, fixture.http_address).await?;
 
         let system_login = client
             .post(format!(
-                "http://{}/api/system/auth/login",
-                fixture.management_address
+                "http://{}/api/v1/system/auth/login",
+                fixture.http_address
             ))
             .json(&json!({
                 "username": "e2e-system",
@@ -527,8 +518,8 @@ impl E2eSession {
 
         let tenant = client
             .post(format!(
-                "http://{}/api/system/tenants",
-                fixture.management_address
+                "http://{}/api/v1/system/tenants",
+                fixture.http_address
             ))
             .header(COOKIE, system_cookie)
             .json(&json!({
@@ -542,8 +533,8 @@ impl E2eSession {
 
         let tenant_login = client
             .post(format!(
-                "http://{}/api/tenant/auth/login",
-                fixture.management_address
+                "http://{}/api/v1/tenant/auth/login",
+                fixture.http_address
             ))
             .json(&json!({
                 "tenant_slug": "e2e-tenant",
@@ -568,8 +559,8 @@ impl E2eSession {
             return Err(io::Error::other(format!("monolith exited with {exit}")).into());
         }
         for address in [
-            self.fixture.public_address,
-            self.fixture.management_address,
+            self.fixture.http_address,
+            self.fixture.http_address,
             self.fixture.mqtt_tcp_address,
             self.fixture.mqtt_tls_address,
         ] {
@@ -597,7 +588,7 @@ async fn run_device_pairing_claim_and_share_e2e() -> Result<(), Box<dyn std::err
             .client
             .post(format!(
                 "http://{}/app/devices/claim",
-                session.fixture.management_address
+                session.fixture.http_address
             ))
             .header(COOKIE, &owner_cookie)
             .form(&[("device_id", device_id.as_str()), ("code", code.as_str())])
@@ -610,7 +601,7 @@ async fn run_device_pairing_claim_and_share_e2e() -> Result<(), Box<dyn std::err
             .client
             .post(format!(
                 "http://{}/app/devices/{device_id}/permissions",
-                session.fixture.management_address
+                session.fixture.http_address
             ))
             .header(COOKIE, &owner_cookie)
             .form(&[("username", "recipient"), ("permission", "view")])
@@ -621,7 +612,7 @@ async fn run_device_pairing_claim_and_share_e2e() -> Result<(), Box<dyn std::err
         let recipient_cookie = user_cookie(&session, "recipient", "RecipientPassword@2026").await?;
         let workspace_before = session
             .client
-            .get(format!("http://{}/app", session.fixture.management_address))
+            .get(format!("http://{}/app", session.fixture.http_address))
             .header(COOKIE, &recipient_cookie)
             .send()
             .await?
@@ -634,7 +625,7 @@ async fn run_device_pairing_claim_and_share_e2e() -> Result<(), Box<dyn std::err
             .client
             .get(format!(
                 "http://{}/app/invitations",
-                session.fixture.management_address
+                session.fixture.http_address
             ))
             .header(COOKIE, &recipient_cookie)
             .send()
@@ -651,7 +642,7 @@ async fn run_device_pairing_claim_and_share_e2e() -> Result<(), Box<dyn std::err
             .client
             .post(format!(
                 "http://{}/app/invitations/{invitation_id}/accept",
-                session.fixture.management_address
+                session.fixture.http_address
             ))
             .header(COOKIE, &recipient_cookie)
             .send()
@@ -660,7 +651,7 @@ async fn run_device_pairing_claim_and_share_e2e() -> Result<(), Box<dyn std::err
 
         let workspace_after = session
             .client
-            .get(format!("http://{}/app", session.fixture.management_address))
+            .get(format!("http://{}/app", session.fixture.http_address))
             .header(COOKIE, &recipient_cookie)
             .send()
             .await?
@@ -686,7 +677,7 @@ async fn run_user_capability_e2e() -> Result<(), Box<dyn std::error::Error>> {
             .client
             .post(format!(
                 "http://{}/app/devices",
-                session.fixture.management_address
+                session.fixture.http_address
             ))
             .header(COOKIE, &contributor_cookie)
             .form(&[("display_name", "Denied Device")])
@@ -698,7 +689,7 @@ async fn run_user_capability_e2e() -> Result<(), Box<dyn std::error::Error>> {
             .client
             .post(format!(
                 "http://{}/app/assets",
-                session.fixture.management_address
+                session.fixture.http_address
             ))
             .header(COOKIE, &contributor_cookie)
             .form(&[("name", "Default Asset")])
@@ -709,8 +700,8 @@ async fn run_user_capability_e2e() -> Result<(), Box<dyn std::error::Error>> {
         let capabilities = session
             .client
             .put(format!(
-                "http://{}/api/management/users/contributor/capabilities",
-                session.fixture.management_address
+                "http://{}/api/v1/management/users/contributor/capabilities",
+                session.fixture.http_address
             ))
             .header(COOKIE, &session.tenant_cookie)
             .json(&json!({
@@ -731,7 +722,7 @@ async fn run_user_capability_e2e() -> Result<(), Box<dyn std::error::Error>> {
             .client
             .post(format!(
                 "http://{}/app/devices",
-                session.fixture.management_address
+                session.fixture.http_address
             ))
             .header(COOKIE, &contributor_cookie)
             .form(&[("display_name", "Allowed Device")])
@@ -747,7 +738,7 @@ async fn run_user_capability_e2e() -> Result<(), Box<dyn std::error::Error>> {
             .client
             .get(format!(
                 "http://{}{}",
-                session.fixture.management_address, detail
+                session.fixture.http_address, detail
             ))
             .header(COOKIE, &contributor_cookie)
             .send()
@@ -771,8 +762,8 @@ async fn run_alert_lifecycle_e2e() -> Result<(), Box<dyn std::error::Error>> {
         let rule = session
             .client
             .post(format!(
-                "http://{}/api/management/alert-rules",
-                session.fixture.management_address
+                "http://{}/api/v1/management/alert-rules",
+                session.fixture.http_address
             ))
             .header(COOKIE, &session.tenant_cookie)
             .json(&json!({
@@ -808,8 +799,8 @@ async fn run_alert_lifecycle_e2e() -> Result<(), Box<dyn std::error::Error>> {
         let acknowledged = session
             .client
             .post(format!(
-                "http://{}/api/management/alert-incidents/{incident_id}/acknowledge",
-                session.fixture.management_address
+                "http://{}/api/v1/management/alert-incidents/{incident_id}/acknowledge",
+                session.fixture.http_address
             ))
             .header(COOKIE, &session.tenant_cookie)
             .send()
@@ -821,8 +812,8 @@ async fn run_alert_lifecycle_e2e() -> Result<(), Box<dyn std::error::Error>> {
         let archived = session
             .client
             .post(format!(
-                "http://{}/api/management/alert-rules/{rule_id}/archive",
-                session.fixture.management_address
+                "http://{}/api/v1/management/alert-rules/{rule_id}/archive",
+                session.fixture.http_address
             ))
             .header(COOKIE, &session.tenant_cookie)
             .send()
@@ -857,8 +848,8 @@ async fn create_management_user(
     let response = session
         .client
         .post(format!(
-            "http://{}/api/management/users",
-            session.fixture.management_address
+            "http://{}/api/v1/management/users",
+            session.fixture.http_address
         ))
         .header(COOKIE, &session.tenant_cookie)
         .json(&json!({ "username": username, "password": password }))
@@ -876,8 +867,8 @@ async fn user_cookie(
     let response = session
         .client
         .post(format!(
-            "http://{}/api/user/auth/login",
-            session.fixture.management_address
+            "http://{}/api/v1/user/auth/login",
+            session.fixture.http_address
         ))
         .json(&json!({
             "tenant_slug": "e2e-tenant",
@@ -895,7 +886,7 @@ async fn enable_claim_policy(session: &E2eSession) -> Result<(), Box<dyn std::er
         .client
         .post(format!(
             "http://{}/tenant/devices/claim-policy",
-            session.fixture.management_address
+            session.fixture.http_address
         ))
         .header(COOKIE, &session.tenant_cookie)
         .form(&[
@@ -918,8 +909,8 @@ async fn provision_device(
     let response = session
         .client
         .post(format!(
-            "http://{}/api/management/devices",
-            session.fixture.management_address
+            "http://{}/api/v1/management/devices",
+            session.fixture.http_address
         ))
         .header(COOKIE, &session.tenant_cookie)
         .json(&json!({ "display_name": display_name }))
@@ -940,8 +931,8 @@ async fn create_device_token(
     let response = session
         .client
         .post(format!(
-            "http://{}/api/management/devices/{device_id}/tokens",
-            session.fixture.management_address
+            "http://{}/api/v1/management/devices/{device_id}/tokens",
+            session.fixture.http_address
         ))
         .header(COOKIE, &session.tenant_cookie)
         .send()
@@ -1040,8 +1031,8 @@ async fn wait_for_alert_incident(
         let response = session
             .client
             .get(format!(
-                "http://{}/api/management/alert-incidents",
-                session.fixture.management_address
+                "http://{}/api/v1/management/alert-incidents",
+                session.fixture.http_address
             ))
             .header(COOKIE, &session.tenant_cookie)
             .send()

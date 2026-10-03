@@ -4,7 +4,7 @@ import {
   createCallbackHandler,
   exchangeAuthorizationCode,
   oauthConfigFromEnvironment,
-} from "../../../../lib/oauth";
+} from "../../../../../lib/oauth";
 
 export async function GET(request: Request) {
   const config = oauthConfigFromEnvironment();

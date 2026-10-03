@@ -234,6 +234,28 @@ pub(in crate::management) async fn platform_tenant_applications(
     .await
 }
 
+pub(in crate::management) async fn platform_tenant_personal_access_tokens(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let token =
+        iot_storage::TenantPersonalAccessTokenRepository::active_tenant_personal_access_token(
+            state.store.as_ref(),
+            tenant.tenant_id,
+            tenant.tenant_account_id,
+        )
+        .await
+        .map_err(|_| ManagementSessionError::Unavailable)?;
+    let page = crate::platform_ui::TenantPersonalAccessTokenPage::new(token);
+    let rendered = crate::PlatformUiRenderer::render_tenant_personal_access_tokens(
+        &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
+        &page,
+    )
+    .map_err(|_| ManagementSessionError::Unavailable)?;
+    Ok(Html(rendered))
+}
+
 pub(in crate::management) async fn tenant_assets_page(
     state: &ManagementState,
     tenant: TenantSession,

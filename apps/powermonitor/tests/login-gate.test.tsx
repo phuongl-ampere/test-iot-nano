@@ -10,7 +10,7 @@ describe("PowerMonitorLoginGate", () => {
     render(<PowerMonitorLoginGate />);
 
     expect(screen.getByRole("form", { name: "PowerMonitor sign in" }).getAttribute("action"))
-      .toBe("/api/auth/login");
+      .toBe("/api/v1/auth/login");
     expect(screen.getByRole("form", { name: "PowerMonitor sign in" }).getAttribute("method"))
       .toBe("post");
     expect(screen.getByLabelText("Username").getAttribute("name")).toBe("username");

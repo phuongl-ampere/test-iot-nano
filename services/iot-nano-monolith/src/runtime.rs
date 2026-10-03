@@ -203,36 +203,23 @@ impl MonolithRuntime {
             }
         };
 
-        let public_listener = match TcpListener::bind(config.public_http).await {
+        let http_listener = match TcpListener::bind(config.http).await {
             Ok(listener) => listener,
             Err(error) => {
                 cleanup_started_components(&core, &mut mqtt, config.shutdown_deadline).await;
-                return Err(StartupError::PublicHttpBind(error));
-            }
-        };
-        let management_listener = match TcpListener::bind(config.management_http).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                cleanup_started_components(&core, &mut mqtt, config.shutdown_deadline).await;
-                return Err(StartupError::ManagementHttpBind(error));
+                return Err(StartupError::HttpBind(error));
             }
         };
         infrastructure_status.mark_started(
             &config.storage,
-            public_listener.local_addr().unwrap_or(config.public_http),
-            management_listener
-                .local_addr()
-                .unwrap_or(config.management_http),
+            http_listener.local_addr().unwrap_or(config.http),
             mqtt.plaintext_address(),
         );
-        let http_tasks = vec![
-            spawn_http_server(public_listener, public_router, http_cancellation.clone()),
-            spawn_http_server(
-                management_listener,
-                health_router(readiness.clone()).merge(management_sessions.router),
-                http_cancellation.clone(),
-            ),
-        ];
+        let http_tasks = vec![spawn_http_server(
+            http_listener,
+            public_router.merge(management_sessions.router),
+            http_cancellation.clone(),
+        )];
         let readiness_monitor = spawn_readiness_monitor(
             readiness.clone(),
             cancellation.clone(),
@@ -367,10 +354,8 @@ pub enum StartupError {
     MqttRuntime(#[source] iot_nano_mqttd::MqttRuntimeStartError),
     #[error("Core runtime startup failed")]
     CoreRuntime(#[source] iot_nano_core::CoreRuntimeError),
-    #[error("public HTTP listener bind failed")]
-    PublicHttpBind(#[source] io::Error),
-    #[error("management HTTP listener bind failed")]
-    ManagementHttpBind(#[source] io::Error),
+    #[error("HTTP listener bind failed")]
+    HttpBind(#[source] io::Error),
 }
 
 #[derive(Debug, Error)]

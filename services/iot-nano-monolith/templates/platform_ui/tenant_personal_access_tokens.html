@@ -1,0 +1,153 @@
+{% extends "platform_ui/base.html" %}
+
+{% block title %}Personal access tokens | IoT Nano{% endblock %}
+{% block account_kind %}Tenant Account{% endblock %}
+{% block navigation_label %}Tenant navigation{% endblock %}
+{% block navigation %}
+  {% let active_nav = "personal-access-tokens" %}
+  {% include "platform_ui/tenant_navigation.html" %}
+{% endblock %}
+{% block content %}
+  <section class="page-heading">
+    <p class="eyebrow">Tenant Account</p>
+    <h1>Personal access tokens</h1>
+    <p>Use this token for tenant-scoped public API automation. Only one active token is allowed.</p>
+  </section>
+  <section class="workspace-panel">
+    <header>
+      <div class="panel-heading"><h2>Active token</h2></div>
+      <p class="panel-caption">The token secret is shown only immediately after it is created or rotated.</p>
+    </header>
+    <div data-personal-access-token-metadata>
+    {% if page.has_token %}
+      <dl class="resource-details">
+        <div><dt>Name</dt><dd>{{ page.name }}</dd></div>
+        <div><dt>Prefix</dt><dd><code>{{ page.prefix }}</code></dd></div>
+        <div><dt>Created</dt><dd>{{ page.created_at }}</dd></div>
+        <div><dt>Last used</dt><dd>{{ page.last_used_at }}</dd></div>
+      </dl>
+    {% else %}
+      <p class="empty-state">No personal access token is active for this tenant.</p>
+    {% endif %}
+    </div>
+    <form class="form-grid" data-personal-access-token-form>
+      <label class="field">
+        <span>Token name</span>
+        <input name="name" type="text" maxlength="128" required>
+      </label>
+      <div class="form-actions" data-personal-access-token-actions>
+        <button type="submit">{% if page.has_token %}Rotate token{% else %}Create token{% endif %}</button>
+        {% if page.has_token %}
+          <button type="button" class="button-secondary" data-personal-access-token-revoke>Revoke token</button>
+        {% endif %}
+      </div>
+    </form>
+    <p data-personal-access-token-error class="notice" role="alert" hidden></p>
+  </section>
+  <section class="workspace-panel" data-personal-access-token-secret-panel hidden>
+    <header>
+      <div class="panel-heading"><h2>Copy this token now</h2></div>
+      <p class="panel-caption">It will not be shown again after leaving or refreshing this page.</p>
+    </header>
+    <div class="credential-control">
+      <code id="personal-access-token-secret" class="credential"></code>
+      <button class="icon-button credential-copy" type="button" data-copy-target="personal-access-token-secret" data-copy-status="personal-access-token-copy-status" aria-label="Copy personal access token" title="Copy personal access token">Copy</button>
+      <span id="personal-access-token-copy-status" class="copy-status" role="status" aria-live="polite"></span>
+    </div>
+  </section>
+  <script>
+    (() => {
+      const endpoint = "/api/v1/management/personal-access-token";
+      const form = document.querySelector("[data-personal-access-token-form]");
+      const error = document.querySelector("[data-personal-access-token-error]");
+      const secretPanel = document.querySelector("[data-personal-access-token-secret-panel]");
+      const secret = document.getElementById("personal-access-token-secret");
+      const metadata = document.querySelector("[data-personal-access-token-metadata]");
+      const actions = document.querySelector("[data-personal-access-token-actions]");
+      const setError = (message) => {
+        error.hidden = !message;
+        error.textContent = message || "";
+      };
+      const metadataRow = (label, value, code) => {
+        const row = document.createElement("div");
+        const term = document.createElement("dt");
+        const definition = document.createElement("dd");
+        term.textContent = label;
+        const content = code ? document.createElement("code") : document.createElement("span");
+        content.textContent = value || "Never used";
+        definition.append(content);
+        row.append(term, definition);
+        return row;
+      };
+      const renderMetadata = (token) => {
+        const details = document.createElement("dl");
+        details.className = "resource-details";
+        details.append(
+          metadataRow("Name", token.name),
+          metadataRow("Prefix", token.prefix, true),
+          metadataRow("Created", token.created_at),
+          metadataRow("Last used", token.last_used_at),
+        );
+        metadata.replaceChildren(details);
+      };
+      const revoke = async () => {
+        try {
+          const response = await fetch(`${endpoint}/revoke`, { method: "POST" });
+          if (!response.ok) throw new Error("The token could not be revoked.");
+          window.location.reload();
+        } catch (exception) {
+          setError(exception.message || "The token could not be revoked.");
+        }
+      };
+      const ensureRevokeButton = () => {
+        if (actions.querySelector("[data-personal-access-token-revoke]")) return;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "button-secondary";
+        button.dataset.personalAccessTokenRevoke = "";
+        button.textContent = "Revoke token";
+        button.addEventListener("click", revoke);
+        actions.append(button);
+      };
+      form?.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const name = new FormData(form).get("name");
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+          });
+          if (!response.ok) throw new Error("The token could not be saved.");
+          const payload = await response.json();
+          secret.textContent = payload.secret;
+          secretPanel.hidden = false;
+          renderMetadata(payload.token);
+          form.querySelector("button[type=submit]").textContent = "Rotate token";
+          ensureRevokeButton();
+          setError("");
+          form.reset();
+        } catch (exception) {
+          setError(exception.message || "The token could not be saved.");
+        }
+      });
+      document.querySelector("[data-personal-access-token-revoke]")?.addEventListener("click", revoke);
+      document.querySelectorAll("[data-copy-target]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const value = document.getElementById(button.dataset.copyTarget);
+          const status = document.getElementById(button.dataset.copyStatus);
+          if (!value || !status || !navigator.clipboard) {
+            if (status) status.textContent = "Copy is unavailable in this browser.";
+            return;
+          }
+          try {
+            await navigator.clipboard.writeText(value.textContent || "");
+            status.textContent = "Token copied.";
+          } catch (_) {
+            status.textContent = "Copy failed. Select the token and copy it manually.";
+          }
+        });
+      });
+    })();
+  </script>
+{% endblock %}

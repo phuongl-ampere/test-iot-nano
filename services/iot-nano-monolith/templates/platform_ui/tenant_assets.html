@@ -171,7 +171,7 @@
 
       const loadCreateProfiles = async () => {
         try {
-          const profiles = await ui.request("/api/management/profiles/asset-profiles");
+          const profiles = await ui.request("/api/v1/management/profiles/asset-profiles");
           replaceOptions(createProfileSelect, profiles, null, "No profile");
           profileField.hidden = false;
           metadataField.hidden = false;
@@ -185,7 +185,7 @@
         const assetId = selectedAsset.id;
         ownerStatus.textContent = "Loading users...";
         try {
-          const users = await ui.request("/api/management/users");
+          const users = await ui.request("/api/v1/management/users");
           if (!editor.open || selectedAsset?.id !== assetId) return;
           replaceOptions(
             ownerForm.elements.user_id,
@@ -204,8 +204,8 @@
         ui.setPending(control, true);
         try {
           const [assets, profiles] = await Promise.all([
-            ui.request("/api/management/assets"),
-            ui.request("/api/management/profiles/asset-profiles"),
+            ui.request("/api/v1/management/assets"),
+            ui.request("/api/v1/management/profiles/asset-profiles"),
           ]);
           selectedAsset = assets.find((asset) => asset.id === assetId);
           if (!selectedAsset) throw new Error("The asset no longer exists.");
@@ -236,7 +236,7 @@
         const submit = event.submitter || createForm.querySelector("button[type=submit]");
         ui.setPending(submit, true);
         try {
-          await ui.request("/api/management/assets", {
+          await ui.request("/api/v1/management/assets", {
             method: "POST",
             body: {
               name: createForm.elements.name.value.trim(),
@@ -263,7 +263,7 @@
         if (!window.confirm("Changing the assigned user clears all existing shares for this asset.")) return;
         ui.setPending(ownerSubmit, true);
         try {
-          await ui.request(`/api/management/assets/${encodeURIComponent(selectedAsset.id)}/owner`, {
+          await ui.request(`/api/v1/management/assets/${encodeURIComponent(selectedAsset.id)}/owner`, {
             method: "PUT",
             body: { user_id: ownerUserId },
           });
@@ -285,7 +285,7 @@
         ui.setPending(submit, true);
         try {
           const fields = editorForm.elements;
-          await ui.request(`/api/management/assets/${encodeURIComponent(selectedAsset.id)}`, {
+          await ui.request(`/api/v1/management/assets/${encodeURIComponent(selectedAsset.id)}`, {
             method: "PUT",
             body: {
               name: fields.name.value.trim(),
@@ -315,7 +315,7 @@
           if (!window.confirm(`Delete asset ${assetId}? Child assets and attached devices may be affected.`)) return;
           ui.setPending(control, true);
           try {
-            await ui.request(`/api/management/assets/${encodeURIComponent(assetId)}`, { method: "DELETE" });
+            await ui.request(`/api/v1/management/assets/${encodeURIComponent(assetId)}`, { method: "DELETE" });
             ui.announce("Asset deleted.");
             window.location.reload();
           } catch (error) {

@@ -2,8 +2,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use iot_nano_foundation::{DatabaseStorage, StorageConfiguration};
 use iot_storage::{
     AccountClass, AuditPrincipal, ManagementAssetRepository, NewPublicAsset, NewPublicDevice,
-    PlatformStore, PublicApiRepository, PublicDeviceError, PublicPrincipal, ResourceAccess,
-    ResourceAccessSource, ResourcePermission,
+    PlatformStore, PublicApiRepository, PublicAssetError, PublicDeviceError, PublicPrincipal,
+    ResourceAccess, ResourceAccessSource, ResourcePermission,
 };
 use serde_json::json;
 use sqlx::{Connection, PgConnection, PgPool};
@@ -136,6 +136,274 @@ async fn sqlite_public_assets_are_invisible_across_tenants() {
             .unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn sqlite_tenant_account_principal_has_full_tenant_public_resource_authority() {
+    let (_directory, store) = sqlite_store().await;
+    let pool = store.sqlite_pool().unwrap();
+    let owner_id = Uuid::now_v7();
+    let other_tenant_id = Uuid::now_v7();
+    let other_owner_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tenants (id, slug, status) VALUES (?, 'tenant-account-other', 'active');
+         INSERT INTO users (id, tenant_id, username, password_hash, role, account_class)
+         VALUES (?, ?, 'tenant-account-owner', 'unused', 'viewer', 'user'),
+                (?, ?, 'tenant-account-other-owner', 'unused', 'viewer', 'user')",
+    )
+    .bind(other_tenant_id.to_string())
+    .bind(owner_id.to_string())
+    .bind(test_tenant_id().to_string())
+    .bind(other_owner_id.to_string())
+    .bind(other_tenant_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let owner = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: Some(owner_id),
+        app_id: "tenant-account-owner-app".to_owned(),
+        account_class: AccountClass::User,
+    };
+    let tenant_account = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: None,
+        app_id: "tenant-personal-access-token".to_owned(),
+        account_class: AccountClass::Admin,
+    };
+    let app_only = PublicPrincipal {
+        tenant_id: test_tenant_id(),
+        user_id: None,
+        app_id: "ordinary-app-only-token".to_owned(),
+        account_class: AccountClass::User,
+    };
+
+    let owned_asset = PublicApiRepository::create_public_asset(
+        &store,
+        &owner,
+        NewPublicAsset {
+            name: "tenant-account-owned-asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let owned_device = PublicApiRepository::create_public_device(
+        &store,
+        &owner,
+        NewPublicDevice {
+            device_id: "tenant-account-owned-device".to_owned(),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: Some(owned_asset.id),
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let other_asset_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, name, owner_user_id, metadata)
+         VALUES (?, ?, 'tenant-account-other-asset', ?, '{}')",
+    )
+    .bind(other_asset_id.to_string())
+    .bind(other_tenant_id.to_string())
+    .bind(other_owner_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        PublicApiRepository::list_public_assets(&store, &tenant_account, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>(),
+        vec![owned_asset.id]
+    );
+    assert_eq!(
+        PublicApiRepository::list_public_devices(&store, &tenant_account, None, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect::<Vec<_>>(),
+        vec![owned_device.device_id.clone()]
+    );
+    assert_eq!(
+        PublicApiRepository::public_asset_permission(&store, &tenant_account, owned_asset.id)
+            .await
+            .unwrap(),
+        Some(ResourcePermission::Owner)
+    );
+    assert_eq!(
+        PublicApiRepository::public_device_permission(
+            &store,
+            &tenant_account,
+            &owned_device.device_id,
+        )
+        .await
+        .unwrap(),
+        Some(ResourcePermission::Owner)
+    );
+    assert_eq!(
+        PublicApiRepository::get_public_asset(&store, &tenant_account, owned_asset.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        owned_asset.id
+    );
+    assert_eq!(
+        PublicApiRepository::get_public_device(&store, &tenant_account, &owned_device.device_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .device_id,
+        owned_device.device_id
+    );
+    assert!(
+        PublicApiRepository::get_public_asset(&store, &tenant_account, other_asset_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let created_asset = PublicApiRepository::create_public_asset(
+        &store,
+        &tenant_account,
+        NewPublicAsset {
+            name: "tenant-account-created-asset".to_owned(),
+            asset_profile_id: None,
+            parent_asset_id: None,
+            metadata: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let created_device = PublicApiRepository::create_public_device(
+        &store,
+        &tenant_account,
+        NewPublicDevice {
+            device_id: "tenant-account-created-device".to_owned(),
+            display_name: None,
+            metadata: json!({}),
+            asset_id: Some(created_asset.id),
+            device_profile_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        PublicApiRepository::update_public_asset(
+            &store,
+            &tenant_account,
+            owned_asset.id,
+            NewPublicAsset {
+                name: "tenant-account-updated-asset".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        PublicApiRepository::update_public_device(
+            &store,
+            &tenant_account,
+            &owned_device.device_id,
+            NewPublicDevice {
+                device_id: owned_device.device_id.clone(),
+                display_name: Some("tenant account updated".to_owned()),
+                metadata: json!({}),
+                asset_id: Some(owned_asset.id),
+                device_profile_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        PublicApiRepository::update_public_device(
+            &store,
+            &tenant_account,
+            &created_device.device_id,
+            NewPublicDevice {
+                device_id: created_device.device_id.clone(),
+                display_name: None,
+                metadata: json!({}),
+                asset_id: None,
+                device_profile_id: None,
+            },
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        PublicApiRepository::delete_public_device(
+            &store,
+            &tenant_account,
+            &created_device.device_id
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        PublicApiRepository::delete_public_asset(&store, &tenant_account, created_asset.id)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        PublicApiRepository::list_public_assets(&store, &app_only, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        PublicApiRepository::list_public_devices(&store, &app_only, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        PublicApiRepository::create_public_asset(
+            &store,
+            &app_only,
+            NewPublicAsset {
+                name: "ordinary-app-asset".to_owned(),
+                asset_profile_id: None,
+                parent_asset_id: None,
+                metadata: json!({}),
+            },
+        )
+        .await,
+        Err(PublicAssetError::Unauthorized)
+    ));
+    assert!(matches!(
+        PublicApiRepository::create_public_device(
+            &store,
+            &app_only,
+            NewPublicDevice {
+                device_id: "ordinary-app-device".to_owned(),
+                display_name: None,
+                metadata: json!({}),
+                asset_id: None,
+                device_profile_id: None,
+            },
+        )
+        .await,
+        Err(PublicDeviceError::Unauthorized)
+    ));
 }
 
 #[tokio::test]

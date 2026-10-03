@@ -2,6 +2,7 @@ mod alerts;
 mod assets;
 pub(super) mod devices;
 mod ota;
+mod personal_access_tokens;
 mod profiles;
 pub(super) mod tokens;
 mod users;
@@ -28,6 +29,11 @@ pub use devices::{
 };
 
 pub use ota::{OtaArtifact, OtaPolicy};
+
+pub use personal_access_tokens::{
+    NewTenantPersonalAccessToken, TenantPersonalAccessTokenRecord,
+    TenantPersonalAccessTokenRepository, TenantPersonalAccessTokenRepositoryError,
+};
 
 pub use profiles::{
     CreateManagementAssetProfile, CreateManagementDeviceProfile, ManagementAssetProfile,

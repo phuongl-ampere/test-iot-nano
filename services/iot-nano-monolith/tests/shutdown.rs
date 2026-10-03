@@ -49,8 +49,7 @@ impl Fixture {
                 },
                 device_token_vault_key: vault_key().to_owned(),
                 internal_dir: root.join("internal"),
-                public_http: reserve_address().await,
-                management_http: reserve_address().await,
+                http: reserve_address().await,
                 mqtt_tcp: reserve_address().await,
                 mqtt_tls: reserve_address().await,
                 web_https_enabled: false,
@@ -105,7 +104,7 @@ async fn shutdown_handoff_finishes_an_in_flight_core_command_after_listener_clos
 
     let mut shutdown = start_shutdown(runtime);
     fixture
-        .wait_for_listener_release(&[fixture.config.public_http])
+        .wait_for_listener_release(&[fixture.config.http])
         .await;
     assert!(
         timeout(Duration::from_millis(100), &mut shutdown)
@@ -130,8 +129,7 @@ async fn shutdown_handoff_finishes_an_in_flight_core_command_after_listener_clos
     );
     fixture
         .wait_for_listener_release(&[
-            fixture.config.public_http,
-            fixture.config.management_http,
+            fixture.config.http,
             fixture.config.mqtt_tcp,
             fixture.config.mqtt_tls,
         ])

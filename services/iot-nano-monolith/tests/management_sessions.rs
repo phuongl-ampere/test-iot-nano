@@ -124,7 +124,7 @@ async fn tenant_account_cookie(router: &axum::Router) -> String {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
@@ -154,7 +154,7 @@ async fn tenant_account_replaces_a_users_elevated_capabilities() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/management/users/viewer/capabilities")
+                .uri("/api/v1/management/users/viewer/capabilities")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, cookie)
                 .body(Body::from(
@@ -371,7 +371,7 @@ async fn tenant_account_can_issue_and_immediately_replace_a_manual_device_claim_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/management/devices/{device_id}/claim-code"))
+                .uri(format!("/api/v1/management/devices/{device_id}/claim-code"))
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -402,7 +402,7 @@ async fn tenant_account_can_issue_and_immediately_replace_a_manual_device_claim_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/management/devices/{device_id}/claim-code"))
+                .uri(format!("/api/v1/management/devices/{device_id}/claim-code"))
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -464,7 +464,7 @@ async fn management_user_cookie(router: &axum::Router, username: &str, password:
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/v1/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({ "username": username, "password": password }).to_string(),
@@ -489,7 +489,7 @@ async fn system_account_cookie(router: &axum::Router) -> String {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/auth/login")
+                .uri("/api/v1/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"system","password":"SystemAccount@2026"}"#,
@@ -518,7 +518,7 @@ async fn user_account_cookie_for(router: &axum::Router, username: &str, password
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/user/auth/login")
+                .uri("/api/v1/user/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({ "tenant_slug": "test", "username": username, "password": password })
@@ -586,7 +586,7 @@ async fn tenant_account_login_status(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({ "tenant_slug": tenant_slug, "password": password }).to_string(),
@@ -1960,7 +1960,7 @@ async fn tenant_account_assigns_and_unassigns_device_and_asset_owners_revoking_e
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/management/devices/tenant-assignment-device/owner")
+                .uri("/api/v1/management/devices/tenant-assignment-device/owner")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(json!({ "user_id": owner_id }).to_string()))
@@ -2019,7 +2019,7 @@ async fn tenant_account_assigns_and_unassigns_device_and_asset_owners_revoking_e
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/assets/{asset_id}/owner"))
+                .uri(format!("/api/v1/management/assets/{asset_id}/owner"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(json!({ "user_id": owner_id }).to_string()))
@@ -2067,7 +2067,7 @@ async fn tenant_account_assigns_and_unassigns_device_and_asset_owners_revoking_e
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/assets/{asset_id}/owner"))
+                .uri(format!("/api/v1/management/assets/{asset_id}/owner"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(json!({ "user_id": null }).to_string()))
@@ -2317,8 +2317,7 @@ async fn system_infrastructure_page_renders_non_secret_runtime_status() {
     for status in [
         "Runtime health",
         "Not ready",
-        "Public HTTP listener",
-        "Management HTTP listener",
+        "HTTP listener",
         "MQTT plaintext listener",
         "MQTT TLS listener",
         "Migrations",
@@ -2603,7 +2602,7 @@ async fn management_login_issues_a_cookie_used_by_the_oauth_session_verifier_and
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/v1/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
@@ -2634,7 +2633,7 @@ async fn management_login_issues_a_cookie_used_by_the_oauth_session_verifier_and
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/logout")
+                .uri("/api/v1/auth/logout")
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -2693,7 +2692,7 @@ async fn management_login_rejects_invalid_credentials_without_setting_a_session_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/v1/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))
                 .unwrap(),
@@ -2740,135 +2739,157 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
     let paths = document["paths"].as_object().unwrap();
     let actual_paths: BTreeSet<_> = paths.keys().map(String::as_str).collect();
     let expected_paths = BTreeSet::from([
-        "/api/auth/login",
-        "/api/auth/logout",
-        "/api/auth/me",
-        "/api/management/alerts",
-        "/api/management/alerts/summary",
-        "/api/management/alert-incidents",
-        "/api/management/alert-incidents/{incident_id}/acknowledge",
-        "/api/management/alert-rules",
-        "/api/management/alert-rules/{rule_id}",
-        "/api/management/alert-rules/{rule_id}/archive",
-        "/api/management/audit",
-        "/api/management/applications",
-        "/api/management/ota/artifacts",
-        "/api/management/ota/policy",
-        "/api/management/assets",
-        "/api/management/assets/{asset_id}",
-        "/api/management/devices",
-        "/api/management/devices/{device_id}",
-        "/api/management/devices/{device_id}/owner",
-        "/api/management/devices/{device_id}/claim-code",
-        "/api/management/devices/{device_id}/tokens",
-        "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
-        "/api/management/devices/{device_id}/token",
-        "/api/management/devices/{device_id}/telemetry",
-        "/api/management/assets/{asset_id}/owner",
-        "/api/management/profiles/asset-profiles",
-        "/api/management/profiles/asset-profiles/{profile_id}",
-        "/api/management/profiles/device-profiles",
-        "/api/management/profiles/device-profiles/{profile_id}",
-        "/api/management/profile",
-        "/api/management/profile/export",
-        "/api/management/profile/import",
-        "/api/management/users",
-        "/api/management/users/{username}",
-        "/api/management/users/{username}/capabilities",
+        "/api/v1/auth/login",
+        "/api/v1/auth/logout",
+        "/api/v1/auth/me",
+        "/api/v1/management/alerts",
+        "/api/v1/management/alerts/summary",
+        "/api/v1/management/alert-incidents",
+        "/api/v1/management/alert-incidents/{incident_id}/acknowledge",
+        "/api/v1/management/alert-rules",
+        "/api/v1/management/alert-rules/{rule_id}",
+        "/api/v1/management/alert-rules/{rule_id}/archive",
+        "/api/v1/management/audit",
+        "/api/v1/management/applications",
+        "/api/v1/management/personal-access-token",
+        "/api/v1/management/personal-access-token/revoke",
+        "/api/v1/management/ota/artifacts",
+        "/api/v1/management/ota/policy",
+        "/api/v1/management/assets",
+        "/api/v1/management/assets/{asset_id}",
+        "/api/v1/management/devices",
+        "/api/v1/management/devices/{device_id}",
+        "/api/v1/management/devices/{device_id}/owner",
+        "/api/v1/management/devices/{device_id}/claim-code",
+        "/api/v1/management/devices/{device_id}/tokens",
+        "/api/v1/management/devices/{device_id}/tokens/{token_id}/rotate",
+        "/api/v1/management/devices/{device_id}/token",
+        "/api/v1/management/devices/{device_id}/telemetry",
+        "/api/v1/management/assets/{asset_id}/owner",
+        "/api/v1/management/profiles/asset-profiles",
+        "/api/v1/management/profiles/asset-profiles/{profile_id}",
+        "/api/v1/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles/{profile_id}",
+        "/api/v1/management/profile",
+        "/api/v1/management/profile/export",
+        "/api/v1/management/profile/import",
+        "/api/v1/management/users",
+        "/api/v1/management/users/{username}",
+        "/api/v1/management/users/{username}/capabilities",
     ]);
     assert_eq!(actual_paths, expected_paths);
 
     let expected_methods = BTreeMap::from([
-        ("/api/auth/login", BTreeSet::from(["post"])),
-        ("/api/auth/logout", BTreeSet::from(["post"])),
-        ("/api/auth/me", BTreeSet::from(["get"])),
-        ("/api/management/alerts", BTreeSet::from(["get"])),
-        ("/api/management/alerts/summary", BTreeSet::from(["get"])),
-        ("/api/management/alert-incidents", BTreeSet::from(["get"])),
+        ("/api/v1/auth/login", BTreeSet::from(["post"])),
+        ("/api/v1/auth/logout", BTreeSet::from(["post"])),
+        ("/api/v1/auth/me", BTreeSet::from(["get"])),
+        ("/api/v1/management/alerts", BTreeSet::from(["get"])),
+        ("/api/v1/management/alerts/summary", BTreeSet::from(["get"])),
         (
-            "/api/management/alert-incidents/{incident_id}/acknowledge",
-            BTreeSet::from(["post"]),
-        ),
-        (
-            "/api/management/alert-rules",
-            BTreeSet::from(["get", "post"]),
-        ),
-        (
-            "/api/management/alert-rules/{rule_id}",
-            BTreeSet::from(["put"]),
-        ),
-        (
-            "/api/management/alert-rules/{rule_id}/archive",
-            BTreeSet::from(["post"]),
-        ),
-        ("/api/management/audit", BTreeSet::from(["get"])),
-        ("/api/management/applications", BTreeSet::from(["post"])),
-        (
-            "/api/management/ota/artifacts",
-            BTreeSet::from(["get", "post"]),
-        ),
-        ("/api/management/ota/policy", BTreeSet::from(["get", "put"])),
-        ("/api/management/assets", BTreeSet::from(["get", "post"])),
-        (
-            "/api/management/assets/{asset_id}",
-            BTreeSet::from(["delete", "put"]),
-        ),
-        ("/api/management/devices", BTreeSet::from(["get", "post"])),
-        (
-            "/api/management/devices/{device_id}",
-            BTreeSet::from(["delete", "put"]),
-        ),
-        (
-            "/api/management/devices/{device_id}/owner",
-            BTreeSet::from(["put"]),
-        ),
-        (
-            "/api/management/devices/{device_id}/telemetry",
+            "/api/v1/management/alert-incidents",
             BTreeSet::from(["get"]),
         ),
         (
-            "/api/management/devices/{device_id}/claim-code",
+            "/api/v1/management/alert-incidents/{incident_id}/acknowledge",
             BTreeSet::from(["post"]),
         ),
         (
-            "/api/management/devices/{device_id}/tokens",
-            BTreeSet::from(["post"]),
+            "/api/v1/management/alert-rules",
+            BTreeSet::from(["get", "post"]),
         ),
         (
-            "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
-            BTreeSet::from(["post"]),
-        ),
-        (
-            "/api/management/devices/{device_id}/token",
-            BTreeSet::from(["get"]),
-        ),
-        (
-            "/api/management/assets/{asset_id}/owner",
+            "/api/v1/management/alert-rules/{rule_id}",
             BTreeSet::from(["put"]),
         ),
         (
-            "/api/management/profiles/asset-profiles",
+            "/api/v1/management/alert-rules/{rule_id}/archive",
+            BTreeSet::from(["post"]),
+        ),
+        ("/api/v1/management/audit", BTreeSet::from(["get"])),
+        ("/api/v1/management/applications", BTreeSet::from(["post"])),
+        (
+            "/api/v1/management/personal-access-token",
             BTreeSet::from(["get", "post"]),
         ),
         (
-            "/api/management/profiles/asset-profiles/{profile_id}",
-            BTreeSet::from(["delete", "put"]),
+            "/api/v1/management/personal-access-token/revoke",
+            BTreeSet::from(["post"]),
         ),
         (
-            "/api/management/profiles/device-profiles",
+            "/api/v1/management/ota/artifacts",
             BTreeSet::from(["get", "post"]),
         ),
         (
-            "/api/management/profiles/device-profiles/{profile_id}",
+            "/api/v1/management/ota/policy",
+            BTreeSet::from(["get", "put"]),
+        ),
+        ("/api/v1/management/assets", BTreeSet::from(["get", "post"])),
+        (
+            "/api/v1/management/assets/{asset_id}",
             BTreeSet::from(["delete", "put"]),
         ),
-        ("/api/management/profile", BTreeSet::from(["get", "put"])),
-        ("/api/management/profile/export", BTreeSet::from(["get"])),
-        ("/api/management/profile/import", BTreeSet::from(["put"])),
-        ("/api/management/users", BTreeSet::from(["get", "post"])),
-        ("/api/management/users/{username}", BTreeSet::from(["put"])),
         (
-            "/api/management/users/{username}/capabilities",
+            "/api/v1/management/devices",
+            BTreeSet::from(["get", "post"]),
+        ),
+        (
+            "/api/v1/management/devices/{device_id}",
+            BTreeSet::from(["delete", "put"]),
+        ),
+        (
+            "/api/v1/management/devices/{device_id}/owner",
+            BTreeSet::from(["put"]),
+        ),
+        (
+            "/api/v1/management/devices/{device_id}/telemetry",
+            BTreeSet::from(["get"]),
+        ),
+        (
+            "/api/v1/management/devices/{device_id}/claim-code",
+            BTreeSet::from(["post"]),
+        ),
+        (
+            "/api/v1/management/devices/{device_id}/tokens",
+            BTreeSet::from(["post"]),
+        ),
+        (
+            "/api/v1/management/devices/{device_id}/tokens/{token_id}/rotate",
+            BTreeSet::from(["post"]),
+        ),
+        (
+            "/api/v1/management/devices/{device_id}/token",
+            BTreeSet::from(["get"]),
+        ),
+        (
+            "/api/v1/management/assets/{asset_id}/owner",
+            BTreeSet::from(["put"]),
+        ),
+        (
+            "/api/v1/management/profiles/asset-profiles",
+            BTreeSet::from(["get", "post"]),
+        ),
+        (
+            "/api/v1/management/profiles/asset-profiles/{profile_id}",
+            BTreeSet::from(["delete", "put"]),
+        ),
+        (
+            "/api/v1/management/profiles/device-profiles",
+            BTreeSet::from(["get", "post"]),
+        ),
+        (
+            "/api/v1/management/profiles/device-profiles/{profile_id}",
+            BTreeSet::from(["delete", "put"]),
+        ),
+        ("/api/v1/management/profile", BTreeSet::from(["get", "put"])),
+        ("/api/v1/management/profile/export", BTreeSet::from(["get"])),
+        ("/api/v1/management/profile/import", BTreeSet::from(["put"])),
+        ("/api/v1/management/users", BTreeSet::from(["get", "post"])),
+        (
+            "/api/v1/management/users/{username}",
+            BTreeSet::from(["put"]),
+        ),
+        (
+            "/api/v1/management/users/{username}/capabilities",
             BTreeSet::from(["put"]),
         ),
     ]);
@@ -2883,11 +2904,11 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         assert_eq!(actual_methods, expected_methods, "methods for {path}");
     }
     assert_eq!(
-        paths["/api/management/alerts"]["get"]["responses"]["403"]["description"],
+        paths["/api/v1/management/alerts"]["get"]["responses"]["403"]["description"],
         "Tenant Account required"
     );
     assert_eq!(
-        paths["/api/management/audit"]["get"]["parameters"],
+        paths["/api/v1/management/audit"]["get"]["parameters"],
         json!([
             {
                 "name": "after",
@@ -2908,79 +2929,91 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
 
     for (path, method, status, schema) in [
         (
-            "/api/management/alerts",
+            "/api/v1/management/alerts",
             "get",
             "200",
             "#/components/schemas/ManagementAlertList",
         ),
         (
-            "/api/management/alerts/summary",
+            "/api/v1/management/alerts/summary",
             "get",
             "200",
             "#/components/schemas/ManagementAlertSummary",
         ),
         (
-            "/api/management/alert-incidents",
+            "/api/v1/management/alert-incidents",
             "get",
             "200",
             "#/components/schemas/ManagementAlertIncidentList",
         ),
         (
-            "/api/management/alert-rules",
+            "/api/v1/management/alert-rules",
             "get",
             "200",
             "#/components/schemas/ManagementAlertRuleList",
         ),
         (
-            "/api/management/alert-rules",
+            "/api/v1/management/alert-rules",
             "post",
             "201",
             "#/components/schemas/ManagementAlertRule",
         ),
         (
-            "/api/management/audit",
+            "/api/v1/management/audit",
             "get",
             "200",
             "#/components/schemas/ManagementAuditEventPage",
         ),
         (
-            "/api/management/ota/artifacts",
+            "/api/v1/management/personal-access-token",
+            "get",
+            "200",
+            "#/components/schemas/PersonalAccessTokenGetResponse",
+        ),
+        (
+            "/api/v1/management/personal-access-token",
+            "post",
+            "201",
+            "#/components/schemas/PersonalAccessTokenCreateResponse",
+        ),
+        (
+            "/api/v1/management/ota/artifacts",
             "get",
             "200",
             "#/components/schemas/OtaArtifactList",
         ),
         (
-            "/api/management/ota/artifacts",
+            "/api/v1/management/ota/artifacts",
             "post",
             "201",
             "#/components/schemas/OtaArtifact",
         ),
         (
-            "/api/management/ota/policy",
+            "/api/v1/management/ota/policy",
             "get",
             "200",
             "#/components/schemas/OtaPolicy",
         ),
         (
-            "/api/management/devices",
+            "/api/v1/management/devices",
             "post",
             "201",
             "#/components/schemas/DeviceToken",
         ),
         (
-            "/api/management/devices/{device_id}/tokens",
+            "/api/v1/management/devices/{device_id}/tokens",
             "post",
             "201",
             "#/components/schemas/DeviceToken",
         ),
         (
-            "/api/management/devices/{device_id}/claim-code",
+            "/api/v1/management/devices/{device_id}/claim-code",
             "post",
             "201",
             "#/components/schemas/ManagementDeviceClaimCode",
         ),
         (
-            "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
+            "/api/v1/management/devices/{device_id}/tokens/{token_id}/rotate",
             "post",
             "201",
             "#/components/schemas/DeviceToken",
@@ -3036,6 +3069,10 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         "OtaArtifactList",
         "OtaArtifactUpload",
         "OtaPolicy",
+        "PersonalAccessTokenCreateResponse",
+        "PersonalAccessTokenGetResponse",
+        "PersonalAccessTokenMetadata",
+        "PersonalAccessTokenRequest",
         "PlatformLoginResponse",
         "SessionResponse",
         "TenantProfileConfiguration",
@@ -3093,6 +3130,22 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         );
     }
     assert_eq!(device_token["properties"]["token"]["type"], "string");
+
+    let personal_access_token_metadata = &schemas["PersonalAccessTokenMetadata"];
+    assert!(
+        personal_access_token_metadata["properties"]
+            .get("secret")
+            .is_none()
+    );
+    assert!(
+        schemas["PersonalAccessTokenGetResponse"]["properties"]
+            .get("secret")
+            .is_none()
+    );
+    assert_eq!(
+        schemas["PersonalAccessTokenCreateResponse"]["properties"]["secret"]["type"],
+        "string"
+    );
 
     let management_alert = &schemas["ManagementAlert"];
     assert_eq!(management_alert["type"], "object");
@@ -3181,13 +3234,14 @@ async fn management_openapi_has_only_the_operator_route_allowlist_without_sensit
         );
     }
 
-    let logout = &document["paths"]["/api/auth/logout"]["post"];
+    let logout = &document["paths"]["/api/v1/auth/logout"]["post"];
     assert!(logout.get("security").is_none());
     assert!(logout["responses"]["204"]["content"].is_null());
 
     let rendered = document.to_string();
     for forbidden in [
-        "/api/v1/",
+        "\"/api/v1/devices",
+        "\"/api/v1/assets",
         "/oauth/",
         "/internal/",
         "bearerAuth",
@@ -3294,7 +3348,7 @@ async fn bootstrap_system_creates_the_only_initial_system_account_and_enables_sy
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/auth/login")
+                .uri("/api/v1/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"initial-system","password":"SystemAccount@2026"}"#,
@@ -3332,7 +3386,7 @@ async fn tenant_account_registers_tenant_bound_oauth_applications_and_denies_use
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
@@ -3352,7 +3406,7 @@ async fn tenant_account_registers_tenant_bound_oauth_applications_and_denies_use
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/applications")
+                .uri("/api/v1/management/applications")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, cookie)
                 .body(Body::from(
@@ -3381,7 +3435,7 @@ async fn tenant_account_registers_tenant_bound_oauth_applications_and_denies_use
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/v1/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
@@ -3400,7 +3454,7 @@ async fn tenant_account_registers_tenant_bound_oauth_applications_and_denies_use
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/applications")
+                .uri("/api/v1/management/applications")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, user_cookie)
                 .body(Body::from(
@@ -3422,7 +3476,7 @@ async fn legacy_management_admin_cannot_provision_a_device_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/auth/login")
+                .uri("/api/v1/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
@@ -3441,7 +3495,7 @@ async fn legacy_management_admin_cannot_provision_a_device_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, cookie)
                 .body(Body::from(r#"{"display_name":"Provisioned Device"}"#))
@@ -3462,7 +3516,7 @@ async fn tenant_account_provisions_tenant_bound_devices_and_denies_user_sessions
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
@@ -3485,7 +3539,7 @@ async fn tenant_account_provisions_tenant_bound_devices_and_denies_user_sessions
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -3522,7 +3576,7 @@ async fn tenant_account_provisions_tenant_bound_devices_and_denies_user_sessions
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/auth/login")
+                    .uri("/api/v1/auth/login")
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({ "username": username, "password": password }).to_string(),
@@ -3543,7 +3597,7 @@ async fn tenant_account_provisions_tenant_bound_devices_and_denies_user_sessions
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/management/devices")
+                    .uri("/api/v1/management/devices")
                     .header(CONTENT_TYPE, "application/json")
                     .header(COOKIE, cookie)
                     .body(Body::from(r#"{"display_name":"Denied Device"}"#))
@@ -3565,7 +3619,7 @@ async fn tenant_account_can_replace_a_device_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Rotated Device"}"#))
@@ -3587,7 +3641,7 @@ async fn tenant_account_can_replace_a_device_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/management/devices/{device_id}/tokens"))
+                .uri(format!("/api/v1/management/devices/{device_id}/tokens"))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3610,6 +3664,190 @@ async fn tenant_account_can_replace_a_device_token() {
 }
 
 #[tokio::test]
+async fn tenant_account_manages_a_personal_access_token_without_list_secret_leaks() {
+    let (_directory, management) = management_session_router().await;
+    let router = management.router;
+    let tenant_cookie = tenant_account_cookie(&router).await;
+
+    let page = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tenant/personal-access-tokens")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Personal access tokens"));
+    assert!(!page.contains("iotpat_"));
+
+    let listed = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/management/personal-access-token")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(listed["token"].is_null());
+    assert!(listed.get("secret").is_none());
+
+    let invalid = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/management/personal-access-token")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(r#"{"name":"   "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/management/personal-access-token")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(r#"{"name":"CI deployment"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(created.headers()[CACHE_CONTROL], "no-store");
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let first_secret = created["secret"].as_str().unwrap().to_owned();
+    assert!(first_secret.starts_with("iotpat_"));
+    assert_eq!(created["token"]["name"], "CI deployment");
+    assert!(created["token"].get("token_hash").is_none());
+
+    let listed = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/management/personal-access-token")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(listed["token"]["name"], "CI deployment");
+    assert!(listed.get("secret").is_none());
+    assert!(!listed.to_string().contains(&first_secret));
+
+    let rotated = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/management/personal-access-token")
+                .header(CONTENT_TYPE, "application/json")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::from(r#"{"name":"CI deployment rotated"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::CREATED);
+    let rotated: serde_json::Value =
+        serde_json::from_slice(&to_bytes(rotated.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_ne!(rotated["secret"], first_secret);
+
+    let revoked = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/management/personal-access-token/revoke")
+                .header(COOKIE, &tenant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    assert!(
+        to_bytes(revoked.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let user_login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"NanoAdmin@1234"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let user_cookie = user_login.headers()[SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let denied = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/management/personal-access-token")
+                .header(COOKIE, user_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let denied_page = router
+        .oneshot(
+            Request::builder()
+                .uri("/tenant/personal-access-tokens")
+                .header(COOKIE, user_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied_page.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn tenant_account_can_reveal_the_single_active_device_token() {
     let (_directory, store, management) = management_session_router_with_store().await;
     let router = management.router;
@@ -3619,7 +3857,7 @@ async fn tenant_account_can_reveal_the_single_active_device_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Copyable Token Device"}"#))
@@ -3639,7 +3877,7 @@ async fn tenant_account_can_reveal_the_single_active_device_token() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/management/devices/{device_id}/token"))
+                .uri(format!("/api/v1/management/devices/{device_id}/token"))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3658,7 +3896,7 @@ async fn tenant_account_can_reveal_the_single_active_device_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/management/devices/{device_id}/tokens"))
+                .uri(format!("/api/v1/management/devices/{device_id}/tokens"))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3675,7 +3913,7 @@ async fn tenant_account_can_reveal_the_single_active_device_token() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/management/devices/{device_id}/token"))
+                .uri(format!("/api/v1/management/devices/{device_id}/token"))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3707,7 +3945,7 @@ async fn tenant_account_can_list_raw_device_telemetry_for_a_selected_range() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Telemetry Device"}"#))
@@ -3748,7 +3986,7 @@ async fn tenant_account_can_list_raw_device_telemetry_for_a_selected_range() {
             Request::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/management/devices/{device_id}/telemetry?range=1h"
+                    "/api/v1/management/devices/{device_id}/telemetry?range=1h"
                 ))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
@@ -3776,7 +4014,7 @@ async fn tenant_account_provisioning_accepts_assignment_and_attributes() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/assets")
+                .uri("/api/v1/management/assets")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"name":"Assigned Asset","metadata":{}}"#))
@@ -3793,7 +4031,7 @@ async fn tenant_account_provisioning_accepts_assignment_and_attributes() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/profiles/device-profiles")
+                .uri("/api/v1/management/profiles/device-profiles")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -3812,7 +4050,7 @@ async fn tenant_account_provisioning_accepts_assignment_and_attributes() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -3878,7 +4116,7 @@ async fn tenant_account_rotates_a_specific_active_device_token() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Rotatable Device"}"#))
@@ -3898,7 +4136,7 @@ async fn tenant_account_rotates_a_specific_active_device_token() {
             Request::builder()
                 .method("POST")
                 .uri(format!(
-                    "/api/management/devices/{device_id}/tokens/{token_id}/rotate"
+                    "/api/v1/management/devices/{device_id}/tokens/{token_id}/rotate"
                 ))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
@@ -3941,7 +4179,7 @@ async fn tenant_account_manages_alert_rules_and_incidents() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Alert Device"}"#))
@@ -3968,7 +4206,7 @@ async fn tenant_account_manages_alert_rules_and_incidents() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/alert-rules")
+                .uri("/api/v1/management/alert-rules")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(request.to_string()))
@@ -4007,7 +4245,7 @@ async fn tenant_account_manages_alert_rules_and_incidents() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/management/alerts/summary")
+                .uri("/api/v1/management/alerts/summary")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4025,7 +4263,7 @@ async fn tenant_account_manages_alert_rules_and_incidents() {
             Request::builder()
                 .method("POST")
                 .uri(format!(
-                    "/api/management/alert-incidents/{incident_id}/acknowledge"
+                    "/api/v1/management/alert-incidents/{incident_id}/acknowledge"
                 ))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
@@ -4047,7 +4285,7 @@ async fn tenant_account_manages_alert_rules_and_incidents() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/management/alert-rules/{rule_id}/archive"))
+                .uri(format!("/api/v1/management/alert-rules/{rule_id}/archive"))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4068,7 +4306,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Gateway"}"#))
@@ -4089,7 +4327,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"Child"}"#))
@@ -4110,7 +4348,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4124,7 +4362,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/devices/{gateway_id}"))
+                .uri(format!("/api/v1/management/devices/{gateway_id}"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4159,7 +4397,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri(format!("/api/management/devices/{child_id}"))
+                    .uri(format!("/api/v1/management/devices/{child_id}"))
                     .header(CONTENT_TYPE, "application/json")
                     .header(COOKIE, &cookie)
                     .body(Body::from(request.to_string()))
@@ -4175,7 +4413,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/devices/{child_id}"))
+                .uri(format!("/api/v1/management/devices/{child_id}"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4196,7 +4434,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/management/devices/{gateway_id}"))
+                .uri(format!("/api/v1/management/devices/{gateway_id}"))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4210,7 +4448,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/management/devices/{child_id}"))
+                .uri(format!("/api/v1/management/devices/{child_id}"))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4223,7 +4461,7 @@ async fn tenant_account_manages_devices_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/management/devices/{gateway_id}"))
+                .uri(format!("/api/v1/management/devices/{gateway_id}"))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4242,7 +4480,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"test","password":"TenantAccount@2026"}"#,
@@ -4264,7 +4502,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/assets")
+                .uri("/api/v1/management/assets")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4300,7 +4538,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/assets")
+                .uri("/api/v1/management/assets")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4326,7 +4564,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/assets/{asset_id}"))
+                .uri(format!("/api/v1/management/assets/{asset_id}"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4362,7 +4600,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/management/assets/not-a-uuid")
+                .uri("/api/v1/management/assets/not-a-uuid")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4386,7 +4624,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/api/management/assets/not-a-uuid")
+                .uri("/api/v1/management/assets/not-a-uuid")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4400,7 +4638,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/assets")
+                .uri("/api/v1/management/assets")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4424,7 +4662,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/api/management/assets/00000000-0000-0000-0000-000000000000")
+                .uri("/api/v1/management/assets/00000000-0000-0000-0000-000000000000")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4437,7 +4675,7 @@ async fn tenant_account_manages_assets_through_the_typed_storage_port() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/management/assets/{asset_id}"))
+                .uri(format!("/api/v1/management/assets/{asset_id}"))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4457,7 +4695,7 @@ async fn management_device_routes_require_a_tenant_account_and_map_typed_errors(
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4471,7 +4709,7 @@ async fn management_device_routes_require_a_tenant_account_and_map_typed_errors(
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(COOKIE, viewer_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4486,7 +4724,7 @@ async fn management_device_routes_require_a_tenant_account_and_map_typed_errors(
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(COOKIE, &admin_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4502,7 +4740,7 @@ async fn management_device_routes_require_a_tenant_account_and_map_typed_errors(
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/management/devices/not.valid")
+                .uri("/api/v1/management/devices/not.valid")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(r#"{"display_name":"Device"}"#))
@@ -4517,7 +4755,7 @@ async fn management_device_routes_require_a_tenant_account_and_map_typed_errors(
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/api/management/devices/missing-device")
+                .uri("/api/v1/management/devices/missing-device")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4531,7 +4769,7 @@ async fn management_device_routes_require_a_tenant_account_and_map_typed_errors(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(r#"{"display_name":"Gateway"}"#))
@@ -4550,7 +4788,7 @@ async fn management_device_routes_require_a_tenant_account_and_map_typed_errors(
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/devices/{gateway_id}"))
+                .uri(format!("/api/v1/management/devices/{gateway_id}"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, tenant_cookie)
                 .body(Body::from(
@@ -4575,7 +4813,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
     for request in [
         Request::builder()
             .method("POST")
-            .uri("/api/management/applications")
+            .uri("/api/v1/management/applications")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
                 r#"{"app_id":"test-app","kind":"frontend","launch_url":"https://example.test","client_id":"test-client","redirect_uris":["https://example.test/callback"],"allowed_scopes":["devices:read"],"enabled":true}"#,
@@ -4583,13 +4821,13 @@ async fn tenant_account_management_mutations_map_token_errors() {
             .unwrap(),
         Request::builder()
             .method("POST")
-            .uri("/api/management/devices")
+            .uri("/api/v1/management/devices")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"display_name":"Anonymous"}"#))
             .unwrap(),
         Request::builder()
             .method("POST")
-            .uri("/api/management/devices/missing-device/tokens")
+            .uri("/api/v1/management/devices/missing-device/tokens")
             .body(Body::empty())
             .unwrap(),
     ] {
@@ -4602,7 +4840,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, "iot_nano_session=invalid")
                 .body(Body::from(r#"{"display_name":"Invalid session"}"#))
@@ -4617,7 +4855,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from("{"))
                 .unwrap(),
@@ -4632,7 +4870,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, viewer_cookie)
                 .body(Body::from("{"))
@@ -4648,7 +4886,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices/missing-device/tokens")
+                .uri("/api/v1/management/devices/missing-device/tokens")
                 .header(COOKIE, &admin_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4664,7 +4902,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices/missing-device/tokens")
+                .uri("/api/v1/management/devices/missing-device/tokens")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4680,7 +4918,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/devices/{gateway_id}"))
+                .uri(format!("/api/v1/management/devices/{gateway_id}"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4703,7 +4941,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/devices/{child_id}"))
+                .uri(format!("/api/v1/management/devices/{child_id}"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &cookie)
                 .body(Body::from(
@@ -4723,7 +4961,7 @@ async fn tenant_account_management_mutations_map_token_errors() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/api/management/devices/{child_id}/tokens"))
+                .uri(format!("/api/v1/management/devices/{child_id}/tokens"))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -4743,7 +4981,7 @@ async fn management_mutation_reports_unavailable_when_the_store_closes_after_log
     for request in [
         Request::builder()
             .method("POST")
-            .uri("/api/management/applications")
+            .uri("/api/v1/management/applications")
             .header(CONTENT_TYPE, "application/json")
             .header(COOKIE, &cookie)
             .body(Body::from(
@@ -4752,21 +4990,21 @@ async fn management_mutation_reports_unavailable_when_the_store_closes_after_log
             .unwrap(),
         Request::builder()
             .method("POST")
-            .uri("/api/management/devices")
+            .uri("/api/v1/management/devices")
             .header(CONTENT_TYPE, "application/json")
             .header(COOKIE, &cookie)
             .body(Body::from(r#"{"display_name":"Unavailable"}"#))
             .unwrap(),
         Request::builder()
             .method("PUT")
-            .uri("/api/management/devices/unavailable-device")
+            .uri("/api/v1/management/devices/unavailable-device")
             .header(CONTENT_TYPE, "application/json")
             .header(COOKIE, &cookie)
             .body(Body::from(r#"{"display_name":"Unavailable"}"#))
             .unwrap(),
         Request::builder()
             .method("POST")
-            .uri("/api/management/assets")
+            .uri("/api/v1/management/assets")
             .header(CONTENT_TYPE, "application/json")
             .header(COOKIE, &cookie)
             .body(Body::from(
@@ -4775,7 +5013,7 @@ async fn management_mutation_reports_unavailable_when_the_store_closes_after_log
             .unwrap(),
         Request::builder()
             .method("PUT")
-            .uri("/api/management/assets/00000000-0000-0000-0000-000000000000")
+            .uri("/api/v1/management/assets/00000000-0000-0000-0000-000000000000")
             .header(CONTENT_TYPE, "application/json")
             .header(COOKIE, &cookie)
             .body(Body::from(
@@ -4799,7 +5037,7 @@ async fn management_mutation_preserves_json_rejection_semantics_after_authorizat
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(COOKIE, &cookie)
                 .body(Body::from(r#"{"display_name":"No content type"}"#))
                 .unwrap(),
@@ -4816,7 +5054,7 @@ async fn management_mutation_preserves_json_rejection_semantics_after_authorizat
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, cookie)
                 .body(Body::from(oversized_body))
@@ -4835,11 +5073,11 @@ async fn management_mutation_authorization_precedes_json_rejection_for_every_bod
     let admin_cookie = management_user_cookie(&router, "admin", "NanoAdmin@1234").await;
 
     for (method, path) in [
-        ("POST", "/api/management/applications"),
-        ("POST", "/api/management/devices"),
-        ("PUT", "/api/management/devices/not-valid"),
-        ("POST", "/api/management/assets"),
-        ("PUT", "/api/management/assets/not-valid"),
+        ("POST", "/api/v1/management/applications"),
+        ("POST", "/api/v1/management/devices"),
+        ("PUT", "/api/v1/management/devices/not-valid"),
+        ("POST", "/api/v1/management/assets"),
+        ("PUT", "/api/v1/management/assets/not-valid"),
     ] {
         let anonymous = router
             .clone()
@@ -4884,7 +5122,7 @@ async fn management_provision_device(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, cookie)
                 .body(Body::from(
@@ -4914,7 +5152,7 @@ fn invalid_login_request() -> Request<Body> {
 fn invalid_login_request_for(username: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/api/auth/login")
+        .uri("/api/v1/auth/login")
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
             json!({ "username": username, "password": "wrong" }).to_string(),
@@ -6077,7 +6315,7 @@ async fn tenant_topology_forms_scope_gateway_children_and_reject_invalid_assignm
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri(format!("/api/management/devices/{gateway_id}"))
+                .uri(format!("/api/v1/management/devices/{gateway_id}"))
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -6596,7 +6834,7 @@ async fn tenant_account_has_no_application_scoped_profile_page_or_api() {
 
     let api = router
         .oneshot(platform_get(
-            "/api/management/applications/powermonitor/domain-profiles",
+            "/api/v1/management/applications/powermonitor/domain-profiles",
             Some(&tenant_cookie),
         ))
         .await
@@ -6629,7 +6867,7 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/management/profile/export")
+                .uri("/api/v1/management/profile/export")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -6690,7 +6928,7 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/management/profile/import")
+                .uri("/api/v1/management/profile/import")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(configuration.to_string()))
@@ -6704,7 +6942,7 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/management/profile")
+                .uri("/api/v1/management/profile")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -6723,7 +6961,7 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
         .oneshot(
             Request::builder()
                 .method("PUT")
-                .uri("/api/management/profile/import")
+                .uri("/api/v1/management/profile/import")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(invalid.to_string()))
@@ -6737,7 +6975,7 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/management/profile/export")
+                .uri("/api/v1/management/profile/export")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -6770,7 +7008,7 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -6794,7 +7032,7 @@ async fn tenant_account_imports_and_exports_its_single_profile_configuration() {
     let other_export = router
         .oneshot(
             Request::builder()
-                .uri("/api/management/profile/export")
+                .uri("/api/v1/management/profile/export")
                 .header(COOKIE, other_cookie)
                 .body(Body::empty())
                 .unwrap(),

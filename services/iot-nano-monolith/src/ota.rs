@@ -42,8 +42,8 @@ struct UpdateManifest {
 
 pub(crate) fn router(store: Arc<PlatformStore>) -> Router {
     Router::new()
-        .route("/api/device/ota/manifest", get(manifest))
-        .route("/api/device/ota/artifacts/{artifact_id}", get(download))
+        .route("/api/v1/device/ota/manifest", get(manifest))
+        .route("/api/v1/device/ota/artifacts/{artifact_id}", get(download))
         .with_state(OtaState { store })
 }
 
@@ -154,7 +154,7 @@ async fn manifest(
             version: artifact.version,
             sha256: artifact.sha256,
             size_bytes: artifact.size_bytes,
-            download_path: format!("/api/device/ota/artifacts/{}", artifact.id),
+            download_path: format!("/api/v1/device/ota/artifacts/{}", artifact.id),
         })
         .into_response()),
         None => Ok(Json(NoUpdate { update: false }).into_response()),
@@ -286,7 +286,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/device/ota/manifest")
+                    .uri("/api/v1/device/ota/manifest")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -306,7 +306,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/device/ota/manifest?current_version=latest")
+                    .uri("/api/v1/device/ota/manifest?current_version=latest")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -319,7 +319,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/device/ota/manifest?current_version=1.0.0")
+                    .uri("/api/v1/device/ota/manifest?current_version=1.0.0")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -337,7 +337,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/device/ota/artifacts/{artifact_id}"))
+                    .uri(format!("/api/v1/device/ota/artifacts/{artifact_id}"))
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -350,7 +350,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/device/ota/artifacts/{artifact_id}?current_version=1.0.0"
+                        "/api/v1/device/ota/artifacts/{artifact_id}?current_version=1.0.0"
                     ))
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
@@ -405,7 +405,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/device/ota/manifest?current_version=1.0.0")
+                    .uri("/api/v1/device/ota/manifest?current_version=1.0.0")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -430,7 +430,7 @@ mod tests {
         let offered = router
             .oneshot(
                 Request::builder()
-                    .uri("/api/device/ota/manifest?current_version=1.0.0")
+                    .uri("/api/v1/device/ota/manifest?current_version=1.0.0")
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),

@@ -409,7 +409,7 @@
         if (isInitialLoad) telemetryStatus.textContent = "Loading telemetry...";
         try {
           const response = await ui.request(
-            `/api/management/devices/${encodeURIComponent(deviceId)}/telemetry?range=${encodeURIComponent(range)}`,
+            `/api/v1/management/devices/${encodeURIComponent(deviceId)}/telemetry?range=${encodeURIComponent(range)}`,
           );
           if (!editor.open || selectedDevice?.device_id !== deviceId || telemetryRange.value !== range || request !== telemetryRequest) return;
           if (!Array.isArray(response.items)) throw new Error("Telemetry response is invalid.");
@@ -439,7 +439,7 @@
         const deviceId = selectedDevice.device_id;
         ownerStatus.textContent = "Loading users...";
         try {
-          const users = await ui.request("/api/management/users");
+          const users = await ui.request("/api/v1/management/users");
           if (!editor.open || selectedDevice?.device_id !== deviceId) return;
           replaceOptions(
             ownerForm.elements.user_id,
@@ -460,7 +460,7 @@
         tokenStatus.textContent = "Loading active token...";
         try {
           const response = await ui.request(
-            `/api/management/devices/${encodeURIComponent(deviceId)}/token`,
+            `/api/v1/management/devices/${encodeURIComponent(deviceId)}/token`,
           );
           if (!editor.open || selectedDevice?.device_id !== deviceId) return;
           if (!response.token) throw new Error("The active token is unavailable. Create a new token.");
@@ -497,9 +497,9 @@
         ui.setPending(control, true);
         try {
           const [devices, assets, profiles] = await Promise.all([
-            ui.request("/api/management/devices"),
-            ui.request("/api/management/assets"),
-            ui.request("/api/management/profiles/device-profiles"),
+            ui.request("/api/v1/management/devices"),
+            ui.request("/api/v1/management/assets"),
+            ui.request("/api/v1/management/profiles/device-profiles"),
           ]);
           selectedDevice = devices.find((device) => device.device_id === deviceId);
           if (!selectedDevice) throw new Error("The device no longer exists.");
@@ -553,7 +553,7 @@
         const submit = event.submitter || provisionForm.querySelector("button[type=submit]");
         ui.setPending(submit, true);
         try {
-          const response = await ui.request("/api/management/devices", {
+          const response = await ui.request("/api/v1/management/devices", {
             method: "POST",
             body: {
               serial_number: provisionForm.elements.serial_number.value.trim(),
@@ -592,7 +592,7 @@
         if (!window.confirm("Changing the assigned user clears all existing shares for this device.")) return;
         ui.setPending(ownerSubmit, true);
         try {
-          await ui.request(`/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/owner`, {
+          await ui.request(`/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}/owner`, {
             method: "PUT",
             body: { user_id: ownerUserId },
           });
@@ -650,7 +650,7 @@
         try {
           const fields = editorForm.elements;
           const isGateway = fields.is_gateway.checked;
-          await ui.request(`/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}`, {
+          await ui.request(`/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}`, {
             method: "PUT",
             body: {
               display_name: fields.display_name.value.trim(),
@@ -678,7 +678,7 @@
         ui.setPending(issueToken, true);
         try {
           const response = await ui.request(
-            `/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/tokens`,
+            `/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}/tokens`,
             { method: "POST" },
           );
           if (!response.token) throw new Error("The token was not returned. Try again.");
@@ -701,7 +701,7 @@
         claimCodeStatus.textContent = "Generating pairing code...";
         try {
           const response = await ui.request(
-            `/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/claim-code`,
+            `/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}/claim-code`,
             { method: "POST" },
           );
           if (!response.code || !response.expires_at) throw new Error("The pairing code was not returned. Try again.");
@@ -756,7 +756,7 @@
         if (!window.confirm(`Delete device ${deviceId}? Its active credentials will stop working.`)) return;
         ui.setPending(control, true);
         try {
-          await ui.request(`/api/management/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
+          await ui.request(`/api/v1/management/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
           ui.announce("Device deleted.");
           refreshDevices();
         } catch (error) {

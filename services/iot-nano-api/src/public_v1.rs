@@ -11,14 +11,15 @@ use axum::{
 use chrono::Utc;
 use iot_nano_foundation::RpcMode;
 use iot_storage::{
-    ApplicationDomainResourceKind, AuthorizationRepository, CreateManagementAlertRule,
-    DeviceClaimError, DeviceClaimRepository, ManagementAlertRule, ManagementAlertRuleError,
-    ManagementAlertRuleRepository, ManagementAssetProfileRepository, ManagementAssetRepository,
-    ManagementDeviceProfileRepository, ManagementDeviceRepository, ManagementUserRepository,
-    NewPublicAsset, NewPublicDevice, OwnershipTransferTarget, PlatformStore, PublicAlert,
-    PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice, PublicDeviceError,
-    PublicPrincipal, PublicTelemetry, ResourceInvitation, ResourceInvitationRepository,
-    ResourcePermission, TenantProfileRepository, UpdateManagementAlertRule, UserCapability,
+    AccountClass, ApplicationDomainResourceKind, AuthorizationRepository,
+    CreateManagementAlertRule, DeviceClaimError, DeviceClaimRepository, ManagementAlertRule,
+    ManagementAlertRuleError, ManagementAlertRuleRepository, ManagementAssetProfileRepository,
+    ManagementAssetRepository, ManagementDeviceProfileRepository, ManagementDeviceRepository,
+    ManagementUserRepository, NewPublicAsset, NewPublicDevice, OwnershipTransferTarget,
+    PlatformStore, PublicAlert, PublicApiRepository, PublicAsset, PublicAssetError, PublicDevice,
+    PublicDeviceError, PublicPrincipal, PublicTelemetry, ResourceInvitation,
+    ResourceInvitationRepository, ResourcePermission, TenantProfileRepository,
+    UpdateManagementAlertRule, UserCapability,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -27,7 +28,10 @@ use uuid::Uuid;
 use crate::{
     CoreAuthorizedCommandCreateRequest, CoreCommandCreateRequest, CoreFacade, CoreFacadeError,
     DeviceTokenResponse, DeviceTokenStoreError, TokenVault,
-    auth::{BearerAccessTokenError, extract_bearer_access_token, validate_bearer_access_token},
+    auth::{
+        BearerAccessTokenError, PERSONAL_ACCESS_TOKEN_APP_ID, extract_bearer_access_token,
+        validate_bearer_access_token,
+    },
     reveal_platform_device_token, rotate_platform_device_token,
 };
 
@@ -474,6 +478,17 @@ async fn authenticate(
     let token = validate_bearer_access_token(store.as_ref(), headers, Utc::now()).await?;
     if !token.allows_scope(scope) {
         return Err(PublicApiError::Forbidden);
+    }
+    if token.tenant_account_id.is_some() {
+        return Ok((
+            store,
+            PublicPrincipal {
+                tenant_id: token.tenant_id,
+                user_id: None,
+                app_id: PERSONAL_ACCESS_TOKEN_APP_ID.to_owned(),
+                account_class: AccountClass::Admin,
+            },
+        ));
     }
     let user_id = token.user_id.ok_or(PublicApiError::Forbidden)?;
     let tenant_id = PublicApiRepository::public_user_tenant_id(store.as_ref(), user_id)

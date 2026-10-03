@@ -33,8 +33,7 @@ impl Fixture {
                 },
                 device_token_vault_key: "test-device-token-vault-key-material-0001".to_owned(),
                 internal_dir: root.join("internal"),
-                public_http: reserve_address(),
-                management_http: reserve_address(),
+                http: reserve_address(),
                 mqtt_tcp: reserve_address(),
                 mqtt_tls: reserve_address(),
                 web_https_enabled: false,
@@ -76,14 +75,7 @@ impl Fixture {
                 "IOT_NANO_TLS_KEY_PATH",
                 self.config.tls_key_path.as_os_str(),
             )
-            .env(
-                "IOT_NANO_PUBLIC_HTTP_ADDRESS",
-                self.config.public_http.to_string(),
-            )
-            .env(
-                "IOT_NANO_MANAGEMENT_ADDRESS",
-                self.config.management_http.to_string(),
-            )
+            .env("IOT_NANO_HTTP_ADDRESS", self.config.http.to_string())
             .env(
                 "IOT_NANO_MQTT_TCP_ADDRESS",
                 self.config.mqtt_tcp.to_string(),
@@ -97,8 +89,7 @@ impl Fixture {
 
     fn assert_configured_addresses_are_unbound(&self) {
         for address in [
-            self.config.public_http,
-            self.config.management_http,
+            self.config.http,
             self.config.mqtt_tcp,
             self.config.mqtt_tls,
         ] {

@@ -35,6 +35,8 @@ pub const RETIRED_ENVIRONMENT_NAMES: &[&str] = &[
     "IOT_NANO_MQTTD_API_SECRET",
     "IOT_NANO_MQTTD_INTERNAL_URL",
     "IOT_NANO_MQTTD_STREAM_SECRET",
+    "IOT_NANO_MANAGEMENT_ADDRESS",
+    "IOT_NANO_PUBLIC_HTTP_ADDRESS",
     "IOT_NANO_STREAM_ADDRESS",
     "IOT_NANO_STREAM_DIR",
     "IOT_NANO_STREAM_MAX_RECORD_BYTES",
@@ -50,8 +52,7 @@ pub const RETIRED_ENVIRONMENT_NAMES: &[&str] = &[
     "USE_DATABASE_STORAGE",
 ];
 
-const DEFAULT_PUBLIC_HTTP_ADDRESS: &str = "0.0.0.0:8080";
-const DEFAULT_MANAGEMENT_HTTP_ADDRESS: &str = "127.0.0.1:8081";
+const DEFAULT_HTTP_ADDRESS: &str = "127.0.0.1:8081";
 const DEFAULT_MQTT_TCP_ADDRESS: &str = "0.0.0.0:1883";
 const DEFAULT_MQTT_TLS_ADDRESS: &str = "0.0.0.0:8883";
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -65,8 +66,7 @@ pub struct MonolithConfig {
     pub storage: StorageConfiguration,
     pub device_token_vault_key: String,
     pub internal_dir: PathBuf,
-    pub public_http: SocketAddr,
-    pub management_http: SocketAddr,
+    pub http: SocketAddr,
     pub mqtt_tcp: SocketAddr,
     pub mqtt_tls: SocketAddr,
     /// Whether the public web origin is HTTPS and browser cookies must carry
@@ -96,16 +96,7 @@ impl MonolithConfig {
         let internal_dir = absolute_path(&values, "IOT_NANO_INTERNAL_DIR")?;
         let tls_cert_path = absolute_path(&values, "IOT_NANO_TLS_CERT_PATH")?;
         let tls_key_path = absolute_path(&values, "IOT_NANO_TLS_KEY_PATH")?;
-        let public_http = socket_address(
-            &values,
-            "IOT_NANO_PUBLIC_HTTP_ADDRESS",
-            DEFAULT_PUBLIC_HTTP_ADDRESS,
-        )?;
-        let management_http = socket_address(
-            &values,
-            "IOT_NANO_MANAGEMENT_ADDRESS",
-            DEFAULT_MANAGEMENT_HTTP_ADDRESS,
-        )?;
+        let http = socket_address(&values, "IOT_NANO_HTTP_ADDRESS", DEFAULT_HTTP_ADDRESS)?;
         let mqtt_tcp = socket_address(
             &values,
             "IOT_NANO_MQTT_TCP_ADDRESS",
@@ -118,7 +109,7 @@ impl MonolithConfig {
         )?;
         let web_https_enabled =
             boolean(&values, "IOT_NANO_HTTPS_ENABLED", DEFAULT_WEB_HTTPS_ENABLED)?;
-        validate_unique_addresses([public_http, management_http, mqtt_tcp, mqtt_tls])?;
+        validate_unique_addresses([http, mqtt_tcp, mqtt_tls])?;
         let shutdown_deadline = Duration::from_secs(bounded_u64(
             &values,
             "IOT_NANO_SHUTDOWN_DEADLINE_SECONDS",
@@ -130,8 +121,7 @@ impl MonolithConfig {
             storage,
             device_token_vault_key,
             internal_dir,
-            public_http,
-            management_http,
+            http,
             mqtt_tcp,
             mqtt_tls,
             web_https_enabled,

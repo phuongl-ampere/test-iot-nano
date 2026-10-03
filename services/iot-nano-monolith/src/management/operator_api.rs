@@ -19,6 +19,149 @@ pub(super) struct OtaArtifactResponse {
     size_bytes: u64,
 }
 
+#[derive(Deserialize)]
+struct PersonalAccessTokenRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct PersonalAccessTokenMetadataResponse {
+    name: String,
+    prefix: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Serialize)]
+pub(super) struct PersonalAccessTokenGetResponse {
+    token: Option<PersonalAccessTokenMetadataResponse>,
+}
+
+#[derive(Serialize)]
+pub(super) struct PersonalAccessTokenCreateResponse {
+    token: PersonalAccessTokenMetadataResponse,
+    secret: String,
+}
+
+pub(super) fn personal_access_token_metadata_response(
+    token: iot_storage::TenantPersonalAccessTokenRecord,
+) -> PersonalAccessTokenMetadataResponse {
+    PersonalAccessTokenMetadataResponse {
+        name: token.name,
+        prefix: token.token_prefix,
+        created_at: token.created_at,
+        last_used_at: token.last_used_at,
+    }
+}
+
+pub(super) async fn get_personal_access_token(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<Json<PersonalAccessTokenGetResponse>, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let token =
+        iot_storage::TenantPersonalAccessTokenRepository::active_tenant_personal_access_token(
+            state.store.as_ref(),
+            tenant.tenant_id,
+            tenant.tenant_account_id,
+        )
+        .await
+        .map_err(personal_access_token_error)?
+        .map(personal_access_token_metadata_response);
+    Ok(Json(PersonalAccessTokenGetResponse { token }))
+}
+
+pub(super) async fn create_personal_access_token(
+    State(state): State<ManagementState>,
+    request: Request,
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::header::HeaderName, HeaderValue); 1],
+        Json<PersonalAccessTokenCreateResponse>,
+    ),
+    ManagementSessionError,
+> {
+    let headers = request.headers().clone();
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let request: PersonalAccessTokenRequest = management_request_json(&state, request).await?;
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err(ManagementSessionError::BadRequest);
+    }
+    let secret = format!(
+        "iotpat_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let token_hash = format!("{:x}", Sha256::digest(secret.as_bytes()));
+    let token = iot_storage::NewTenantPersonalAccessToken {
+        id: Uuid::now_v7(),
+        name: name.to_owned(),
+        token_prefix: secret.chars().take(15).collect(),
+        token_hash,
+    };
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    let token =
+        iot_storage::TenantPersonalAccessTokenRepository::rotate_tenant_personal_access_token(
+            state.store.as_ref(),
+            tenant.tenant_id,
+            tenant.tenant_account_id,
+            token,
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(personal_access_token_error)?;
+    Ok((
+        StatusCode::CREATED,
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(PersonalAccessTokenCreateResponse {
+            token: personal_access_token_metadata_response(token),
+            secret,
+        }),
+    ))
+}
+
+pub(super) async fn revoke_personal_access_token(
+    State(state): State<ManagementState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ManagementSessionError> {
+    let tenant = require_tenant_account(&state.session_verifier, &headers)?;
+    let _lease = authorize_tenant_mutation(&state, &headers).await?;
+    iot_storage::TenantPersonalAccessTokenRepository::revoke_tenant_personal_access_token(
+        state.store.as_ref(),
+        tenant.tenant_id,
+        tenant.tenant_account_id,
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(personal_access_token_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn personal_access_token_error(
+    error: iot_storage::TenantPersonalAccessTokenRepositoryError,
+) -> ManagementSessionError {
+    match error {
+        iot_storage::TenantPersonalAccessTokenRepositoryError::EmptyName
+        | iot_storage::TenantPersonalAccessTokenRepositoryError::EmptyTokenPrefix
+        | iot_storage::TenantPersonalAccessTokenRepositoryError::InvalidTokenHash => {
+            ManagementSessionError::BadRequest
+        }
+        iot_storage::TenantPersonalAccessTokenRepositoryError::TenantAccountNotFound
+        | iot_storage::TenantPersonalAccessTokenRepositoryError::TokenNotFound => {
+            ManagementSessionError::NotFound
+        }
+        iot_storage::TenantPersonalAccessTokenRepositoryError::TokenPrefixConflict => {
+            ManagementSessionError::Conflict
+        }
+        iot_storage::TenantPersonalAccessTokenRepositoryError::InvalidStoredTimestamp
+        | iot_storage::TenantPersonalAccessTokenRepositoryError::Storage { .. } => {
+            ManagementSessionError::Unavailable
+        }
+    }
+}
+
 pub(super) async fn list_ota_artifacts(
     State(state): State<ManagementState>,
     headers: HeaderMap,

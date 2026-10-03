@@ -89,8 +89,7 @@ struct Fixture {
     database_url: String,
     platform_path: PathBuf,
     internal_dir: PathBuf,
-    public_address: SocketAddr,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
     mqtt_tcp_address: SocketAddr,
     mqtt_tls_address: SocketAddr,
     reserved_listeners: Option<Vec<TcpListener>>,
@@ -108,8 +107,7 @@ impl Fixture {
         let root = directory.path().canonicalize()?;
         let tls_fixtures =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../iot-nano-mqttd/tests/fixtures");
-        let (public_address, public_listener) = reserve_address().await?;
-        let (management_address, management_listener) = reserve_address().await?;
+        let (http_address, http_listener) = reserve_address().await?;
         let (mqtt_tcp_address, mqtt_tcp_listener) = reserve_address().await?;
         let (mqtt_tls_address, mqtt_tls_listener) = reserve_address().await?;
 
@@ -118,13 +116,11 @@ impl Fixture {
             database_url,
             platform_path: root.join("platform.sqlite"),
             internal_dir: root.join("internal"),
-            public_address,
-            management_address,
+            http_address,
             mqtt_tcp_address,
             mqtt_tls_address,
             reserved_listeners: Some(vec![
-                public_listener,
-                management_listener,
+                http_listener,
                 mqtt_tcp_listener,
                 mqtt_tls_listener,
             ]),
@@ -134,17 +130,14 @@ impl Fixture {
     }
 
     async fn rotate_reserved_addresses(&mut self) -> E2eResult {
-        let (public_address, public_listener) = reserve_address().await?;
-        let (management_address, management_listener) = reserve_address().await?;
+        let (http_address, http_listener) = reserve_address().await?;
         let (mqtt_tcp_address, mqtt_tcp_listener) = reserve_address().await?;
         let (mqtt_tls_address, mqtt_tls_listener) = reserve_address().await?;
-        self.public_address = public_address;
-        self.management_address = management_address;
+        self.http_address = http_address;
         self.mqtt_tcp_address = mqtt_tcp_address;
         self.mqtt_tls_address = mqtt_tls_address;
         self.reserved_listeners = Some(vec![
-            public_listener,
-            management_listener,
+            http_listener,
             mqtt_tcp_listener,
             mqtt_tls_listener,
         ]);
@@ -164,14 +157,7 @@ impl Fixture {
             .env("IOT_NANO_TLS_CERT_PATH", &self.tls_cert_path)
             .env("IOT_NANO_TLS_KEY_PATH", &self.tls_key_path)
             .env("IOT_DEVICE_TOKEN_VAULT_KEY", DEVICE_TOKEN_VAULT_KEY)
-            .env(
-                "IOT_NANO_PUBLIC_HTTP_ADDRESS",
-                self.public_address.to_string(),
-            )
-            .env(
-                "IOT_NANO_MANAGEMENT_ADDRESS",
-                self.management_address.to_string(),
-            )
+            .env("IOT_NANO_HTTP_ADDRESS", self.http_address.to_string())
             .env(
                 "IOT_NANO_MQTT_TCP_ADDRESS",
                 self.mqtt_tcp_address.to_string(),
@@ -392,7 +378,7 @@ async fn start_monolith(
         )
         .await?;
 
-        match wait_ready(client, fixture.public_address, child.child_mut()?).await {
+        match wait_ready(client, fixture.http_address, child.child_mut()?).await {
             Ok(()) => return Ok(child),
             Err(error) => {
                 let exited_before_cleanup = matches!(child.try_wait(), Ok(Some(_)));
@@ -436,8 +422,8 @@ async fn run_e2e_flow(
 ) -> E2eResult {
     let system_login = client
         .post(format!(
-            "http://{}/api/system/auth/login",
-            fixture.management_address
+            "http://{}/api/v1/system/auth/login",
+            fixture.http_address
         ))
         .json(&json!({
             "username": credentials.system_username,
@@ -459,8 +445,8 @@ async fn run_e2e_flow(
 
     let tenant = client
         .post(format!(
-            "http://{}/api/system/tenants",
-            fixture.management_address
+            "http://{}/api/v1/system/tenants",
+            fixture.http_address
         ))
         .header(COOKIE, &system_cookie)
         .json(&json!({
@@ -474,8 +460,8 @@ async fn run_e2e_flow(
 
     let tenant_login = client
         .post(format!(
-            "http://{}/api/tenant/auth/login",
-            fixture.management_address
+            "http://{}/api/v1/tenant/auth/login",
+            fixture.http_address
         ))
         .json(&json!({
             "tenant_slug": credentials.tenant_slug,
@@ -502,8 +488,8 @@ async fn run_e2e_flow(
     let password = format!("E2eTimescaleUser-{suffix}@2026");
     let registered = client
         .post(format!(
-            "http://{}/api/management/applications",
-            fixture.management_address
+            "http://{}/api/v1/management/applications",
+            fixture.http_address
         ))
         .header(COOKIE, &tenant_cookie)
         .json(&json!({
@@ -522,8 +508,8 @@ async fn run_e2e_flow(
 
     let user = client
         .post(format!(
-            "http://{}/api/management/users",
-            fixture.management_address
+            "http://{}/api/v1/management/users",
+            fixture.http_address
         ))
         .header(COOKIE, &tenant_cookie)
         .json(&json!({
@@ -536,8 +522,8 @@ async fn run_e2e_flow(
 
     let user_login = client
         .post(format!(
-            "http://{}/api/user/auth/login",
-            fixture.management_address
+            "http://{}/api/v1/user/auth/login",
+            fixture.http_address
         ))
         .json(&json!({
             "tenant_slug": credentials.tenant_slug,
@@ -559,7 +545,7 @@ async fn run_e2e_flow(
         .to_owned();
 
     let application_oauth = client
-        .post(format!("http://{}/oauth/token", fixture.public_address))
+        .post(format!("http://{}/oauth/token", fixture.http_address))
         .form(&[
             ("grant_type", "client_credentials"),
             ("client_id", credentials.client_id.as_str()),
@@ -579,7 +565,7 @@ async fn run_e2e_flow(
         .ok_or_else(|| test_error("client credentials response omitted access_token"))?;
 
     let application_devices = client
-        .get(format!("http://{}/api/v1/devices", fixture.public_address))
+        .get(format!("http://{}/api/v1/devices", fixture.http_address))
         .bearer_auth(application_access_token)
         .send()
         .await?;
@@ -591,7 +577,7 @@ async fn run_e2e_flow(
 
     let verifier = "e2e-timescale-pkce-verifier-with-at-least-forty-three-characters";
     let authorize = client
-        .get(format!("http://{}/oauth/authorize", fixture.public_address))
+        .get(format!("http://{}/oauth/authorize", fixture.http_address))
         .query(&[
             ("response_type", "code"),
             ("client_id", credentials.client_id.as_str()),
@@ -628,7 +614,7 @@ async fn run_e2e_flow(
         .ok_or_else(|| test_error("authorization redirect omitted authorization code"))?;
 
     let oauth = client
-        .post(format!("http://{}/oauth/token", fixture.public_address))
+        .post(format!("http://{}/oauth/token", fixture.http_address))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", authorization_code),
@@ -646,7 +632,7 @@ async fn run_e2e_flow(
         .ok_or_else(|| test_error("authorization-code response omitted access_token"))?;
 
     let created = client
-        .post(format!("http://{}/api/v1/devices", fixture.public_address))
+        .post(format!("http://{}/api/v1/devices", fixture.http_address))
         .bearer_auth(access_token)
         .json(&json!({
             "device_id": device_id,
@@ -658,7 +644,7 @@ async fn run_e2e_flow(
     require_status(&created, StatusCode::CREATED, "public device creation")?;
 
     let devices_response = client
-        .get(format!("http://{}/api/v1/devices", fixture.public_address))
+        .get(format!("http://{}/api/v1/devices", fixture.http_address))
         .bearer_auth(access_token)
         .send()
         .await?;
@@ -673,7 +659,7 @@ async fn run_e2e_flow(
     let detail_response = client
         .get(format!(
             "http://{}/api/v1/devices/{device_id}",
-            fixture.public_address
+            fixture.http_address
         ))
         .bearer_auth(access_token)
         .send()
@@ -688,8 +674,8 @@ async fn run_e2e_flow(
 
     let device_token_response = client
         .post(format!(
-            "http://{}/api/management/devices/{device_id}/tokens",
-            fixture.management_address
+            "http://{}/api/v1/management/devices/{device_id}/tokens",
+            fixture.http_address
         ))
         .header(COOKIE, &tenant_cookie)
         .send()
@@ -706,7 +692,7 @@ async fn run_e2e_flow(
 
     publish_device_telemetry(fixture.mqtt_tcp_address, &device_id, device_token).await?;
     let telemetry =
-        wait_for_telemetry(client, fixture.public_address, access_token, &device_id).await?;
+        wait_for_telemetry(client, fixture.http_address, access_token, &device_id).await?;
     if telemetry["items"][0]["device_id"] != device_id
         || telemetry["items"][0]["measurements"]["temperature_c"] != 22.5
     {
@@ -1068,8 +1054,8 @@ async fn managed_child_drop_during_task_abort_kills_its_process_group() {
 async fn assert_all_addresses_rebind(fixture: &Fixture) -> E2eResult {
     let mut failures = Vec::new();
     for address in [
-        fixture.public_address,
-        fixture.management_address,
+        fixture.http_address,
+        fixture.http_address,
         fixture.mqtt_tcp_address,
         fixture.mqtt_tls_address,
     ] {

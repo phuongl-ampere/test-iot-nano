@@ -1,6 +1,6 @@
 import { cookies } from "next/headers";
 
-import { oauthStateCookieName, sessionCookieName } from "../../../../lib/oauth";
+import { oauthStateCookieName, sessionCookieName } from "../../../../../lib/oauth";
 
 export async function POST(request: Request) {
   const cookieStore = await cookies();

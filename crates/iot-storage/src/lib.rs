@@ -92,8 +92,10 @@ pub use management::{
     ManagementDeviceProfile, ManagementDeviceProfileError, ManagementDeviceProfileRepository,
     ManagementDeviceRepository, ManagementDeviceTelemetry, ManagementDeviceTelemetryRepository,
     ManagementDeviceTopology, ManagementGatewayStatus, ManagementUser, ManagementUserError,
-    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOwnedDeviceToken, OtaArtifact,
-    OtaPolicy, ProvisionManagementDevice, ProvisionManagementDeviceError,
+    ManagementUserRepository, ManagementUserRole, NewDeviceToken, NewOwnedDeviceToken,
+    NewTenantPersonalAccessToken, OtaArtifact, OtaPolicy, ProvisionManagementDevice,
+    ProvisionManagementDeviceError, TenantPersonalAccessTokenRecord,
+    TenantPersonalAccessTokenRepository, TenantPersonalAccessTokenRepositoryError,
     UpdateManagementAlertRule, UpdateManagementAsset, UpdateManagementAssetProfile,
     UpdateManagementDevice, UpdateManagementDeviceProfile, UpdateManagementUser, UserCapability,
 };

@@ -18,7 +18,7 @@ describe("PowerMonitor OAuth BFF", () => {
       config: {
         platformBaseUrl: "https://platform.example.test",
         clientId: "powermonitor-client",
-        redirectUri: "https://powermonitor.example.test/api/auth/callback",
+        redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
         scope: "devices:read telemetry:read",
       },
     });
@@ -45,7 +45,7 @@ describe("PowerMonitor OAuth BFF", () => {
       config: {
         platformBaseUrl: "https://platform.example.test",
         clientId: "powermonitor-client",
-        redirectUri: "https://powermonitor.example.test/api/auth/callback",
+        redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
         scope: "devices:read telemetry:read",
       },
     });
@@ -68,17 +68,17 @@ describe("PowerMonitor OAuth BFF", () => {
     });
     const response = await createCallbackHandler({
       requestUrl:
-        "https://powermonitor.example.test/api/auth/callback?code=code-123&state=state-123",
+        "https://powermonitor.example.test/api/v1/auth/callback?code=code-123&state=state-123",
       cookies,
       unsealState: vi.fn().mockReturnValue({ state: "state-123", verifier: "verifier-123" }),
       exchangeCode,
-      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
     });
 
     expect(exchangeCode).toHaveBeenCalledWith({
       code: "code-123",
       codeVerifier: "verifier-123",
-      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
     });
     expect(response.status).toBe(307);
     expect(response.headers.get("location")).toBe("https://powermonitor.example.test/");
@@ -95,9 +95,9 @@ describe("PowerMonitor OAuth BFF", () => {
       set: vi.fn(),
     };
     const exchangeCode = vi.fn().mockResolvedValue({ accessToken: "opaque-access-token" });
-    const redirectUri = "https://powermonitor.example.test/api/auth/callback";
+    const redirectUri = "https://powermonitor.example.test/api/v1/auth/callback";
     const response = await createCallbackHandler({
-      requestUrl: "https://proxy.example.test/api/auth/callback?code=code-123&state=state-123",
+      requestUrl: "https://proxy.example.test/api/v1/auth/callback?code=code-123&state=state-123",
       cookies,
       unsealState: vi.fn().mockReturnValue({ state: "state-123", verifier: "verifier-123" }),
       exchangeCode,
@@ -120,7 +120,7 @@ describe("PowerMonitor OAuth BFF", () => {
       platformBaseUrl: "https://platform.example.test",
       clientId: "client: id+%",
       clientSecret: "secret: value+%",
-      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
       scope: "devices:read",
     };
 
@@ -140,7 +140,7 @@ describe("PowerMonitor OAuth BFF", () => {
       `Basic ${Buffer.from("client%3A+id%2B%25:secret%3A+value%2B%25").toString("base64")}`,
     );
     expect(String(init.body)).toBe(
-      "grant_type=authorization_code&code=code-123&code_verifier=verifier-123&redirect_uri=https%3A%2F%2Fpowermonitor.example.test%2Fapi%2Fauth%2Fcallback",
+      "grant_type=authorization_code&code=code-123&code_verifier=verifier-123&redirect_uri=https%3A%2F%2Fpowermonitor.example.test%2Fapi%2Fv1%2Fauth%2Fcallback",
     );
   });
 
@@ -152,10 +152,10 @@ describe("PowerMonitor OAuth BFF", () => {
 
     await createCallbackHandler({
       requestUrl:
-        "https://powermonitor.example.test/api/auth/callback?code=code-123&state=state-123",
+        "https://powermonitor.example.test/api/v1/auth/callback?code=code-123&state=state-123",
       cookies,
       exchangeCode: vi.fn().mockResolvedValue({ accessToken: "opaque-access-token" }),
-      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
       unsealState: vi.fn().mockReturnValue({ state: "state-123", verifier: "verifier-123" }),
     });
 

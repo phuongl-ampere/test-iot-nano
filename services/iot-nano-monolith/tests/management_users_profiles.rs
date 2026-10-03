@@ -154,7 +154,7 @@ async fn user_account_cookie(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/user/auth/login")
+                .uri("/api/v1/user/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({
@@ -184,7 +184,7 @@ async fn tenant_account_cookie(router: &axum::Router, tenant_slug: &str, passwor
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({ "tenant_slug": tenant_slug, "password": password }).to_string(),
@@ -209,7 +209,7 @@ async fn system_account_cookie(router: &axum::Router) -> String {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/auth/login")
+                .uri("/api/v1/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     json!({ "username": "system", "password": "SystemAccount@2026" }).to_string(),
@@ -266,9 +266,9 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     let tenant_cookie = tenant_account_cookie(&router, "test", "TenantAccount@2026").await;
 
     for path in [
-        "/api/management/users",
-        "/api/management/profiles/device-profiles",
-        "/api/management/profiles/asset-profiles",
+        "/api/v1/management/users",
+        "/api/v1/management/profiles/device-profiles",
+        "/api/v1/management/profiles/asset-profiles",
     ] {
         let anonymous = router
             .clone()
@@ -313,12 +313,12 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     }
 
     for (method, path) in [
-        ("POST", "/api/management/users"),
-        ("PUT", "/api/management/users/alice"),
-        ("POST", "/api/management/profiles/device-profiles"),
-        ("PUT", "/api/management/profiles/device-profiles/not-a-uuid"),
-        ("POST", "/api/management/profiles/asset-profiles"),
-        ("PUT", "/api/management/profiles/asset-profiles/not-a-uuid"),
+        ("POST", "/api/v1/management/users"),
+        ("PUT", "/api/v1/management/users/alice"),
+        ("POST", "/api/v1/management/profiles/device-profiles"),
+        ("PUT", "/api/v1/management/profiles/device-profiles/not-a-uuid"),
+        ("POST", "/api/v1/management/profiles/asset-profiles"),
+        ("PUT", "/api/v1/management/profiles/asset-profiles/not-a-uuid"),
     ] {
         let anonymous = router
             .clone()
@@ -378,7 +378,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
                     r#"{"username":"content-type","password":"ContentType@123"}"#,
@@ -396,7 +396,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/profiles/asset-profiles")
+                .uri("/api/v1/management/profiles/asset-profiles")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -418,7 +418,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -442,7 +442,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     let created = json_request(
         &router,
         "POST",
-        "/api/management/users",
+        "/api/v1/management/users",
         &tenant_cookie,
         json!({
             "username": "alice",
@@ -460,7 +460,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     json_request(
         &router,
         "POST",
-        "/api/management/users",
+        "/api/v1/management/users",
         &tenant_cookie,
         json!({
             "username": "alice",
@@ -472,7 +472,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     json_request(
         &router,
         "POST",
-        "/api/management/users",
+        "/api/v1/management/users",
         &tenant_cookie,
         json!({
             "username": "not a valid username",
@@ -484,7 +484,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     json_request(
         &router,
         "PUT",
-        "/api/management/users/missing",
+        "/api/v1/management/users/missing",
         &tenant_cookie,
         json!({
             "role": "admin",
@@ -495,7 +495,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     let updated = json_request(
         &router,
         "PUT",
-        "/api/management/users/alice",
+        "/api/v1/management/users/alice",
         &tenant_cookie,
         json!({
             "role": "admin",
@@ -509,7 +509,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     json_request(
         &router,
         "PUT",
-        "/api/management/users/alice",
+        "/api/v1/management/users/alice",
         &tenant_cookie,
         json!({
             "role": "operator",
@@ -528,7 +528,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/management/users")
+                    .uri("/api/v1/management/users")
                     .header(COOKIE, cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -541,7 +541,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
     json_request(
         &router,
         "PUT",
-        "/api/management/users/alice",
+        "/api/v1/management/users/alice",
         &tenant_cookie,
         json!({
             "role": "viewer",
@@ -555,7 +555,7 @@ async fn management_user_routes_authorize_before_json_and_support_crud() {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/management/users")
+                    .uri("/api/v1/management/users")
                     .header(COOKIE, cookie)
                     .body(Body::empty())
                     .unwrap(),
@@ -574,7 +574,7 @@ async fn management_user_routes_reject_removed_application_fields() {
     json_request(
         &router,
         "POST",
-        "/api/management/users",
+        "/api/v1/management/users",
         &tenant_cookie,
         json!({
             "username": "legacy-contract-user",
@@ -589,7 +589,7 @@ async fn management_user_routes_reject_removed_application_fields() {
     json_request(
         &router,
         "PUT",
-        "/api/management/users/admin",
+        "/api/v1/management/users/admin",
         &tenant_cookie,
         json!({
             "role": "admin",
@@ -614,7 +614,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     let created = json_request(
         &router,
         "POST",
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         &cookie,
         request,
         StatusCode::CREATED,
@@ -641,7 +641,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/profiles/device-profiles")
+                .uri("/api/v1/management/profiles/device-profiles")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -653,7 +653,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     let updated = json_request(
         &router,
         "PUT",
-        &format!("/api/management/profiles/device-profiles/{id}"),
+        &format!("/api/v1/management/profiles/device-profiles/{id}"),
         &cookie,
         json!({
             "name": "Environmental Sensor v2",
@@ -669,7 +669,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "POST",
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         &cookie,
         json!({
             "name": "Environmental Sensor v2",
@@ -683,7 +683,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "POST",
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         &cookie,
         json!({
             "name": "Invalid",
@@ -697,7 +697,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "PUT",
-        "/api/management/profiles/device-profiles/not-a-uuid",
+        "/api/v1/management/profiles/device-profiles/not-a-uuid",
         &cookie,
         json!({
             "name": "Ignored",
@@ -711,7 +711,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "PUT",
-        "/api/management/profiles/device-profiles/00000000-0000-0000-0000-000000000000",
+        "/api/v1/management/profiles/device-profiles/00000000-0000-0000-0000-000000000000",
         &cookie,
         json!({
             "name": "Missing",
@@ -736,7 +736,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
                 Request::builder()
                     .method("DELETE")
                     .uri(format!(
-                        "/api/management/profiles/device-profiles/{profile_id}"
+                        "/api/v1/management/profiles/device-profiles/{profile_id}"
                     ))
                     .header(COOKIE, &cookie)
                     .body(Body::empty())
@@ -750,7 +750,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     let device = json_request(
         &router,
         "POST",
-        "/api/management/devices",
+        "/api/v1/management/devices",
         &cookie,
         json!({"display_name": "Profile Reference Device"}),
         StatusCode::CREATED,
@@ -760,7 +760,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "PUT",
-        &format!("/api/management/devices/{device_id}"),
+        &format!("/api/v1/management/devices/{device_id}"),
         &cookie,
         json!({
             "display_name": "Profile Reference Device",
@@ -775,7 +775,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/management/profiles/device-profiles/{id}"))
+                .uri(format!("/api/v1/management/profiles/device-profiles/{id}"))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -786,7 +786,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
     let disposable = json_request(
         &router,
         "POST",
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         &cookie,
         json!({
             "name": "Disposable",
@@ -803,7 +803,7 @@ async fn management_device_profile_routes_support_crud_and_typed_errors() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!(
-                    "/api/management/profiles/device-profiles/{disposable_id}"
+                    "/api/v1/management/profiles/device-profiles/{disposable_id}"
                 ))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
@@ -821,7 +821,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     let created = json_request(
         &router,
         "POST",
-        "/api/management/profiles/asset-profiles",
+        "/api/v1/management/profiles/asset-profiles",
         &cookie,
         json!({
             "name": "Campus",
@@ -842,7 +842,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/profiles/asset-profiles")
+                .uri("/api/v1/management/profiles/asset-profiles")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -854,7 +854,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     let updated = json_request(
         &router,
         "PUT",
-        &format!("/api/management/profiles/asset-profiles/{id}"),
+        &format!("/api/v1/management/profiles/asset-profiles/{id}"),
         &cookie,
         json!({
             "name": "Campus v2",
@@ -870,7 +870,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "POST",
-        "/api/management/profiles/asset-profiles",
+        "/api/v1/management/profiles/asset-profiles",
         &cookie,
         json!({
             "name": "Campus v2",
@@ -883,7 +883,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "POST",
-        "/api/management/profiles/asset-profiles",
+        "/api/v1/management/profiles/asset-profiles",
         &cookie,
         json!({
             "name": "Invalid",
@@ -896,7 +896,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "PUT",
-        "/api/management/profiles/asset-profiles/not-a-uuid",
+        "/api/v1/management/profiles/asset-profiles/not-a-uuid",
         &cookie,
         json!({
             "name": "Ignored",
@@ -909,7 +909,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "PUT",
-        "/api/management/profiles/asset-profiles/00000000-0000-0000-0000-000000000000",
+        "/api/v1/management/profiles/asset-profiles/00000000-0000-0000-0000-000000000000",
         &cookie,
         json!({
             "name": "Missing",
@@ -933,7 +933,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
                 Request::builder()
                     .method("DELETE")
                     .uri(format!(
-                        "/api/management/profiles/asset-profiles/{profile_id}"
+                        "/api/v1/management/profiles/asset-profiles/{profile_id}"
                     ))
                     .header(COOKIE, &cookie)
                     .body(Body::empty())
@@ -947,7 +947,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     json_request(
         &router,
         "POST",
-        "/api/management/assets",
+        "/api/v1/management/assets",
         &cookie,
         json!({
             "name": "Referenced profile asset",
@@ -964,7 +964,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/api/management/profiles/asset-profiles/{id}"))
+                .uri(format!("/api/v1/management/profiles/asset-profiles/{id}"))
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -975,7 +975,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
     let disposable = json_request(
         &router,
         "POST",
-        "/api/management/profiles/asset-profiles",
+        "/api/v1/management/profiles/asset-profiles",
         &cookie,
         json!({
             "name": "Disposable asset profile",
@@ -992,7 +992,7 @@ async fn management_asset_profile_routes_support_crud_and_typed_errors() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!(
-                    "/api/management/profiles/asset-profiles/{disposable_id}"
+                    "/api/v1/management/profiles/asset-profiles/{disposable_id}"
                 ))
                 .header(COOKIE, cookie)
                 .body(Body::empty())
@@ -1024,7 +1024,7 @@ async fn management_profile_routes_are_scoped_to_the_tenant_account() {
     let tenant_a_device_profile = json_request(
         &router,
         "POST",
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         &tenant_a_cookie,
         json!({
             "name": "Shared Device Profile",
@@ -1038,7 +1038,7 @@ async fn management_profile_routes_are_scoped_to_the_tenant_account() {
     let tenant_b_device_profile = json_request(
         &router,
         "POST",
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         &tenant_b_cookie,
         json!({
             "name": "Shared Device Profile",
@@ -1055,7 +1055,7 @@ async fn management_profile_routes_are_scoped_to_the_tenant_account() {
         let profiles = json_request(
             &router,
             "GET",
-            "/api/management/profiles/device-profiles",
+            "/api/v1/management/profiles/device-profiles",
             cookie,
             json!({}),
             StatusCode::OK,
@@ -1071,7 +1071,7 @@ async fn management_profile_routes_are_scoped_to_the_tenant_account() {
             Request::builder()
                 .method("PUT")
                 .uri(format!(
-                    "/api/management/profiles/device-profiles/{}",
+                    "/api/v1/management/profiles/device-profiles/{}",
                     tenant_a_device_profile["id"].as_str().unwrap()
                 ))
                 .header(CONTENT_TYPE, "application/json")
@@ -1095,7 +1095,7 @@ async fn management_profile_routes_are_scoped_to_the_tenant_account() {
         let profile = json_request(
             &router,
             "POST",
-            "/api/management/profiles/asset-profiles",
+            "/api/v1/management/profiles/asset-profiles",
             cookie,
             json!({
                 "name": "Shared Asset Profile",
@@ -1120,7 +1120,7 @@ async fn management_users_and_profiles_report_unavailable_storage() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(COOKIE, &cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1131,7 +1131,7 @@ async fn management_users_and_profiles_report_unavailable_storage() {
     json_request(
         &router,
         "POST",
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         &cookie,
         json!({
             "name": "Unavailable",
@@ -1145,7 +1145,7 @@ async fn management_users_and_profiles_report_unavailable_storage() {
     json_request(
         &router,
         "POST",
-        "/api/management/profiles/asset-profiles",
+        "/api/v1/management/profiles/asset-profiles",
         &cookie,
         json!({
             "name": "Unavailable",
@@ -1190,7 +1190,7 @@ async fn management_alerts_are_guarded_and_scoped_to_the_authenticated_tenant() 
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/alerts")
+                .uri("/api/v1/management/alerts")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1203,7 +1203,7 @@ async fn management_alerts_are_guarded_and_scoped_to_the_authenticated_tenant() 
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/alerts")
+                .uri("/api/v1/management/alerts")
                 .header(COOKIE, &viewer_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1215,7 +1215,7 @@ async fn management_alerts_are_guarded_and_scoped_to_the_authenticated_tenant() 
     let tenant_a_alerts = json_request(
         &router,
         "GET",
-        &format!("/api/management/alerts?tenant_id={}", tenant_b.id),
+        &format!("/api/v1/management/alerts?tenant_id={}", tenant_b.id),
         &tenant_a_cookie,
         json!({}),
         StatusCode::OK,
@@ -1228,7 +1228,7 @@ async fn management_alerts_are_guarded_and_scoped_to_the_authenticated_tenant() 
     let tenant_b_alerts = json_request(
         &router,
         "GET",
-        "/api/management/alerts",
+        "/api/v1/management/alerts",
         &tenant_b_cookie,
         json!({}),
         StatusCode::OK,
@@ -1397,7 +1397,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
         (Some(system_cookie.as_str()), StatusCode::FORBIDDEN),
         (Some(user_cookie.as_str()), StatusCode::FORBIDDEN),
     ] {
-        for path in ["/api/management/audit", "/tenant/audit"] {
+        for path in ["/api/v1/management/audit", "/tenant/audit"] {
             let mut request = Request::builder().method("GET").uri(path);
             if let Some(cookie) = cookie {
                 request = request.header(COOKIE, cookie);
@@ -1416,7 +1416,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/audit?limit=101")
+                .uri("/api/v1/management/audit?limit=101")
                 .header(COOKIE, &tenant_a_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1426,7 +1426,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
     assert_eq!(over_limit.status(), StatusCode::BAD_REQUEST);
 
     for path in [
-        format!("/api/management/audit?tenant_id={}", tenant_b.id),
+        format!("/api/v1/management/audit?tenant_id={}", tenant_b.id),
         format!("/tenant/audit?tenant_id={}", tenant_b.id),
     ] {
         let arbitrary_tenant = router
@@ -1447,7 +1447,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
     let first_page = json_request(
         &router,
         "GET",
-        "/api/management/audit?limit=1",
+        "/api/v1/management/audit?limit=1",
         &tenant_a_cookie,
         json!({}),
         StatusCode::OK,
@@ -1475,7 +1475,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!("/api/management/audit?limit=1&after={next_cursor}"))
+                .uri(format!("/api/v1/management/audit?limit=1&after={next_cursor}"))
                 .header(COOKIE, &tenant_b_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1487,7 +1487,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
     let second_page = json_request(
         &router,
         "GET",
-        &format!("/api/management/audit?limit=1&after={next_cursor}"),
+        &format!("/api/v1/management/audit?limit=1&after={next_cursor}"),
         &tenant_a_cookie,
         json!({}),
         StatusCode::OK,
@@ -1501,7 +1501,7 @@ async fn tenant_audit_routes_require_a_tenant_account_scope_events_and_follow_ke
     let tenant_b_page = json_request(
         &router,
         "GET",
-        "/api/management/audit",
+        "/api/v1/management/audit",
         &tenant_b_cookie,
         json!({}),
         StatusCode::OK,

@@ -84,6 +84,10 @@ pub struct PublicPrincipal {
     pub account_class: AccountClass,
 }
 
+fn is_tenant_admin(principal: &PublicPrincipal) -> bool {
+    principal.user_id.is_none() && principal.account_class == AccountClass::Admin
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublicAsset {
     pub id: Uuid,
@@ -554,6 +558,11 @@ async fn public_device_permission(
     principal: &PublicPrincipal,
     device_id: &str,
 ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        return Ok(get_public_device(store, principal, device_id)
+            .await?
+            .map(|_| ResourcePermission::Owner));
+    }
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(None);
     };
@@ -607,6 +616,46 @@ async fn list_public_devices_with_handoff_token(
     limit: u32,
     handoff_token: Option<Uuid>,
 ) -> Result<Vec<PublicDevice>, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        let limit = i64::from(limit);
+        return match store {
+            PlatformStore::Sqlite(store) => sqlx::query(
+                "SELECT device_id, serial_number, display_name, metadata, asset_id, device_profile_id,
+                        'owner' AS effective_permission, 'owner' AS access_source
+                 FROM devices
+                 WHERE tenant_id = ? AND deleted_at IS NULL
+                   AND (? IS NULL OR device_id > ?)
+                 ORDER BY device_id
+                 LIMIT ?",
+            )
+            .bind(principal.tenant_id.to_string())
+            .bind(after)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(store.pool())
+            .await?
+            .into_iter()
+            .map(sqlite_authorized_device_record)
+            .collect(),
+            PlatformStore::Timescale(pool) => sqlx::query(
+                "SELECT device_id, serial_number, display_name, metadata, asset_id, device_profile_id,
+                        'owner' AS effective_permission, 'owner' AS access_source
+                 FROM devices
+                 WHERE tenant_id = $1 AND deleted_at IS NULL
+                   AND ($2::text IS NULL OR device_id > $2)
+                 ORDER BY device_id
+                 LIMIT $3",
+            )
+            .bind(principal.tenant_id)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(timescale_authorized_device_record)
+            .collect(),
+        };
+    }
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(Vec::new());
     };
@@ -867,7 +916,7 @@ async fn create_public_device(
     principal: &PublicPrincipal,
     device: NewPublicDevice,
 ) -> Result<PublicDevice, PublicDeviceError> {
-    if principal.user_id.is_none() {
+    if principal.user_id.is_none() && !is_tenant_admin(principal) {
         return Err(PublicDeviceError::Unauthorized);
     }
     match store {
@@ -1099,6 +1148,16 @@ async fn sqlite_public_asset_manager_permission(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        return Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?",
+        )
+        .bind(asset_id.to_string())
+        .bind(principal.tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some());
+    }
     let asset_id = asset_id.to_string();
     let Some(user_id) = principal.user_id.map(|id| id.to_string()) else {
         return Ok(false);
@@ -1159,6 +1218,17 @@ async fn sqlite_public_device_manager_permission(
     principal: &PublicPrincipal,
     device_id: &str,
 ) -> Result<bool, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        return Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM devices
+             WHERE device_id = ? AND tenant_id = ? AND deleted_at IS NULL",
+        )
+        .bind(device_id)
+        .bind(principal.tenant_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some());
+    }
     let Some(user_id) = principal.user_id.map(|id| id.to_string()) else {
         return Ok(false);
     };
@@ -1400,6 +1470,16 @@ async fn timescale_public_asset_manager_permission(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        return Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2 FOR SHARE",
+        )
+        .bind(asset_id)
+        .bind(principal.tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some());
+    }
     let Some(user_id) = principal.user_id else {
         return Ok(false);
     };
@@ -1471,6 +1551,18 @@ async fn timescale_public_device_manager_permission(
     principal: &PublicPrincipal,
     device_id: &str,
 ) -> Result<bool, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        return Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM devices
+             WHERE device_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+             FOR SHARE",
+        )
+        .bind(device_id)
+        .bind(principal.tenant_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .is_some());
+    }
     let Some(user_id) = principal.user_id else {
         return Ok(false);
     };
@@ -1821,6 +1913,103 @@ async fn list_public_telemetry(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicTelemetry>, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        let cursor = public_cursor_parts(after)?;
+        let limit = i64::from(limit);
+        return match store {
+            PlatformStore::Sqlite(store) => {
+                let asset_id = asset_id.map(|asset_id| asset_id.to_string());
+                let cursor_at = cursor.as_ref().map(|value| value.0.to_rfc3339());
+                let cursor_device = cursor.as_ref().map(|value| value.1.clone());
+                let cursor_sequence = cursor.as_ref().map(|value| value.2);
+                sqlx::query(
+                    "WITH RECURSIVE asset_tree(id, depth) AS (
+                         SELECT id, 0 FROM assets WHERE tenant_id = ? AND id = ?
+                         UNION ALL
+                         SELECT asset.id, asset_tree.depth + 1
+                         FROM assets AS asset
+                         JOIN asset_tree ON asset.parent_asset_id = asset_tree.id
+                         WHERE asset.tenant_id = ? AND asset_tree.depth < 64
+                     )
+                     SELECT event_at, received_at, device_id, boot_id, sequence, measurements, topic
+                     FROM telemetry
+                     WHERE tenant_id = ?
+                       AND event_at >= ? AND event_at <= ?
+                       AND (? IS NULL OR device_id = ?)
+                       AND (? IS NULL OR device_id IN (
+                            SELECT device_id FROM devices
+                            WHERE tenant_id = ? AND asset_id IN (SELECT id FROM asset_tree)
+                       ))
+                       AND (? IS NULL OR event_at > ?
+                            OR (event_at = ? AND (device_id > ?
+                                OR (device_id = ? AND sequence > ?))))
+                     ORDER BY event_at, device_id, sequence
+                     LIMIT ?",
+                )
+                .bind(principal.tenant_id.to_string())
+                .bind(&asset_id)
+                .bind(principal.tenant_id.to_string())
+                .bind(principal.tenant_id.to_string())
+                .bind(from.to_rfc3339())
+                .bind(to.to_rfc3339())
+                .bind(device_id)
+                .bind(device_id)
+                .bind(&asset_id)
+                .bind(principal.tenant_id.to_string())
+                .bind(&cursor_at)
+                .bind(&cursor_at)
+                .bind(&cursor_at)
+                .bind(&cursor_device)
+                .bind(&cursor_device)
+                .bind(cursor_sequence)
+                .bind(limit)
+                .fetch_all(store.pool())
+                .await?
+                .into_iter()
+                .map(sqlite_telemetry_record)
+                .collect()
+            }
+            PlatformStore::Timescale(pool) => sqlx::query(
+                "WITH RECURSIVE asset_tree(id, depth) AS (
+                     SELECT id, 0 FROM assets WHERE tenant_id = $1 AND id = $2::uuid
+                     UNION ALL
+                     SELECT asset.id, asset_tree.depth + 1
+                     FROM assets AS asset
+                     JOIN asset_tree ON asset.parent_asset_id = asset_tree.id
+                     WHERE asset.tenant_id = $1 AND asset_tree.depth < 64
+                 )
+                 SELECT event_at, received_at, device_id, boot_id, sequence, measurements, topic
+                 FROM telemetry
+                 WHERE tenant_id = $1
+                   AND event_at >= $3 AND event_at <= $4
+                   AND ($5::text IS NULL OR device_id = $5)
+                   AND ($6::uuid IS NULL OR device_id IN (
+                        SELECT device_id FROM devices
+                        WHERE tenant_id = $1 AND asset_id IN (SELECT id FROM asset_tree)
+                   ))
+                   AND ($7::timestamptz IS NULL OR event_at > $7
+                        OR (event_at = $7 AND (device_id > $8
+                            OR (device_id = $8 AND sequence > $9))))
+                 ORDER BY event_at, device_id, sequence
+                 LIMIT $10",
+            )
+            .bind(principal.tenant_id)
+            .bind(asset_id)
+            .bind(from)
+            .bind(to)
+            .bind(device_id)
+            .bind(asset_id)
+            .bind(cursor.as_ref().map(|value| value.0))
+            .bind(cursor.as_ref().map(|value| value.1.clone()))
+            .bind(cursor.as_ref().map(|value| value.2))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(timescale_telemetry_record)
+            .collect(),
+        };
+    }
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(Vec::new());
     };
@@ -2088,6 +2277,56 @@ async fn list_public_alerts(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicAlert>, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        let limit = i64::from(limit);
+        return match store {
+            PlatformStore::Sqlite(store) => sqlx::query(
+                "SELECT incidents.id, incidents.rule_id, rules.name AS rule_name, rules.severity,
+                        incidents.device_id, incidents.status, incidents.condition_started_at,
+                        incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
+                        incidents.acknowledged_by, incidents.last_value, incidents.updated_at
+                 FROM alert_incidents AS incidents
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id AND rules.tenant_id = incidents.tenant_id
+                 JOIN devices AS devices
+                    ON devices.device_id = incidents.device_id AND devices.tenant_id = incidents.tenant_id
+                 WHERE incidents.tenant_id = ? AND (? IS NULL OR incidents.id > ?)
+                 ORDER BY incidents.id
+                 LIMIT ?",
+            )
+            .bind(principal.tenant_id.to_string())
+            .bind(after)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(store.pool())
+            .await?
+            .into_iter()
+            .map(sqlite_alert_record)
+            .collect(),
+            PlatformStore::Timescale(pool) => sqlx::query(
+                "SELECT incidents.id, incidents.rule_id, rules.name AS rule_name, rules.severity,
+                        incidents.device_id, incidents.status, incidents.condition_started_at,
+                        incidents.opened_at, incidents.resolved_at, incidents.acknowledged_at,
+                        incidents.acknowledged_by, incidents.last_value, incidents.updated_at
+                 FROM alert_incidents AS incidents
+                 JOIN alert_rules AS rules
+                    ON rules.id = incidents.rule_id AND rules.tenant_id = incidents.tenant_id
+                 JOIN devices AS devices
+                    ON devices.device_id = incidents.device_id AND devices.tenant_id = incidents.tenant_id
+                 WHERE incidents.tenant_id = $1 AND ($2::uuid IS NULL OR incidents.id > $2)
+                 ORDER BY incidents.id
+                 LIMIT $3",
+            )
+            .bind(principal.tenant_id)
+            .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(timescale_alert_record)
+            .collect(),
+        };
+    }
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(Vec::new());
     };
@@ -2482,6 +2721,11 @@ async fn public_asset_permission(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<Option<ResourcePermission>, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        return Ok(get_public_asset(store, principal, asset_id)
+            .await?
+            .map(|_| ResourcePermission::Owner));
+    }
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(None);
     };
@@ -2494,6 +2738,44 @@ async fn list_public_assets(
     after: Option<&str>,
     limit: u32,
 ) -> Result<Vec<PublicAsset>, PlatformStoreError> {
+    if is_tenant_admin(principal) {
+        let limit = i64::from(limit);
+        return match store {
+            PlatformStore::Sqlite(store) => sqlx::query(
+                "SELECT id, name, asset_profile_id, parent_asset_id, metadata,
+                        'owner' AS effective_permission, 'owner' AS access_source
+                 FROM assets
+                 WHERE tenant_id = ? AND (? IS NULL OR id > ?)
+                 ORDER BY id
+                 LIMIT ?",
+            )
+            .bind(principal.tenant_id.to_string())
+            .bind(after)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(store.pool())
+            .await?
+            .into_iter()
+            .map(sqlite_authorized_asset_record)
+            .collect(),
+            PlatformStore::Timescale(pool) => sqlx::query(
+                "SELECT id, name, asset_profile_id, parent_asset_id, metadata,
+                        'owner' AS effective_permission, 'owner' AS access_source
+                 FROM assets
+                 WHERE tenant_id = $1 AND ($2::uuid IS NULL OR id > $2)
+                 ORDER BY id
+                 LIMIT $3",
+            )
+            .bind(principal.tenant_id)
+            .bind(after.and_then(|value| Uuid::parse_str(value).ok()))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(timescale_authorized_asset_record)
+            .collect(),
+        };
+    }
     let Some(subject) = public_authorization_subject(store, principal).await? else {
         return Ok(Vec::new());
     };
@@ -2774,7 +3056,7 @@ async fn create_public_asset(
     principal: &PublicPrincipal,
     asset: NewPublicAsset,
 ) -> Result<PublicAsset, PublicAssetError> {
-    if principal.user_id.is_none() {
+    if principal.user_id.is_none() && !is_tenant_admin(principal) {
         return Err(PublicAssetError::Unauthorized);
     }
     let id = Uuid::now_v7();
@@ -3016,18 +3298,24 @@ async fn delete_public_asset(
     principal: &PublicPrincipal,
     asset_id: Uuid,
 ) -> Result<bool, PlatformStoreError> {
-    let Some(user_id) = principal.user_id else {
+    let user_id = if is_tenant_admin(principal) {
+        None
+    } else if let Some(user_id) = principal.user_id {
+        Some(user_id)
+    } else {
         return Ok(false);
     };
     match store {
         PlatformStore::Sqlite(store) => {
             let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await?;
             let owner: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE id = ? AND tenant_id = ? AND owner_user_id = ?)",
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE id = ? AND tenant_id = ?
+                 AND (? IS NULL OR owner_user_id = ?))",
             )
             .bind(asset_id.to_string())
             .bind(principal.tenant_id.to_string())
-            .bind(user_id.to_string())
+            .bind(user_id.map(|id| id.to_string()))
+            .bind(user_id.map(|id| id.to_string()))
             .fetch_one(&mut *transaction)
             .await?;
             if !owner {
@@ -3048,7 +3336,8 @@ async fn delete_public_asset(
                 .execute(&mut *transaction)
                 .await?;
             let owner: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2 AND owner_user_id = $3)",
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE id = $1 AND tenant_id = $2
+                 AND ($3::uuid IS NULL OR owner_user_id = $3))",
             )
             .bind(asset_id)
             .bind(principal.tenant_id)

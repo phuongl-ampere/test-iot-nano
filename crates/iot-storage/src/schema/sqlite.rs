@@ -32,6 +32,7 @@ pub(crate) const CANONICAL_TABLES: &[&str] = &[
     "resource_invitations",
     "audit_events",
     "device_tokens",
+    "tenant_personal_access_tokens",
     "tenant_device_claim_policies",
     "tenant_ota_policies",
     "ota_artifacts",
@@ -702,6 +703,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS device_tokens_one_active_per_device
     WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS device_tokens_active_prefix_index
     ON device_tokens (token_prefix)
+    WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS tenant_personal_access_tokens (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    tenant_account_user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    token_prefix TEXT NOT NULL UNIQUE,
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TEXT,
+    revoked_at TEXT,
+    FOREIGN KEY (tenant_account_user_id, tenant_id)
+        REFERENCES tenant_accounts(id, tenant_id) ON DELETE RESTRICT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tenant_personal_access_tokens_one_active_per_account
+    ON tenant_personal_access_tokens (tenant_account_user_id)
+    WHERE revoked_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS tenant_personal_access_tokens_active_hash_index
+    ON tenant_personal_access_tokens (token_hash)
     WHERE revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS tenant_device_claim_policies (

@@ -8,7 +8,7 @@ use iot_nano_monolith::{
 use std::fs;
 use std::path::Path;
 
-const TENANT_NAVIGATION: [(&str, &str, &str); 15] = [
+const TENANT_NAVIGATION: [(&str, &str, &str); 16] = [
     ("overview", "/tenant", "Overview"),
     ("devices", "/tenant/devices", "Devices"),
     ("assets", "/tenant/assets", "Assets"),
@@ -32,9 +32,14 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 15] = [
     ("groups", "/tenant/groups", "Groups"),
     ("permissions", "/tenant/permissions", "Permissions"),
     ("applications", "/tenant/applications", "Applications"),
+    (
+        "personal-access-tokens",
+        "/tenant/personal-access-tokens",
+        "Personal access tokens",
+    ),
 ];
 
-const TENANT_TEMPLATES: [(&str, &str); 17] = [
+const TENANT_TEMPLATES: [(&str, &str); 18] = [
     ("tenant.html", "overview"),
     ("tenant_devices.html", "devices"),
     ("tenant_assets.html", "assets"),
@@ -52,6 +57,10 @@ const TENANT_TEMPLATES: [(&str, &str); 17] = [
     ("tenant_device_profiles.html", "device-profiles"),
     ("tenant_device_credential.html", "devices"),
     ("tenant_device_claim_policy.html", "devices"),
+    (
+        "tenant_personal_access_tokens.html",
+        "personal-access-tokens",
+    ),
 ];
 
 #[test]
@@ -64,8 +73,8 @@ fn tenant_ota_template_offers_profile_scoped_upload_and_policy_controls() {
         "data-ota-artifact-items",
         "Device profile",
         "Semantic version",
-        "/api/management/ota/artifacts",
-        "/api/management/ota/policy",
+        "/api/v1/management/ota/artifacts",
+        "/api/v1/management/ota/policy",
         "x-ota-device-profile-id",
         "x-ota-version",
         "x-ota-filename",
@@ -469,8 +478,8 @@ fn tenant_profile_template_keeps_json_import_export_separate_from_profile_tabs()
     let tabs = platform_template_source("tenant_profile_tabs.html");
 
     assert!(template.contains("data-tenant-profile-json"));
-    assert!(template.contains("/api/management/profile/export"));
-    assert!(template.contains("/api/management/profile/import"));
+    assert!(template.contains("/api/v1/management/profile/export"));
+    assert!(template.contains("/api/v1/management/profile/import"));
     assert!(template.contains("type=\"file\""));
     assert!(tabs.contains("href=\"/tenant/profile\""));
     assert!(tabs.contains("href=\"/tenant/profiles/asset\""));
@@ -714,7 +723,7 @@ fn tenant_users_layout_renders_a_capability_editor_only_for_user_accounts() {
 
     assert!(rendered.contains("data-user-capability-edit"));
     assert!(rendered.contains("data-user-capability-form"));
-    assert!(rendered.contains("/api/management/users/"));
+    assert!(rendered.contains("/api/v1/management/users/"));
     assert!(rendered.contains("/capabilities"));
     assert!(rendered.contains("name=\"create_devices\""));
     assert!(rendered.contains("name=\"claim_devices\""));
@@ -788,7 +797,7 @@ fn tenant_alerts_layout_loads_dynamic_rows_without_rendering_server_data() {
     assert!(rendered.contains("Updated"));
     assert!(rendered.contains("data-alert-rule-items"));
     assert!(rendered.contains("data-alert-incident-items"));
-    assert!(rendered.contains("/api/management/alert-rules"));
+    assert!(rendered.contains("/api/v1/management/alert-rules"));
     assert!(rendered.contains("cell.textContent = value"));
     assert!(!rendered.contains("name=\"tenant_id\""));
     assert_excludes_navigation_namespaces(&rendered, &["/system", "/app"]);
@@ -1142,13 +1151,11 @@ fn tenant_devices_editor_reveals_and_replaces_the_active_token_without_a_separat
 
     assert!(devices.contains("data-device-token-issue"));
     assert!(devices.contains(
-        "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/tokens"
+        "/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}/tokens"
     ));
-    assert!(
-        devices.contains(
-            "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/token"
-        )
-    );
+    assert!(devices.contains(
+        "/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}/token"
+    ));
     assert!(devices.contains("Device token"));
     assert!(devices.contains("data-device-token-copy"));
     assert!(devices.contains("Only one token is active."));
@@ -1198,7 +1205,7 @@ fn tenant_pairing_policy_and_device_editor_keep_pairing_codes_out_of_server_rend
     assert!(devices.contains("data-device-claim-code-issue"));
     assert!(devices.contains("data-device-claim-code-copy"));
     assert!(devices.contains(
-        "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/claim-code"
+        "/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}/claim-code"
     ));
     assert!(devices.contains("clearIssuedClaimCode();"));
     assert!(!devices.contains("{{ device.claim_code"));
@@ -1215,13 +1222,13 @@ fn tenant_resource_editors_assign_one_owner_and_never_create_direct_grants() {
             &devices,
             "data-device-owner-form",
             "selectedDevice.device_id",
-            "/api/management/devices/${encodeURIComponent(selectedDevice.device_id)}/owner",
+            "/api/v1/management/devices/${encodeURIComponent(selectedDevice.device_id)}/owner",
         ),
         (
             &assets,
             "data-asset-owner-form",
             "selectedAsset.id",
-            "/api/management/assets/${encodeURIComponent(selectedAsset.id)}/owner",
+            "/api/v1/management/assets/${encodeURIComponent(selectedAsset.id)}/owner",
         ),
     ] {
         assert!(template.contains(form), "resource editor contains {form}");
@@ -1231,7 +1238,7 @@ fn tenant_resource_editors_assign_one_owner_and_never_create_direct_grants() {
         assert!(template.contains(resource_id));
         assert!(template.contains(owner_path));
         assert!(!template.contains("User access"));
-        assert!(!template.contains("/api/management/resource-access?scope="));
+        assert!(!template.contains("/api/v1/management/resource-access?scope="));
         assert!(!template.contains("/tenant/permissions/revoke"));
     }
 
@@ -1289,7 +1296,7 @@ fn tenant_devices_editor_lists_recent_raw_telemetry_for_the_selected_range() {
         "<option value=\"1h\">Last hour</option>",
         "<option value=\"1d\">Last day</option>",
         "<option value=\"7d\">Last 7 days</option>",
-        "/api/management/devices/${encodeURIComponent(deviceId)}/telemetry?range=${encodeURIComponent(range)}",
+        "/api/v1/management/devices/${encodeURIComponent(deviceId)}/telemetry?range=${encodeURIComponent(range)}",
         "<th scope=\"col\">Value</th>",
         "formatTelemetryValue(event.measurements)",
         "const TELEMETRY_REFRESH_INTERVAL_MS = 2_000;",
@@ -1375,8 +1382,8 @@ fn tenant_operations_templates_make_supported_work_clear_without_inventing_backe
         "data-alert-rule-form",
         "data-alert-rule-items",
         "data-alert-incident-items",
-        "/api/management/alert-rules",
-        "/api/management/alert-incidents",
+        "/api/v1/management/alert-rules",
+        "/api/v1/management/alert-incidents",
         "/archive",
         "Acknowledge",
     ] {

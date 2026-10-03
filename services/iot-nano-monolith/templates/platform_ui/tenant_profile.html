@@ -21,7 +21,7 @@
         <h2>Tenant profile JSON</h2>
         <p class="panel-caption">Import replaces this tenant’s complete profile catalog. Operational data is never included.</p>
       </div>
-      <a class="button-link button-link-secondary" href="/api/management/profile/export" download="tenant-profile.json">Export JSON</a>
+      <a class="button-link button-link-secondary" href="/api/v1/management/profile/export" download="tenant-profile.json">Export JSON</a>
     </header>
     <form id="tenant-profile-form" class="form-grid" novalidate>
       <label class="field">
@@ -46,7 +46,7 @@
       const fileInput = document.getElementById('tenant-profile-file');
       const importButton = document.getElementById('tenant-profile-import');
       const feedback = document.getElementById('tenant-profile-feedback');
-      const endpoint = '/api/management/profile/import';
+      const endpoint = '/api/v1/management/profile/import';
 
       const parseConfiguration = (text) => JSON.parse(text);
       const show = (message) => { feedback.textContent = message; };

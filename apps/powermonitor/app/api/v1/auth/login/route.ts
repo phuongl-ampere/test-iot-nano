@@ -5,7 +5,7 @@ import {
   createPasswordLoginHandler,
   oauthConfigFromEnvironment,
   platformAuthBaseUrlFromEnvironment,
-} from "../../../../lib/oauth";
+} from "../../../../../lib/oauth";
 
 export async function GET(request: Request) {
   return createLoginHandler({

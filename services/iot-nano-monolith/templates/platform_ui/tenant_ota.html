@@ -95,7 +95,7 @@
         const submit = policyForm.querySelector("button[type=submit]");
         ui.setPending(submit, true);
         try {
-          await ui.request("/api/management/ota/policy", {
+          await ui.request("/api/v1/management/ota/policy", {
             method: "PUT",
             body: {
               require_matching_device_profile: policyForm.elements.require_matching_device_profile.checked,
@@ -120,7 +120,7 @@
         }
         ui.setPending(submit, true);
         try {
-          const response = await fetch("/api/management/ota/artifacts", {
+          const response = await fetch("/api/v1/management/ota/artifacts", {
             method: "POST",
             credentials: "same-origin",
             headers: {

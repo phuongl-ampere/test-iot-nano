@@ -21,10 +21,10 @@ describe("PowerMonitor page session", () => {
     };
     await createCallbackHandler({
       requestUrl:
-        "https://powermonitor.example.test/api/auth/callback?code=code-123&state=state-123",
+        "https://powermonitor.example.test/api/v1/auth/callback?code=code-123&state=state-123",
       cookies: oauthCookies,
       exchangeCode: vi.fn().mockResolvedValue({ accessToken: "opaque-access-token" }),
-      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
       unsealState: vi.fn().mockReturnValue({ state: "state-123", verifier: "verifier-123" }),
     });
     const value = oauthCookies.set.mock.calls.find(([name]) => name === sessionCookieName)?.[1] as string;

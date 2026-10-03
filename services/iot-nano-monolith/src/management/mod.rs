@@ -293,6 +293,10 @@ impl ManagementSessionRouter {
                 "/tenant/applications",
                 get(platform_tenant_applications).post(save_tenant_application_form),
             )
+            .route(
+                "/tenant/personal-access-tokens",
+                get(platform_tenant_personal_access_tokens),
+            )
             .route("/app", get(platform_app))
             .route("/app/devices", post(create_user_device_form))
             .route("/app/devices/claim", post(claim_user_device_form))
@@ -335,157 +339,168 @@ impl ManagementSessionRouter {
             )
             .route("/assets/platform-ui.css", get(platform_stylesheet))
             .route("/assets/htmx.min.js", get(platform_htmx))
-            .route("/api/auth/login", post(login))
-            .route("/api/auth/logout", post(logout))
-            .route("/api/auth/me", get(current_session))
-            .route("/api/system/auth/login", post(system_login))
-            .route("/api/system/tenants", post(create_system_tenant))
+            .route("/api/v1/auth/login", post(login))
+            .route("/api/v1/auth/logout", post(logout))
+            .route("/api/v1/auth/me", get(current_session))
+            .route("/api/v1/system/auth/login", post(system_login))
+            .route("/api/v1/system/tenants", post(create_system_tenant))
             .route(
-                "/api/system/tenants/{tenant_slug}/suspend",
+                "/api/v1/system/tenants/{tenant_slug}/suspend",
                 post(suspend_system_tenant),
             )
             .route(
-                "/api/system/tenants/{tenant_slug}/reactivate",
+                "/api/v1/system/tenants/{tenant_slug}/reactivate",
                 post(reactivate_system_tenant),
             )
             .route(
-                "/api/system/tenants/{tenant_slug}/delete",
+                "/api/v1/system/tenants/{tenant_slug}/delete",
                 post(delete_system_tenant),
             )
             .route(
-                "/api/system/tenants/{tenant_slug}/tenant-account/reset",
+                "/api/v1/system/tenants/{tenant_slug}/tenant-account/reset",
                 post(reset_system_tenant_account),
             )
             .route(
-                "/api/system/tenants/{tenant_slug}/tenant-account/disable",
+                "/api/v1/system/tenants/{tenant_slug}/tenant-account/disable",
                 post(disable_system_tenant_account),
             )
-            .route("/api/tenant/auth/login", post(tenant_login))
-            .route("/api/tenant/auth/me", get(current_tenant_session))
-            .route("/api/user/auth/login", post(user_login))
-            .route("/api/user/auth/me", get(current_user_session))
-            .route("/api/management/applications", post(create_application))
+            .route("/api/v1/tenant/auth/login", post(tenant_login))
+            .route("/api/v1/tenant/auth/me", get(current_tenant_session))
+            .route("/api/v1/user/auth/login", post(user_login))
+            .route("/api/v1/user/auth/me", get(current_user_session))
+            .route("/api/v1/management/applications", post(create_application))
             .route(
-                "/api/management/profile",
+                "/api/v1/management/personal-access-token",
+                get(get_personal_access_token).post(create_personal_access_token),
+            )
+            .route(
+                "/api/v1/management/personal-access-token/revoke",
+                post(revoke_personal_access_token),
+            )
+            .route(
+                "/api/v1/management/profile",
                 get(get_management_tenant_profile_configuration)
                     .put(replace_management_tenant_profile_configuration),
             )
             .route(
-                "/api/management/profile/export",
+                "/api/v1/management/profile/export",
                 get(get_management_tenant_profile_configuration),
             )
             .route(
-                "/api/management/profile/import",
+                "/api/v1/management/profile/import",
                 put(replace_management_tenant_profile_configuration),
             )
-            .route("/api/management/alerts", get(list_management_alerts))
+            .route("/api/v1/management/alerts", get(list_management_alerts))
             .route(
-                "/api/management/alerts/summary",
+                "/api/v1/management/alerts/summary",
                 get(management_alert_summary),
             )
             .route(
-                "/api/management/alert-rules",
+                "/api/v1/management/alert-rules",
                 get(list_management_alert_rules).post(create_management_alert_rule),
             )
             .route(
-                "/api/management/alert-rules/{rule_id}",
+                "/api/v1/management/alert-rules/{rule_id}",
                 put(update_management_alert_rule),
             )
             .route(
-                "/api/management/alert-rules/{rule_id}/archive",
+                "/api/v1/management/alert-rules/{rule_id}/archive",
                 post(archive_management_alert_rule),
             )
             .route(
-                "/api/management/alert-incidents",
+                "/api/v1/management/alert-incidents",
                 get(list_management_alert_incidents),
             )
             .route(
-                "/api/management/alert-incidents/{incident_id}/acknowledge",
+                "/api/v1/management/alert-incidents/{incident_id}/acknowledge",
                 post(acknowledge_management_alert_incident),
             )
-            .route("/api/management/audit", get(list_management_audit_events))
             .route(
-                "/api/management/users",
+                "/api/v1/management/audit",
+                get(list_management_audit_events),
+            )
+            .route(
+                "/api/v1/management/users",
                 get(list_management_users).post(create_management_user),
             )
             .route(
-                "/api/management/users/{username}",
+                "/api/v1/management/users/{username}",
                 put(update_management_user),
             )
             .route(
-                "/api/management/users/{username}/capabilities",
+                "/api/v1/management/users/{username}/capabilities",
                 put(update_management_user_capabilities),
             )
             .route(
-                "/api/management/resource-access",
+                "/api/v1/management/resource-access",
                 get(list_management_resource_access),
             )
             .route(
-                "/api/management/profiles/device-profiles",
+                "/api/v1/management/profiles/device-profiles",
                 get(list_management_device_profiles).post(create_management_device_profile),
             )
             .route(
-                "/api/management/profiles/device-profiles/{profile_id}",
+                "/api/v1/management/profiles/device-profiles/{profile_id}",
                 put(update_management_device_profile).delete(delete_management_device_profile),
             )
             .route(
-                "/api/management/profiles/asset-profiles",
+                "/api/v1/management/profiles/asset-profiles",
                 get(list_management_asset_profiles).post(create_management_asset_profile),
             )
             .route(
-                "/api/management/profiles/asset-profiles/{profile_id}",
+                "/api/v1/management/profiles/asset-profiles/{profile_id}",
                 put(update_management_asset_profile).delete(delete_management_asset_profile),
             )
             .route(
-                "/api/management/devices",
+                "/api/v1/management/devices",
                 get(list_management_devices).post(provision_device),
             )
             .route(
-                "/api/management/ota/artifacts",
+                "/api/v1/management/ota/artifacts",
                 get(list_ota_artifacts).post(upload_ota_artifact),
             )
             .route(
-                "/api/management/ota/policy",
+                "/api/v1/management/ota/policy",
                 get(get_ota_policy).put(update_ota_policy),
             )
             .route(
-                "/api/management/devices/{device_id}",
+                "/api/v1/management/devices/{device_id}",
                 put(update_management_device).delete(delete_management_device),
             )
             .route(
-                "/api/management/devices/{device_id}/owner",
+                "/api/v1/management/devices/{device_id}/owner",
                 put(assign_management_device_owner),
             )
             .route(
-                "/api/management/devices/{device_id}/telemetry",
+                "/api/v1/management/devices/{device_id}/telemetry",
                 get(list_management_device_telemetry),
             )
             .route(
-                "/api/management/assets",
+                "/api/v1/management/assets",
                 get(list_management_assets).post(create_management_asset),
             )
             .route(
-                "/api/management/assets/{asset_id}",
+                "/api/v1/management/assets/{asset_id}",
                 put(update_management_asset).delete(delete_management_asset),
             )
             .route(
-                "/api/management/assets/{asset_id}/owner",
+                "/api/v1/management/assets/{asset_id}/owner",
                 put(assign_management_asset_owner),
             )
             .route(
-                "/api/management/devices/{device_id}/tokens",
+                "/api/v1/management/devices/{device_id}/tokens",
                 post(create_device_token),
             )
             .route(
-                "/api/management/devices/{device_id}/claim-code",
+                "/api/v1/management/devices/{device_id}/claim-code",
                 post(issue_management_device_claim_code),
             )
             .route(
-                "/api/management/devices/{device_id}/token",
+                "/api/v1/management/devices/{device_id}/token",
                 get(reveal_management_device_token),
             )
             .route(
-                "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
+                "/api/v1/management/devices/{device_id}/tokens/{token_id}/rotate",
                 post(rotate_management_device_token),
             )
             .with_state(state)
@@ -507,8 +522,7 @@ pub(crate) struct SystemInfrastructureStatus {
 }
 
 struct SystemInfrastructureSnapshot {
-    public_http_listener: String,
-    management_http_listener: String,
+    http_listener: String,
     mqtt_plaintext_listener: String,
     mqtt_tls_listener: String,
     migration: String,
@@ -534,8 +548,7 @@ impl SystemInfrastructureStatus {
     pub(crate) fn mark_started(
         &self,
         storage: &StorageConfiguration,
-        public_http_listener: SocketAddr,
-        management_http_listener: SocketAddr,
+        http_listener: SocketAddr,
         mqtt_plaintext_listener: SocketAddr,
     ) {
         let storage = match &storage.storage {
@@ -547,8 +560,7 @@ impl SystemInfrastructureStatus {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *snapshot = SystemInfrastructureSnapshot {
-            public_http_listener: format!("Listening on {public_http_listener}"),
-            management_http_listener: format!("Listening on {management_http_listener}"),
+            http_listener: format!("Listening on {http_listener}"),
             mqtt_plaintext_listener: format!("Listening on {mqtt_plaintext_listener}"),
             mqtt_tls_listener: "Listening (TLS endpoint bound)".to_owned(),
             migration: "Completed at startup".to_owned(),
@@ -579,12 +591,8 @@ impl SystemInfrastructureStatus {
             if ready { "Ready" } else { "Not ready" },
             vec![
                 crate::SystemInfrastructureStatusRow::new(
-                    "Public HTTP listener",
-                    Self::component_status(ready, &snapshot.public_http_listener),
-                ),
-                crate::SystemInfrastructureStatusRow::new(
-                    "Management HTTP listener",
-                    Self::component_status(ready, &snapshot.management_http_listener),
+                    "HTTP listener",
+                    Self::component_status(ready, &snapshot.http_listener),
                 ),
                 crate::SystemInfrastructureStatusRow::new(
                     "MQTT plaintext listener",
@@ -616,8 +624,7 @@ impl SystemInfrastructureStatus {
 impl SystemInfrastructureSnapshot {
     fn not_running() -> Self {
         Self {
-            public_http_listener: "Not running".to_owned(),
-            management_http_listener: "Not running".to_owned(),
+            http_listener: "Not running".to_owned(),
             mqtt_plaintext_listener: "Not running".to_owned(),
             mqtt_tls_listener: "Not running".to_owned(),
             migration: "Not run by this router".to_owned(),
@@ -628,8 +635,7 @@ impl SystemInfrastructureSnapshot {
 
     fn starting() -> Self {
         Self {
-            public_http_listener: "Starting".to_owned(),
-            management_http_listener: "Starting".to_owned(),
+            http_listener: "Starting".to_owned(),
             mqtt_plaintext_listener: "Starting".to_owned(),
             mqtt_tls_listener: "Starting".to_owned(),
             migration: "Completed before listener startup".to_owned(),

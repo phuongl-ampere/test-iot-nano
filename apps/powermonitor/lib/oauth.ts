@@ -70,7 +70,7 @@ export async function createPasswordLoginHandler(input: {
   const fetcher = input.fetcher ?? fetch;
   let loginResponse: Response;
   try {
-    loginResponse = await fetcher(new URL("/api/auth/login", input.authBaseUrl), {
+    loginResponse = await fetcher(new URL("/api/v1/auth/login", input.authBaseUrl), {
       body: JSON.stringify({ username: input.username, password: input.password }),
       cache: "no-store",
       headers: { "content-type": "application/json" },

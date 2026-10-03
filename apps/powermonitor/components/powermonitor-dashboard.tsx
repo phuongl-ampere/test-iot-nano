@@ -599,7 +599,7 @@ export function PowerMonitorDashboard({
             <button aria-label="Refresh Power Monitor" disabled={loading} onClick={() => void refreshWorkspaceAndTelemetry()} type="button">
               Refresh
             </button>
-            <form action="/api/auth/logout" method="post">
+            <form action="/api/v1/auth/logout" method="post">
               <button type="submit">Sign out</button>
             </form>
           </div>
@@ -767,7 +767,7 @@ export function PowerMonitorDashboard({
           <div className="error-banner" role="alert">
             <span>{error}</span>
             {(error === "Sign in is required." || error === invitationScopeMessage) && (
-              <a href="/api/auth/login">Sign in again</a>
+              <a href="/api/v1/auth/login">Sign in again</a>
             )}
           </div>
         )}

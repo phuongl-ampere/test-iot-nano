@@ -37,8 +37,7 @@ impl Fixture {
                 },
                 device_token_vault_key: "test-device-token-vault-key-material-0001".to_owned(),
                 internal_dir: root.join("internal"),
-                public_http: reserve_address().await,
-                management_http: reserve_address().await,
+                http: reserve_address().await,
                 mqtt_tcp: reserve_address().await,
                 mqtt_tls: reserve_address().await,
                 web_https_enabled: false,
@@ -60,8 +59,7 @@ impl Fixture {
 
     async fn assert_configured_addresses_are_unbound(&self) {
         for address in [
-            self.config.public_http,
-            self.config.management_http,
+            self.config.http,
             self.config.mqtt_tcp,
             self.config.mqtt_tls,
         ] {

@@ -42,8 +42,7 @@ struct Fixture {
     root: PathBuf,
     platform_path: PathBuf,
     internal_dir: PathBuf,
-    public_address: SocketAddr,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
     mqtt_tcp_address: SocketAddr,
     mqtt_tls_address: SocketAddr,
     reserved_monolith_addresses: Option<Vec<TcpListener>>,
@@ -62,10 +61,9 @@ impl Fixture {
             root: root.clone(),
             platform_path: root.join("platform.sqlite"),
             internal_dir: root.join("internal"),
-            public_address: addresses[0],
-            management_address: addresses[1],
-            mqtt_tcp_address: addresses[2],
-            mqtt_tls_address: addresses[3],
+            http_address: addresses[0],
+            mqtt_tcp_address: addresses[1],
+            mqtt_tls_address: addresses[2],
             reserved_monolith_addresses: Some(reserved_monolith_addresses),
             tls_cert_path: tls_fixtures.join("server.crt"),
             tls_key_path: tls_fixtures.join("server.key"),
@@ -85,14 +83,7 @@ impl Fixture {
                 "IOT_DEVICE_TOKEN_VAULT_KEY",
                 "external-contract-device-token-vault-key-material-0001",
             )
-            .env(
-                "IOT_NANO_PUBLIC_HTTP_ADDRESS",
-                self.public_address.to_string(),
-            )
-            .env(
-                "IOT_NANO_MANAGEMENT_ADDRESS",
-                self.management_address.to_string(),
-            )
+            .env("IOT_NANO_HTTP_ADDRESS", self.http_address.to_string())
             .env(
                 "IOT_NANO_MQTT_TCP_ADDRESS",
                 self.mqtt_tcp_address.to_string(),
@@ -105,7 +96,7 @@ impl Fixture {
     }
 
     fn public_url(&self) -> String {
-        format!("http://{}", self.public_address)
+        format!("http://{}", self.http_address)
     }
 
     fn release_monolith_addresses(&mut self) {
@@ -114,10 +105,9 @@ impl Fixture {
 
     async fn rebind_monolith_addresses(&mut self) -> Result<(), Box<dyn Error>> {
         let (addresses, listeners) = reserve_monolith_addresses().await?;
-        self.public_address = addresses[0];
-        self.management_address = addresses[1];
-        self.mqtt_tcp_address = addresses[2];
-        self.mqtt_tls_address = addresses[3];
+        self.http_address = addresses[0];
+        self.mqtt_tcp_address = addresses[1];
+        self.mqtt_tls_address = addresses[2];
         self.reserved_monolith_addresses = Some(listeners);
         Ok(())
     }
@@ -278,9 +268,9 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
     let result = async {
         processes
             .register_monolith(start_monolith_with_retry(&mut fixture, binary, &client).await?);
-        let system_cookie = system_login(&client, fixture.management_address).await?;
-        create_tenant(&client, fixture.management_address, &system_cookie).await?;
-        let tenant_cookie = tenant_login(&client, fixture.management_address).await?;
+        let system_cookie = system_login(&client, fixture.http_address).await?;
+        create_tenant(&client, fixture.http_address, &system_cookie).await?;
+        let tenant_cookie = tenant_login(&client, fixture.http_address).await?;
         let (child, powermonitor_address) =
             start_powermonitor_with_retry(&fixture, &prepared_powermonitor, &client, CLIENT_SECRET)
                 .await?;
@@ -289,11 +279,11 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         assert_powermonitor_environment(&prepared_powermonitor.audit_path)?;
         register_application(
             &client,
-            fixture.management_address,
+            fixture.http_address,
             &tenant_cookie,
             "powermonitor-external",
             "powermonitor-external-client",
-            &format!("{powermonitor_url}/api/auth/callback"),
+            &format!("{powermonitor_url}/api/v1/auth/callback"),
             true,
             &["devices:read"],
             Some(CLIENT_SECRET),
@@ -301,7 +291,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         .await?;
         register_application(
             &client,
-            fixture.management_address,
+            fixture.http_address,
             &tenant_cookie,
             "disabled-external",
             "disabled-external-client",
@@ -312,17 +302,17 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-        create_user(&client, fixture.management_address, &tenant_cookie).await?;
-        let user_cookie = user_login(&client, fixture.management_address).await?;
+        create_user(&client, fixture.http_address, &tenant_cookie).await?;
+        let user_cookie = user_login(&client, fixture.http_address).await?;
         assert_management_mutation_denied_to_user(
             &client,
-            fixture.management_address,
+            fixture.http_address,
             &user_cookie,
         )
         .await?;
 
         let login = client
-            .get(format!("{powermonitor_url}/api/auth/login"))
+            .get(format!("{powermonitor_url}/api/v1/auth/login"))
             .send()
             .await?;
         assert_eq!(login.status(), StatusCode::TEMPORARY_REDIRECT);
@@ -347,7 +337,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
             .expect("public authorization did not redirect to the PowerMonitor callback")
             .to_str()?
             .to_owned();
-        assert!(callback_url.starts_with(&format!("{powermonitor_url}/api/auth/callback")));
+        assert!(callback_url.starts_with(&format!("{powermonitor_url}/api/v1/auth/callback")));
 
         let callback = client
             .get(callback_url)
@@ -395,11 +385,11 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         processes.register_powermonitor(invalid_child, vec![CLIENT_SECRET, INVALID_CLIENT_SECRET]);
         register_application(
             &client,
-            fixture.management_address,
+            fixture.http_address,
             &tenant_cookie,
             "powermonitor-external",
             "powermonitor-external-client",
-            &format!("{invalid_powermonitor_url}/api/auth/callback"),
+            &format!("{invalid_powermonitor_url}/api/v1/auth/callback"),
             true,
             &["devices:read"],
             None,
@@ -408,7 +398,7 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
         assert_powermonitor_environment(&prepared_powermonitor.audit_path)?;
 
         let invalid_login = client
-            .get(format!("{invalid_powermonitor_url}/api/auth/login"))
+            .get(format!("{invalid_powermonitor_url}/api/v1/auth/login"))
             .send()
             .await?;
         assert_eq!(invalid_login.status(), StatusCode::TEMPORARY_REDIRECT);
@@ -523,10 +513,10 @@ async fn run_external_app_contract(npm: PathBuf) -> Result<(), Box<dyn Error>> {
 
 async fn system_login(
     client: &Client,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let response = client
-        .post(format!("http://{management_address}/api/system/auth/login"))
+        .post(format!("http://{http_address}/api/v1/system/auth/login"))
         .json(&json!({
             "username": SYSTEM_USERNAME,
             "password": SYSTEM_PASSWORD,
@@ -539,11 +529,11 @@ async fn system_login(
 
 async fn create_tenant(
     client: &Client,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
     system_cookie: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = client
-        .post(format!("http://{management_address}/api/system/tenants"))
+        .post(format!("http://{http_address}/api/v1/system/tenants"))
         .header(COOKIE, system_cookie)
         .json(&json!({
             "slug": TENANT_SLUG,
@@ -558,10 +548,10 @@ async fn create_tenant(
 
 async fn tenant_login(
     client: &Client,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let response = client
-        .post(format!("http://{management_address}/api/tenant/auth/login"))
+        .post(format!("http://{http_address}/api/v1/tenant/auth/login"))
         .json(&json!({
             "tenant_slug": TENANT_SLUG,
             "password": TENANT_ACCOUNT_PASSWORD,
@@ -574,11 +564,11 @@ async fn tenant_login(
 
 async fn create_user(
     client: &Client,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
     tenant_cookie: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = client
-        .post(format!("http://{management_address}/api/management/users"))
+        .post(format!("http://{http_address}/api/v1/management/users"))
         .header(COOKIE, tenant_cookie)
         .json(&json!({
             "username": USERNAME,
@@ -592,10 +582,10 @@ async fn create_user(
 
 async fn user_login(
     client: &Client,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let response = client
-        .post(format!("http://{management_address}/api/user/auth/login"))
+        .post(format!("http://{http_address}/api/v1/user/auth/login"))
         .json(&json!({
             "tenant_slug": TENANT_SLUG,
             "username": USERNAME,
@@ -609,12 +599,12 @@ async fn user_login(
 
 async fn assert_management_mutation_denied_to_user(
     client: &Client,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
     user_cookie: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = client
         .post(format!(
-            "http://{management_address}/api/management/applications"
+            "http://{http_address}/api/v1/management/applications"
         ))
         .header(COOKIE, user_cookie)
         .json(&json!({
@@ -634,7 +624,7 @@ async fn assert_management_mutation_denied_to_user(
 
 async fn register_application(
     client: &Client,
-    management_address: SocketAddr,
+    http_address: SocketAddr,
     tenant_cookie: &str,
     app_id: &str,
     client_id: &str,
@@ -645,7 +635,7 @@ async fn register_application(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = client
         .post(format!(
-            "http://{management_address}/api/management/applications"
+            "http://{http_address}/api/v1/management/applications"
         ))
         .header(COOKIE, tenant_cookie)
         .json(&json!({
@@ -816,11 +806,12 @@ async fn start_powermonitor(
         .env("NO_COLOR", "1")
         .env("PATH", &prepared.path)
         .env("PLATFORM_BASE_URL", fixture.public_url())
+        .env("PLATFORM_AUTH_BASE_URL", fixture.public_url())
         .env("OAUTH_CLIENT_ID", "powermonitor-external-client")
         .env("OAUTH_CLIENT_SECRET", client_secret)
         .env(
             "OAUTH_REDIRECT_URI",
-            format!("http://{address}/api/auth/callback"),
+            format!("http://{address}/api/v1/auth/callback"),
         )
         .env("OAUTH_SCOPE", "devices:read")
         .env("SESSION_SECRET", SESSION_SECRET)
@@ -997,6 +988,7 @@ fn assert_powermonitor_environment(audit_path: &Path) -> Result<(), Box<dyn Erro
         "OAUTH_SCOPE",
         "PATH",
         "PLATFORM_BASE_URL",
+        "PLATFORM_AUTH_BASE_URL",
         "PWD",
         "SESSION_SECRET",
         "SHLVL",
@@ -1069,7 +1061,7 @@ async fn wait_powermonitor(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..200 {
         if client
-            .get(format!("{powermonitor_url}/api/auth/login"))
+            .get(format!("{powermonitor_url}/api/v1/auth/login"))
             .send()
             .await
             .is_ok_and(|response| response.status() == StatusCode::TEMPORARY_REDIRECT)
@@ -1147,17 +1139,17 @@ async fn reserve_address() -> io::Result<(SocketAddr, TcpListener)> {
     Ok((address, listener))
 }
 
-async fn reserve_monolith_addresses() -> io::Result<([SocketAddr; 4], Vec<TcpListener>)> {
-    let mut addresses = Vec::with_capacity(4);
-    let mut listeners = Vec::with_capacity(4);
-    for _ in 0..4 {
+async fn reserve_monolith_addresses() -> io::Result<([SocketAddr; 3], Vec<TcpListener>)> {
+    let mut addresses = Vec::with_capacity(3);
+    let mut listeners = Vec::with_capacity(3);
+    for _ in 0..3 {
         let (address, listener) = reserve_address().await?;
         addresses.push(address);
         listeners.push(listener);
     }
     let addresses = addresses
         .try_into()
-        .expect("four reserved monolith addresses");
+        .expect("three reserved monolith addresses");
     Ok((addresses, listeners))
 }
 

@@ -39,8 +39,7 @@ impl Fixture {
                 },
                 device_token_vault_key: "test-device-token-vault-key-material-0001".to_owned(),
                 internal_dir: root.join("internal"),
-                public_http: reserve_address().await,
-                management_http: reserve_address().await,
+                http: reserve_address().await,
                 mqtt_tcp: reserve_address().await,
                 mqtt_tls: reserve_address().await,
                 web_https_enabled: false,
@@ -61,8 +60,8 @@ async fn alpha_runtime_binds_health_and_mqtt_after_recovery() {
         .unwrap();
 
     assert!(runtime.readiness().is_ready());
-    assert_health(fixture.config.public_http).await;
-    assert_health(fixture.config.management_http).await;
+    assert_health(fixture.config.http).await;
+    assert_health(fixture.config.http).await;
     let mqtt = TcpStream::connect(fixture.config.mqtt_tcp).await.unwrap();
     drop(mqtt);
     let mqtt_tls = TcpStream::connect(fixture.config.mqtt_tls).await.unwrap();
@@ -73,14 +72,32 @@ async fn alpha_runtime_binds_health_and_mqtt_after_recovery() {
         .await
         .unwrap();
     for address in [
-        fixture.config.public_http,
-        fixture.config.management_http,
+        fixture.config.http,
+        fixture.config.http,
         fixture.config.mqtt_tcp,
         fixture.config.mqtt_tls,
     ] {
         let listener = TcpListener::bind(address).await.unwrap();
         drop(listener);
     }
+}
+
+#[tokio::test]
+async fn alpha_runtime_serves_oauth_public_api_and_management_api_on_one_listener() {
+    let fixture = Fixture::new().await;
+    let mut runtime = MonolithRuntime::start(fixture.config.clone())
+        .await
+        .unwrap();
+
+    assert_http_status(fixture.config.http, "/api/v1/devices", 401).await;
+    assert_http_status(fixture.config.http, "/api/v1/auth/me", 401).await;
+    assert_http_status(fixture.config.http, "/api/auth/me", 404).await;
+    assert_form_post_status(fixture.config.http, "/oauth/token", "", 400).await;
+
+    runtime
+        .shutdown(Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -95,9 +112,9 @@ async fn alpha_runtime_renders_system_infrastructure_from_started_runtime_withou
 
     let login_body = r#"{"username":"system","password":"SystemAccount@2026"}"#;
     let login = send_http(
-        fixture.config.management_http,
+        fixture.config.http,
         format!(
-            "POST /api/system/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{login_body}",
+            "POST /api/v1/system/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{login_body}",
             login_body.len(),
         ),
     )
@@ -117,7 +134,7 @@ async fn alpha_runtime_renders_system_infrastructure_from_started_runtime_withou
         .to_owned();
 
     let infrastructure = send_http(
-        fixture.config.management_http,
+        fixture.config.http,
         format!(
             "GET /system/infrastructure HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
         ),
@@ -131,8 +148,8 @@ async fn alpha_runtime_renders_system_infrastructure_from_started_runtime_withou
     let infrastructure = String::from_utf8(infrastructure).unwrap();
     assert!(infrastructure.contains("Runtime health"));
     assert!(infrastructure.contains("Ready"));
-    assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.public_http)));
-    assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.management_http)));
+    assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.http)));
+    assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.http)));
     assert!(infrastructure.contains(&format!("Listening on {}", fixture.config.mqtt_tcp)));
     assert!(infrastructure.contains("Listening (TLS endpoint bound)"));
     assert!(infrastructure.contains("Completed at startup"));
@@ -174,9 +191,9 @@ async fn alpha_runtime_infrastructure_page_stops_presenting_components_as_health
 
     let login_body = r#"{"username":"system","password":"SystemAccount@2026"}"#;
     let login = send_http(
-        fixture.config.management_http,
+        fixture.config.http,
         format!(
-            "POST /api/system/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{login_body}",
+            "POST /api/v1/system/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{login_body}",
             login_body.len(),
         ),
     )
@@ -196,7 +213,7 @@ async fn alpha_runtime_infrastructure_page_stops_presenting_components_as_health
         .to_owned();
 
     let started = send_http(
-        fixture.config.management_http,
+        fixture.config.http,
         format!(
             "GET /system/infrastructure HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
         ),
@@ -216,7 +233,7 @@ async fn alpha_runtime_infrastructure_page_stops_presenting_components_as_health
     .expect("runtime readiness remained healthy after parent cancellation");
 
     let failed = send_http(
-        fixture.config.management_http,
+        fixture.config.http,
         format!(
             "GET /system/infrastructure HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
         ),
@@ -265,7 +282,7 @@ async fn alpha_runtime_marks_not_ready_after_parent_cancellation() {
     })
     .await
     .expect("runtime readiness remained healthy after parent cancellation");
-    assert_health_status(fixture.config.public_http, 503).await;
+    assert_health_status(fixture.config.http, 503).await;
 
     let _ = timeout(
         Duration::from_secs(3),
@@ -282,10 +299,10 @@ async fn alpha_runtime_mounts_generic_public_api_and_requires_bearer_token() {
         .await
         .unwrap();
 
-    assert_http_status(fixture.config.public_http, "/api/v1/assets", 401).await;
-    assert_http_status(fixture.config.public_http, "/api/v1/devices", 401).await;
+    assert_http_status(fixture.config.http, "/api/v1/assets", 401).await;
+    assert_http_status(fixture.config.http, "/api/v1/devices", 401).await;
     assert_http_status(
-        fixture.config.public_http,
+        fixture.config.http,
         "/api/v1/devices/missing-device",
         401,
     )
@@ -304,7 +321,7 @@ async fn alpha_runtime_mounts_public_oauth_token_endpoint() {
         .await
         .unwrap();
 
-    assert_form_post_status(fixture.config.public_http, "/oauth/token", "", 400).await;
+    assert_form_post_status(fixture.config.http, "/oauth/token", "", 400).await;
 
     runtime
         .shutdown(Instant::now() + Duration::from_secs(2))
@@ -320,14 +337,14 @@ async fn alpha_runtime_mounts_management_login_endpoint() {
         .unwrap();
 
     assert_json_post_status(
-        fixture.config.management_http,
-        "/api/auth/login",
+        fixture.config.http,
+        "/api/v1/auth/login",
         r#"{"username":"missing","password":"wrong"}"#,
         401,
     )
     .await;
     assert_json_post_status(
-        fixture.config.public_http,
+        fixture.config.http,
         "/api/auth/login",
         r#"{"username":"missing","password":"wrong"}"#,
         404,
@@ -341,21 +358,19 @@ async fn alpha_runtime_mounts_management_login_endpoint() {
 }
 
 #[tokio::test]
-async fn alpha_runtime_exposes_openapi_and_swagger_only_on_the_management_listener() {
+async fn alpha_runtime_exposes_openapi_and_swagger_on_the_single_http_listener() {
     let fixture = Fixture::new().await;
     let mut runtime = MonolithRuntime::start(fixture.config.clone())
         .await
         .unwrap();
 
     assert_http_status(
-        fixture.config.management_http,
+        fixture.config.http,
         "/api-docs/openapi.json",
         200,
     )
     .await;
-    assert_http_status(fixture.config.management_http, "/docs/", 200).await;
-    assert_http_status(fixture.config.public_http, "/api-docs/openapi.json", 404).await;
-    assert_http_status(fixture.config.public_http, "/docs/", 404).await;
+    assert_http_status(fixture.config.http, "/docs/", 200).await;
 
     runtime
         .shutdown(Instant::now() + Duration::from_secs(2))
@@ -409,8 +424,8 @@ async fn alpha_runtime_uses_a_management_session_to_issue_a_public_pkce_code() {
     .unwrap();
 
     let login = send_http(
-        fixture.config.management_http,
-        "POST /api/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"username\":\"admin\",\"password\":\"NanoAdmin@1234\"}".to_owned(),
+        fixture.config.http,
+        "POST /api/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"username\":\"admin\",\"password\":\"NanoAdmin@1234\"}".to_owned(),
     )
     .await;
     assert!(login.starts_with(b"HTTP/1.1 200"));
@@ -424,7 +439,7 @@ async fn alpha_runtime_uses_a_management_session_to_issue_a_public_pkce_code() {
         .to_owned();
     let challenge = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let authorize = send_http(
-        fixture.config.public_http,
+        fixture.config.http,
         format!(
             "GET /oauth/authorize?response_type=code&client_id=alpha-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=devices%3Aread&state=carry-me&code_challenge={challenge}&code_challenge_method=S256 HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
         ),

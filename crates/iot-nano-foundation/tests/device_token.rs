@@ -96,6 +96,32 @@ fn direct_payload_allows_ts_without_a_values_wrapper() {
 }
 
 #[test]
+fn firmware_payload_preserves_boot_sequence_and_measurements_for_idempotency() {
+    let received_at = Utc.with_ymd_and_hms(2026, 9, 4, 10, 13, 0).unwrap();
+    let parsed = serde_json::from_str::<DeviceTelemetryPayload>(
+        r#"{
+            "schema_version": 1,
+            "boot_id": "018f68d1-cc91-7000-8000-000000000002",
+            "sequence": 42,
+            "event_at": "2026-09-04T10:12:59Z",
+            "measurements": {"temperature_c": 26.4, "uptime_ms": 1000}
+        }"#,
+    )
+    .unwrap();
+
+    let event = parsed.into_event("esp-000123", received_at).unwrap();
+
+    assert_eq!(
+        event.boot_id,
+        "018f68d1-cc91-7000-8000-000000000002".parse::<uuid::Uuid>().unwrap(),
+    );
+    assert_eq!(event.sequence, 42);
+    assert_eq!(event.event_at, Utc.with_ymd_and_hms(2026, 9, 4, 10, 12, 59).unwrap());
+    assert_eq!(event.measurements["temperature_c"], json!(26.4));
+    assert_eq!(event.measurements["uptime_ms"], json!(1000));
+}
+
+#[test]
 fn token_payload_rejects_a_client_supplied_device_id() {
     let payload = r#"{
         "device_id": "esp-attacker",

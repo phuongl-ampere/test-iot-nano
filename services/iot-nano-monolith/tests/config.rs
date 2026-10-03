@@ -80,6 +80,29 @@ fn config_accepts_only_complete_sqlite_or_timescale_storage() {
 }
 
 #[test]
+fn config_uses_one_http_address_and_rejects_retired_listener_names() {
+    let mut values = sqlite_values();
+    values.insert(
+        "IOT_NANO_HTTP_ADDRESS".to_owned(),
+        "127.0.0.1:18081".to_owned(),
+    );
+    let config = MonolithConfig::from_values(values).unwrap();
+    assert_eq!(config.http, "127.0.0.1:18081".parse().unwrap());
+
+    for retired in ["IOT_NANO_PUBLIC_HTTP_ADDRESS", "IOT_NANO_MANAGEMENT_ADDRESS"] {
+        let mut retired_values = sqlite_values();
+        retired_values.insert(retired.to_owned(), "127.0.0.1:18080".to_owned());
+        assert!(
+            matches!(
+                MonolithConfig::from_values(retired_values),
+                Err(ConfigError::RetiredEnvironment(found)) if found == retired
+            ),
+            "expected {retired} to be rejected",
+        );
+    }
+}
+
+#[test]
 fn config_requires_a_strong_device_token_vault_key() {
     let mut missing_key = sqlite_values();
     missing_key.remove("IOT_DEVICE_TOKEN_VAULT_KEY");
@@ -169,11 +192,11 @@ fn config_rejects_unsafe_paths_incomplete_tls_and_duplicate_listener_addresses()
 
     let mut duplicate_addresses = sqlite_values();
     duplicate_addresses.insert(
-        "IOT_NANO_PUBLIC_HTTP_ADDRESS".to_owned(),
+        "IOT_NANO_HTTP_ADDRESS".to_owned(),
         "127.0.0.1:8080".to_owned(),
     );
     duplicate_addresses.insert(
-        "IOT_NANO_MANAGEMENT_ADDRESS".to_owned(),
+        "IOT_NANO_MQTT_TCP_ADDRESS".to_owned(),
         "127.0.0.1:8080".to_owned(),
     );
     assert!(matches!(
@@ -183,11 +206,11 @@ fn config_rejects_unsafe_paths_incomplete_tls_and_duplicate_listener_addresses()
 
     let mut conflicting_port = sqlite_values();
     conflicting_port.insert(
-        "IOT_NANO_PUBLIC_HTTP_ADDRESS".to_owned(),
+        "IOT_NANO_HTTP_ADDRESS".to_owned(),
         "0.0.0.0:8080".to_owned(),
     );
     conflicting_port.insert(
-        "IOT_NANO_MANAGEMENT_ADDRESS".to_owned(),
+        "IOT_NANO_MQTT_TCP_ADDRESS".to_owned(),
         "127.0.0.1:8080".to_owned(),
     );
     assert!(matches!(
@@ -255,6 +278,8 @@ fn retired_environment_denylist_covers_all_current_topology_variables() {
         "IOT_NANO_MQTTD_API_SECRET",
         "IOT_NANO_MQTTD_INTERNAL_URL",
         "IOT_NANO_MQTTD_STREAM_SECRET",
+        "IOT_NANO_MANAGEMENT_ADDRESS",
+        "IOT_NANO_PUBLIC_HTTP_ADDRESS",
         "IOT_NANO_STREAM_ADDRESS",
         "IOT_NANO_STREAM_DIR",
         "IOT_NANO_STREAM_MAX_RECORD_BYTES",
@@ -307,17 +332,11 @@ fn config_check_validates_without_logging_secret_values() {
 fn migrate_only_requires_complete_config_and_prepares_internal_state_without_binding_listeners() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let addresses = [
-        reserve_address(),
-        reserve_address(),
-        reserve_address(),
-        reserve_address(),
-    ];
+    let addresses = [reserve_address(), reserve_address(), reserve_address()];
     let platform_path = root.join("platform.sqlite").display().to_string();
-    let public_address = addresses[0].to_string();
-    let management_address = addresses[1].to_string();
-    let mqtt_tcp_address = addresses[2].to_string();
-    let mqtt_tls_address = addresses[3].to_string();
+    let http_address = addresses[0].to_string();
+    let mqtt_tcp_address = addresses[1].to_string();
+    let mqtt_tls_address = addresses[2].to_string();
     let incomplete_configuration = values(&[
         ("IOT_NANO_STORAGE", "sqlite"),
         ("IOT_NANO_SQLITE_PATH", &platform_path),
@@ -344,8 +363,7 @@ fn migrate_only_requires_complete_config_and_prepares_internal_state_without_bin
         ("IOT_NANO_INTERNAL_DIR", &internal_dir),
         ("IOT_NANO_TLS_CERT_PATH", "/run/tls/server.crt"),
         ("IOT_NANO_TLS_KEY_PATH", "/run/tls/server.key"),
-        ("IOT_NANO_PUBLIC_HTTP_ADDRESS", &public_address),
-        ("IOT_NANO_MANAGEMENT_ADDRESS", &management_address),
+        ("IOT_NANO_HTTP_ADDRESS", &http_address),
         ("IOT_NANO_MQTT_TCP_ADDRESS", &mqtt_tcp_address),
         ("IOT_NANO_MQTT_TLS_ADDRESS", &mqtt_tls_address),
     ]);
@@ -371,22 +389,15 @@ fn migrate_only_requires_complete_config_and_prepares_internal_state_without_bin
 fn bootstrap_system_provisions_an_empty_platform_without_binding_listeners() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
-    let addresses = [
-        reserve_address(),
-        reserve_address(),
-        reserve_address(),
-        reserve_address(),
-    ];
+    let addresses = [reserve_address(), reserve_address(), reserve_address()];
     let platform_path = root.join("platform.sqlite").display().to_string();
-    let public_address = addresses[0].to_string();
-    let management_address = addresses[1].to_string();
-    let mqtt_tcp_address = addresses[2].to_string();
-    let mqtt_tls_address = addresses[3].to_string();
+    let http_address = addresses[0].to_string();
+    let mqtt_tcp_address = addresses[1].to_string();
+    let mqtt_tls_address = addresses[2].to_string();
     let configuration = values(&[
         ("IOT_NANO_STORAGE", "sqlite"),
         ("IOT_NANO_SQLITE_PATH", &platform_path),
-        ("IOT_NANO_PUBLIC_HTTP_ADDRESS", &public_address),
-        ("IOT_NANO_MANAGEMENT_ADDRESS", &management_address),
+        ("IOT_NANO_HTTP_ADDRESS", &http_address),
         ("IOT_NANO_MQTT_TCP_ADDRESS", &mqtt_tcp_address),
         ("IOT_NANO_MQTT_TLS_ADDRESS", &mqtt_tls_address),
         ("IOT_NANO_BOOTSTRAP_SYSTEM_USERNAME", "initial-system"),

@@ -22,23 +22,23 @@ vi.mock("../lib/oauth", () => ({
   platformAuthBaseUrlFromEnvironment,
 }));
 
-import { POST } from "../app/api/auth/login/route";
+import { POST } from "../app/api/v1/auth/login/route";
 
 describe("PowerMonitor password login route", () => {
   it("accepts a browser origin that matches the incoming Host", async () => {
     const handoff = new Response(null, {
-      headers: { location: "http://127.0.0.1:3001/api/auth/callback?code=code&state=state" },
+      headers: { location: "http://127.0.0.1:3001/api/v1/auth/callback?code=code&state=state" },
       status: 303,
     });
     cookies.mockResolvedValue({ set: vi.fn() });
     createPasswordLoginHandler.mockResolvedValue(handoff);
     oauthConfigFromEnvironment.mockReturnValue({
       clientId: "client",
-      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
     });
     platformAuthBaseUrlFromEnvironment.mockReturnValue("http://127.0.0.1:18081");
 
-    const response = await POST(new Request("http://internal-powermonitor:3001/api/auth/login", {
+    const response = await POST(new Request("http://internal-powermonitor:3001/api/v1/auth/login", {
       body: new URLSearchParams({ password: "correct-password", username: "operator" }),
       headers: {
         "content-type": "application/x-www-form-urlencoded",
@@ -58,10 +58,10 @@ describe("PowerMonitor password login route", () => {
   it("rejects a cross-origin password submission", async () => {
     oauthConfigFromEnvironment.mockReturnValue({
       clientId: "client",
-      redirectUri: "https://powermonitor.example.test/api/auth/callback",
+      redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
     });
 
-    const response = await POST(new Request("http://internal-powermonitor:3001/api/auth/login", {
+    const response = await POST(new Request("http://internal-powermonitor:3001/api/v1/auth/login", {
       body: new URLSearchParams({ password: "correct-password", username: "operator" }),
       headers: {
         "content-type": "application/x-www-form-urlencoded",

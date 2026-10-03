@@ -31,6 +31,7 @@ const CANONICAL_TABLES: &[&str] = &[
     "device_relations",
     "device_asset_relations",
     "device_tokens",
+    "tenant_personal_access_tokens",
     "user_groups",
     "user_group_members",
     "resource_permissions",

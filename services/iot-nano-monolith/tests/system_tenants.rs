@@ -51,7 +51,7 @@ async fn system_account_logs_in_and_creates_a_tenant_without_tenant_resource_acc
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/auth/login")
+                .uri("/api/v1/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"system","password":"SystemAccount@2026"}"#,
@@ -74,7 +74,7 @@ async fn system_account_logs_in_and_creates_a_tenant_without_tenant_resource_acc
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants")
+                .uri("/api/v1/system/tenants")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &system_cookie)
                 .body(Body::from(
@@ -90,7 +90,7 @@ async fn system_account_logs_in_and_creates_a_tenant_without_tenant_resource_acc
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/devices")
+                .uri("/api/v1/management/devices")
                 .header(COOKIE, system_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -108,7 +108,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/auth/login")
+                .uri("/api/v1/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"system","password":"SystemAccount@2026"}"#,
@@ -129,7 +129,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants")
+                .uri("/api/v1/system/tenants")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &system_cookie)
                 .body(Body::from(
@@ -146,7 +146,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"north","password":"TenantAccount@2026"}"#,
@@ -169,7 +169,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/tenant/auth/me")
+                .uri("/api/v1/tenant/auth/me")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -183,7 +183,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/applications")
+                .uri("/api/v1/management/applications")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -200,7 +200,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -217,7 +217,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -231,7 +231,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(COOKIE, &system_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -244,7 +244,7 @@ async fn tenant_account_logs_in_only_for_its_tenant_and_is_denied_system_routes(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants")
+                .uri("/api/v1/system/tenants")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -265,7 +265,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/auth/login")
+                .uri("/api/v1/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"system","password":"SystemAccount@2026"}"#,
@@ -286,7 +286,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants")
+                .uri("/api/v1/system/tenants")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &system_cookie)
                 .body(Body::from(
@@ -302,7 +302,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"north","password":"TenantAccount@2026"}"#,
@@ -323,7 +323,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/applications")
+                .uri("/api/v1/management/applications")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -339,7 +339,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::from(
@@ -356,7 +356,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/user/auth/login")
+                .uri("/api/v1/user/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"north","username":"north-user","password":"NorthUser@2026"}"#,
@@ -379,7 +379,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/user/auth/me")
+                .uri("/api/v1/user/auth/me")
                 .header(COOKIE, &user_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -392,7 +392,7 @@ async fn user_logs_in_with_tenant_slug_and_is_denied_tenant_management_routes() 
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/management/users")
+                .uri("/api/v1/management/users")
                 .header(COOKIE, user_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -410,7 +410,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/auth/login")
+                .uri("/api/v1/system/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"username":"system","password":"SystemAccount@2026"}"#,
@@ -431,7 +431,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants")
+                .uri("/api/v1/system/tenants")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &system_cookie)
                 .body(Body::from(
@@ -448,7 +448,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"north","password":"TenantAccount@2026"}"#,
@@ -470,7 +470,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants/north/suspend")
+                .uri("/api/v1/system/tenants/north/suspend")
                 .header(COOKIE, &system_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -483,7 +483,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/tenant/auth/me")
+                .uri("/api/v1/tenant/auth/me")
                 .header(COOKIE, &tenant_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -497,7 +497,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants/north/reactivate")
+                .uri("/api/v1/system/tenants/north/reactivate")
                 .header(COOKIE, &system_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -511,7 +511,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants/north/tenant-account/reset")
+                .uri("/api/v1/system/tenants/north/tenant-account/reset")
                 .header(CONTENT_TYPE, "application/json")
                 .header(COOKIE, &system_cookie)
                 .body(Body::from(r#"{"password":"NewTenantAccount@2026"}"#))
@@ -526,7 +526,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"north","password":"TenantAccount@2026"}"#,
@@ -542,7 +542,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"north","password":"NewTenantAccount@2026"}"#,
@@ -565,7 +565,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants/north/tenant-account/disable")
+                .uri("/api/v1/system/tenants/north/tenant-account/disable")
                 .header(COOKIE, &system_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -578,7 +578,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/tenant/auth/me")
+                .uri("/api/v1/tenant/auth/me")
                 .header(COOKIE, replacement_cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -591,7 +591,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/tenant/auth/login")
+                .uri("/api/v1/tenant/auth/login")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     r#"{"tenant_slug":"north","password":"NewTenantAccount@2026"}"#,
@@ -606,7 +606,7 @@ async fn system_account_controls_tenant_lifecycle_and_revokes_tenant_sessions() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/system/tenants/north/delete")
+                .uri("/api/v1/system/tenants/north/delete")
                 .header(COOKIE, system_cookie)
                 .body(Body::empty())
                 .unwrap(),

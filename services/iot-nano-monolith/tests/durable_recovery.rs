@@ -78,8 +78,7 @@ impl Fixture {
                 device_token_vault_key: "durable-recovery-device-token-key-material-0001"
                     .to_owned(),
                 internal_dir: root.join("internal"),
-                public_http: SocketAddr::from(([127, 0, 0, 1], 0)),
-                management_http: SocketAddr::from(([127, 0, 0, 1], 0)),
+                http: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mqtt_tcp: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mqtt_tls: SocketAddr::from(([127, 0, 0, 1], 0)),
                 web_https_enabled: false,

@@ -4,7 +4,7 @@ const { cookies } = vi.hoisted(() => ({ cookies: vi.fn() }));
 
 vi.mock("next/headers", () => ({ cookies }));
 
-import { POST } from "../app/api/auth/logout/route";
+import { POST } from "../app/api/v1/auth/logout/route";
 import { oauthStateCookieName, sessionCookieName } from "../lib/oauth";
 
 describe("PowerMonitor logout route", () => {
@@ -12,7 +12,7 @@ describe("PowerMonitor logout route", () => {
     const removeCookie = vi.fn();
     cookies.mockResolvedValue({ delete: removeCookie });
 
-    const response = await POST(new Request("http://localhost:3002/api/auth/logout", {
+    const response = await POST(new Request("http://localhost:3002/api/v1/auth/logout", {
       method: "POST",
     }));
 

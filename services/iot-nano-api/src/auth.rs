@@ -6,10 +6,11 @@ use axum::http::{HeaderMap, header::AUTHORIZATION};
 use chrono::{DateTime, Utc};
 use iot_storage::{
     OAuthRepository, PlatformAccountCredential, PlatformStore, PlatformStoreError,
-    TenantIdentityError, TenantIdentityRepository,
+    TenantIdentityError, TenantIdentityRepository, TenantPersonalAccessTokenRepository,
 };
 use rand_core::{OsRng, RngCore};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -33,6 +34,7 @@ pub struct BearerAccessToken {
     pub app_id: String,
     pub tenant_id: Uuid,
     pub user_id: Option<Uuid>,
+    pub tenant_account_id: Option<Uuid>,
     pub scopes: Vec<String>,
     pub expires_at: DateTime<Utc>,
 }
@@ -50,6 +52,33 @@ pub enum BearerAccessTokenError {
     Unavailable,
 }
 
+const PERSONAL_ACCESS_TOKEN_PREFIX: &str = "iotpat_";
+pub const PERSONAL_ACCESS_TOKEN_APP_ID: &str = "tenant-personal-access-token";
+const PERSONAL_ACCESS_TOKEN_SCOPES: [&str; 11] = [
+    "assets:read",
+    "assets:write",
+    "devices:read",
+    "devices:write",
+    "telemetry:read",
+    "alerts:read",
+    "alerts:write",
+    "commands:read",
+    "commands:write",
+    "authorization:read",
+    "authorization:write",
+];
+
+fn personal_access_token_scopes() -> Vec<String> {
+    PERSONAL_ACCESS_TOKEN_SCOPES
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn personal_access_token_expiry() -> DateTime<Utc> {
+    DateTime::from_timestamp(253_402_300_799, 0).expect("the year 9999 is representable")
+}
+
 pub fn extract_bearer_access_token(headers: &HeaderMap) -> Result<&str, BearerAccessTokenError> {
     let value = headers
         .get(AUTHORIZATION)
@@ -63,24 +92,44 @@ pub fn extract_bearer_access_token(headers: &HeaderMap) -> Result<&str, BearerAc
 }
 
 pub async fn validate_bearer_access_token(
-    store: &impl OAuthRepository,
+    store: &(impl OAuthRepository + TenantPersonalAccessTokenRepository),
     headers: &HeaderMap,
     now: DateTime<Utc>,
 ) -> Result<BearerAccessToken, BearerAccessTokenError> {
     let token = extract_bearer_access_token(headers)?;
-    let record = OAuthRepository::resolve_access_token(store, token, now)
-        .await
-        .map_err(|error| match error {
-            PlatformStoreError::OAuthAccessTokenDenied => BearerAccessTokenError::Denied,
-            _ => BearerAccessTokenError::Unavailable,
-        })?;
-    Ok(BearerAccessToken {
-        app_id: record.app_id.as_str().to_owned(),
-        tenant_id: record.tenant_id,
-        user_id: record.user_id,
-        scopes: record.scopes,
-        expires_at: record.expires_at,
-    })
+    match OAuthRepository::resolve_access_token(store, token, now).await {
+        Ok(record) => Ok(BearerAccessToken {
+            app_id: record.app_id.as_str().to_owned(),
+            tenant_id: record.tenant_id,
+            user_id: record.user_id,
+            tenant_account_id: None,
+            scopes: record.scopes,
+            expires_at: record.expires_at,
+        }),
+        Err(PlatformStoreError::OAuthAccessTokenDenied)
+            if token.starts_with(PERSONAL_ACCESS_TOKEN_PREFIX) =>
+        {
+            let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+            let record = TenantPersonalAccessTokenRepository::resolve_tenant_personal_access_token(
+                store,
+                &token_hash,
+                now,
+            )
+            .await
+            .map_err(|_| BearerAccessTokenError::Unavailable)?
+            .ok_or(BearerAccessTokenError::Denied)?;
+            Ok(BearerAccessToken {
+                app_id: PERSONAL_ACCESS_TOKEN_APP_ID.to_owned(),
+                tenant_id: record.tenant_id,
+                user_id: None,
+                tenant_account_id: Some(record.tenant_account_user_id),
+                scopes: personal_access_token_scopes(),
+                expires_at: personal_access_token_expiry(),
+            })
+        }
+        Err(PlatformStoreError::OAuthAccessTokenDenied) => Err(BearerAccessTokenError::Denied),
+        Err(_) => Err(BearerAccessTokenError::Unavailable),
+    }
 }
 
 #[derive(Debug, Error)]

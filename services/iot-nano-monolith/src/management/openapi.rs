@@ -5,7 +5,7 @@ pub(super) fn management_openapi() -> Value {
 
     documented_path(
         &mut paths,
-        "/api/auth/login",
+        "/api/v1/auth/login",
         vec![(
             "post",
             documented_operation(
@@ -27,7 +27,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/auth/logout",
+        "/api/v1/auth/logout",
         vec![(
             "post",
             documented_operation(
@@ -41,7 +41,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/auth/me",
+        "/api/v1/auth/me",
         vec![(
             "get",
             documented_operation(
@@ -55,7 +55,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/applications",
+        "/api/v1/management/applications",
         vec![(
             "post",
             management_operation(
@@ -68,7 +68,48 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/profile",
+        "/api/v1/management/personal-access-token",
+        vec![
+            (
+                "get",
+                tenant_management_list_operation(
+                    "Get the active tenant personal access token metadata",
+                    "PersonalAccessTokenGetResponse",
+                ),
+            ),
+            (
+                "post",
+                documented_operation(
+                    "Create or rotate the tenant personal access token",
+                    Some("managementSession"),
+                    Some(("application/json", "PersonalAccessTokenRequest")),
+                    (
+                        "201",
+                        "Personal access token created; copy the secret now",
+                        Some("PersonalAccessTokenCreateResponse"),
+                    ),
+                    &tenant_management_errors(),
+                ),
+            ),
+        ],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/management/personal-access-token/revoke",
+        vec![(
+            "post",
+            documented_operation(
+                "Revoke the active tenant personal access token",
+                Some("managementSession"),
+                None,
+                ("204", "Personal access token revoked", None),
+                &tenant_management_errors(),
+            ),
+        )],
+    );
+    documented_path(
+        &mut paths,
+        "/api/v1/management/profile",
         vec![
             (
                 "get",
@@ -98,7 +139,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/profile/export",
+        "/api/v1/management/profile/export",
         vec![(
             "get",
             documented_operation(
@@ -116,7 +157,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/profile/import",
+        "/api/v1/management/profile/import",
         vec![(
             "put",
             documented_operation(
@@ -130,7 +171,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/ota/artifacts",
+        "/api/v1/management/ota/artifacts",
         vec![
             (
                 "get",
@@ -141,7 +182,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/ota/policy",
+        "/api/v1/management/ota/policy",
         vec![
             (
                 "get",
@@ -161,7 +202,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/alerts",
+        "/api/v1/management/alerts",
         vec![(
             "get",
             tenant_management_list_operation("List tenant alerts", "ManagementAlertList"),
@@ -169,7 +210,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/alerts/summary",
+        "/api/v1/management/alerts/summary",
         vec![(
             "get",
             management_list_operation("Get tenant alert summary", "ManagementAlertSummary"),
@@ -177,7 +218,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/alert-rules",
+        "/api/v1/management/alert-rules",
         vec![
             (
                 "get",
@@ -196,7 +237,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/alert-rules/{rule_id}",
+        "/api/v1/management/alert-rules/{rule_id}",
         vec![(
             "put",
             management_operation(
@@ -209,7 +250,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/alert-rules/{rule_id}/archive",
+        "/api/v1/management/alert-rules/{rule_id}/archive",
         vec![(
             "post",
             management_no_content_operation("Archive a tenant alert rule"),
@@ -217,7 +258,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/alert-incidents",
+        "/api/v1/management/alert-incidents",
         vec![(
             "get",
             management_list_operation("List tenant alert incidents", "ManagementAlertIncidentList"),
@@ -225,7 +266,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/alert-incidents/{incident_id}/acknowledge",
+        "/api/v1/management/alert-incidents/{incident_id}/acknowledge",
         vec![(
             "post",
             documented_operation(
@@ -248,7 +289,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/audit",
+        "/api/v1/management/audit",
         vec![(
             "get",
             tenant_audit_list_operation("List tenant audit events", "ManagementAuditEventPage"),
@@ -256,7 +297,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/users",
+        "/api/v1/management/users",
         vec![
             (
                 "get",
@@ -275,7 +316,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/users/{username}",
+        "/api/v1/management/users/{username}",
         vec![(
             "put",
             management_operation(
@@ -288,7 +329,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/users/{username}/capabilities",
+        "/api/v1/management/users/{username}/capabilities",
         vec![(
             "put",
             management_operation(
@@ -301,7 +342,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/profiles/device-profiles",
+        "/api/v1/management/profiles/device-profiles",
         vec![
             (
                 "get",
@@ -320,7 +361,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/profiles/device-profiles/{profile_id}",
+        "/api/v1/management/profiles/device-profiles/{profile_id}",
         vec![
             (
                 "put",
@@ -339,7 +380,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/profiles/asset-profiles",
+        "/api/v1/management/profiles/asset-profiles",
         vec![
             (
                 "get",
@@ -358,7 +399,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/profiles/asset-profiles/{profile_id}",
+        "/api/v1/management/profiles/asset-profiles/{profile_id}",
         vec![
             (
                 "put",
@@ -377,7 +418,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices",
+        "/api/v1/management/devices",
         vec![
             (
                 "get",
@@ -396,7 +437,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices/{device_id}",
+        "/api/v1/management/devices/{device_id}",
         vec![
             (
                 "put",
@@ -415,7 +456,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices/{device_id}/owner",
+        "/api/v1/management/devices/{device_id}/owner",
         vec![(
             "put",
             documented_operation(
@@ -429,7 +470,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices/{device_id}/telemetry",
+        "/api/v1/management/devices/{device_id}/telemetry",
         vec![(
             "get",
             documented_operation(
@@ -447,7 +488,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices/{device_id}/claim-code",
+        "/api/v1/management/devices/{device_id}/claim-code",
         vec![(
             "post",
             documented_operation(
@@ -470,7 +511,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices/{device_id}/tokens",
+        "/api/v1/management/devices/{device_id}/tokens",
         vec![(
             "post",
             documented_operation(
@@ -490,7 +531,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices/{device_id}/token",
+        "/api/v1/management/devices/{device_id}/token",
         vec![(
             "get",
             documented_operation(
@@ -509,7 +550,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/devices/{device_id}/tokens/{token_id}/rotate",
+        "/api/v1/management/devices/{device_id}/tokens/{token_id}/rotate",
         vec![(
             "post",
             documented_operation(
@@ -534,7 +575,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/assets",
+        "/api/v1/management/assets",
         vec![
             (
                 "get",
@@ -553,7 +594,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/assets/{asset_id}",
+        "/api/v1/management/assets/{asset_id}",
         vec![
             (
                 "put",
@@ -572,7 +613,7 @@ pub(super) fn management_openapi() -> Value {
     );
     documented_path(
         &mut paths,
-        "/api/management/assets/{asset_id}/owner",
+        "/api/v1/management/assets/{asset_id}/owner",
         vec![(
             "put",
             documented_operation(
@@ -907,6 +948,44 @@ fn management_openapi_schemas() -> Value {
         object_schema(
             json!({"app_id": {"type": "string"}, "client_id": {"type": "string"}}),
             &["app_id", "client_id"],
+        ),
+    );
+    schemas.insert(
+        "PersonalAccessTokenRequest".to_owned(),
+        object_schema(
+            json!({"name": {"type": "string", "minLength": 1}}),
+            &["name"],
+        ),
+    );
+    schemas.insert(
+        "PersonalAccessTokenMetadata".to_owned(),
+        object_schema(
+            json!({
+                "name": {"type": "string"},
+                "prefix": {"type": "string"},
+                "created_at": {"type": "string", "format": "date-time"},
+                "last_used_at": {"type": ["string", "null"], "format": "date-time"}
+            }),
+            &["name", "prefix", "created_at", "last_used_at"],
+        ),
+    );
+    schemas.insert(
+        "PersonalAccessTokenGetResponse".to_owned(),
+        object_schema(
+            json!({
+                "token": {"anyOf": [schema_reference("PersonalAccessTokenMetadata"), {"type": "null"}]}
+            }),
+            &["token"],
+        ),
+    );
+    schemas.insert(
+        "PersonalAccessTokenCreateResponse".to_owned(),
+        object_schema(
+            json!({
+                "token": schema_reference("PersonalAccessTokenMetadata"),
+                "secret": {"type": "string", "description": "Returned only by create or rotate; store it immediately."}
+            }),
+            &["token", "secret"],
         ),
     );
     schemas.insert(

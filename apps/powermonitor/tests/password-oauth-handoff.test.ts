@@ -13,7 +13,7 @@ const config: OAuthConfig = {
   platformBaseUrl: "https://public.example.test",
   clientId: "powermonitor-client",
   clientSecret: "client-secret",
-  redirectUri: "https://powermonitor.example.test/api/auth/callback",
+  redirectUri: "https://powermonitor.example.test/api/v1/auth/callback",
   scope: "devices:read",
 };
 
@@ -24,7 +24,7 @@ describe("PowerMonitor password OAuth handoff", () => {
     const sealSession = vi.fn().mockReturnValue("sealed-powermonitor-session");
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
-      if (url.pathname === "/api/auth/login") {
+      if (url.pathname === "/api/v1/auth/login") {
         expect(init).toMatchObject({
           body: JSON.stringify({ username: "operator", password: "correct-password" }),
           headers: { "content-type": "application/json" },
@@ -104,7 +104,7 @@ describe("PowerMonitor password OAuth handoff", () => {
     const cookies = { set: vi.fn() };
     const fetcher = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
-      if (url.pathname === "/api/auth/login") {
+      if (url.pathname === "/api/v1/auth/login") {
         return new Response(null, {
           headers: { "set-cookie": "iot_nano_session=platform-session; HttpOnly; Path=/" },
           status: 200,

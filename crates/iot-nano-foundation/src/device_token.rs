@@ -20,11 +20,23 @@ pub const DEVICE_TOKEN_PREFIX_LENGTH: usize = 16;
 pub struct DeviceTelemetryPayload {
     pub event_at: Option<DateTime<Utc>>,
     pub measurements: Map<String, Value>,
+    boot_id: Option<Uuid>,
     device_id: Option<String>,
+    sequence: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct DirectTelemetryWirePayload {
+    #[serde(default)]
+    boot_id: Option<Uuid>,
+    #[serde(default)]
+    event_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    measurements: Option<Map<String, Value>>,
+    #[serde(default)]
+    schema_version: Option<u16>,
+    #[serde(default)]
+    sequence: Option<u64>,
     #[serde(default)]
     ts: Option<i64>,
     #[serde(default)]
@@ -32,7 +44,7 @@ struct DirectTelemetryWirePayload {
     #[serde(default)]
     device_id: Option<String>,
     #[serde(flatten)]
-    measurements: Map<String, Value>,
+    top_level_measurements: Map<String, Value>,
 }
 
 impl<'de> Deserialize<'de> for DeviceTelemetryPayload {
@@ -41,28 +53,38 @@ impl<'de> Deserialize<'de> for DeviceTelemetryPayload {
         D: Deserializer<'de>,
     {
         let wire = DirectTelemetryWirePayload::deserialize(deserializer)?;
-        let measurements = match wire.values {
-            Some(values) if wire.measurements.is_empty() => values,
-            Some(_) => {
+        let measurements = match (wire.measurements, wire.values) {
+            (Some(measurements), None) if wire.top_level_measurements.is_empty() => measurements,
+            (None, Some(values)) if wire.top_level_measurements.is_empty() => values,
+            (None, None) => wire.top_level_measurements,
+            _ => {
                 return Err(D::Error::custom(
-                    "direct telemetry must use either top-level key-values or a values object",
+                    "direct telemetry must use one of top-level key-values, values, or measurements",
                 ));
             }
-            None => wire.measurements,
         };
-        let event_at = wire
-            .ts
-            .map(|timestamp| {
-                Utc.timestamp_millis_opt(timestamp).single().ok_or_else(|| {
-                    D::Error::custom("ts must be a valid Unix timestamp in milliseconds")
-                })
-            })
-            .transpose()?;
+        if wire.schema_version.is_some_and(|version| version != 1) {
+            return Err(D::Error::custom("schema_version must be 1"));
+        }
+        let event_at = match (wire.event_at, wire.ts) {
+            (Some(_), Some(_)) => {
+                return Err(D::Error::custom("direct telemetry must use either event_at or ts"));
+            }
+            (Some(event_at), None) => Some(event_at),
+            (None, Some(timestamp)) => Some(
+                Utc.timestamp_millis_opt(timestamp)
+                    .single()
+                    .ok_or_else(|| D::Error::custom("ts must be a valid Unix timestamp in milliseconds"))?,
+            ),
+            (None, None) => None,
+        };
 
         Ok(Self {
             event_at,
             measurements,
+            boot_id: wire.boot_id,
             device_id: wire.device_id,
+            sequence: wire.sequence,
         })
     }
 }
@@ -80,8 +102,8 @@ impl DeviceTelemetryPayload {
         Ok(TelemetryEvent {
             schema_version: 1,
             device_id: device_id.into(),
-            boot_id: Uuid::new_v4(),
-            sequence: 0,
+            boot_id: self.boot_id.unwrap_or_else(Uuid::new_v4),
+            sequence: self.sequence.unwrap_or(0),
             event_at: self.event_at.unwrap_or(received_at),
             measurements: self.measurements,
             gateway_device_id: None,

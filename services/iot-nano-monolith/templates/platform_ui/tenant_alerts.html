@@ -310,10 +310,10 @@
       const loadConsole = async () => {
         try {
           const [nextRules, incidents, summary, nextDevices] = await Promise.all([
-            ui.request("/api/management/alert-rules"),
-            ui.request("/api/management/alert-incidents"),
-            ui.request("/api/management/alerts/summary"),
-            ui.request("/api/management/devices"),
+            ui.request("/api/v1/management/alert-rules"),
+            ui.request("/api/v1/management/alert-incidents"),
+            ui.request("/api/v1/management/alerts/summary"),
+            ui.request("/api/v1/management/devices"),
           ]);
           rules = nextRules;
           devices = nextDevices;
@@ -351,7 +351,7 @@
       const toggleRule = async (rule, control) => {
         ui.setPending(control, true);
         try {
-          await ui.request(`/api/management/alert-rules/${encodeURIComponent(rule.id)}`, {
+          await ui.request(`/api/v1/management/alert-rules/${encodeURIComponent(rule.id)}`, {
             method: "PUT",
             body: updatePayload(rule, { enabled: !rule.enabled }),
           });
@@ -367,7 +367,7 @@
         if (!window.confirm(`Archive alert rule ${rule.name}? Existing incidents remain available for review.`)) return;
         ui.setPending(control, true);
         try {
-          await ui.request(`/api/management/alert-rules/${encodeURIComponent(rule.id)}/archive`, { method: "POST" });
+          await ui.request(`/api/v1/management/alert-rules/${encodeURIComponent(rule.id)}/archive`, { method: "POST" });
           ui.announce("Alert rule archived.");
           await loadConsole();
         } catch (error) {
@@ -379,7 +379,7 @@
       const acknowledgeIncident = async (incident, control) => {
         ui.setPending(control, true);
         try {
-          await ui.request(`/api/management/alert-incidents/${encodeURIComponent(incident.id)}/acknowledge`, { method: "POST" });
+          await ui.request(`/api/v1/management/alert-incidents/${encodeURIComponent(incident.id)}/acknowledge`, { method: "POST" });
           ui.announce("Incident acknowledged.");
           await loadConsole();
         } catch (error) {
@@ -407,10 +407,10 @@
             throw new Error("Window average requires at least 60 seconds.");
           }
           if (editingRule) {
-            await ui.request(`/api/management/alert-rules/${encodeURIComponent(editingRule.id)}`, { method: "PUT", body });
+            await ui.request(`/api/v1/management/alert-rules/${encodeURIComponent(editingRule.id)}`, { method: "PUT", body });
             ui.announce("Alert rule updated.");
           } else {
-            await ui.request("/api/management/alert-rules", { method: "POST", body });
+            await ui.request("/api/v1/management/alert-rules", { method: "POST", body });
             ui.announce("Alert rule created.");
           }
           closeEditor();
