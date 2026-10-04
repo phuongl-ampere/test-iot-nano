@@ -6386,6 +6386,15 @@ async fn tenant_topology_forms_scope_gateway_children_and_reject_invalid_assignm
     assert!(page.contains(&child_id));
     assert!(!page.contains("Other tenant gateway"));
     assert!(!page.contains("gateway_child"));
+    let assignment_summary = page
+        .split("<tbody>")
+        .nth(1)
+        .and_then(|summary| summary.split("</tbody>").next())
+        .unwrap();
+    assert!(assignment_summary.contains(&gateway_id));
+    assert!(assignment_summary.contains("No assigned devices"));
+    assert!(!assignment_summary.contains(&child_id));
+    assert!(!assignment_summary.contains(&direct_id));
 
     let assigned = router
         .clone()
@@ -6425,9 +6434,17 @@ async fn tenant_topology_forms_scope_gateway_children_and_reject_invalid_assignm
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("Gateway"));
-    assert!(body.contains("Child"));
-    assert!(!body.contains("<td><strong>Direct device</strong></td>"));
+    let assignment_summary = body
+        .split("<tbody>")
+        .nth(1)
+        .and_then(|summary| summary.split("</tbody>").next())
+        .unwrap();
+    assert!(assignment_summary.contains(&gateway_id));
+    assert!(assignment_summary.contains(&format!(
+        "<li><strong>Tenant child</strong> <code>{child_id}</code></li>"
+    )));
+    assert!(!assignment_summary.contains(&direct_id));
+    assert!(!assignment_summary.contains("No assigned devices"));
 
     let detached = router
         .clone()
