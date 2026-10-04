@@ -1,6 +1,6 @@
 {% extends "platform_ui/base.html" %}
 
-{% block title %}Gateway Topology | IoT Nano{% endblock %}
+{% block title %}Gateway assignments | IoT Nano{% endblock %}
 {% block account_kind %}Tenant Account{% endblock %}
 {% block navigation_label %}Tenant navigation{% endblock %}
 {% block navigation %}
@@ -10,19 +10,19 @@
 {% block content %}
   <section class="page-heading">
     <p class="eyebrow">Tenant Account</p>
-    <h1>Gateway Topology</h1>
-    <p>Manage gateway-child assignments separately from general device relations.</p>
+    <h1>Gateway assignments</h1>
+    <p>Manage which devices communicate through each gateway.</p>
   </section>
   {% if page.has_notice %}
     <p class="notice" role="status">{{ page.notice }}</p>
   {% endif %}
   <section class="workspace-panel">
     <header>
-      <div class="panel-heading"><h2>Assign gateway child</h2></div>
-      <p class="panel-caption">Only direct devices can be assigned beneath a gateway.</p>
+      <div class="panel-heading"><h2>Assign device to gateway</h2></div>
+      <p class="panel-caption">Choose an available device and gateway.</p>
     </header>
     {% if page.children.is_empty() || page.gateways.is_empty() %}
-      <p class="empty-state">A direct device and a gateway are required before creating a gateway-child assignment.</p>
+      <p class="empty-state">A device and a gateway are required before creating an assignment.</p>
     {% else %}
       <form class="form-grid" action="/tenant/topology/assign" method="post">
         <label class="field">
@@ -47,8 +47,8 @@
   </section>
   <section class="workspace-panel">
     <header>
-      <div class="panel-heading"><h2>Detach gateway child</h2></div>
-      <p class="panel-caption">Detaching returns the child device to direct connectivity.</p>
+      <div class="panel-heading"><h2>Remove gateway assignment</h2></div>
+      <p class="panel-caption">Removing an assignment disconnects the device from its gateway parent.</p>
     </header>
     {% if page.assigned_children.is_empty() %}
       <p class="empty-state">No devices are currently assigned to a gateway.</p>
@@ -63,38 +63,44 @@
           </select>
         </label>
         <details class="confirmation">
-          <summary>Detach selected child</summary>
+          <summary>Remove selected assignment</summary>
           <p>The selected device will no longer use its gateway parent.</p>
-          <button class="danger-button" type="submit">Detach child from gateway</button>
+          <button class="danger-button" type="submit">Remove gateway assignment</button>
         </details>
       </form>
     {% endif %}
   </section>
   <section class="workspace-panel">
     <header>
-      <div class="panel-heading"><h2>Topology devices</h2></div>
-      <p class="panel-caption">Gateway role and parent assignment are shown independently.</p>
+      <div class="panel-heading"><h2>Gateway assignments</h2></div>
+      <p class="panel-caption">Only gateways and their assigned devices are listed.</p>
     </header>
-    {% if page.devices.is_empty() %}
-      <p class="empty-state">No devices are available for topology management.</p>
+    {% if page.assignments.is_empty() %}
+      <p class="empty-state">No gateway assignments. Ordinary devices connect directly by default.</p>
     {% else %}
       <div class="table-scroll">
         <table class="data-table">
           <thead>
             <tr>
-              <th scope="col">Device</th>
-              <th scope="col">Name</th>
-              <th scope="col">Topology role</th>
-              <th scope="col">Gateway assignment</th>
+              <th scope="col">Gateway</th>
+              <th scope="col">Assigned devices</th>
             </tr>
           </thead>
           <tbody>
-            {% for device in page.devices %}
+            {% for assignment in page.assignments %}
               <tr>
-                <td><code>{{ device.device_id }}</code></td>
-                <td><strong>{{ device.display_name }}</strong></td>
-                <td><span class="status-chip status-chip--neutral">{{ device.role }}</span></td>
-                <td><span class="status-chip status-chip--neutral">{{ device.gateway }}</span></td>
+                <td><strong>{{ assignment.display_name }}</strong><br><code>{{ assignment.device_id }}</code></td>
+                <td>
+                  {% if assignment.children.is_empty() %}
+                    <span class="status-chip status-chip--neutral">No assigned devices</span>
+                  {% else %}
+                    <ul>
+                      {% for child in assignment.children %}
+                        <li><strong>{{ child.display_name }}</strong> <code>{{ child.device_id }}</code></li>
+                      {% endfor %}
+                    </ul>
+                  {% endif %}
+                </td>
               </tr>
             {% endfor %}
           </tbody>

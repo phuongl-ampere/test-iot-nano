@@ -15,7 +15,7 @@ const TENANT_NAVIGATION: [(&str, &str, &str); 16] = [
     ("ota", "/tenant/ota", "OTA"),
     ("alerts", "/tenant/alerts", "Alerts"),
     ("audit", "/tenant/audit", "Audit"),
-    ("topology", "/tenant/topology", "Topology"),
+    ("topology", "/tenant/topology", "Gateway assignments"),
     ("relations", "/tenant/relations", "Relations"),
     (
         "profile-configuration",
@@ -1349,8 +1349,8 @@ fn tenant_operations_templates_make_supported_work_clear_without_inventing_backe
     for marker in [
         "Remove member",
         "Add member",
-        "Assign child to gateway",
-        "Detach child from gateway",
+        "Assign device to gateway",
+        "Remove gateway assignment",
         "Delete relation",
         "Save application",
     ] {
@@ -1407,4 +1407,16 @@ fn tenant_operations_templates_make_supported_work_clear_without_inventing_backe
     ] {
         assert!(stylesheet.contains(marker), "stylesheet contains {marker}");
     }
+}
+
+#[test]
+fn gateway_assignments_templates_use_the_simplified_page_labels() {
+    let topology = platform_template_source("tenant_topology.html");
+    let navigation = platform_template_source("tenant_navigation.html");
+
+    assert!(topology.contains("Gateway assignments"));
+    assert!(topology.contains("No gateway assignments"));
+    assert!(!topology.contains("Topology devices"));
+    assert!(!navigation.contains(">Topology</span>"));
+    assert!(navigation.contains(">Gateway assignments</span>"));
 }

@@ -603,29 +603,41 @@ impl TenantAuditPage {
 pub struct TenantTopologyRow {
     display_name: String,
     device_id: String,
-    role: String,
-    gateway: String,
+    children: Vec<TenantTopologyChildRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantTopologyChildRow {
+    device_id: String,
+    display_name: String,
+}
+
+impl TenantTopologyChildRow {
+    pub(crate) fn new(device_id: impl Into<String>, display_name: impl Into<String>) -> Self {
+        Self {
+            device_id: device_id.into(),
+            display_name: display_name.into(),
+        }
+    }
 }
 
 impl TenantTopologyRow {
     pub(crate) fn new(
         display_name: impl Into<String>,
         device_id: impl Into<String>,
-        role: impl Into<String>,
-        gateway: impl Into<String>,
+        children: Vec<TenantTopologyChildRow>,
     ) -> Self {
         Self {
             display_name: display_name.into(),
             device_id: device_id.into(),
-            role: role.into(),
-            gateway: gateway.into(),
+            children,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantTopologyPage {
-    devices: Vec<TenantTopologyRow>,
+    assignments: Vec<TenantTopologyRow>,
     gateways: Vec<TenantSelectOption>,
     children: Vec<TenantSelectOption>,
     assigned_children: Vec<TenantSelectOption>,
@@ -635,14 +647,14 @@ pub struct TenantTopologyPage {
 
 impl TenantTopologyPage {
     pub(crate) fn new(
-        devices: Vec<TenantTopologyRow>,
+        assignments: Vec<TenantTopologyRow>,
         gateways: Vec<TenantSelectOption>,
         children: Vec<TenantSelectOption>,
         assigned_children: Vec<TenantSelectOption>,
         notice: Option<&'static str>,
     ) -> Self {
         Self {
-            devices,
+            assignments,
             gateways,
             children,
             assigned_children,

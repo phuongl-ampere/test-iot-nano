@@ -6303,6 +6303,22 @@ async fn tenant_topology_forms_scope_gateway_children_and_reject_invalid_assignm
     let tenant_cookie = tenant_account_cookie(&router).await;
     let pool = store.sqlite_pool().unwrap();
 
+    let page = router
+        .clone()
+        .oneshot(platform_get("/tenant/topology", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Gateway assignments"));
+    assert!(body.contains("No gateway assignments"));
+
     let gateway = management_provision_device(&router, &tenant_cookie, "Tenant gateway").await;
     let gateway_id = gateway["device_id"].as_str().unwrap().to_owned();
     let child = management_provision_device(&router, &tenant_cookie, "Tenant child").await;
@@ -6365,7 +6381,7 @@ async fn tenant_topology_forms_scope_gateway_children_and_reject_invalid_assignm
             .to_vec(),
     )
     .unwrap();
-    assert!(page.contains("Gateway Topology"));
+    assert!(page.contains("Gateway assignments"));
     assert!(page.contains(&gateway_id));
     assert!(page.contains(&child_id));
     assert!(!page.contains("Other tenant gateway"));
@@ -6395,6 +6411,23 @@ async fn tenant_topology_forms_scope_gateway_children_and_reject_invalid_assignm
         .unwrap(),
         Some(gateway_id.clone())
     );
+
+    let page = router
+        .clone()
+        .oneshot(platform_get("/tenant/topology", Some(&tenant_cookie)))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Gateway"));
+    assert!(body.contains("Child"));
+    assert!(!body.contains("<td><strong>Direct device</strong></td>"));
 
     let detached = router
         .clone()

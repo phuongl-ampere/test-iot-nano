@@ -665,19 +665,6 @@ pub(in crate::management) async fn tenant_topology_page(
         ManagementDeviceRepository::list_management_devices(state.store.as_ref(), tenant.tenant_id)
             .await
             .map_err(management_device_error)?;
-    let gateway_names: HashMap<String, String> = devices
-        .iter()
-        .filter(|device| device.topology.is_gateway)
-        .map(|device| {
-            (
-                device.device_id.clone(),
-                device
-                    .display_name
-                    .clone()
-                    .unwrap_or_else(|| device.device_id.clone()),
-            )
-        })
-        .collect();
     let gateways = devices
         .iter()
         .filter(|device| device.topology.is_gateway)
@@ -729,40 +716,39 @@ pub(in crate::management) async fn tenant_topology_page(
             )
         })
         .collect();
-    let page = crate::TenantTopologyPage::new(
-        devices
-            .into_iter()
-            .map(|device| {
-                let device_id = device.device_id;
-                let gateway = device
-                    .topology
-                    .gateway_device_id
-                    .as_deref()
-                    .map(|gateway_id| {
-                        let gateway_name = gateway_names
-                            .get(gateway_id)
-                            .cloned()
-                            .unwrap_or_else(|| gateway_id.to_owned());
-                        format!("{gateway_name} ({gateway_id})")
-                    })
-                    .unwrap_or_else(|| "Direct".to_owned());
-                crate::TenantTopologyRow::new(
-                    device.display_name.unwrap_or_else(|| device_id.clone()),
-                    device_id,
-                    if device.topology.is_gateway {
-                        "Gateway"
-                    } else {
-                        "Device"
-                    },
-                    gateway,
-                )
-            })
-            .collect(),
-        gateways,
-        children,
-        assigned_children,
-        notice,
-    );
+    let assignments = devices
+        .iter()
+        .filter(|device| device.topology.is_gateway)
+        .map(|gateway| {
+            let children = devices
+                .iter()
+                .filter(|device| {
+                    !device.topology.is_gateway
+                        && device.topology.gateway_device_id.as_deref()
+                            == Some(gateway.device_id.as_str())
+                })
+                .map(|child| {
+                    crate::TenantTopologyChildRow::new(
+                        child.device_id.clone(),
+                        child
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| child.device_id.clone()),
+                    )
+                })
+                .collect();
+            crate::TenantTopologyRow::new(
+                gateway
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| gateway.device_id.clone()),
+                gateway.device_id.clone(),
+                children,
+            )
+        })
+        .collect();
+    let page =
+        crate::TenantTopologyPage::new(assignments, gateways, children, assigned_children, notice);
     let rendered = crate::PlatformUiRenderer::render_tenant_topology(
         &crate::PlatformUiIdentity::new(format!("Tenant {}", tenant.tenant_id)),
         &page,
