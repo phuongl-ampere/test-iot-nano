@@ -3361,7 +3361,7 @@ async fn bootstrap_system_creates_the_only_initial_system_account_and_enables_sy
 }
 
 #[tokio::test]
-async fn tenant_account_registers_tenant_bound_oauth_applications_and_denies_user_sessions() {
+async fn tenant_account_cannot_register_a_second_oauth_application_and_denies_user_sessions() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         PlatformStore::open(&StorageConfiguration {
@@ -3417,18 +3417,25 @@ async fn tenant_account_registers_tenant_bound_oauth_applications_and_denies_use
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let application_tenant_id: String =
-        sqlx::query_scalar("SELECT tenant_id FROM applications WHERE app_id = 'alpha-client-app'")
-            .fetch_one(store.sqlite_pool().unwrap())
-            .await
-            .unwrap();
-    let expected_tenant_id: String =
-        sqlx::query_scalar("SELECT id FROM tenants WHERE slug = 'test'")
-            .fetch_one(store.sqlite_pool().unwrap())
-            .await
-            .unwrap();
-    assert_eq!(application_tenant_id, expected_tenant_id);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM applications WHERE app_id = 'alpha-client-app'",
+        )
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM applications WHERE app_id = 'powermonitor'",
+        )
+        .fetch_one(store.sqlite_pool().unwrap())
+        .await
+        .unwrap(),
+        1
+    );
 
     let user_login = router
         .clone()
