@@ -268,11 +268,10 @@ demo_seed() {
   seed_api_json POST /api/v1/management/applications \
     "$(jq -nc --arg launch_url "$powermonitor_url" '{
       app_id:"powermonitor",kind:"full_stack",launch_url:$launch_url,
-      client_id:"powermonitor-client",redirect_uris:[($launch_url + "/api/v1/auth/callback")],
-      allowed_scopes:["assets:read","assets:write","alerts:read","alerts:write","authorization:read","authorization:write","commands:read","commands:write","devices:read","devices:write","telemetry:read"],enabled:true
+      client_id:"powermonitor-client",redirect_uris:[($launch_url + "/api/v1/auth/callback")],enabled:true
     }')" >/dev/null
   owner_user_id="$(seed_api_get /api/v1/management/users | jq -er --arg username "$user1_username" '[.[] | select(.username == $username)] | if length == 1 then .[0].id else error("demo owner is missing or ambiguous") end')"
-  power_meter_profile_id="$(demo_create_profile /api/v1/management/profiles/device-profiles '{name:"Power Meter",telemetry_schema:{"power_w":{"type":"number","unit":"W"},"voltage_v":{"type":"number","unit":"V"},"current_a":{"type":"number","unit":"A"},"energy_kwh":{"type":"number","unit":"kWh"}},metric_mapping:{"power_w":"Active power","voltage_v":"Voltage","current_a":"Current","energy_kwh":"Energy"},reporting_settings:{"interval_seconds":60}}')"
+  power_meter_profile_id="$(demo_create_profile /api/v1/management/profiles/device-profiles '{name:"Power Meter",telemetry_schema:{"power_w":{"type":"number","unit":"W"},"voltage_v":{"type":"number","unit":"V"},"current_a":{"type":"number","unit":"A"},"energy_kwh":{"type":"number","unit":"kWh"}},metric_mapping:{"power_w":"Active power","voltage_v":"Voltage","current_a":"Current","energy_kwh":"Energy"}}')"
   power_farm_profile_id="$(demo_create_profile /api/v1/management/profiles/asset-profiles '{name:"Power Farm",fields:{"location":{"type":"string"},"capacity_kw":{"type":"number"}},dashboard_defaults:{"primary_metric":"power_w","aggregation":"sum"}}')"
   power_zone_profile_id="$(demo_create_profile /api/v1/management/profiles/asset-profiles '{name:"Power Zone",fields:{"location":{"type":"string"}},dashboard_defaults:{"primary_metric":"power_w","aggregation":"sum"}}')"
   farm_1_id="$(demo_create_asset 'Power Farm 1' '' "$power_farm_profile_id")"

@@ -101,8 +101,7 @@ pub(super) fn management_device_profile_error(
     match error {
         ManagementDeviceProfileError::InvalidName
         | ManagementDeviceProfileError::TelemetrySchemaMustBeObject
-        | ManagementDeviceProfileError::MetricMappingMustBeObject
-        | ManagementDeviceProfileError::ReportingSettingsMustBeObject => {
+        | ManagementDeviceProfileError::MetricMappingMustBeObject => {
             ManagementSessionError::BadRequest
         }
         ManagementDeviceProfileError::DeviceProfileNotFound => ManagementSessionError::NotFound,

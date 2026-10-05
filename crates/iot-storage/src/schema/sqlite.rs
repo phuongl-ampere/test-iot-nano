@@ -384,7 +384,6 @@ CREATE TABLE IF NOT EXISTS device_profiles (
     name TEXT NOT NULL,
     telemetry_schema TEXT NOT NULL DEFAULT '{}',
     metric_mapping TEXT NOT NULL DEFAULT '{}',
-    reporting_settings TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (id, tenant_id),

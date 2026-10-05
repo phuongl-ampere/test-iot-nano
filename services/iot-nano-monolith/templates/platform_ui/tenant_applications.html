@@ -45,67 +45,6 @@
         <span>Redirect URIs</span>
         <textarea name="redirect_uris" rows="3" required></textarea>
       </label>
-      <fieldset class="scope-picker">
-        <legend>Allowed scopes</legend>
-        <p class="scope-picker__hint">Select only the API permissions this application needs.</p>
-        <div class="scope-picker__groups">
-          <section class="scope-picker__group" aria-labelledby="scope-group-resources">
-            <h3 id="scope-group-resources">Resources</h3>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="devices:read" data-scope-checkbox>
-              <span><strong>Devices: read</strong><small>Read device inventory and status.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="devices:write" data-scope-checkbox>
-              <span><strong>Devices: write</strong><small>Create and change device configuration.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="assets:read" data-scope-checkbox>
-              <span><strong>Assets: read</strong><small>Read assets and their hierarchy.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="assets:write" data-scope-checkbox>
-              <span><strong>Assets: write</strong><small>Create and change asset configuration.</small></span>
-            </label>
-          </section>
-          <section class="scope-picker__group" aria-labelledby="scope-group-operations">
-            <h3 id="scope-group-operations">Operations</h3>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="telemetry:read" data-scope-checkbox>
-              <span><strong>Telemetry: read</strong><small>Read device measurements and events.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="alerts:read" data-scope-checkbox>
-              <span><strong>Alerts: read</strong><small>Read alert rules and incidents.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="alerts:write" data-scope-checkbox>
-              <span><strong>Alerts: write</strong><small>Create and update alert rules.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="commands:read" data-scope-checkbox>
-              <span><strong>Commands: read</strong><small>Read device command status.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="commands:write" data-scope-checkbox>
-              <span><strong>Commands: write</strong><small>Send commands to devices.</small></span>
-            </label>
-          </section>
-          <section class="scope-picker__group" aria-labelledby="scope-group-authorization">
-            <h3 id="scope-group-authorization">Authorization</h3>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="authorization:read" data-scope-checkbox>
-              <span><strong>Authorization: read</strong><small>Read groups, grants, and permissions.</small></span>
-            </label>
-            <label class="scope-picker__option">
-              <input type="checkbox" value="authorization:write" data-scope-checkbox>
-              <span><strong>Authorization: write</strong><small>Change groups, grants, and permissions.</small></span>
-            </label>
-          </section>
-        </div>
-        <input name="allowed_scopes" type="hidden" data-allowed-scopes-output>
-        <p class="scope-picker__summary" data-allowed-scopes-summary role="status"></p>
-      </fieldset>
       <label class="field">
         <span class="field-checkbox"><input name="enabled" type="checkbox" checked> Enabled</span>
       </label>
@@ -129,7 +68,6 @@
               <th scope="col">Kind</th>
               <th scope="col">Launch URL</th>
               <th scope="col">Redirect URIs</th>
-              <th scope="col">Scopes</th>
               <th scope="col">Status</th>
             </tr>
           </thead>
@@ -141,7 +79,6 @@
                 <td><span class="status-chip status-chip--neutral">{{ application.kind }}</span></td>
                 <td>{{ application.launch_url }}</td>
                 <td>{{ application.redirect_uris }}</td>
-                <td>{{ application.scopes }}</td>
                 <td><span class="status-chip status-chip--neutral">{{ application.status }}</span></td>
               </tr>
             {% endfor %}
@@ -150,25 +87,4 @@
       </div>
     {% endif %}
   </section>
-  <script>
-    (() => {
-      const form = document.querySelector("[data-application-form]");
-      if (!form) return;
-
-      const checkboxes = [...form.querySelectorAll("[data-scope-checkbox]")];
-      const output = form.querySelector("[data-allowed-scopes-output]");
-      const summary = form.querySelector("[data-allowed-scopes-summary]");
-      if (!checkboxes.length || !output || !summary) return;
-
-      const syncAllowedScopes = () => {
-        const scopes = checkboxes.filter((checkbox) => checkbox.checked).map((checkbox) => checkbox.value);
-        output.value = scopes.join(" ");
-        checkboxes[0].setCustomValidity(scopes.length ? "" : "Select at least one allowed scope.");
-        summary.textContent = scopes.length ? `${scopes.length} scope${scopes.length === 1 ? "" : "s"} selected.` : "No scopes selected.";
-      };
-
-      checkboxes.forEach((checkbox) => checkbox.addEventListener("change", syncAllowedScopes));
-      syncAllowedScopes();
-    })();
-  </script>
 {% endblock %}

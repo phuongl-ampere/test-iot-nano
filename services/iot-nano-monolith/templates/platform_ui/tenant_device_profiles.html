@@ -38,11 +38,6 @@
         <textarea name="metric_mapping" rows="4" required data-json-input aria-describedby="device-profile-mapping-feedback">{}</textarea>
         <span id="device-profile-mapping-feedback" class="json-feedback" data-json-feedback role="status"></span>
       </label>
-      <label class="field">
-        <span>Reporting settings (JSON)</span>
-        <textarea name="reporting_settings" rows="4" required data-json-input aria-describedby="device-profile-reporting-feedback">{}</textarea>
-        <span id="device-profile-reporting-feedback" class="json-feedback" data-json-feedback role="status"></span>
-      </label>
       <div class="form-actions"><button type="submit">Create device profile</button></div>
     </form>
   </section>
@@ -97,10 +92,6 @@
         <span>Metric mapping (JSON)</span>
         <textarea name="metric_mapping" rows="4" required data-json-input></textarea>
       </label>
-      <label class="field">
-        <span>Reporting settings (JSON)</span>
-        <textarea name="reporting_settings" rows="4" required data-json-input></textarea>
-      </label>
       <div class="dialog-actions">
         <button type="button" class="button-link-secondary" data-dialog-close>Cancel</button>
         <button type="submit">Save changes</button>
@@ -149,7 +140,6 @@
         name: currentForm.elements.name.value.trim(),
         telemetry_schema: ui.parseObject(currentForm.elements.telemetry_schema.value),
         metric_mapping: ui.parseObject(currentForm.elements.metric_mapping.value),
-        reporting_settings: ui.parseObject(currentForm.elements.reporting_settings.value),
       });
 
       document.querySelectorAll("[data-dialog-close]").forEach((control) => {
@@ -187,7 +177,6 @@
             fields.name.value = selectedProfile.name;
             fields.telemetry_schema.value = JSON.stringify(selectedProfile.telemetry_schema, null, 2);
             fields.metric_mapping.value = JSON.stringify(selectedProfile.metric_mapping, null, 2);
-            fields.reporting_settings.value = JSON.stringify(selectedProfile.reporting_settings, null, 2);
             editor.showModal();
             fields.name.focus();
           } catch (error) {

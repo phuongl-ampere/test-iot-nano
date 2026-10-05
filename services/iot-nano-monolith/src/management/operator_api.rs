@@ -244,7 +244,7 @@ pub(super) async fn create_application(
         .into_iter()
         .map(|value| RedirectUri::from_str(&value).map_err(|_| ManagementSessionError::BadRequest))
         .collect::<Result<Vec<_>, _>>()?;
-    if request.launch_url.is_empty() || request.allowed_scopes.is_empty() {
+    if request.launch_url.is_empty() {
         return Err(ManagementSessionError::BadRequest);
     }
     let _lease = authorize_tenant_mutation(&state, &headers).await?;
@@ -257,7 +257,7 @@ pub(super) async fn create_application(
             launch_url: request.launch_url,
             client_id,
             redirect_uris,
-            allowed_scopes: request.allowed_scopes,
+            allowed_scopes: Vec::new(),
             enabled: request.enabled,
         },
     )
@@ -815,7 +815,6 @@ pub(super) async fn create_management_device_profile(
             name: request.name,
             telemetry_schema: request.telemetry_schema,
             metric_mapping: request.metric_mapping,
-            reporting_settings: request.reporting_settings,
         },
     )
     .await
@@ -845,7 +844,6 @@ pub(super) async fn update_management_device_profile(
             name: request.name,
             telemetry_schema: request.telemetry_schema,
             metric_mapping: request.metric_mapping,
-            reporting_settings: request.reporting_settings,
         },
     )
     .await
@@ -1454,7 +1452,6 @@ pub(super) fn management_device_profile_response(
         name: profile.name,
         telemetry_schema: profile.telemetry_schema,
         metric_mapping: profile.metric_mapping,
-        reporting_settings: profile.reporting_settings,
     }
 }
 

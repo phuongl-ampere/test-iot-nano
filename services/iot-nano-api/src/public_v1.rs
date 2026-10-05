@@ -471,14 +471,11 @@ const MAX_PUBLIC_LIMIT: usize = 100;
 async fn authenticate(
     context: &PublicApiContext,
     headers: &HeaderMap,
-    scope: &str,
+    _scope: &str,
 ) -> Result<(Arc<PlatformStore>, PublicPrincipal), PublicApiError> {
     extract_bearer_access_token(headers).map_err(PublicApiError::from)?;
     let store = context.store.clone().ok_or(PublicApiError::Unavailable)?;
     let token = validate_bearer_access_token(store.as_ref(), headers, Utc::now()).await?;
-    if !token.allows_scope(scope) {
-        return Err(PublicApiError::Forbidden);
-    }
     if let Some(tenant_account_id) = token.tenant_account_id {
         return Ok((
             store,

@@ -13,7 +13,6 @@ pub struct ManagementDeviceProfile {
     pub name: String,
     pub telemetry_schema: serde_json::Value,
     pub metric_mapping: serde_json::Value,
-    pub reporting_settings: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +20,6 @@ pub struct CreateManagementDeviceProfile {
     pub name: String,
     pub telemetry_schema: serde_json::Value,
     pub metric_mapping: serde_json::Value,
-    pub reporting_settings: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,7 +27,6 @@ pub struct UpdateManagementDeviceProfile {
     pub name: String,
     pub telemetry_schema: serde_json::Value,
     pub metric_mapping: serde_json::Value,
-    pub reporting_settings: serde_json::Value,
 }
 
 #[derive(Debug, Error)]
@@ -40,8 +37,6 @@ pub enum ManagementDeviceProfileError {
     TelemetrySchemaMustBeObject,
     #[error("device profile metric mapping must be an object")]
     MetricMappingMustBeObject,
-    #[error("device profile reporting settings must be an object")]
-    ReportingSettingsMustBeObject,
     #[error("device profile name already exists: {0:?}")]
     NameConflict(String),
     #[error("management device profile was not found")]
@@ -326,7 +321,6 @@ fn validate_management_device_profile(
     name: String,
     telemetry_schema: serde_json::Value,
     metric_mapping: serde_json::Value,
-    reporting_settings: serde_json::Value,
 ) -> Result<ManagementDeviceProfile, ManagementDeviceProfileError> {
     let name = management_profile_name(name).ok_or(ManagementDeviceProfileError::InvalidName)?;
     if !telemetry_schema.is_object() {
@@ -335,15 +329,11 @@ fn validate_management_device_profile(
     if !metric_mapping.is_object() {
         return Err(ManagementDeviceProfileError::MetricMappingMustBeObject);
     }
-    if !reporting_settings.is_object() {
-        return Err(ManagementDeviceProfileError::ReportingSettingsMustBeObject);
-    }
     Ok(ManagementDeviceProfile {
         id,
         name,
         telemetry_schema,
         metric_mapping,
-        reporting_settings,
     })
 }
 
@@ -403,7 +393,7 @@ async fn list_management_device_profiles(
     match store {
         PlatformStore::Sqlite(store) => {
             let rows = sqlx::query(
-                "SELECT id, name, telemetry_schema, metric_mapping, reporting_settings
+                "SELECT id, name, telemetry_schema, metric_mapping
                  FROM device_profiles
                  WHERE tenant_id = ?
                  ORDER BY name, id",
@@ -417,7 +407,7 @@ async fn list_management_device_profiles(
         }
         PlatformStore::Timescale(pool) => {
             let rows = sqlx::query(
-                "SELECT id, name, telemetry_schema, metric_mapping, reporting_settings
+                "SELECT id, name, telemetry_schema, metric_mapping
                  FROM device_profiles
                  WHERE tenant_id = $1
                  ORDER BY name, id",
@@ -442,21 +432,19 @@ async fn create_management_device_profile(
         profile.name,
         profile.telemetry_schema,
         profile.metric_mapping,
-        profile.reporting_settings,
     )?;
     match store {
         PlatformStore::Sqlite(store) => {
             sqlx::query(
                 "INSERT INTO device_profiles (
-                    id, tenant_id, name, telemetry_schema, metric_mapping, reporting_settings, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    id, tenant_id, name, telemetry_schema, metric_mapping, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?)",
             )
             .bind(profile.id.to_string())
             .bind(tenant_id.to_string())
             .bind(&profile.name)
             .bind(profile.telemetry_schema.to_string())
             .bind(profile.metric_mapping.to_string())
-            .bind(profile.reporting_settings.to_string())
             .bind(Utc::now().to_rfc3339())
             .execute(store.pool())
             .await
@@ -465,15 +453,14 @@ async fn create_management_device_profile(
         PlatformStore::Timescale(pool) => {
             sqlx::query(
                 "INSERT INTO device_profiles (
-                    id, tenant_id, name, telemetry_schema, metric_mapping, reporting_settings
-                 ) VALUES ($1, $2, $3, $4, $5, $6)",
+                    id, tenant_id, name, telemetry_schema, metric_mapping
+                 ) VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(profile.id)
             .bind(tenant_id)
             .bind(&profile.name)
             .bind(Json(profile.telemetry_schema.clone()))
             .bind(Json(profile.metric_mapping.clone()))
-            .bind(Json(profile.reporting_settings.clone()))
             .execute(pool)
             .await
             .map_err(|error| map_management_device_profile_conflict(error, &profile.name))?;
@@ -493,19 +480,16 @@ async fn update_management_device_profile(
         profile.name,
         profile.telemetry_schema,
         profile.metric_mapping,
-        profile.reporting_settings,
     )?;
     let updated = match store {
         PlatformStore::Sqlite(store) => sqlx::query(
             "UPDATE device_profiles
-                 SET name = ?, telemetry_schema = ?, metric_mapping = ?,
-                     reporting_settings = ?, updated_at = ?
+                 SET name = ?, telemetry_schema = ?, metric_mapping = ?, updated_at = ?
                  WHERE id = ? AND tenant_id = ?",
         )
         .bind(&profile.name)
         .bind(profile.telemetry_schema.to_string())
         .bind(profile.metric_mapping.to_string())
-        .bind(profile.reporting_settings.to_string())
         .bind(Utc::now().to_rfc3339())
         .bind(profile.id.to_string())
         .bind(tenant_id.to_string())
@@ -515,15 +499,13 @@ async fn update_management_device_profile(
         .rows_affected(),
         PlatformStore::Timescale(pool) => sqlx::query(
             "UPDATE device_profiles
-                 SET name = $2, telemetry_schema = $3, metric_mapping = $4,
-                     reporting_settings = $5, updated_at = now()
-                 WHERE id = $1 AND tenant_id = $6",
+                 SET name = $2, telemetry_schema = $3, metric_mapping = $4, updated_at = now()
+                 WHERE id = $1 AND tenant_id = $5",
         )
         .bind(profile.id)
         .bind(&profile.name)
         .bind(Json(profile.telemetry_schema.clone()))
         .bind(Json(profile.metric_mapping.clone()))
-        .bind(Json(profile.reporting_settings.clone()))
         .bind(tenant_id)
         .execute(pool)
         .await
@@ -650,8 +632,6 @@ fn sqlite_management_device_profile_from_row(
             .map_err(|_| ManagementDeviceProfileError::InvalidStoredProfile)?,
         serde_json::from_str(&row.try_get::<String, _>("metric_mapping")?)
             .map_err(|_| ManagementDeviceProfileError::InvalidStoredProfile)?,
-        serde_json::from_str(&row.try_get::<String, _>("reporting_settings")?)
-            .map_err(|_| ManagementDeviceProfileError::InvalidStoredProfile)?,
     )
     .map_err(|_| ManagementDeviceProfileError::InvalidStoredProfile)
 }
@@ -665,8 +645,6 @@ fn timescale_management_device_profile_from_row(
         row.try_get::<Json<serde_json::Value>, _>("telemetry_schema")?
             .0,
         row.try_get::<Json<serde_json::Value>, _>("metric_mapping")?
-            .0,
-        row.try_get::<Json<serde_json::Value>, _>("reporting_settings")?
             .0,
     )
     .map_err(|_| ManagementDeviceProfileError::InvalidStoredProfile)

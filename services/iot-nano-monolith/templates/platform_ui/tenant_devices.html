@@ -78,7 +78,6 @@
               <th scope="col">Device status</th>
               <th scope="col">Assigned asset</th>
               <th scope="col">Assigned user</th>
-              <th scope="col">Pairing</th>
               <th scope="col">Actions</th>
             </tr>
           </thead>
@@ -91,14 +90,6 @@
                 <td><span class="status-chip">{{ device.status }}</span></td>
                 <td>{{ device.asset }}</td>
                 <td>{{ device.assigned_user }}</td>
-                <td>
-                  <span class="operation-note">{{ device.claim_status }}</span>
-                  {% if device.has_active_claim_code %}
-                    <form action="/tenant/devices/{{ device.device_id|urlencode_strict }}/claim-code/revoke" method="post">
-                      <button type="submit" class="button-link-secondary" aria-label="Revoke pairing code for {{ device.display_name }}" title="Revoke pairing code">Revoke</button>
-                    </form>
-                  {% endif %}
-                </td>
                 <td>
                   <div class="action-buttons">
                     <button type="button" class="button-link-secondary" data-device-edit data-device-id="{{ device.device_id }}" aria-label="Edit {{ device.display_name }}" title="Edit device">Edit</button>

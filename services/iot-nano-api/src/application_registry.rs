@@ -15,7 +15,6 @@ pub(crate) enum ApplicationRegistryError {
     UnknownClient,
     Disabled,
     RedirectDenied,
-    ScopeDenied,
     Unavailable,
 }
 
@@ -28,7 +27,7 @@ impl ApplicationRegistry {
         &self,
         client_id: &str,
         redirect_uri: &str,
-        scopes: &[String],
+        _scopes: &[String],
     ) -> Result<ApplicationRecord, ApplicationRegistryError> {
         let client_id =
             ClientId::from_str(client_id).map_err(|_| ApplicationRegistryError::UnknownClient)?;
@@ -54,13 +53,6 @@ impl ApplicationRegistry {
         {
             return Err(ApplicationRegistryError::RedirectDenied);
         }
-        if !scopes
-            .iter()
-            .all(|scope| application.allowed_scopes.binary_search(scope).is_ok())
-        {
-            return Err(ApplicationRegistryError::ScopeDenied);
-        }
-
         Ok(application)
     }
 }

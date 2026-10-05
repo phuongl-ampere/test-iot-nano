@@ -744,11 +744,9 @@ fn tenant_application_scopes_use_a_described_checklist_and_preserve_the_form_con
     let stylesheet = platform_stylesheet_source();
 
     assert!(applications.contains("class=\"scope-picker\""));
-    assert!(applications.contains("data-scope-checkbox"));
-    assert!(applications.contains("data-allowed-scopes-output"));
-    assert!(applications.contains("name=\"allowed_scopes\""));
-    assert!(applications.contains("devices:read"));
-    assert!(applications.contains("commands:write"));
+    assert!(!applications.contains("data-scope-checkbox"));
+    assert!(!applications.contains("data-allowed-scopes-output"));
+    assert!(!applications.contains("name=\"allowed_scopes\""));
     assert!(applications.contains("authorization:write"));
     assert!(applications.contains("Read device inventory and status."));
     assert!(applications.contains("syncAllowedScopes"));

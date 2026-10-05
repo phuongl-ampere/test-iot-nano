@@ -197,7 +197,6 @@ CREATE TABLE IF NOT EXISTS device_profiles (
     name TEXT NOT NULL,
     telemetry_schema JSONB NOT NULL DEFAULT '{}'::jsonb,
     metric_mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
-    reporting_settings JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (id, tenant_id),
     UNIQUE (tenant_id, name)

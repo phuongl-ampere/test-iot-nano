@@ -446,13 +446,6 @@ impl PlatformStore {
         {
             return Err(PlatformStoreError::OAuthRedirectUriDenied);
         }
-        if !scopes
-            .iter()
-            .all(|scope| application.allowed_scopes.binary_search(scope).is_ok())
-        {
-            return Err(PlatformStoreError::OAuthScopeDenied);
-        }
-
         let code_hash = sha256_hex(&code.code);
         let scopes_json = serde_json::to_string(&scopes)
             .map_err(|_| PlatformStoreError::InvalidApplicationScopes)?;
@@ -695,12 +688,6 @@ impl PlatformStore {
             .await?
             .ok_or(PlatformStoreError::OAuthClientAuthenticationDenied)?;
         let scopes = canonical_application_scopes(request.scopes)?;
-        if !scopes
-            .iter()
-            .all(|scope| application.allowed_scopes.binary_search(scope).is_ok())
-        {
-            return Err(PlatformStoreError::OAuthScopeDenied);
-        }
         let token_hash = sha256_hex(&request.access_token);
         let scopes_json = serde_json::to_string(&scopes)
             .map_err(|_| PlatformStoreError::InvalidApplicationScopes)?;

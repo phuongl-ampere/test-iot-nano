@@ -223,7 +223,6 @@ create_device_profile() {
   local name="$1"
   local telemetry_schema="$2"
   local metric_mapping="$3"
-  local reporting_settings="$4"
   local profile_status
   local profile_body="$state_dir/device-profile-${name// /-}.json"
 
@@ -234,8 +233,7 @@ create_device_profile() {
       --arg name "$name" \
       --argjson telemetry_schema "$telemetry_schema" \
       --argjson metric_mapping "$metric_mapping" \
-      --argjson reporting_settings "$reporting_settings" \
-      '{name: $name, telemetry_schema: $telemetry_schema, metric_mapping: $metric_mapping, reporting_settings: $reporting_settings}')" \
+      '{name: $name, telemetry_schema: $telemetry_schema, metric_mapping: $metric_mapping}')" \
     "$management_url/api/v1/management/profiles/device-profiles")"
   require_status "$profile_status" 201 "Device profile seed ($name)"
   jq -r '.id' "$profile_body"
@@ -501,8 +499,7 @@ ensure_user "$IOT_NANO_SEED_UNASSIGNED_USERNAME" "$IOT_NANO_SEED_UNASSIGNED_PASS
 power_meter_profile_id="$(create_device_profile \
   'Power Meter' \
   '{"power_w":{"type":"number","unit":"W"},"voltage_v":{"type":"number","unit":"V"},"current_a":{"type":"number","unit":"A"},"energy_kwh":{"type":"number","unit":"kWh"}}' \
-  '{"power_w":"Active power","voltage_v":"Voltage","current_a":"Current","energy_kwh":"Energy"}' \
-  '{"interval_seconds":60}')"
+  '{"power_w":"Active power","voltage_v":"Voltage","current_a":"Current","energy_kwh":"Energy"}')"
 power_farm_profile_id="$(create_asset_profile \
   'Power Farm' \
   '{"location":{"type":"string"},"capacity_kw":{"type":"number"}}' \

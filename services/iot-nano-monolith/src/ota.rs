@@ -349,7 +349,6 @@ mod tests {
                 name: "OTA meter".to_owned(),
                 telemetry_schema: json!({}),
                 metric_mapping: json!({}),
-                reporting_settings: json!({}),
             },
         )
         .await
@@ -497,7 +496,6 @@ mod tests {
                 name: "Other meter".to_owned(),
                 telemetry_schema: json!({}),
                 metric_mapping: json!({}),
-                reporting_settings: json!({}),
             },
         )
         .await

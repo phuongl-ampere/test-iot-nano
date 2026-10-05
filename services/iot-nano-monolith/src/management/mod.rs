@@ -876,7 +876,6 @@ struct CreateTenantDeviceProfileForm {
     name: String,
     telemetry_schema: String,
     metric_mapping: String,
-    reporting_settings: String,
 }
 
 #[derive(Deserialize)]
@@ -925,7 +924,6 @@ struct TenantApplicationForm {
     launch_url: String,
     client_id: String,
     redirect_uris: String,
-    allowed_scopes: String,
     #[serde(default)]
     enabled: Option<String>,
 }
@@ -944,7 +942,6 @@ struct CreateApplicationRequest {
     launch_url: String,
     client_id: String,
     redirect_uris: Vec<String>,
-    allowed_scopes: Vec<String>,
     enabled: bool,
     client_secret: Option<String>,
 }
@@ -1149,7 +1146,6 @@ struct ManagementDeviceProfileRequest {
     name: String,
     telemetry_schema: Value,
     metric_mapping: Value,
-    reporting_settings: Value,
 }
 
 #[derive(Serialize)]
@@ -1158,7 +1154,6 @@ struct ManagementDeviceProfileResponse {
     name: String,
     telemetry_schema: Value,
     metric_mapping: Value,
-    reporting_settings: Value,
 }
 
 #[derive(Deserialize)]

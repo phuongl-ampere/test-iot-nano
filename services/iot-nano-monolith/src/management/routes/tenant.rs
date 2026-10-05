@@ -879,7 +879,7 @@ pub(in crate::management) async fn tenant_applications_page(
                         .map(|uri| uri.as_str())
                         .collect::<Vec<_>>()
                         .join("\n"),
-                    application.allowed_scopes.join(" "),
+                    "",
                     if application.enabled {
                         "Enabled"
                     } else {
@@ -1125,10 +1125,6 @@ pub(in crate::management) async fn create_tenant_device_profile_form(
         Ok(value) => value,
         Err(error) => return tenant_profile_form_error(TenantProfileKind::Device, error),
     };
-    let reporting_settings = match tenant_profile_object(&request.reporting_settings) {
-        Ok(value) => value,
-        Err(error) => return tenant_profile_form_error(TenantProfileKind::Device, error),
-    };
     let _lease = authorize_tenant_mutation(&state, &headers).await?;
     match ManagementDeviceProfileRepository::create_management_device_profile(
         state.store.as_ref(),
@@ -1137,7 +1133,6 @@ pub(in crate::management) async fn create_tenant_device_profile_form(
             name: request.name,
             telemetry_schema,
             metric_mapping,
-            reporting_settings,
         },
     )
     .await
@@ -1395,14 +1390,6 @@ pub(in crate::management) fn tenant_application_from_form(
     if redirect_uris.is_empty() {
         return Err(ManagementSessionError::BadRequest);
     }
-    let allowed_scopes: Vec<_> = request
-        .allowed_scopes
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect();
-    if allowed_scopes.is_empty() {
-        return Err(ManagementSessionError::BadRequest);
-    }
     Ok(NewApplication {
         app_id,
         tenant_id,
@@ -1410,7 +1397,7 @@ pub(in crate::management) fn tenant_application_from_form(
         launch_url: launch_url.to_owned(),
         client_id,
         redirect_uris,
-        allowed_scopes,
+        allowed_scopes: Vec::new(),
         enabled: request.enabled.is_some(),
     })
 }

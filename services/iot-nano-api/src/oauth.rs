@@ -200,7 +200,6 @@ impl From<ApplicationRegistryError> for OAuthError {
             ApplicationRegistryError::Disabled | ApplicationRegistryError::UnknownClient => {
                 Self::UnauthorizedClient
             }
-            ApplicationRegistryError::ScopeDenied => Self::InvalidScope,
             _ => Self::ServerError,
         }
     }
