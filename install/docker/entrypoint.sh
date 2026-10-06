@@ -33,4 +33,4 @@ export IOT_NANO_HTTPS_ENABLED="${IOT_NANO_HTTPS_ENABLED:-false}"
 export IOT_NANO_ALLOW_INSECURE_DEFAULT_PASSWORDS="${IOT_NANO_ALLOW_INSECURE_DEFAULT_PASSWORDS:-false}"
 export IOT_DEVICE_TOKEN_VAULT_KEY="$(tr -d '\r\n' <"$vault_file")"
 
-exec /usr/local/bin/iot-nano-monolith
+exec /usr/local/bin/iot-nano-monolith "$@"

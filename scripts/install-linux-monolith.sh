@@ -33,6 +33,7 @@ Usage: sudo ./scripts/install-linux-monolith.sh [command] [options]
 
 Commands:
   install       Install, bootstrap, start, smoke-test, and optionally seed (default).
+  seed-demo     Seed a clean existing platform with the Power Monitor demo; does not reset data.
   status        Show service status and health.
   smoke-test    Check public health/ready endpoints.
   backup        Stop, archive platform plus internal state, then restart.
@@ -43,6 +44,15 @@ Options:
   --public-address ADDR  Default: 0.0.0.0:17180.
   --mqtt-address ADDR    Default: 0.0.0.0:17183.
   --mqtt-tls-address ADDR Default: 0.0.0.0:17184.
+  --system-username NAME System Account username used by seed-demo.
+  --system-password VALUE System Account password used by seed-demo.
+  --tenant-slug SLUG     Tenant slug used by seed-demo.
+  --tenant-username NAME Tenant Account username used by seed-demo.
+  --tenant-password VALUE Tenant Account password used by seed-demo.
+  --user1-username NAME  Demo owner username used by seed-demo.
+  --user1-password VALUE Demo owner password used by seed-demo.
+  --user2-username NAME  Demo viewer username used by seed-demo.
+  --user2-password VALUE Demo viewer password used by seed-demo.
   --powermonitor-url URL Launch URL seeded for Power Monitor demo mode.
   --yes                  Skip destructive uninstall confirmation.
   --purge-data           With uninstall, remove /var/lib/iot-nano.
@@ -275,9 +285,9 @@ demo_seed() {
       client_id:"powermonitor-client",redirect_uris:[($launch_url + "/api/v1/auth/callback")],enabled:true
     }')" >/dev/null
   owner_user_id="$(seed_api_get /api/v1/management/users | jq -er --arg username "$user1_username" '[.[] | select(.username == $username)] | if length == 1 then .[0].id else error("demo owner is missing or ambiguous") end')"
-  power_meter_profile_id="$(demo_create_profile /api/v1/management/profiles/device-profiles '{name:"Power Meter",telemetry_schema:{"power_w":{"type":"number","unit":"W"},"voltage_v":{"type":"number","unit":"V"},"current_a":{"type":"number","unit":"A"},"energy_kwh":{"type":"number","unit":"kWh"}},metric_mapping:{"power_w":"Active power","voltage_v":"Voltage","current_a":"Current","energy_kwh":"Energy"}}')"
-  power_farm_profile_id="$(demo_create_profile /api/v1/management/profiles/asset-profiles '{name:"Power Farm",fields:{"location":{"type":"string"},"capacity_kw":{"type":"number"}},dashboard_defaults:{"primary_metric":"power_w","aggregation":"sum"}}')"
-  power_zone_profile_id="$(demo_create_profile /api/v1/management/profiles/asset-profiles '{name:"Power Zone",fields:{"location":{"type":"string"}},dashboard_defaults:{"primary_metric":"power_w","aggregation":"sum"}}')"
+  power_meter_profile_id="$(demo_create_profile /api/v1/management/profiles/device-profiles '{"name":"Power Meter","telemetry_schema":{"power_w":{"type":"number","unit":"W"},"voltage_v":{"type":"number","unit":"V"},"current_a":{"type":"number","unit":"A"},"energy_kwh":{"type":"number","unit":"kWh"}},"metric_mapping":{"power_w":"Active power","voltage_v":"Voltage","current_a":"Current","energy_kwh":"Energy"}}')"
+  power_farm_profile_id="$(demo_create_profile /api/v1/management/profiles/asset-profiles '{"name":"Power Farm","fields":{"location":{"type":"string"},"capacity_kw":{"type":"number"}},"dashboard_defaults":{"primary_metric":"power_w","aggregation":"sum"}}')"
+  power_zone_profile_id="$(demo_create_profile /api/v1/management/profiles/asset-profiles '{"name":"Power Zone","fields":{"location":{"type":"string"}},"dashboard_defaults":{"primary_metric":"power_w","aggregation":"sum"}}')"
   farm_1_id="$(demo_create_asset 'Power Farm 1' '' "$power_farm_profile_id")"
   farm_1_zone_1_id="$(demo_create_asset 'Farm 1 / Zone 1' "$farm_1_id" "$power_zone_profile_id")"
   farm_1_zone_2_id="$(demo_create_asset 'Farm 1 / Zone 2' "$farm_1_id" "$power_zone_profile_id")"
@@ -352,6 +362,15 @@ while [[ "$#" -gt 0 ]]; do
     --public-address) public_address="$2"; shift 2 ;;
     --mqtt-address) mqtt_address="$2"; shift 2 ;;
     --mqtt-tls-address) mqtt_tls_address="$2"; shift 2 ;;
+    --system-username) system_username="$2"; shift 2 ;;
+    --system-password) system_password="$2"; shift 2 ;;
+    --tenant-slug) tenant_slug="$2"; shift 2 ;;
+    --tenant-username) tenant_username="$2"; shift 2 ;;
+    --tenant-password) tenant_password="$2"; shift 2 ;;
+    --user1-username) user1_username="$2"; shift 2 ;;
+    --user1-password) user1_password="$2"; shift 2 ;;
+    --user2-username) user2_username="$2"; shift 2 ;;
+    --user2-password) user2_password="$2"; shift 2 ;;
     --powermonitor-url) powermonitor_url="$2"; shift 2 ;;
     --yes) uninstall_yes=1; shift ;;
     --purge-data) uninstall_purge_data=1; shift ;;
@@ -360,6 +379,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 case "$command" in
   install) require_root; prompt_install_values; install_dependencies; install_paths; build_and_install_binary; write_runtime_material; bootstrap_system; systemctl daemon-reload; systemctl enable --now "$service_name"; wait_ready; seed_platform; smoke_test ;;
+  seed-demo) seed_mode="demo"; seed_platform ;;
   status) systemctl status "$service_name" --no-pager; smoke_test ;;
   smoke-test) smoke_test ;;
   backup) require_root; backup ;;

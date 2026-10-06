@@ -44,5 +44,6 @@ assert_contains "$dockerfile_contents" 'mkdir -p /var/lib/iot-nano/platform /var
 [[ "$dockerfile_contents" != *'mkdir -p /var/lib/iot-nano/platform /var/lib/iot-nano/internal /var/lib/iot-nano/tls'* ]] || fail 'Dockerfile must not pre-create the runtime-owned internal state directory'
 assert_contains "$entrypoint_contents" 'mkdir -p "$state_root/platform" "$tls_root"'
 [[ "$entrypoint_contents" != *'mkdir -p "$state_root/platform" "$state_root/internal" "$tls_root"'* ]] || fail 'entrypoint must leave the internal state directory for the runtime to create securely'
+assert_contains "$entrypoint_contents" 'exec /usr/local/bin/iot-nano-monolith "$@"'
 
 printf 'test-docker-install: ok\n'
