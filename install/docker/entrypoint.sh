@@ -7,7 +7,7 @@ vault_file="$state_root/vault.key"
 cert_file="$tls_root/mqtt-cert.pem"
 key_file="$tls_root/mqtt-key.pem"
 
-mkdir -p "$state_root/platform" "$state_root/internal" "$tls_root"
+mkdir -p "$state_root/platform" "$tls_root"
 
 if [ ! -s "$vault_file" ]; then
   umask 077

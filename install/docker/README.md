@@ -8,6 +8,10 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+The first build on a new machine compiles the Rust service locally. Subsequent
+changes limited to Docker configuration or this documentation reuse the Rust
+build layer.
+
 Verify it:
 
 ```sh

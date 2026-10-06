@@ -21,7 +21,7 @@ pub struct PersistentCache {
 
 #[derive(Debug, Error)]
 pub enum CacheError {
-    #[error("cache SQLite operation failed")]
+    #[error("cache SQLite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("cache state I/O failed")]
     Io(#[from] std::io::Error),

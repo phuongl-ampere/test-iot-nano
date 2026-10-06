@@ -118,9 +118,11 @@ impl MonolithRuntime {
         let cache_file = internal_directory
             .open_state_file("cache.sqlite")
             .map_err(StartupError::InternalDirectory)?;
-        let cache_path = internal_directory
-            .state_path("cache.sqlite")
-            .map_err(StartupError::InternalDirectory)?;
+        // SQLite's SQLITE_OPEN_NOFOLLOW rejects the `/proc/self/fd` anchor used
+        // for other state files. The internal directory and this file were
+        // already opened and validated above; retain NOFOLLOW on this real path
+        // so a replacement cache file is still rejected.
+        let cache_path = internal_directory.path.join("cache.sqlite");
         let cache = Arc::new(
             PersistentCache::open_file(cache_file, cache_path)
                 .await
@@ -348,7 +350,7 @@ pub enum StartupError {
     MqttStorage(#[source] iot_nano_mqttd::StorageError),
     #[error("MQTTD state recovery task failed: {0}")]
     MqttStorageTask(String),
-    #[error("cache state recovery failed")]
+    #[error("cache state recovery failed: {0}")]
     CacheRecovery(#[source] CacheError),
     #[error("MQTT runtime startup failed")]
     MqttRuntime(#[source] iot_nano_mqttd::MqttRuntimeStartError),
@@ -1208,7 +1210,7 @@ mod tests {
         std::fs::create_dir(&parent).unwrap();
         let directory = prepare_internal_directory_unix(&internal).unwrap();
         let cache_file = directory.open_state_file("cache.sqlite").unwrap();
-        let cache_path = directory.state_path("cache.sqlite").unwrap();
+        let cache_path = directory.path.join("cache.sqlite");
 
         let original = internal.join("original-cache.sqlite");
         std::fs::rename(internal.join("cache.sqlite"), &original).unwrap();
