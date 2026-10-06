@@ -11,9 +11,9 @@ data_root="/var/lib/iot-nano"
 service_name="iot-nano-monolith.service"
 service_user="iotnano"
 seed_mode="starter"
-public_address="0.0.0.0:18080"
-mqtt_address="0.0.0.0:1883"
-mqtt_tls_address="0.0.0.0:8883"
+public_address="0.0.0.0:17180"
+mqtt_address="0.0.0.0:17183"
+mqtt_tls_address="0.0.0.0:17184"
 web_https_enabled="false"
 powermonitor_url="http://localhost:3002"
 tls_common_name="iot-nano"
@@ -40,7 +40,9 @@ Commands:
 
 Options:
   --seed-mode MODE       starter (default), demo, or none.
-  --public-address ADDR  Default: 0.0.0.0:18080.
+  --public-address ADDR  Default: 0.0.0.0:17180.
+  --mqtt-address ADDR    Default: 0.0.0.0:17183.
+  --mqtt-tls-address ADDR Default: 0.0.0.0:17184.
   --powermonitor-url URL Launch URL seeded for Power Monitor demo mode.
   --yes                  Skip destructive uninstall confirmation.
   --purge-data           With uninstall, remove /var/lib/iot-nano.
@@ -66,6 +68,8 @@ prompt() {
 prompt_install_values() {
   printf '%s\n' 'Press Enter to use each displayed default.'
   public_address="$(prompt 'Public HTTP address' "$public_address")"
+  mqtt_address="$(prompt 'MQTT plaintext address' "$mqtt_address")"
+  mqtt_tls_address="$(prompt 'MQTT TLS address' "$mqtt_tls_address")"
   web_https_enabled="$(prompt 'HTTPS enabled for browser cookies: true or false' "$web_https_enabled")"
   seed_mode="$(prompt 'Seed mode: starter, demo, or none' "$seed_mode")"
   powermonitor_url="$(prompt 'Power Monitor launch URL' "$powermonitor_url")"
@@ -346,6 +350,8 @@ while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --seed-mode) seed_mode="$2"; shift 2 ;;
     --public-address) public_address="$2"; shift 2 ;;
+    --mqtt-address) mqtt_address="$2"; shift 2 ;;
+    --mqtt-tls-address) mqtt_tls_address="$2"; shift 2 ;;
     --powermonitor-url) powermonitor_url="$2"; shift 2 ;;
     --yes) uninstall_yes=1; shift ;;
     --purge-data) uninstall_purge_data=1; shift ;;

@@ -1,0 +1,21 @@
+services:
+  iot-nano:
+    build:
+      context: ../..
+      dockerfile: install/docker/Dockerfile
+    container_name: iot-nano
+    restart: unless-stopped
+    environment:
+      IOT_NANO_HTTP_ADDRESS: 0.0.0.0:18080
+      IOT_NANO_MQTT_TCP_ADDRESS: 0.0.0.0:1883
+      IOT_NANO_MQTT_TLS_ADDRESS: 0.0.0.0:8883
+      IOT_NANO_HTTPS_ENABLED: "false"
+    ports:
+      - "${HTTP_PORT:-17180}:18080"
+      - "${MQTT_PORT:-17183}:1883"
+      - "${MQTT_TLS_PORT:-17184}:8883"
+    volumes:
+      - iot-nano-data:/var/lib/iot-nano
+
+volumes:
+  iot-nano-data:
